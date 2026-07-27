@@ -1,0 +1,49 @@
+[package]
+name = "hercules-agent"
+version = "0.1.0"
+edition = "2024"
+description = "Hercules Agent — local coding TUI agent (pure-Rust llama.rs + optional llama.cpp)"
+license = "MIT"
+readme = "README.md"
+keywords = ["llm", "tui", "agent", "llama", "local"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "hercules_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hercules"
+path = "src/main.rs"
+
+[features]
+default = ["llama-rs", "simd", "parallel"]
+# Pure-Rust GGUF engine (no C/FFI). Always safe to enable on any target.
+llama-rs = []
+# std::arch SIMD kernels for desktop CPUs (still pure Rust).
+simd = []
+# Multi-thread GEMV via rayon (desktop/server; disable for embedded).
+parallel = ["dep:rayon"]
+# Tighter defaults: single-thread, no rayon preference.
+embedded = []
+# Future: in-process llama.cpp shared library bindings (not pure path).
+llama-cpp-bindings = []
+
+[dependencies]
+burn = { version = "0.21.0", features = ["wgpu"] }
+cand = "0.3.2"
+crossterm = "0.29.0"
+futures-util = "0.3.33"
+hf-hub = { version = "0.3.2", features = ["tokio"] }
+kramaframe = "0.2.3"
+libc = "0.2.189"
+ollama-rs = { version = "0.3.5", features = ["stream"] }
+ratatui = "0.30.0"
+reqwest = { version = "0.13.4", features = ["stream"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sysinfo = "0.39.6"
+tokio = { version = "1.53.1", features = ["full"] }
+arboard = "3.4.0"
+toml = "1.1.2"
+rayon = { version = "1.10", optional = true }

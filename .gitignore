@@ -1,0 +1,46 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs and local runtime
+*.log
+/tmp/
+/logs/
+
+# Hercules local state (models, sessions, locks)
+.local/hercules/
+**/hercules/model/
+**/hercules/*.pid
+**/hercules/*.lock
+**/hercules/*.log
+
+# Core dumps and debug
+core
+core.*
+*.core
+*.dmp
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Test / scratch
+dummy_folder/
+*.gguf
+!tests/fixtures/**/*.gguf
