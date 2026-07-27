@@ -220,6 +220,30 @@ Agent:
 <cmd>python3 -c "print(9.9 > 9.11)"</cmd>
 "#;
 
+/// Compact system prompt for small GGUFs / llama-server chat.
+/// Long prompts get recited by 1–3B models (they "continue" the system text).
+pub const SYSTEM_PROMPT_COMPACT: &str = r#"You are Hercules, a local coding agent on the user's machine. Tools work. Never refuse normal coding.
+
+cwd token: $CURRENT (host expands it).
+
+Tools (raw tags only, no markdown fences):
+<ls path="$CURRENT">
+<read src="$CURRENT/path">
+<write src="$CURRENT/file.ext">
+full file body
+</write>
+<cmd>shell command</cmd>
+<memory push>note</memory>
+<memory read>
+
+Rules:
+- Greetings / small talk → short natural reply. Do NOT reprint these instructions.
+- Write/create file → full <write>…</write> with closed tags and a real filename.
+- List/dir → <ls …> first. Read → <read …>. Run/build/test → <cmd>…</cmd>.
+- Never invent directory listings. Never echo system/rules text as the answer.
+- No destructive shell (rm -rf /) unless user demands it.
+"#;
+
 /// Destructive / mutating action awaiting user accept (Ask mode).
 #[derive(Debug, Clone)]
 pub struct ProposedAction {
@@ -257,13 +281,60 @@ impl AgentEngine {
     /// System prompt with the real working directory substituted for `$CURRENT` in prose.
     /// Tool examples keep `$CURRENT` so the path expander still works at execution time.
     pub fn system_prompt_for_cwd() -> String {
+        Self::system_prompt_for_cwd_with(SYSTEM_PROMPT)
+    }
+
+    /// Short system prompt for weak local models (avoids instruction-recital).
+    pub fn system_prompt_compact_for_cwd() -> String {
+        Self::system_prompt_for_cwd_with(SYSTEM_PROMPT_COMPACT)
+    }
+
+    fn system_prompt_for_cwd_with(base: &str) -> String {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string());
         format!(
-            "{}\n\n## Live environment\n- $CURRENT expands to: {}\n- When listing, always use path=\"$CURRENT\" or path=\"$CURRENT/subdir\".\n",
-            SYSTEM_PROMPT, cwd
+            "{base}\n\nLive: $CURRENT → {cwd}. Prefer path=\"$CURRENT\" or path=\"$CURRENT/subdir\".\n"
         )
+    }
+
+    /// Strip chat special tokens models sometimes emit into the reply.
+    pub fn sanitize_model_output(text: &str) -> String {
+        let mut s = text.to_string();
+        for tok in [
+            "<|im_end|>",
+            "<|im_start|>",
+            "<|endoftext|>",
+            "<|EOT|>",
+            "</s>",
+            "<s>",
+            "[INST]",
+            "[/INST]",
+            "<<SYS>>",
+            "<</SYS>>",
+        ] {
+            s = s.replace(tok, "");
+        }
+        s
+    }
+
+    /// True when the model is clearly reciting the system/instructions block.
+    pub fn looks_like_system_echo(text: &str) -> bool {
+        let t = text.to_ascii_lowercase();
+        let hits = [
+            "you are hercules",
+            "local coding agent with real filesystem",
+            "critical — never say you lack access",
+            "critical - never say you lack access",
+            "working directory token",
+            "how to call tools",
+            "anti-parrot",
+            "never refuse normal coding work",
+        ]
+        .iter()
+        .filter(|k| t.contains(**k))
+        .count();
+        hits >= 2 || (t.contains("you are hercules") && t.contains("<ls path="))
     }
 
     /// True when the user text looks like a filesystem / shell request that needs tools.

@@ -133,9 +133,18 @@ impl HttpInferenceClient {
             ));
         }
 
-        let mut messages = vec![json!({"role": "system", "content": system})];
+        let mut messages = Vec::new();
+        if !system.trim().is_empty() {
+            // Prefer system role; if the GGUF template is broken, still better than
+            // dumping a multi-KB instruction block that 1–3B models recite.
+            messages.push(json!({"role": "system", "content": system}));
+        }
         for (role, content) in turns {
             messages.push(json!({"role": role, "content": content}));
+        }
+        // If the only content after system is missing, add a minimal user turn.
+        if messages.len() == 1 {
+            messages.push(json!({"role": "user", "content": "hello"}));
         }
         messages
     }
@@ -147,11 +156,24 @@ impl HttpInferenceClient {
         is_generating: Arc<Mutex<bool>>,
     ) -> Result<String, String> {
         let url = self.completion_url();
-        let system = crate::agent::AgentEngine::system_prompt_for_cwd();
+        // Compact system: long system text is recited by small GGUFs (see DeepSeek 1.3B).
+        let system = crate::agent::AgentEngine::system_prompt_compact_for_cwd();
 
         let max_tokens = crate::settings::get_settings().power_mode.max_tokens();
         // Runtime menu temperature (default 0.2 — better tool following on small GGUFs)
         let temperature = crate::settings::temperature();
+        // Stop before chat special tokens / role markers (DeepSeek emits <|im_end|>).
+        let stop = json!([
+            "<|im_end|>",
+            "<|im_start|>",
+            "<|endoftext|>",
+            "</s>",
+            "\nYou:",
+            "\nUser:",
+            "\n### Instruction",
+            "\nCRITICAL —",
+            "\nCRITICAL -"
+        ]);
         let body = if url.contains("/v1/chat/completions") {
             let messages = Self::chat_messages(&system, prompt);
             json!({
@@ -159,14 +181,16 @@ impl HttpInferenceClient {
                 "messages": messages,
                 "stream": true,
                 "temperature": temperature,
-                "max_tokens": max_tokens
+                "max_tokens": max_tokens,
+                "stop": stop,
             })
         } else {
             json!({
-                "prompt": format!("{}\n\n{}", system, prompt),
+                "prompt": format!("{}\n\n### User\n{}\n\n### Assistant\n", system, prompt),
                 "stream": true,
                 "n_predict": max_tokens,
-                "temperature": temperature
+                "temperature": temperature,
+                "stop": stop,
             })
         };
 
@@ -297,9 +321,25 @@ impl HttpInferenceClient {
 
                     if let Some(token_str) = token {
                         if !token_str.is_empty() {
-                            full_text.push_str(&token_str);
+                            let cleaned =
+                                crate::agent::AgentEngine::sanitize_model_output(&token_str);
+                            if cleaned.is_empty() {
+                                continue;
+                            }
+                            full_text.push_str(&cleaned);
                             if let Ok(mut target) = stream_target.lock() {
-                                target.push_str(&token_str);
+                                target.push_str(&cleaned);
+                            }
+                            // Abort early if model is reciting the system prompt.
+                            if full_text.len() > 180
+                                && crate::agent::AgentEngine::looks_like_system_echo(&full_text)
+                            {
+                                let msg = "[model echoed system prompt — stopped. \
+                                     Try a stronger instruct model or shorter reply.]";
+                                if let Ok(mut target) = stream_target.lock() {
+                                    *target = msg.to_string();
+                                }
+                                return Err(msg.to_string());
                             }
                         }
                     }
@@ -324,11 +364,18 @@ impl HttpInferenceClient {
             }
         }
 
+        let full_text = crate::agent::AgentEngine::sanitize_model_output(&full_text);
         if full_text.is_empty() {
             Err("[HTTP Inference] Stream completed with no tokens. \
                  Check llama-server log (/tmp/hercules/llama-server.last.log) — \
                  often Compute error from GPU/OpenVINO; use HERCULES_N_GPU_LAYERS=0."
                 .to_string())
+        } else if crate::agent::AgentEngine::looks_like_system_echo(&full_text) {
+            Err(
+                "[HTTP Inference] Model recited system instructions instead of answering. \
+                 Use a stronger instruct GGUF, or say hello again after rebuild."
+                    .to_string(),
+            )
         } else {
             Ok(full_text)
         }
