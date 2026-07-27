@@ -1197,10 +1197,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ls_not_inside_think() {
-        // ls inside think is ignored
+    fn test_ls_promoted_from_think_when_no_outside() {
+        // Misplaced <ls> inside think is promoted (small models put tools in think).
         let sample = "<think>Let me list <ls path=\".\"></think>";
-        assert!(AgentEngine::process_response(sample).is_none());
+        assert!(AgentEngine::process_response(sample).is_some());
 
         // ls outside think runs
         let sample2 = "<ls path=\".\">";
