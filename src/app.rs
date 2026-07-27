@@ -1279,36 +1279,11 @@ impl App {
         parts.push(chat[start..].join("\n\n"));
         let body = parts.join("\n\n");
 
-        // If user is complaining about incomplete writes, hard-nudge the model.
-        let last_user = self
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.starts_with("You: "))
-            .map(|m| m.to_ascii_lowercase())
-            .unwrap_or_default();
-        let needs_write_nudge = last_user.contains("forgot")
-            || last_user.contains("incomplete")
-            || (last_user.contains("write")
-                && (last_user.contains("file")
-                    || last_user.contains("html")
-                    || last_user.contains("code")
-                    || last_user.contains("landing")))
-            || last_user.contains("continue")
-            || last_user.contains("finish");
-
         let mut out = body;
-        if needs_write_nudge {
-            out.push_str(
-                "\n\nInstruction: User wants a complete file on disk. \
-                 Emit ONE full <write src=\"$CURRENT/…filename.ext\">…body…</write> with closed tags. \
-                 Prefer landing_page.html if the task was a landing page. Do not echo Notes or compact text.",
-            );
-        }
         if self.auto_tool_turns > 0 {
             out.push_str(
-                "\n\nInstruction: Tool results are above. Answer clearly now. \
-                 For code/files use <write>/<cmd>. Never refuse normal coding. Never parrot Notes.",
+                "\n\nInstruction: Tool results are above. Answer clearly. \
+                 Prefer tools for code/files when needed. Do not parrot Notes.",
             );
         }
         out

@@ -173,8 +173,8 @@ Help (only in think): <help>
   <write src="$CURRENT/file.ext">
   …full file body…
   </write>
-  Always close </write>. Always use a real filename with extension (e.g. landing_page.html not "landing_page").
-- If user says you "forgot how to write", incomplete HTML, or "continue the file" → READ the path if unsure, then <write> the FULL finished file (not a fragment, not a half-open tag).
+  Always close </write>. Use a real path with a sensible filename and extension for the task.
+- If the user says a write was incomplete or missing → READ if needed, then <write> the full finished file.
 
 ## Rules
 1. User asks to WRITE / create a file (e.g. introduction.md, "write about…") → emit <write src="...">...</write> with FULL body. Do NOT only <ls> first unless the path is unknown.
@@ -191,33 +191,18 @@ Help (only in think): <help>
 8. No destructive commands (rm -rf /, disk wipe) unless user explicitly demands them.
 9. Compact / memory notes are FACTS only. Do not re-ask forgotten chat. Do not reprint them.
 
-## Examples (copy this style)
-User: write introduction.md about yourself in dummy_folder
-Agent:
-<write src="$CURRENT/dummy_folder/introduction.md">
-# Introduction
-I am Hercules, a local coding agent...
-</write>
-
-User: list folder / list current dir
+## Examples (tag shape only)
+User: list current dir
 Agent:
 <ls path="$CURRENT">
 
-User: show main.rs
+User: show src/main.rs
 Agent:
 <read src="$CURRENT/src/main.rs">
 
 User: run tests
 Agent:
 <cmd>cargo test</cmd>
-
-User: run python to list audio devices
-Agent:
-<cmd>python3 -c "import sounddevice as sd; print(sd.query_devices())"</cmd>
-
-User: run python 9.9 > 9.11
-Agent:
-<cmd>python3 -c "print(9.9 > 9.11)"</cmd>
 "#;
 
 /// Compact system prompt for small GGUFs / llama-server chat.
@@ -373,62 +358,15 @@ impl AgentEngine {
         KEYS.iter().any(|k| t.contains(k))
     }
 
-    /// Extra user-side nudge so small models emit a tool tag instead of refusing.
-    pub fn tool_force_suffix(user_text: &str) -> Option<&'static str> {
-        if !Self::user_needs_tools(user_text) {
-            return None;
-        }
-        let t = user_text.to_lowercase();
-        // Write / create file takes priority over list (model wrongly lists instead of write)
-        if t.contains("write")
-            || t.contains("create")
-            || t.contains("introduction")
-            || t.contains(".md")
-            || t.contains("save ")
-            || t.contains("make a file")
-            || t.contains("new file")
-        {
-            Some(
-                "\n\n[Host] The user wants a FILE WRITTEN. Do NOT only list a directory.\n\
-                 Reply with a write tool immediately, for example:\n\
-                 <write src=\"$CURRENT/dummy_folder/introduction.md\">\n\
-                 # Introduction\nYour content here...\n\
-                 </write>\n\
-                 Emit the <write> tag with full file body. No listing first unless path is unknown.",
-            )
-        } else if t.contains("list")
-            || t.contains("folder")
-            || t.contains("directory")
-            || t.contains("dir")
-            || t.contains("cwd")
-            || t.contains("pwd")
-            || t.contains("files")
-            || t.contains("tree")
-        {
-            Some(
-                "\n\n[Host] You MUST reply with exactly one tool line first, nothing else:\n\
-                 <ls path=\"$CURRENT\">\n\
-                 Do not explain. Do not refuse. Emit the tag.",
-            )
-        } else if t.contains("read") || t.contains("open") || t.contains("show") || t.contains("cat")
-        {
-            Some(
-                "\n\n[Host] Use a <read src=\"$CURRENT/...\"> tool tag. Do not claim you lack access.",
-            )
-        } else if t.contains("run") || t.contains("cargo") || t.contains("build") || t.contains("test")
-        {
-            Some("\n\n[Host] Use a <cmd>...</cmd> tool tag to run the command on this machine.")
-        } else {
-            Some("\n\n[Host] Use the appropriate Hercules tool tag. You have local filesystem access.")
-        }
+    /// Formerly appended long [Host] tool-force examples. Disabled: coding models
+    /// already know the tags from the system prompt; path examples bias filenames.
+    pub fn tool_force_suffix(_user_text: &str) -> Option<&'static str> {
+        None
     }
 
-    /// Apply tool-force suffix to a user utterance when appropriate.
+    /// Pass-through (no host injection). Kept for call-site compatibility.
     pub fn with_tool_nudge(user_text: &str) -> String {
-        match Self::tool_force_suffix(user_text) {
-            Some(s) => format!("{}{}", user_text.trim_end(), s),
-            None => user_text.to_string(),
-        }
+        user_text.to_string()
     }
 
     /// Strip `<think>...</think>` blocks from response text.
@@ -618,38 +556,217 @@ impl AgentEngine {
         false
     }
 
-    /// If model wrote a directory as `src`, pick a filename from body content.
-    pub fn normalize_write_path(path_str: &str, body: &str) -> String {
-        let p = path_str.trim().trim_end_matches('/');
-        let expanded = Self::expand_path(p);
-        let looks_like_dir = expanded.is_dir()
-            || p.ends_with('/')
-            || (!p.contains('.')
-                && !body.trim().is_empty()
-                && (expanded.exists() && expanded.is_dir()
-                    || !Path::new(p).extension().is_some_and(|e| !e.is_empty())));
-        // path without extension that exists as dir, or no extension at all for html-ish body
-        let no_ext = Path::new(p)
-            .extension()
-            .map(|e| e.is_empty())
-            .unwrap_or(true);
+    /// Suggest a write path from the latest user wording (no hardcoded landing page).
+    pub fn suggested_path_from_user_text(user_text: &str) -> String {
+        let t = user_text.to_ascii_lowercase();
+        let name = if (t.contains("rotat") || t.contains("spin")) && t.contains("cube") {
+            "rotating_cube.html"
+        } else if t.contains("cube") && (t.contains("html") || t.contains("js") || t.contains("webgl"))
+        {
+            "cube.html"
+        } else if t.contains("three.js") || t.contains("threejs") || t.contains("webgl") {
+            "webgl_demo.html"
+        } else if t.contains("canvas") {
+            "canvas_demo.html"
+        } else if t.contains("landing") {
+            "landing_page.html"
+        } else if t.contains("introduction") || t.contains("intro.md") {
+            "introduction.md"
+        } else if t.contains("readme") {
+            "README.md"
+        } else if t.contains(".md") || t.contains("markdown") {
+            "notes.md"
+        } else if t.contains("python") || t.contains(".py") {
+            "main.py"
+        } else if t.contains("rust") || t.contains(".rs") {
+            "main.rs"
+        } else if t.contains("html") || t.contains("javascript") || t.contains(" js") {
+            "index.html"
+        } else {
+            "output.txt"
+        };
+        // Prefer dummy_folder for demo HTML/md when user didn't specify a path
+        if name.ends_with(".html") || name.ends_with(".md") {
+            format!("$CURRENT/dummy_folder/{name}")
+        } else {
+            format!("$CURRENT/{name}")
+        }
+    }
+
+    /// Filename slug from free text (title / topic).
+    fn slugify_filename(raw: &str, max_len: usize) -> String {
+        let mut out = String::new();
+        for c in raw.chars() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c.to_ascii_lowercase());
+            } else if c.is_whitespace() || c == '-' || c == '_' {
+                if !out.ends_with('_') && !out.is_empty() {
+                    out.push('_');
+                }
+            }
+            if out.len() >= max_len {
+                break;
+            }
+        }
+        let out = out.trim_matches('_').to_string();
+        if out.is_empty() {
+            "file".into()
+        } else {
+            out
+        }
+    }
+
+    /// Infer a sensible filename from file body (never force landing_page.html).
+    pub fn infer_filename_from_body(body: &str) -> String {
         let body_l = body.to_ascii_lowercase();
+        // <title>…</title>
+        if let Some(i) = body_l.find("<title") {
+            if let Some(gt) = body[i..].find('>') {
+                let rest = &body[i + gt + 1..];
+                if let Some(end) = rest.to_ascii_lowercase().find("</title") {
+                    let title = rest[..end].trim();
+                    if !title.is_empty() && title.len() < 80 {
+                        let slug = Self::slugify_filename(title, 40);
+                        return format!("{slug}.html");
+                    }
+                }
+            }
+        }
+        if (body_l.contains("rotat") || body_l.contains("requestanimationframe"))
+            && (body_l.contains("cube") || body_l.contains("webgl") || body_l.contains("three"))
+        {
+            return "rotating_cube.html".into();
+        }
+        if body_l.contains("webgl") || body_l.contains("three.js") || body_l.contains("three.min") {
+            return "webgl_demo.html".into();
+        }
+        if body_l.contains("<canvas") {
+            return "canvas_demo.html".into();
+        }
         let html = body_l.contains("<html")
             || body_l.contains("<!doctype")
             || body_l.contains("<head")
             || body_l.contains("<body");
+        if html {
+            return "index.html".into();
+        }
+        if body_l.contains("# ") || body_l.starts_with("---") {
+            return "README.md".into();
+        }
+        if body_l.contains("fn main") || body_l.contains("use std") {
+            return "main.rs".into();
+        }
+        if body_l.contains("def ") || body_l.contains("import ") {
+            return "main.py".into();
+        }
+        "file.txt".into()
+    }
+
+    /// If model wrote a directory as `src` (or a generic/wrong name), pick a better file path.
+    pub fn normalize_write_path(path_str: &str, body: &str) -> String {
+        Self::normalize_write_path_with_hint(path_str, body, None)
+    }
+
+    /// Same as [`normalize_write_path`], optional user-utterance hint for naming.
+    pub fn normalize_write_path_with_hint(
+        path_str: &str,
+        body: &str,
+        user_hint: Option<&str>,
+    ) -> String {
+        let p = path_str.trim().trim_end_matches('/');
+        let expanded = Self::expand_path(p);
+        let base_name = Path::new(p)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        // Known bad/generic defaults the model (or old host text) loves to emit.
+        let generic_html = matches!(
+            base_name.as_str(),
+            "landing_page.html"
+                | "landing.html"
+                | "page.html"
+                | "file.html"
+                | "output.html"
+                | "index.htm"
+        );
+
+        let looks_like_dir = expanded.is_dir()
+            || p.ends_with('/')
+            || (!p.contains('.')
+                && (expanded.exists() && expanded.is_dir()
+                    || !Path::new(p).extension().is_some_and(|e| !e.is_empty())));
+        let no_ext = Path::new(p)
+            .extension()
+            .map(|e| e.is_empty())
+            .unwrap_or(true);
+
+        let body_l = body.to_ascii_lowercase();
+        let html = body_l.contains("<html")
+            || body_l.contains("<!doctype")
+            || body_l.contains("<head")
+            || body_l.contains("<body")
+            || body_l.contains("<canvas");
         let md = body_l.contains("# ") || body_l.starts_with("---");
-        if looks_like_dir || (no_ext && (html || md) && !p.contains('.')) {
-            let name = if html {
-                "landing_page.html"
+
+        // Replace generic landing_page.html when body/user clearly mean something else.
+        if generic_html {
+            let better = user_hint
+                .map(Self::suggested_path_from_user_text)
+                .filter(|s| !s.contains("landing_page") && !s.contains("output.txt"))
+                .unwrap_or_else(|| {
+                    let name = if body.trim().is_empty() {
+                        user_hint
+                            .map(|u| {
+                                Self::suggested_path_from_user_text(u)
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or("index.html")
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "index.html".into())
+                    } else {
+                        Self::infer_filename_from_body(body)
+                    };
+                    if p.contains("dummy_folder") || p.contains("$CURRENT") {
+                        // keep directory prefix
+                        if let Some(parent) = Path::new(p).parent() {
+                            let parent = parent.to_string_lossy();
+                            if parent.is_empty() || parent == "." {
+                                format!("$CURRENT/dummy_folder/{name}")
+                            } else {
+                                format!("{parent}/{name}")
+                            }
+                        } else {
+                            format!("$CURRENT/dummy_folder/{name}")
+                        }
+                    } else {
+                        format!("$CURRENT/dummy_folder/{name}")
+                    }
+                });
+            // If suggested_path is full $CURRENT/... use it; else join
+            if better.starts_with("$CURRENT") || better.contains('/') {
+                return better;
+            }
+        }
+
+        if looks_like_dir || (no_ext && (html || md || !body.trim().is_empty()) && !p.contains('.'))
+        {
+            let name = if !body.trim().is_empty() {
+                Self::infer_filename_from_body(body)
+            } else if let Some(u) = user_hint {
+                Self::suggested_path_from_user_text(u)
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("file.txt")
+                    .to_string()
+            } else if html {
+                "index.html".into()
             } else if md {
-                "README.md"
-            } else if body_l.contains("fn main") || body_l.contains("use std") {
-                "main.rs"
-            } else if body_l.contains("def ") || body_l.contains("import ") {
-                "main.py"
+                "README.md".into()
             } else {
-                "file.txt"
+                "file.txt".into()
             };
             if expanded.is_dir() || p.ends_with('/') || !p.contains('.') {
                 return format!("{p}/{name}");
@@ -962,7 +1079,7 @@ impl AgentEngine {
         // Writing a directory path is never valid
         if path.exists() && path.is_dir() {
             return format!(
-                "Error: '{}' is a directory — use a file path e.g. '{}/landing_page.html'",
+                "Error: '{}' is a directory — use a file path e.g. '{}/index.html' or a task-specific name",
                 path.display(),
                 path.display()
             );
