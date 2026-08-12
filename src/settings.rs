@@ -25,9 +25,7 @@ impl PowerMode {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::PowerSaver => {
-                "Ease off when CPU is busy; fewer threads / GPU layers"
-            }
+            Self::PowerSaver => "Ease off when CPU is busy; fewer threads / GPU layers",
             Self::Normal => "Use available cores; GPU offload as available (default)",
             Self::Extreme => "Max threads + max GPU layers; no mercy on low speed",
         }
@@ -76,9 +74,9 @@ impl PowerMode {
     /// Chat max tokens for HTTP / llama-server completions.
     pub fn max_tokens(self) -> u32 {
         match self {
-            Self::PowerSaver => 256,
-            Self::Normal => 1024,
-            Self::Extreme => 2048,
+            Self::PowerSaver => 512,
+            Self::Normal => 4096, // files need room
+            Self::Extreme => 8192,
         }
     }
 
@@ -113,9 +111,42 @@ pub const CONTEXT_COMPACT_RATIO: f32 = 0.80;
 /// Default sampling temperature (low = more deterministic / better tool following).
 pub const DEFAULT_TEMPERATURE: f32 = 0.2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlamaRsSubBackend {
+    Auto,
+    ParallelSimd,
+    GpuWgpu,
+    SimdOnly,
+    Scalar,
+}
+
+impl LlamaRsSubBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (Parallel SIMD / GPU)",
+            Self::ParallelSimd => "Parallel SIMD (Rayon + AVX2)",
+            Self::GpuWgpu => "GPU Acceleration (WGPU / Vulkan)",
+            Self::SimdOnly => "Single-Thread SIMD",
+            Self::Scalar => "Scalar Fallback",
+        }
+    }
+
+    pub fn env_val(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ParallelSimd => "parallel",
+            Self::GpuWgpu => "gpu",
+            Self::SimdOnly => "simd",
+            Self::Scalar => "scalar",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeSettings {
     pub power_mode: PowerMode,
+    pub llama_rs_sub_backend: LlamaRsSubBackend,
+    pub stall_timeout_secs: u64,
     /// Consecutive identical / pattern hits before we intervene.
     pub repeat_threshold: usize,
     /// Also scan `<think>` bodies for looping phrases.
@@ -132,6 +163,8 @@ impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
             power_mode: PowerMode::Normal,
+            llama_rs_sub_backend: LlamaRsSubBackend::Auto,
+            stall_timeout_secs: 300, // 5m default
             repeat_threshold: 10,
             repeat_detect_thinking: true,
             context_token_limit: context_limit_from_env(),
@@ -139,6 +172,68 @@ impl Default for RuntimeSettings {
             temperature: DEFAULT_TEMPERATURE,
         }
     }
+}
+
+pub fn format_stall_timeout(secs: u64) -> String {
+    if secs == 0 {
+        "Unlimited (No Time Limit)".to_string()
+    } else if secs < 60 {
+        format!("{}s", secs)
+    } else {
+        format!("{}m", secs / 60)
+    }
+}
+
+pub fn cycle_stall_timeout() -> u64 {
+    let cur = get_settings().stall_timeout_secs;
+    let next = match cur {
+        300 => 600,
+        600 => 1200,
+        1200 => 0, // 0 = Unlimited
+        _ => 300,
+    };
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.stall_timeout_secs = next;
+    }
+    next
+}
+
+pub fn nudge_stall_timeout(dir: i32) -> u64 {
+    let cur = get_settings().stall_timeout_secs;
+    let presets = [300, 600, 1200, 0];
+    let idx = presets.iter().position(|&x| x == cur).unwrap_or(0);
+    let new_idx = if dir > 0 {
+        (idx + 1) % presets.len()
+    } else if idx == 0 {
+        presets.len() - 1
+    } else {
+        idx - 1
+    };
+    let next = presets[new_idx];
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.stall_timeout_secs = next;
+    }
+    next
+}
+
+pub fn cycle_llama_rs_sub_backend() -> LlamaRsSubBackend {
+    let next = match get_settings().llama_rs_sub_backend {
+        LlamaRsSubBackend::Auto => LlamaRsSubBackend::ParallelSimd,
+        LlamaRsSubBackend::ParallelSimd => LlamaRsSubBackend::GpuWgpu,
+        LlamaRsSubBackend::GpuWgpu => LlamaRsSubBackend::SimdOnly,
+        LlamaRsSubBackend::SimdOnly => LlamaRsSubBackend::Scalar,
+        LlamaRsSubBackend::Scalar => LlamaRsSubBackend::Auto,
+    };
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.llama_rs_sub_backend = next;
+    }
+    unsafe {
+        std::env::set_var("HERCULES_COMPUTE_BACKEND", next.env_val());
+    }
+    next
 }
 
 fn context_limit_from_env() -> usize {
@@ -186,13 +281,7 @@ pub fn set_context_token_limit(n: usize) {
 
 /// Menu presets for context window (tokens). Enter / +/− step these.
 pub const CONTEXT_PRESETS: &[usize] = &[
-    4_096,
-    8_192,
-    16_384,
-    32_768,
-    65_536,
-    131_072,
-    262_144,   // 256K default
+    4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144,   // 256K default
     524_288,   // 512K
     1_048_576, // 1M max
 ];
@@ -293,7 +382,8 @@ pub fn set_power_mode(mode: PowerMode) {
 
 pub fn set_repeat_threshold(n: usize) {
     if let Ok(mut g) = SETTINGS.lock() {
-        g.get_or_insert_with(RuntimeSettings::default).repeat_threshold = n.clamp(2, 100);
+        g.get_or_insert_with(RuntimeSettings::default)
+            .repeat_threshold = n.clamp(2, 100);
     }
 }
 
@@ -366,7 +456,11 @@ fn phrase_signature(s: &str) -> String {
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
-    cleaned.split_whitespace().take(8).collect::<Vec<_>>().join(" ")
+    cleaned
+        .split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Returns a human-readable reason if history shows a repeat loop at/above threshold.
@@ -396,7 +490,11 @@ pub fn detect_repeat_loop(history: &[String], settings: &RuntimeSettings) -> Opt
         }
     }
     if same >= thr {
-        return Some(format!("identical output ×{}: '{}'", same, truncate(last, 48)));
+        return Some(format!(
+            "identical output ×{}: '{}'",
+            same,
+            truncate(last, 48)
+        ));
     }
 
     // 2) Alternating A,B,A,B… (period 2)
@@ -445,7 +543,14 @@ pub fn detect_repeat_loop(history: &[String], settings: &RuntimeSettings) -> Opt
                 return Some(format!(
                     "repeating cycle (period {}): '{}'",
                     p,
-                    truncate(&pattern.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" | "), 60)
+                    truncate(
+                        &pattern
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" | "),
+                        60
+                    )
                 ));
             }
         }
@@ -476,11 +581,7 @@ pub fn detect_repeat_loop(history: &[String], settings: &RuntimeSettings) -> Opt
             }
             if let Some((sig, c)) = counts.into_iter().max_by_key(|(_, c)| *c) {
                 if c >= thr {
-                    return Some(format!(
-                        "thinking loop ×{}: '{}'",
-                        c,
-                        truncate(sig, 48)
-                    ));
+                    return Some(format!("thinking loop ×{}: '{}'", c, truncate(sig, 48)));
                 }
             }
         }

@@ -26,6 +26,7 @@ pub struct ModelHyperparams {
     pub rope_dim: usize,
     pub rope_freq_base: f32,
     pub rms_eps: f32,
+    pub is_neox_rope: bool,
 }
 
 impl ModelHyperparams {
@@ -36,19 +37,19 @@ impl ModelHyperparams {
         let n_embd = gguf
             .meta_u64(&format!("{}.embedding_length", prefix))
             .or_else(|| gguf.meta_u64("llama.embedding_length"))
-            .ok_or("missing embedding_length")? as usize;
+            .unwrap_or(4096) as usize;
         let n_layer = gguf
             .meta_u64(&format!("{}.block_count", prefix))
             .or_else(|| gguf.meta_u64("llama.block_count"))
-            .ok_or("missing block_count")? as usize;
+            .unwrap_or(32) as usize;
         let n_ff = gguf
             .meta_u64(&format!("{}.feed_forward_length", prefix))
             .or_else(|| gguf.meta_u64("llama.feed_forward_length"))
-            .unwrap_or((n_embd * 4) as u64) as usize;
+            .unwrap_or(11008) as usize;
         let n_head = gguf
             .meta_u64(&format!("{}.attention.head_count", prefix))
             .or_else(|| gguf.meta_u64("llama.attention.head_count"))
-            .ok_or("missing attention.head_count")? as usize;
+            .unwrap_or(32) as usize;
         let n_head_kv = gguf
             .meta_u64(&format!("{}.attention.head_count_kv", prefix))
             .or_else(|| gguf.meta_u64("llama.attention.head_count_kv"))
@@ -71,6 +72,11 @@ impl ModelHyperparams {
             .meta_f32(&format!("{}.attention.layer_norm_rms_epsilon", prefix))
             .or_else(|| gguf.meta_f32("llama.attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
+        let is_neox_rope = gguf
+            .meta_u64(&format!("{}.rope.dimension_type", prefix))
+            .or_else(|| gguf.meta_u64("llama.rope.dimension_type"))
+            .map(|t| t == 2 || t == 1)
+            .unwrap_or(true);
 
         let n_vocab = gguf
             .metadata
@@ -103,6 +109,7 @@ impl ModelHyperparams {
             rope_dim,
             rope_freq_base,
             rms_eps,
+            is_neox_rope,
         })
     }
 
@@ -261,6 +268,28 @@ impl QuantMatrix {
                 self.n_elements,
                 x,
                 y,
+            )
+            .map_err(|e| e.0)
+    }
+
+    /// Batched 2D/3D matrix multiplication via [`crate::llama::ComputeBackend`].
+    pub fn gemm(
+        &self,
+        x_batch: &[f32],
+        batch_size: usize,
+        y_batch: &mut [f32],
+        compute: &dyn crate::llama::ComputeBackend,
+    ) -> Result<(), String> {
+        compute
+            .gemm_quant(
+                self.ggml_type,
+                &self.raw,
+                self.rows,
+                self.cols,
+                self.n_elements,
+                x_batch,
+                batch_size,
+                y_batch,
             )
             .map_err(|e| e.0)
     }
@@ -595,33 +624,70 @@ pub fn rope_inplace(
     pos: usize,
     rope_dim: usize,
     freq_base: f32,
+    is_neox: bool,
 ) {
     for h in 0..n_head {
         let off = h * head_dim;
         if off + head_dim <= q.len() {
-            rope_vec(&mut q[off..off + head_dim], pos, rope_dim, freq_base);
+            rope_vec(&mut q[off..off + head_dim], pos, rope_dim, freq_base, is_neox);
         }
     }
     for h in 0..n_head_kv {
         let off = h * head_dim;
         if off + head_dim <= k.len() {
-            rope_vec(&mut k[off..off + head_dim], pos, rope_dim, freq_base);
+            rope_vec(&mut k[off..off + head_dim], pos, rope_dim, freq_base, is_neox);
         }
     }
 }
 
-fn rope_vec(x: &mut [f32], pos: usize, rope_dim: usize, freq_base: f32) {
+fn rope_vec(x: &mut [f32], pos: usize, rope_dim: usize, freq_base: f32, is_neox: bool) {
     let dim = rope_dim.min(x.len());
-    for i in (0..dim).step_by(2) {
-        let freq = 1.0 / freq_base.powf((i as f32) / (dim as f32).max(1.0));
-        let val = pos as f32 * freq;
-        let (sin, cos) = val.sin_cos();
-        let x0 = x[i];
-        let x1 = if i + 1 < x.len() { x[i + 1] } else { 0.0 };
-        x[i] = x0 * cos - x1 * sin;
-        if i + 1 < x.len() {
-            x[i + 1] = x0 * sin + x1 * cos;
+    if is_neox {
+        let half_dim = dim / 2;
+        for i in 0..half_dim {
+            let freq = 1.0 / freq_base.powf(((i * 2) as f32) / (dim as f32).max(1.0));
+            let val = pos as f32 * freq;
+            let (sin, cos) = val.sin_cos();
+            let x0 = x[i];
+            let x1 = x[i + half_dim];
+            x[i] = x0 * cos - x1 * sin;
+            x[i + half_dim] = x0 * sin + x1 * cos;
         }
+    } else {
+        for i in (0..dim).step_by(2) {
+            let freq = 1.0 / freq_base.powf((i as f32) / (dim as f32).max(1.0));
+            let val = pos as f32 * freq;
+            let (sin, cos) = val.sin_cos();
+            let x0 = x[i];
+            let x1 = if i + 1 < x.len() { x[i + 1] } else { 0.0 };
+            x[i] = x0 * cos - x1 * sin;
+            if i + 1 < x.len() {
+                x[i + 1] = x0 * sin + x1 * cos;
+            }
+        }
+    }
+}
+
+/// Reusable scratch buffers to eliminate per-token heap allocations.
+#[derive(Default)]
+pub struct ForwardBuffers {
+    pub xb: Vec<f32>,
+    pub q_full: Vec<f32>,
+    pub k_full: Vec<f32>,
+    pub v_full: Vec<f32>,
+    pub attn_out: Vec<f32>,
+    pub att_proj: Vec<f32>,
+    pub gate: Vec<f32>,
+    pub up: Vec<f32>,
+    pub hb: Vec<f32>,
+    pub hb2: Vec<f32>,
+    pub scores: Vec<f32>,
+    pub logits: Vec<f32>,
+}
+
+impl ForwardBuffers {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -632,6 +698,19 @@ pub fn forward_token(
     token: u32,
     pos: usize,
     compute: &dyn crate::llama::ComputeBackend,
+) -> Result<Vec<f32>, String> {
+    let mut buf = ForwardBuffers::new();
+    forward_token_with_buffers(model, cache, token, pos, compute, &mut buf)
+}
+
+/// Forward one token position with reusable scratch buffers (zero heap allocations in loop).
+pub fn forward_token_with_buffers(
+    model: &LlamaModel,
+    cache: &mut KvCache,
+    token: u32,
+    pos: usize,
+    compute: &dyn crate::llama::ComputeBackend,
+    buf: &mut ForwardBuffers,
 ) -> Result<Vec<f32>, String> {
     let h = &model.hparams;
     let n_embd = h.n_embd;
@@ -644,25 +723,21 @@ pub fn forward_token(
     }
 
     let mut x = model.tok_embeddings.lookup(token, n_embd)?;
-
-    let mut xb = vec![0.0f32; n_embd];
-    let mut q = vec![0.0f32; n_embd];
-    let mut k_cur = vec![0.0f32; h.n_head_kv.max(1) * head_dim];
-    let mut v_cur = vec![0.0f32; h.n_head_kv.max(1) * head_dim];
+    buf.xb.resize(n_embd, 0.0);
 
     for (il, layer) in model.layers.iter().enumerate() {
-        compute.rms_norm(&x, &layer.attn_norm, h.rms_eps, &mut xb);
+        compute.rms_norm(&x, &layer.attn_norm, h.rms_eps, &mut buf.xb);
 
-        let mut q_full = vec![0.0f32; layer.wq.rows];
-        let mut k_full = vec![0.0f32; layer.wk.rows];
-        let mut v_full = vec![0.0f32; layer.wv.rows];
-        layer.wq.gemv(&xb, &mut q_full, compute)?;
-        layer.wk.gemv(&xb, &mut k_full, compute)?;
-        layer.wv.gemv(&xb, &mut v_full, compute)?;
+        buf.q_full.resize(layer.wq.rows, 0.0);
+        buf.k_full.resize(layer.wk.rows, 0.0);
+        buf.v_full.resize(layer.wv.rows, 0.0);
+        layer.wq.gemv(&buf.xb, &mut buf.q_full, compute)?;
+        layer.wk.gemv(&buf.xb, &mut buf.k_full, compute)?;
+        layer.wv.gemv(&buf.xb, &mut buf.v_full, compute)?;
 
-        q = q_full;
-        k_cur = k_full;
-        v_cur = v_full;
+        let mut q = std::mem::take(&mut buf.q_full);
+        let mut k_cur = std::mem::take(&mut buf.k_full);
+        let mut v_cur = std::mem::take(&mut buf.v_full);
 
         rope_inplace(
             &mut q,
@@ -673,6 +748,7 @@ pub fn forward_token(
             pos,
             h.rope_dim,
             h.rope_freq_base,
+            h.is_neox_rope,
         );
 
         let kv_head_dim = if h.n_head_kv > 0 {
@@ -690,107 +766,342 @@ pub fn forward_token(
             }
         }
 
+        buf.q_full = q;
+        buf.k_full = k_cur;
+        buf.v_full = v_cur;
+
         let seq_len = pos + 1;
-        let mut attn_out = vec![0.0f32; n_embd.max(q.len())];
+        let attn_out_len = n_embd.max(buf.q_full.len());
+        buf.attn_out.resize(attn_out_len, 0.0);
+        buf.attn_out.fill(0.0);
+
         let n_rep = if h.n_head_kv > 0 {
             h.n_head / h.n_head_kv.max(1)
         } else {
             1
         };
 
+        let dim = head_dim.min(kv_head_dim);
+        buf.scores.resize(seq_len, 0.0);
+
         for head in 0..h.n_head {
             let kv_head = head / n_rep.max(1);
             let q_off = head * head_dim;
             let scale = 1.0 / (head_dim as f32).sqrt();
 
-            let mut scores = vec![0.0f32; seq_len];
-            for t in 0..seq_len {
-                let mut dot = 0.0f32;
-                let k_base = t * cache_stride + kv_head * kv_head_dim;
-                for d in 0..head_dim.min(kv_head_dim) {
-                    let qv = q.get(q_off + d).copied().unwrap_or(0.0);
-                    let kv = cache.k[il].get(k_base + d).copied().unwrap_or(0.0);
-                    dot += qv * kv;
-                }
-                scores[t] = dot * scale;
+            if q_off + dim > buf.q_full.len() {
+                continue;
             }
-            let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let q_slice = &buf.q_full[q_off..q_off + dim];
+
+            for t in 0..seq_len {
+                let k_base = t * cache_stride + kv_head * kv_head_dim;
+                if k_base + dim <= cache.k[il].len() {
+                    let k_slice = &cache.k[il][k_base..k_base + dim];
+                    let mut dot = 0.0f32;
+                    for i in 0..dim {
+                        dot += q_slice[i] * k_slice[i];
+                    }
+                    buf.scores[t] = dot * scale;
+                }
+            }
+
+            let max_s = buf.scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0f32;
-            for s in &mut scores {
+            for s in &mut buf.scores {
                 *s = (*s - max_s).exp();
                 sum += *s;
             }
-            for s in &mut scores {
-                *s /= sum.max(1e-12);
+            let inv_sum = 1.0 / sum.max(1e-12);
+            for s in &mut buf.scores {
+                *s *= inv_sum;
             }
-            for d in 0..head_dim.min(kv_head_dim) {
-                let mut acc = 0.0f32;
+
+            if q_off + dim <= buf.attn_out.len() {
+                let out_slice = &mut buf.attn_out[q_off..q_off + dim];
                 for t in 0..seq_len {
                     let v_base = t * cache_stride + kv_head * kv_head_dim;
-                    acc += scores[t] * cache.v[il].get(v_base + d).copied().unwrap_or(0.0);
-                }
-                if q_off + d < attn_out.len() {
-                    attn_out[q_off + d] = acc;
+                    if v_base + dim <= cache.v[il].len() {
+                        let v_slice = &cache.v[il][v_base..v_base + dim];
+                        let s = buf.scores[t];
+                        for i in 0..dim {
+                            out_slice[i] += s * v_slice[i];
+                        }
+                    }
                 }
             }
         }
 
-        let mut att_proj = vec![0.0f32; layer.wo.rows];
-        if attn_out.len() != layer.wo.cols {
-            attn_out.resize(layer.wo.cols, 0.0);
+        buf.att_proj.resize(layer.wo.rows, 0.0);
+        buf.att_proj.fill(0.0);
+        if buf.attn_out.len() != layer.wo.cols {
+            buf.attn_out.resize(layer.wo.cols, 0.0);
         }
-        layer.wo.gemv(&attn_out, &mut att_proj, compute)?;
-        for i in 0..n_embd.min(att_proj.len()) {
-            x[i] += att_proj[i];
+        layer.wo.gemv(&buf.attn_out, &mut buf.att_proj, compute)?;
+        for i in 0..n_embd.min(buf.att_proj.len()) {
+            x[i] += buf.att_proj[i];
         }
 
-        compute.rms_norm(&x, &layer.ffn_norm, h.rms_eps, &mut xb);
-        let mut gate = vec![0.0f32; layer.w_gate.rows];
-        let mut up = vec![0.0f32; layer.w_up.rows];
-        layer.w_gate.gemv(&xb, &mut gate, compute)?;
-        layer.w_up.gemv(&xb, &mut up, compute)?;
-        let ff_dim = gate.len().min(up.len());
-        let mut hb = vec![0.0f32; ff_dim];
+        compute.rms_norm(&x, &layer.ffn_norm, h.rms_eps, &mut buf.xb);
+        buf.gate.resize(layer.w_gate.rows, 0.0);
+        buf.up.resize(layer.w_up.rows, 0.0);
+        layer.w_gate.gemv(&buf.xb, &mut buf.gate, compute)?;
+        layer.w_up.gemv(&buf.xb, &mut buf.up, compute)?;
+
+        let ff_dim = buf.gate.len().min(buf.up.len());
+        buf.hb.resize(ff_dim, 0.0);
         for i in 0..ff_dim {
-            hb[i] = silu(gate[i]) * up[i];
+            buf.hb[i] = silu(buf.gate[i]) * buf.up[i];
         }
-        let mut hb2 = vec![0.0f32; layer.w_down.rows];
-        if hb.len() != layer.w_down.cols {
-            hb.resize(layer.w_down.cols, 0.0);
+
+        buf.hb2.resize(layer.w_down.rows, 0.0);
+        buf.hb2.fill(0.0);
+        if buf.hb.len() != layer.w_down.cols {
+            buf.hb.resize(layer.w_down.cols, 0.0);
         }
-        layer.w_down.gemv(&hb, &mut hb2, compute)?;
-        for i in 0..n_embd.min(hb2.len()) {
-            x[i] += hb2[i];
+        layer.w_down.gemv(&buf.hb, &mut buf.hb2, compute)?;
+        for i in 0..n_embd.min(buf.hb2.len()) {
+            x[i] += buf.hb2[i];
         }
     }
 
     cache.n_past = pos + 1;
 
-    compute.rms_norm(&x, &model.output_norm, h.rms_eps, &mut xb);
-    let mut logits = vec![0.0f32; model.output.rows.max(h.n_vocab)];
+    compute.rms_norm(&x, &model.output_norm, h.rms_eps, &mut buf.xb);
+    buf.logits.resize(model.output.rows.max(h.n_vocab), 0.0);
+    buf.logits.fill(0.0);
     if model.output.cols == n_embd {
-        logits.resize(model.output.rows, 0.0);
-        model.output.gemv(&xb, &mut logits, compute)?;
+        buf.logits.resize(model.output.rows, 0.0);
+        model.output.gemv(&buf.xb, &mut buf.logits, compute)?;
     } else if model.output.rows == n_embd {
-        // Transposed — dequant once and multiply columns
         let m = model.output.to_f32_matrix()?;
-        logits.resize(m.cols, 0.0);
+        buf.logits.resize(m.cols, 0.0);
         for c in 0..m.cols {
             let mut sum = 0.0f32;
-            for r in 0..n_embd {
-                sum += m.get(r, c) * xb[r];
+            for r in 0..m.rows {
+                sum += m.get(r, c) * buf.xb[r];
             }
-            logits[c] = sum;
+            buf.logits[c] = sum;
         }
     } else {
+    }
+
+    if buf.logits.len() > h.n_vocab {
+        buf.logits.truncate(h.n_vocab);
+    }
+    Ok(buf.logits.clone())
+}
+
+/// Forward a batch of tokens position → logits for the last token position.
+/// Uses 2D/3D batched matrix multiplication (`gemm`) for fast prefill.
+pub fn forward_batch_with_buffers(
+    model: &LlamaModel,
+    cache: &mut KvCache,
+    tokens: &[u32],
+    compute: &dyn crate::llama::ComputeBackend,
+    buf: &mut ForwardBuffers,
+) -> Result<Vec<f32>, String> {
+    if tokens.is_empty() {
+        return Err("Empty tokens slice for forward_batch".into());
+    }
+    if tokens.len() == 1 {
+        return forward_token_with_buffers(model, cache, tokens[0], cache.n_past, compute, buf);
+    }
+
+    let b_size = tokens.len();
+    let start_pos = cache.n_past;
+    let h = &model.hparams;
+    let n_embd = h.n_embd;
+    let head_dim = h.head_dim();
+
+    if start_pos + b_size > h.n_ctx {
         return Err(format!(
-            "Unexpected output weight shape {}x{}",
-            model.output.rows, model.output.cols
+            "Batch position {} exceeds context limit {}",
+            start_pos + b_size,
+            h.n_ctx
         ));
     }
 
-    if logits.len() > h.n_vocab {
-        logits.truncate(h.n_vocab);
+    let mut x_batch = vec![0.0f32; b_size * n_embd];
+    for (i, &t) in tokens.iter().enumerate() {
+        let emb = model.tok_embeddings.lookup(t, n_embd)?;
+        let start = i * n_embd;
+        let end = (i + 1) * n_embd;
+        if start < x_batch.len() && end <= x_batch.len() {
+            x_batch[start..end].copy_from_slice(&emb[..n_embd.min(emb.len())]);
+        }
     }
-    Ok(logits)
+
+    buf.xb.resize(b_size * n_embd, 0.0);
+
+    for (il, layer) in model.layers.iter().enumerate() {
+        for b in 0..b_size {
+            let start = b * n_embd;
+            let end = (b + 1) * n_embd;
+            compute.rms_norm(
+                &x_batch[start..end],
+                &layer.attn_norm,
+                h.rms_eps,
+                &mut buf.xb[start..end],
+            );
+        }
+
+        buf.q_full.resize(b_size * layer.wq.rows, 0.0);
+        buf.k_full.resize(b_size * layer.wk.rows, 0.0);
+        buf.v_full.resize(b_size * layer.wv.rows, 0.0);
+
+        layer.wq.gemm(&buf.xb, b_size, &mut buf.q_full, compute)?;
+        layer.wk.gemm(&buf.xb, b_size, &mut buf.k_full, compute)?;
+        layer.wv.gemm(&buf.xb, b_size, &mut buf.v_full, compute)?;
+
+        for b in 0..b_size {
+            let pos = start_pos + b;
+            let mut q_single = buf.q_full[b * layer.wq.rows..(b + 1) * layer.wq.rows].to_vec();
+            let mut k_single = buf.k_full[b * layer.wk.rows..(b + 1) * layer.wk.rows].to_vec();
+            let v_single = &buf.v_full[b * layer.wv.rows..(b + 1) * layer.wv.rows];
+
+            rope_inplace(
+                &mut q_single,
+                &mut k_single,
+                head_dim,
+                h.n_head,
+                h.n_head_kv,
+                pos,
+                h.rope_dim,
+                h.rope_freq_base,
+                h.is_neox_rope,
+            );
+
+            buf.q_full[b * layer.wq.rows..(b + 1) * layer.wq.rows].copy_from_slice(&q_single);
+            buf.k_full[b * layer.wk.rows..(b + 1) * layer.wk.rows].copy_from_slice(&k_single);
+
+            let kv_head_dim = if h.n_head_kv > 0 { k_single.len() / h.n_head_kv } else { head_dim };
+            let cache_stride = h.n_head_kv.max(1) * kv_head_dim.max(1);
+            if pos < h.n_ctx {
+                let off = pos * cache_stride;
+                if off + k_single.len() <= cache.k[il].len() {
+                    cache.k[il][off..off + k_single.len()].copy_from_slice(&k_single);
+                    let vlen = v_single.len().min(k_single.len());
+                    cache.v[il][off..off + vlen].copy_from_slice(&v_single[..vlen]);
+                }
+            }
+        }
+
+        let attn_out_len = b_size * n_embd;
+        buf.attn_out.resize(attn_out_len, 0.0);
+        buf.attn_out.fill(0.0);
+
+        let kv_head_dim = if h.n_head_kv > 0 { head_dim } else { head_dim };
+        let cache_stride = h.n_head_kv.max(1) * kv_head_dim.max(1);
+        let n_rep = if h.n_head_kv > 0 { h.n_head / h.n_head_kv.max(1) } else { 1 };
+        let dim = head_dim.min(kv_head_dim);
+
+        for b in 0..b_size {
+            let seq_len = start_pos + b + 1;
+            let q_base = b * layer.wq.rows;
+            let out_base = b * n_embd;
+            buf.scores.resize(seq_len, 0.0);
+
+            for head in 0..h.n_head {
+                let kv_head = head / n_rep.max(1);
+                let q_off = q_base + head * head_dim;
+                let scale = 1.0 / (head_dim as f32).sqrt();
+
+                if q_off + dim > buf.q_full.len() { continue; }
+                let q_slice = &buf.q_full[q_off..q_off + dim];
+
+                for t in 0..seq_len {
+                    let k_base = t * cache_stride + kv_head * kv_head_dim;
+                    if k_base + dim <= cache.k[il].len() {
+                        let k_slice = &cache.k[il][k_base..k_base + dim];
+                        let mut dot = 0.0f32;
+                        for i in 0..dim { dot += q_slice[i] * k_slice[i]; }
+                        buf.scores[t] = dot * scale;
+                    }
+                }
+
+                let max_s = buf.scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut buf.scores {
+                    *s = (*s - max_s).exp();
+                    sum += *s;
+                }
+                let inv_sum = 1.0 / sum.max(1e-12);
+                for s in &mut buf.scores { *s *= inv_sum; }
+
+                let out_off = out_base + head * head_dim;
+                if out_off + dim <= buf.attn_out.len() {
+                    let out_slice = &mut buf.attn_out[out_off..out_off + dim];
+                    for t in 0..seq_len {
+                        let v_base = t * cache_stride + kv_head * kv_head_dim;
+                        if v_base + dim <= cache.v[il].len() {
+                            let v_slice = &cache.v[il][v_base..v_base + dim];
+                            let s = buf.scores[t];
+                            for i in 0..dim { out_slice[i] += s * v_slice[i]; }
+                        }
+                    }
+                }
+            }
+        }
+
+        buf.att_proj.resize(b_size * layer.wo.rows, 0.0);
+        layer.wo.gemm(&buf.attn_out, b_size, &mut buf.att_proj, compute)?;
+        for i in 0..x_batch.len().min(buf.att_proj.len()) {
+            x_batch[i] += buf.att_proj[i];
+        }
+
+        for b in 0..b_size {
+            let start = b * n_embd;
+            let end = (b + 1) * n_embd;
+            compute.rms_norm(
+                &x_batch[start..end],
+                &layer.ffn_norm,
+                h.rms_eps,
+                &mut buf.xb[start..end],
+            );
+        }
+
+        buf.gate.resize(b_size * layer.w_gate.rows, 0.0);
+        buf.up.resize(b_size * layer.w_up.rows, 0.0);
+        layer.w_gate.gemm(&buf.xb, b_size, &mut buf.gate, compute)?;
+        layer.w_up.gemm(&buf.xb, b_size, &mut buf.up, compute)?;
+
+        let ff_dim = layer.w_gate.rows.min(layer.w_up.rows);
+        buf.hb.resize(b_size * ff_dim, 0.0);
+        for b in 0..b_size {
+            let g_slice = &buf.gate[b * layer.w_gate.rows..(b + 1) * layer.w_gate.rows];
+            let u_slice = &buf.up[b * layer.w_up.rows..(b + 1) * layer.w_up.rows];
+            let hb_slice = &mut buf.hb[b * ff_dim..(b + 1) * ff_dim];
+            for i in 0..ff_dim {
+                hb_slice[i] = silu(g_slice[i]) * u_slice[i];
+            }
+        }
+
+        buf.hb2.resize(b_size * layer.w_down.rows, 0.0);
+        layer.w_down.gemm(&buf.hb, b_size, &mut buf.hb2, compute)?;
+        for i in 0..x_batch.len().min(buf.hb2.len()) {
+            x_batch[i] += buf.hb2[i];
+        }
+    }
+
+    cache.n_past = start_pos + b_size;
+
+    let last_start = (b_size - 1) * n_embd;
+    let last_x = &x_batch[last_start..last_start + n_embd];
+    let mut last_xb = vec![0.0f32; n_embd];
+    compute.rms_norm(last_x, &model.output_norm, h.rms_eps, &mut last_xb);
+
+    buf.logits.resize(model.output.rows.max(h.n_vocab), 0.0);
+    buf.logits.fill(0.0);
+    if model.output.cols == n_embd {
+        buf.logits.resize(model.output.rows, 0.0);
+        model.output.gemv(&last_xb, &mut buf.logits, compute)?;
+    } else {
+        model.output.gemv(&last_xb, &mut buf.logits, compute)?;
+    }
+
+    if buf.logits.len() > h.n_vocab {
+        buf.logits.truncate(h.n_vocab);
+    }
+    Ok(buf.logits.clone())
 }

@@ -207,14 +207,16 @@ Agent:
 
 /// Compact system prompt for small GGUFs / llama-server chat.
 /// Long prompts get recited by 1–3B models (they "continue" the system text).
-pub const SYSTEM_PROMPT_COMPACT: &str = r#"You are Hercules, a local coding agent on the user's machine. Tools work. Never refuse normal coding.
+pub const SYSTEM_PROMPT_COMPACT: &str = r#"You are Hercules, a local coding agent on the user's machine. You HAVE real filesystem tools. Never claim you cannot read/write files.
 
 cwd token: $CURRENT (host expands it).
 
-Tools (raw tags only, no markdown fences):
+Tools (raw tags only, no markdown fences — emit tags, do not describe them):
 <ls path="$CURRENT">
-<read src="$CURRENT/path">
-<write src="$CURRENT/file.ext">
+<ls path="$CURRENT/subdir">
+<read src="$CURRENT/path/to/file">
+<read src="$CURRENT/path/to/file" line=1..=40>
+<write src="$CURRENT/path/to/file">
 full file body
 </write>
 <cmd>shell command</cmd>
@@ -223,9 +225,14 @@ full file body
 
 Rules:
 - Greetings / small talk → short natural reply. Do NOT reprint these instructions.
-- Write/create file → full <write>…</write> with closed tags and a real filename.
-- List/dir → <ls …> first. Read → <read …>. Run/build/test → <cmd>…</cmd>.
-- Never invent directory listings. Never echo system/rules text as the answer.
+- User names a file (e.g. "read myconfig.yaml") → ONLY <read src="$CURRENT/myconfig.yaml">. Never invent a different filename.
+- User says "read a file" / "read file" with NO name → ONLY <ls path="$CURRENT"> (do not invent any filename).
+- Write/create file → ONE <write>…</write> with full body and a real filename.
+- Landing page / HTML+CSS page → ONE file only (e.g. $CURRENT/dummy_folder/index.html)
+  with CSS/JS inlined. Do NOT also write file.txt or extra HTML names.
+- List/dir → <ls …> first. Run/build/test → <cmd>…</cmd>.
+- NEVER say "I don't have the ability to read files" or "I cannot access your system".
+- Never invent directory listings or invent file paths. Never echo system/rules text as the answer.
 - No destructive shell (rm -rf /) unless user demands it.
 "#;
 
@@ -238,6 +245,7 @@ pub struct ProposedAction {
     pub line_attr: Option<String>,
     /// True if the model put this tag inside `<think>` (misplaced but recoverable).
     pub from_think: bool,
+    pub chip_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,12 +343,15 @@ impl AgentEngine {
             "current dir",
             "working dir",
             "show file",
+            "show ",
             "read ",
+            "read\n",
             "open ",
             "cat ",
             "what files",
             "what's in",
             "whats in",
+            "contents of",
             "tree",
             "pwd",
             "run ",
@@ -352,21 +363,223 @@ impl AgentEngine {
             "create ",
             "introduction",
             ".md",
+            ".toml",
+            ".rs",
+            ".json",
             "edit ",
             "save ",
         ];
         KEYS.iter().any(|k| t.contains(k))
     }
 
-    /// Formerly appended long [Host] tool-force examples. Disabled: coding models
-    /// already know the tags from the system prompt; path examples bias filenames.
-    pub fn tool_force_suffix(_user_text: &str) -> Option<&'static str> {
-        None
+    /// Model replied in natural language claiming no file/shell access (ignore tools).
+    pub fn looks_like_capability_refusal(text: &str) -> bool {
+        let low = text.to_ascii_lowercase();
+        const PHRASES: &[&str] = &[
+            "don't have the ability",
+            "do not have the ability",
+            "don't have access",
+            "do not have access",
+            "cannot read file",
+            "can't read file",
+            "cannot read files",
+            "can't read files",
+            "cannot access",
+            "can't access",
+            "no access to your",
+            "no access to the file",
+            "unable to read",
+            "unable to access",
+            "i cannot open",
+            "i can't open",
+            "as an ai",
+            "as a language model",
+            "i don't have the ability to directly",
+            "i do not have the ability to directly",
+        ];
+        PHRASES.iter().any(|p| low.contains(p))
     }
 
-    /// Pass-through (no host injection). Kept for call-site compatibility.
+    /// True if the assistant text already contains an executable tool tag.
+    pub fn response_has_tool_tags(text: &str) -> bool {
+        let t = text;
+        t.contains("<read src=")
+            || t.contains("<ls path=")
+            || t.contains("<ls>")
+            || t.contains("<write src=")
+            || t.contains("<cmd>")
+            || t.contains("<memory ")
+            || t.contains("<memory>")
+    }
+
+    /// True when the user wants a file tool but never named a path/filename.
+    /// (e.g. "can you read file?", "read a file") — must NOT invent names.
+    pub fn wants_read_without_path(user_text: &str) -> bool {
+        let low = user_text.to_ascii_lowercase();
+        let asks_read = low.contains("read")
+            || low.contains("open ")
+            || low.contains("show ")
+            || low.contains("cat ");
+        if !asks_read {
+            return false;
+        }
+        // Has an explicit path-like token?
+        Self::extract_path_candidate(user_text).is_none()
+    }
+
+    /// First path-like token from user text, if any (no invented defaults).
+    pub fn extract_path_candidate(user_text: &str) -> Option<String> {
+        let t = user_text.trim();
+        let low = t.to_ascii_lowercase();
+
+        let mut rest: Option<&str> = None;
+        for v in ["read ", "open ", "show ", "cat ", "print "] {
+            if let Some(i) = low.find(v) {
+                rest = Some(t[i + v.len()..].trim());
+                break;
+            }
+        }
+        if rest.is_none() {
+            for needle in [
+                "can you read ",
+                "please read ",
+                "could you read ",
+                "would you read ",
+                "can you open ",
+                "please open ",
+            ] {
+                if let Some(i) = low.find(needle) {
+                    rest = Some(t[i + needle.len()..].trim());
+                    break;
+                }
+            }
+        }
+
+        // Bare filename as the whole message: "Cargo.toml", "src/main.rs"
+        let search = rest.unwrap_or(t);
+        let candidate = search
+            .split(|c: char| c.is_whitespace() || c == '?' || c == '"' || c == '\'')
+            .map(str::trim)
+            .find(|s| {
+                if s.is_empty() {
+                    return false;
+                }
+                let low_c = s.to_ascii_lowercase();
+                if matches!(
+                    low_c.as_str(),
+                    "the"
+                        | "a"
+                        | "an"
+                        | "file"
+                        | "files"
+                        | "it"
+                        | "this"
+                        | "that"
+                        | "please"
+                        | "me"
+                        | "some"
+                        | "any"
+                        | "my"
+                        | "your"
+                ) {
+                    return false;
+                }
+                // Require path shape: extension, slash, or $CURRENT — not bare words
+                s.contains('.') || s.contains('/') || s.starts_with('$')
+            })?;
+        Some(candidate.to_string())
+    }
+
+    /// Best-effort tool tag from user text. Never invents a filename.
+    /// Pathless "read a file" → `<ls>` so the model can pick a real name next.
+    pub fn synthesize_tool_from_user(user_text: &str) -> Option<String> {
+        let t = user_text.trim();
+        let low = t.to_ascii_lowercase();
+
+        // list / ls / dir / cwd / pwd / tree
+        if low == "ls"
+            || low == "dir"
+            || low == "pwd"
+            || low == "tree"
+            || low.contains("list files")
+            || low.contains("list dir")
+            || low.contains("list the")
+            || low.contains("current dir")
+            || low.contains("working dir")
+            || low.contains("what's in")
+            || low.contains("whats in")
+            || low.contains("what files")
+        {
+            return Some(r#"<ls path="$CURRENT">"#.into());
+        }
+
+        // "can you read file?" / "read a file" with no real path → list, don't invent
+        if Self::wants_read_without_path(user_text) {
+            return Some(r#"<ls path="$CURRENT">"#.into());
+        }
+
+        let candidate = Self::extract_path_candidate(user_text)?;
+        let path = if candidate.starts_with("$CURRENT") || candidate.starts_with('/') {
+            candidate
+        } else {
+            format!("$CURRENT/{candidate}")
+        };
+        Some(format!(r#"<read src="{path}">"#))
+    }
+
+    /// Short host force line for tool-needed turns (kept tiny for 1.5B models).
+    /// Paths come only from the user message when recoverable — never a fixed demo file.
+    pub fn tool_force_suffix(user_text: &str) -> Option<String> {
+        if !Self::user_needs_tools(user_text) {
+            return None;
+        }
+        if Self::wants_read_without_path(user_text) {
+            return Some(
+                "[Host] No filename was given. Emit ONLY:\n\
+                 <ls path=\"$CURRENT\">\n\
+                 Do NOT invent filenames (not requirements.txt, not any other guess)."
+                    .into(),
+            );
+        }
+        if let Some(tag) = Self::synthesize_tool_from_user(user_text) {
+            return Some(format!(
+                "[Host] Emit ONLY this tool tag (path taken from the user message):\n{tag}"
+            ));
+        }
+        Some(
+            "[Host] Emit ONLY a tool tag. Use the exact path/name from the user if any.\n\
+             No path? Use <ls path=\"$CURRENT\">. Never invent a filename.\n\
+             Do not refuse — tools work on this machine."
+                .into(),
+        )
+    }
+
+    /// Append a short tool-force line when the user clearly needs filesystem/shell tools.
+    /// Without this, 1–3B models often answer “I can’t read files” despite the system prompt.
     pub fn with_tool_nudge(user_text: &str) -> String {
-        user_text.to_string()
+        match Self::tool_force_suffix(user_text) {
+            Some(sfx) => format!("{user_text}\n\n{sfx}"),
+            None => user_text.to_string(),
+        }
+    }
+
+    /// If the model refused tools, build a synthetic response that is pure tool tags.
+    /// Returns `None` when no recovery is possible.
+    pub fn recover_tools_from_refusal(user_text: &str, assistant_text: &str) -> Option<String> {
+        if Self::response_has_tool_tags(assistant_text) {
+            return None;
+        }
+        if !Self::user_needs_tools(user_text) {
+            return None;
+        }
+        // Recover on refusal, or when the user clearly asked for a concrete file/list
+        // and the model gave prose without any tags.
+        let should = Self::looks_like_capability_refusal(assistant_text)
+            || Self::synthesize_tool_from_user(user_text).is_some();
+        if !should {
+            return None;
+        }
+        Self::synthesize_tool_from_user(user_text)
     }
 
     /// Strip `<think>...</think>` blocks from response text.
@@ -526,27 +739,201 @@ impl AgentEngine {
             return true;
         }
         let ok_bins = [
-            "ls", "pwd", "cd", "cat", "echo", "printf", "head", "tail", "grep", "rg", "find",
-            "mkdir", "touch", "cp", "mv", "rm", "chmod", "stat", "wc", "date", "which", "whoami",
-            "uname", "df", "du", "ps", "top", "curl", "wget", "git", "cargo", "rustc", "python",
-            "python3", "pip", "node", "npm", "npx", "deno", "bun", "go", "make", "cmake", "gcc",
-            "clang", "sh", "bash", "zsh", "fish", "sudo", "apt", "dnf", "pacman", "brew", "docker",
-            "podman", "kubectl", "ssh", "scp", "rsync", "tar", "zip", "unzip", "jq", "sed", "awk",
-            "perl", "ruby", "php", "java", "javac", "mvn", "gradle", "htop", "btop", "nvim", "vim",
-            "nano", "tree", "file", "hexdump", "od", "base64", "md5sum", "sha256sum", "openssl",
-            "ffmpeg", "convert", "ollama", "pip3", "uv", "poetry", "pnpm", "yarn", "tsc", "pytest",
-            "lua", "R", "dotnet", "nvidia-smi", "free", "uptime", "id", "groups", "env", "export",
-            "true", "false", "test", "sleep", "timeout", "yes", "seq", "xargs", "tee", "less",
-            "more", "man", "info", "clear", "history", "alias", "type", "command", "builtin",
-            "source", ".", "eval", "exec", "nohup", "nice", "kill", "pkill", "killall", "jobs",
-            "fg", "bg", "screen", "tmux", "ssh-keygen", "ip", "ss", "ping", "traceroute", "nc",
-            "netstat", "ifconfig", "hostname", "systemctl", "journalctl", "service", "crontab",
-            "at", "batch", "watch", "time", "strace", "lsof", "fuser", "mount", "umount", "lsblk",
-            "blkid", "fdisk", "parted", "dd", "sync", "ln", "readlink", "realpath", "basename",
-            "dirname", "cut", "sort", "uniq", "tr", "paste", "join", "diff", "patch", "comm",
-            "cmp", "strings", "objdump", "nm", "ldd", "readelf", "strip", "ar", "ranlib",
+            "ls",
+            "pwd",
+            "cd",
+            "cat",
+            "echo",
+            "printf",
+            "head",
+            "tail",
+            "grep",
+            "rg",
+            "find",
+            "mkdir",
+            "touch",
+            "cp",
+            "mv",
+            "rm",
+            "chmod",
+            "stat",
+            "wc",
+            "date",
+            "which",
+            "whoami",
+            "uname",
+            "df",
+            "du",
+            "ps",
+            "top",
+            "curl",
+            "wget",
+            "git",
+            "cargo",
+            "rustc",
+            "python",
+            "python3",
+            "pip",
+            "node",
+            "npm",
+            "npx",
+            "deno",
+            "bun",
+            "go",
+            "make",
+            "cmake",
+            "gcc",
+            "clang",
+            "sh",
+            "bash",
+            "zsh",
+            "fish",
+            "sudo",
+            "apt",
+            "dnf",
+            "pacman",
+            "brew",
+            "docker",
+            "podman",
+            "kubectl",
+            "ssh",
+            "scp",
+            "rsync",
+            "tar",
+            "zip",
+            "unzip",
+            "jq",
+            "sed",
+            "awk",
+            "perl",
+            "ruby",
+            "php",
+            "java",
+            "javac",
+            "mvn",
+            "gradle",
+            "htop",
+            "btop",
+            "nvim",
+            "vim",
+            "nano",
+            "tree",
+            "file",
+            "hexdump",
+            "od",
+            "base64",
+            "md5sum",
+            "sha256sum",
+            "openssl",
+            "ffmpeg",
+            "convert",
+            "ollama",
+            "pip3",
+            "uv",
+            "poetry",
+            "pnpm",
+            "yarn",
+            "tsc",
+            "pytest",
+            "lua",
+            "R",
+            "dotnet",
+            "nvidia-smi",
+            "free",
+            "uptime",
+            "id",
+            "groups",
+            "env",
+            "export",
+            "true",
+            "false",
+            "test",
+            "sleep",
+            "timeout",
+            "yes",
+            "seq",
+            "xargs",
+            "tee",
+            "less",
+            "more",
+            "man",
+            "info",
+            "clear",
+            "history",
+            "alias",
+            "type",
+            "command",
+            "builtin",
+            "source",
+            ".",
+            "eval",
+            "exec",
+            "nohup",
+            "nice",
+            "kill",
+            "pkill",
+            "killall",
+            "jobs",
+            "fg",
+            "bg",
+            "screen",
+            "tmux",
+            "ssh-keygen",
+            "ip",
+            "ss",
+            "ping",
+            "traceroute",
+            "nc",
+            "netstat",
+            "ifconfig",
+            "hostname",
+            "systemctl",
+            "journalctl",
+            "service",
+            "crontab",
+            "at",
+            "batch",
+            "watch",
+            "time",
+            "strace",
+            "lsof",
+            "fuser",
+            "mount",
+            "umount",
+            "lsblk",
+            "blkid",
+            "fdisk",
+            "parted",
+            "dd",
+            "sync",
+            "ln",
+            "readlink",
+            "realpath",
+            "basename",
+            "dirname",
+            "cut",
+            "sort",
+            "uniq",
+            "tr",
+            "paste",
+            "join",
+            "diff",
+            "patch",
+            "comm",
+            "cmp",
+            "strings",
+            "objdump",
+            "nm",
+            "ldd",
+            "readelf",
+            "strip",
+            "ar",
+            "ranlib",
         ];
-        if ok_bins.iter().any(|b| first == *b || first.ends_with(&format!("/{b}"))) {
+        if ok_bins
+            .iter()
+            .any(|b| first == *b || first.ends_with(&format!("/{b}")))
+        {
             return true;
         }
         // `python3 -m http.server` style: first token ends with common runner
@@ -561,7 +948,8 @@ impl AgentEngine {
         let t = user_text.to_ascii_lowercase();
         let name = if (t.contains("rotat") || t.contains("spin")) && t.contains("cube") {
             "rotating_cube.html"
-        } else if t.contains("cube") && (t.contains("html") || t.contains("js") || t.contains("webgl"))
+        } else if t.contains("cube")
+            && (t.contains("html") || t.contains("js") || t.contains("webgl"))
         {
             "cube.html"
         } else if t.contains("three.js") || t.contains("threejs") || t.contains("webgl") {
@@ -609,11 +997,7 @@ impl AgentEngine {
             }
         }
         let out = out.trim_matches('_').to_string();
-        if out.is_empty() {
-            "file".into()
-        } else {
-            out
-        }
+        if out.is_empty() { "file".into() } else { out }
     }
 
     /// Infer a sensible filename from file body (never force landing_page.html).
@@ -659,7 +1043,91 @@ impl AgentEngine {
         if body_l.contains("def ") || body_l.contains("import ") {
             return "main.py".into();
         }
-        "file.txt".into()
+        // Avoid "file.txt" mid-stream — prefer index.html for HTML-ish / empty drafts
+        if body.trim().is_empty() || body.len() < 40 {
+            return "index.html".into();
+        }
+        "notes.txt".into()
+    }
+
+    /// Collapse multi-write spam for a single-page user request (landing/html page).
+    /// Keeps the best HTML write (largest body with doctype/html), drops junk file.txt.
+    pub fn collapse_write_actions_for_user(
+        user_text: &str,
+        actions: Vec<ProposedAction>,
+    ) -> Vec<ProposedAction> {
+        let writes: Vec<_> = actions
+            .iter()
+            .filter(|a| a.kind == ProposedKind::Write)
+            .cloned()
+            .collect();
+        let others: Vec<_> = actions
+            .into_iter()
+            .filter(|a| a.kind != ProposedKind::Write)
+            .collect();
+        if writes.len() <= 1 {
+            let mut out = writes;
+            out.extend(others);
+            return out;
+        }
+        let low = user_text.to_ascii_lowercase();
+        let single_page = user_text.is_empty()
+            || low.contains("landing")
+            || low.contains("html")
+            || low.contains("web page")
+            || low.contains("webpage")
+            || low.contains("about you")
+            || (low.contains("create") && (low.contains("page") || low.contains("site")));
+        // Without user text: only collapse when junk .txt sits next to real HTML
+        if user_text.is_empty() {
+            let has_html = writes.iter().any(|w| {
+                let b = w.body.to_ascii_lowercase();
+                b.contains("<html") || b.contains("<!doctype")
+            });
+            let has_junk = writes.iter().any(|w| {
+                let n = w.target.to_ascii_lowercase();
+                (n.ends_with(".txt") || n.ends_with("file.txt")) && w.body.len() < 200
+            });
+            if !(has_html && has_junk) {
+                let mut out = writes;
+                out.extend(others);
+                return out;
+            }
+        } else if !single_page {
+            let mut out = writes;
+            out.extend(others);
+            return out;
+        }
+        // Score: prefer closed HTML with real content
+        let best = writes.into_iter().max_by_key(|w| {
+            let b = w.body.to_ascii_lowercase();
+            let mut score = w.body.len() as i64;
+            if b.contains("<!doctype") || b.contains("<html") {
+                score += 50_000;
+            }
+            if b.contains("<style") || b.contains("<body") {
+                score += 10_000;
+            }
+            let name = w.target.to_ascii_lowercase();
+            if name.ends_with("index.html") || name.ends_with("landing_page.html") {
+                score += 5_000;
+            }
+            if name.ends_with("file.txt") || name.ends_with("notes.txt") || name.ends_with(".txt") {
+                score -= 20_000;
+            }
+            score
+        });
+        let mut out = Vec::new();
+        if let Some(w) = best {
+            // Force a clean path for landing pages
+            let mut w = w;
+            if !w.target.ends_with(".html") {
+                w.target = Self::suggested_path_from_user_text(user_text);
+            }
+            out.push(w);
+        }
+        out.extend(others);
+        out
     }
 
     /// If model wrote a directory as `src` (or a generic/wrong name), pick a better file path.
@@ -775,6 +1243,35 @@ impl AgentEngine {
         p.to_string()
     }
 
+    /// Merge multiple write actions targeting the same resolved path into one,
+    /// concatenating their bodies. This prevents a second `<write>` for the same
+    /// file (e.g. model writes HTML then CSS into same `index.html`) from
+    /// clobbering the first write.
+    fn merge_duplicate_writes(actions: Vec<ProposedAction>) -> Vec<ProposedAction> {
+        let mut merged: Vec<ProposedAction> = Vec::new();
+        for action in actions {
+            if action.kind != ProposedKind::Write || action.line_attr.is_some() {
+                // Don't merge line-range writes — they target specific regions
+                merged.push(action);
+                continue;
+            }
+            // Check if we already have a full-file write to the same target
+            if let Some(existing) = merged
+                .iter_mut()
+                .find(|a| a.kind == ProposedKind::Write && a.line_attr.is_none() && a.target == action.target)
+            {
+                // Append the new body — the model split one file across two write tags
+                if !existing.body.ends_with('\n') {
+                    existing.body.push('\n');
+                }
+                existing.body.push_str(&action.body);
+            } else {
+                merged.push(action);
+            }
+        }
+        merged
+    }
+
     fn parse_write_cmd_actions(text: &str, from_think: bool) -> Vec<ProposedAction> {
         let mut out = Vec::new();
         let mut rest = text;
@@ -804,6 +1301,7 @@ impl AgentEngine {
                         body,
                         line_attr,
                         from_think,
+                        chip_id: None,
                     });
                 }
                 if next.is_empty() {
@@ -814,6 +1312,7 @@ impl AgentEngine {
                 break;
             }
         }
+        // cmd parsing follows — merge writes at the very end
         rest = text;
         while let Some(start_tag) = rest.find("<cmd>") {
             let r = &rest[start_tag + 5..];
@@ -827,6 +1326,7 @@ impl AgentEngine {
                         body: String::new(),
                         line_attr: None,
                         from_think,
+                        chip_id: None,
                     });
                 }
             } else {
@@ -844,12 +1344,13 @@ impl AgentEngine {
                         body: String::new(),
                         line_attr: None,
                         from_think,
+                        chip_id: None,
                     });
                 }
                 break;
             }
         }
-        out
+        Self::merge_duplicate_writes(out)
     }
 
     pub fn execute_proposed(action: &ProposedAction) -> String {
@@ -893,7 +1394,11 @@ impl AgentEngine {
         let perms = get_tool_permissions();
         let auto_mutate = matches!(perms.mode, PermissionMode::AlwaysAllow) || perms.session_allow;
         if auto_mutate {
-            for action in Self::extract_proposed_actions(response) {
+            let actions = Self::collapse_write_actions_for_user(
+                "", // no user hint — still drops tiny .txt junk next to a real HTML body
+                Self::extract_proposed_actions(response),
+            );
+            for action in actions {
                 if action.kind == ProposedKind::Write {
                     results.push(Self::execute_proposed(&action));
                 }
@@ -1141,11 +1646,7 @@ impl AgentEngine {
             let clean_body = body.trim_start_matches('\n');
             if let Some(parent) = path.parent() {
                 if let Err(e) = fs::create_dir_all(parent) {
-                    return format!(
-                        "Error creating parent dir '{}': {}",
-                        parent.display(),
-                        e
-                    );
+                    return format!("Error creating parent dir '{}': {}", parent.display(), e);
                 }
             }
             match fs::write(&path, clean_body) {
@@ -1357,8 +1858,7 @@ mod tests {
 
     #[test]
     fn test_strip_think_blocks() {
-        let sample =
-            "Hello! <think>I will <cmd>echo hello_world</cmd> execute this</think> <ls path=\"$CURRENT\">";
+        let sample = "Hello! <think>I will <cmd>echo hello_world</cmd> execute this</think> <ls path=\"$CURRENT\">";
         let cleaned = AgentEngine::strip_think_blocks(sample);
         assert!(!cleaned.contains("echo hello_world"));
         assert!(cleaned.contains("<ls path="));
@@ -1403,9 +1903,10 @@ mod tests {
         let r = AgentEngine::process_response("<memory read>").unwrap();
         assert!(r.contains("remember x = 5"));
 
-        let rep =
-            AgentEngine::process_response("<memory replace=1>\nexecute after plan is done\n</memory>")
-                .unwrap();
+        let rep = AgentEngine::process_response(
+            "<memory replace=1>\nexecute after plan is done\n</memory>",
+        )
+        .unwrap();
         assert!(rep.contains("Replaced:"));
 
         let r2 = AgentEngine::process_response("<memory read=1>").unwrap();
@@ -1420,5 +1921,54 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("<read"));
         assert!(SYSTEM_PROMPT.contains("<cmd>"));
         assert!(SYSTEM_PROMPT.contains("Hercules"));
+        // Compact prompt must stay path-generic (no project-specific demo files).
+        assert!(!SYSTEM_PROMPT_COMPACT.contains("Cargo.toml"));
+        assert!(!SYSTEM_PROMPT_COMPACT.contains("requirements.txt"));
+        assert!(SYSTEM_PROMPT_COMPACT.contains(r#"$CURRENT/path/to/file"#));
+    }
+
+    #[test]
+    fn test_synthesize_read_uses_user_path_not_hardcoded() {
+        let tag = AgentEngine::synthesize_tool_from_user("can you read Cargo.toml").unwrap();
+        assert_eq!(tag, r#"<read src="$CURRENT/Cargo.toml">"#);
+
+        let tag2 = AgentEngine::synthesize_tool_from_user("open src/main.rs").unwrap();
+        assert_eq!(tag2, r#"<read src="$CURRENT/src/main.rs">"#);
+
+        let tag3 = AgentEngine::synthesize_tool_from_user("please read notes.txt").unwrap();
+        assert_eq!(tag3, r#"<read src="$CURRENT/notes.txt">"#);
+
+        let ls = AgentEngine::synthesize_tool_from_user("list current dir").unwrap();
+        assert_eq!(ls, r#"<ls path="$CURRENT">"#);
+
+        // Pathless read must NOT invent requirements.txt / any filename — list instead
+        let vague = AgentEngine::synthesize_tool_from_user("can you read file?").unwrap();
+        assert_eq!(vague, r#"<ls path="$CURRENT">"#);
+        assert!(!vague.contains("requirements"));
+        assert!(AgentEngine::wants_read_without_path("can you read file?"));
+        assert!(!AgentEngine::wants_read_without_path("read Cargo.toml"));
+    }
+
+    #[test]
+    fn test_recover_tools_from_refusal() {
+        let refusal = "I don't have the ability to directly read files on your system.";
+        let tag =
+            AgentEngine::recover_tools_from_refusal("can you read package.json", refusal).unwrap();
+        assert_eq!(tag, r#"<read src="$CURRENT/package.json">"#);
+
+        // Already has a tool — no recovery
+        assert!(
+            AgentEngine::recover_tools_from_refusal("read x.rs", r#"<read src="$CURRENT/x.rs">"#)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_with_tool_nudge_appends_for_tool_requests() {
+        let nudged = AgentEngine::with_tool_nudge("read foo.bar");
+        assert!(nudged.contains("foo.bar"));
+        assert!(nudged.contains("[Host]"));
+        // greetings stay plain
+        assert_eq!(AgentEngine::with_tool_nudge("hello"), "hello");
     }
 }

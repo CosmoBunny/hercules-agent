@@ -1,59 +1,85 @@
 //! Local LLM engines for Hercules Agent.
 //!
-//! # How llama.cpp handles models (reference architecture)
+//! # Backends
 //!
-//! 1. **GGUF load** — single-file format with metadata KV, tokenizer, and quantized tensors
-//! 2. **Tokenizer** — encode text → token ids (BPE / SentencePiece from GGUF)
-//! 3. **Embeddings** — token id rows from `token_embd.weight`
-//! 4. **Transformer graph (ggml)** — per layer: RMSNorm → QKV → RoPE → attention (KV cache) → FFN (SiLU)
-//! 5. **Logits** — final RMSNorm + `output.weight`
-//! 6. **Sampling** — temperature / top-k / top-p / penalties → next token
-//! 7. **Decode loop** — append token, reuse KV cache for O(1) per new token (amortized)
-//!
-//! # Backends in this crate
-//!
-//! | Backend    | Module        | Role |
-//! |------------|---------------|------|
-//! | **llama.rs**  | `infer`, `gguf`, `model`, `compute` | Pure Rust GGUF (**no** C/FFI; pluggable [`ComputeBackend`]) |
-//! | **llama.cpp** | `cpp`, `server` | C++ runtime via CLI / managed `llama-server` (bindings track later) |
-//! | **HTTP**      | `http`        | OpenAI-compatible client (llama.cpp server / remote) |
+//! | Backend       | Module            | Role                              |
+//! |---------------|-------------------|-----------------------------------|
+//! | **llama.cpp** | `ffi`, `libinfer` | In-process via libllama.so (FFI)  |
+//! | **HTTP**      | `http`            | OpenAI-compatible client          |
+//! | **Server**    | `server`, `cpp`   | Managed llama-server process      |
 
-pub mod bench;
-pub mod compute;
 pub mod cpp;
-pub mod gguf;
+pub mod ffi;
 pub mod http;
-pub mod infer;
-pub mod kernels;
-pub mod model;
-pub mod sample;
+pub mod libinfer;
 pub mod server;
-pub mod tokenizer;
 
-pub use compute::{
-    build_default_backend, default_backend, ComputeBackend, ComputeError, ComputePrefs,
-    ScalarBackend,
+// ---------------------------------------------------------------------------
+// Legacy pure-Rust modules (not active at runtime; kept for reference)
+// Re-exported at crate::llama level so their internal cross-imports resolve.
+// ---------------------------------------------------------------------------
+#[allow(dead_code, unused, unused_imports)]
+pub mod legacy {
+    pub mod bench;
+    pub mod compute;
+    pub mod gguf;
+    pub mod infer;
+    pub mod kernels;
+    pub mod model;
+    pub mod sample;
+    pub mod tokenizer;
+}
+
+// Re-export legacy modules at the top crate::llama level so legacy source
+// files that do `use crate::llama::gguf` continue to compile.
+#[allow(unused_imports)]
+pub use legacy::bench;
+#[allow(unused_imports)]
+pub use legacy::compute;
+#[allow(unused_imports)]
+pub use legacy::gguf;
+#[allow(unused_imports)]
+pub use legacy::kernels;
+#[allow(unused_imports)]
+pub use legacy::model;
+#[allow(unused_imports)]
+pub use legacy::sample;
+#[allow(unused_imports)]
+pub use legacy::tokenizer;
+
+// Re-export legacy compute traits at crate::llama level (legacy code uses
+// `crate::llama::ComputeBackend` without the ::compute:: path component).
+#[allow(unused_imports)]
+pub use legacy::compute::{
+    ComputeBackend, ComputeError, ComputePrefs, ScalarBackend, SimdBackend,
+    build_default_backend, default_backend, default_rms_norm,
 };
+#[cfg(feature = "parallel")]
+#[allow(unused_imports)]
+pub use legacy::compute::ParallelBackend;
+
+// Active public API
 pub use cpp::LlamaCppRuntime;
 pub use http::HttpInferenceClient;
-pub use infer::{
-    ensure_warm_rs_engine, shutdown_warm_rs_engine, LlamaRsEngine, LlamaRsRuntime,
+pub use libinfer::{
+    ensure_warm_lib_engine, shutdown_warm_lib_engine,
+    LlamaCppLib, LlamaCppLibRuntime,
 };
 
-/// High-level engine choice exposed to the application backend.
+/// Engine choice exposed to the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlamaEngineKind {
-    /// Pure Rust implementation (this crate).
-    LlamaRs,
-    /// Official llama.cpp (CLI or server).
+    /// In-process libllama.so (C FFI) — primary path.
+    LlamaCppLib,
+    /// Official llama.cpp via CLI or managed server.
     LlamaCpp,
 }
 
 impl LlamaEngineKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::LlamaRs => "llama.rs (Pure Rust)",
-            Self::LlamaCpp => "llama.cpp (C/C++ runtime)",
+            Self::LlamaCppLib => "llama.cpp (in-process libllama.so)",
+            Self::LlamaCpp => "llama.cpp (C/C++ server)",
         }
     }
 }

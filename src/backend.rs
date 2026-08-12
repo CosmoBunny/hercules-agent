@@ -1,17 +1,21 @@
 use ollama_rs::{generation::completion::request::GenerationRequest, Ollama};
+#[cfg(feature = "gpu")]
 use burn::backend::wgpu::WgpuDevice;
+#[cfg(feature = "gpu")]
 use burn::backend::Wgpu;
+#[cfg(feature = "gpu")]
 use burn::tensor::Tensor;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::llama::{HttpInferenceClient, LlamaCppRuntime, LlamaRsRuntime};
+use crate::llama::{HttpInferenceClient, LlamaCppRuntime, LlamaCppLibRuntime};
 
 #[derive(Clone)]
 pub enum AgentBackend {
+    #[cfg(feature = "gpu")]
     BurnWgpu(BurnWgpuBackend),
-    /// Pure Rust GGUF engine (warm in-process; no llama-server).
-    LlamaRs(LlamaRsBackend),
+    /// In-process libllama.so engine (C FFI — no subprocess).
+    LlamaCppLib(LlamaCppLibBackend),
     /// Official llama.cpp via CLI or managed llama-server.
     LlamaCpp(LlamaCppBackend),
     Ollama(OllamaBackend),
@@ -20,8 +24,9 @@ pub enum AgentBackend {
 impl AgentBackend {
     pub async fn generate(&self, prompt: &str) -> Result<String, String> {
         match self {
+            #[cfg(feature = "gpu")]
             Self::BurnWgpu(backend) => backend.generate(prompt).await,
-            Self::LlamaRs(backend) => backend.generate(prompt).await,
+            Self::LlamaCppLib(backend) => backend.generate(prompt).await,
             Self::LlamaCpp(backend) => backend.generate(prompt).await,
             Self::Ollama(backend) => backend.generate(prompt).await,
         }
@@ -35,7 +40,7 @@ impl AgentBackend {
         is_generating: Arc<Mutex<bool>>,
     ) -> Result<String, String> {
         match self {
-            Self::LlamaRs(backend) => {
+            Self::LlamaCppLib(backend) => {
                 backend
                     .generate_stream(prompt, stream_target, is_generating)
                     .await
@@ -50,6 +55,7 @@ impl AgentBackend {
                     .generate_stream(prompt, stream_target, is_generating)
                     .await
             }
+            #[cfg(feature = "gpu")]
             Self::BurnWgpu(backend) => {
                 let result = backend.generate(prompt).await?;
                 if let Ok(mut target) = stream_target.lock() {
@@ -60,10 +66,19 @@ impl AgentBackend {
         }
     }
 
+    pub fn current_model_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::LlamaCppLib(b) => b.runtime.model_path.clone(),
+            Self::LlamaCpp(b) => b.runtime.model_path(),
+            _ => None,
+        }
+    }
+
     pub fn name(&self) -> String {
         match self {
+            #[cfg(feature = "gpu")]
             Self::BurnWgpu(b) => format!("Burn/WGPU ({})", b.model_name),
-            Self::LlamaRs(b) => b.name(),
+            Self::LlamaCppLib(b) => b.name(),
             Self::LlamaCpp(b) => b.runtime.name(),
             Self::Ollama(b) => format!("Ollama ({})", b.model),
         }
@@ -71,37 +86,37 @@ impl AgentBackend {
 }
 
 // ---------------------------------------------------------------------------
-// llama.rs — pure Rust
+// llama.cpp in-process (libllama.so via C FFI)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct LlamaRsBackend {
-    pub runtime: LlamaRsRuntime,
+pub struct LlamaCppLibBackend {
+    pub runtime: LlamaCppLibRuntime,
 }
 
-impl LlamaRsBackend {
+impl LlamaCppLibBackend {
     pub fn http(endpoint: String, model_name: String) -> Self {
         Self {
-            runtime: LlamaRsRuntime::with_endpoint(endpoint, model_name),
+            runtime: LlamaCppLibRuntime::with_endpoint(endpoint, model_name),
         }
     }
 
     pub fn gguf(path: impl Into<PathBuf>) -> Self {
         Self {
-            runtime: LlamaRsRuntime::with_gguf(path),
+            runtime: LlamaCppLibRuntime::with_gguf(path),
         }
     }
 
     pub fn name(&self) -> String {
         if let Some(ref p) = self.runtime.model_path {
             format!(
-                "llama.rs ({})",
+                "llama.cpp lib ({})",
                 p.file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| p.display().to_string())
             )
         } else {
-            format!("llama.rs HTTP ({})", self.runtime.endpoint)
+            format!("llama.cpp lib HTTP ({})", self.runtime.endpoint)
         }
     }
 
@@ -121,8 +136,11 @@ impl LlamaRsBackend {
     }
 }
 
+// Backward compat alias — old code may reference LlamaRsBackend
+pub type LlamaRsBackend = LlamaCppLibBackend;
+
 // ---------------------------------------------------------------------------
-// llama.cpp — C/C++ runtime
+// llama.cpp — C/C++ server/CLI runtime
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -160,7 +178,7 @@ impl LlamaCppBackend {
 }
 
 // Keep old name working for any external references during transition.
-pub type LlamaServerBackend = LlamaRsBackend;
+pub type LlamaServerBackend = LlamaCppLibBackend;
 
 // ---------------------------------------------------------------------------
 // Ollama
@@ -221,9 +239,6 @@ impl OllamaBackend {
             match chunk_result {
                 Ok(responses) => {
                     for resp in responses {
-                        // Ollama-only: `resp.thinking` is a separate stream field.
-                        // We wrap it in <think> so the TUI can label it distinctly.
-                        // llama.cpp does NOT use this path — its tokens are plain content.
                         if let Some(ref think) = resp.thinking {
                             if !think.is_empty() {
                                 if !thinking_active {
@@ -280,15 +295,17 @@ impl OllamaBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Burn / WGPU (demo tensor path)
+// Burn / WGPU (demo tensor path) — only when `gpu` feature is enabled
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "gpu")]
 #[derive(Clone)]
 pub struct BurnWgpuBackend {
     device: WgpuDevice,
     pub model_name: String,
 }
 
+#[cfg(feature = "gpu")]
 impl BurnWgpuBackend {
     pub fn new() -> Self {
         Self {
@@ -315,12 +332,12 @@ impl BurnWgpuBackend {
                 .display()
                 .to_string();
             Ok(format!(
-                "<think>Validating Vulkan/WGPU GPU hardware pipeline and initializing tensor execution graph for Hercules Agent.</think>Hello! I am Hercules agent running on native Burn/WGPU hardware engine. Ready to assist with your project in {}.",
+                "<think>Validating Vulkan/WGPU GPU hardware pipeline.</think>Hello! I am Hercules agent running on native Burn/WGPU hardware engine. Ready to assist with your project in {}.",
                 cwd
             ))
         } else {
             Ok(format!(
-                "<think>Analyzing prompt context. Validating Vulkan/WGPU GPU hardware pipeline.</think>[{}] Executed on Vulkan/WGPU GPU hardware pipeline. Ready for embedded and mobile deployment.\n\n(Tip: select **llama.rs** or **llama.cpp** in Settings for real GGUF inference.)",
+                "<think>Analyzing prompt context.</think>[{}] Executed on Vulkan/WGPU GPU hardware pipeline.\n\n(Tip: select **llama.cpp lib** in Settings for real GGUF inference.)",
                 self.model_name
             ))
         }
@@ -335,6 +352,7 @@ fn _http_type(_: HttpInferenceClient) {}
 mod tests {
     use super::*;
 
+    #[cfg(feature = "gpu")]
     #[tokio::test]
     async fn test_burn_wgpu_backend() {
         let backend = BurnWgpuBackend::new();

@@ -2,15 +2,15 @@
 
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use hercules_agent::app::App;
 use hercules_agent::llama;
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     error::Error,
     io,
@@ -23,7 +23,7 @@ static REQUEST_QUIT: AtomicBool = AtomicBool::new(false);
 
 fn cleanup_engines() {
     llama::server::shutdown_managed_server();
-    llama::infer::shutdown_warm_rs_engine();
+    llama::libinfer::shutdown_warm_lib_engine();
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) {
@@ -31,6 +31,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) 
     let _ = execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         PopKeyboardEnhancementFlags
     );
@@ -56,6 +57,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
+        EnableBracketedPaste,
         // Key release needed so Esc hold cancels when released early
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES

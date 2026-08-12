@@ -2,13 +2,11 @@
 //!
 //! # Engines
 //!
-//! | Track | Feature / module | C/FFI |
-//! |-------|------------------|--------|
-//! | **llama.rs** | always (`llama` pure path) | **None** — portable pure Rust |
-//! | **llama.cpp** | `server` / `cpp` today; `llama-cpp-bindings` later | Shared lib / process |
-//!
-//! External embedders can implement [`llama::ComputeBackend`] for custom devices
-//! (MCU, NPU, …) without forking the decoder graph.
+//! | Track | Module | C/FFI |
+//! |-------|--------|-------|
+//! | **llama.cpp lib** | `llama::ffi`, `llama::libinfer` | `libllama.so` (in-process C FFI) |
+//! | **llama.cpp server** | `llama::server`, `llama::cpp` | Managed subprocess |
+//! | **Ollama** | `backend::OllamaBackend` | HTTP |
 
 #![allow(clippy::too_many_arguments)]
 
@@ -25,7 +23,7 @@ pub mod tool_panel;
 pub mod app;
 
 pub use llama::{
-    build_default_backend, ensure_warm_rs_engine, shutdown_warm_rs_engine, ComputeBackend,
-    ComputePrefs, LlamaEngineKind, LlamaRsEngine, LlamaRsRuntime, ScalarBackend,
+    ensure_warm_lib_engine, shutdown_warm_lib_engine,
+    LlamaEngineKind, LlamaCppLib, LlamaCppLibRuntime,
 };
 pub use settings::{get_settings, PowerMode, RuntimeSettings};

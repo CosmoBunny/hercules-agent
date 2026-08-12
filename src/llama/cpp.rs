@@ -52,6 +52,13 @@ impl LlamaCppRuntime {
         }
     }
 
+    pub fn model_path(&self) -> Option<PathBuf> {
+        match &self.mode {
+            LlamaCppMode::Cli { model_path } => Some(model_path.clone()),
+            _ => None,
+        }
+    }
+
     pub fn name(&self) -> String {
         match &self.mode {
             LlamaCppMode::Cli { model_path } => {

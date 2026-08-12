@@ -17,6 +17,7 @@ use std::time::Instant;
 pub enum ToolPanelKind {
     Write,
     Cmd,
+    Read,
 }
 
 impl ToolPanelKind {
@@ -24,6 +25,7 @@ impl ToolPanelKind {
         match self {
             Self::Write => "WRITE",
             Self::Cmd => "TERM",
+            Self::Read => "READ",
         }
     }
 
@@ -31,6 +33,7 @@ impl ToolPanelKind {
         match self {
             Self::Write => Color::Rgb(80, 220, 140),
             Self::Cmd => Color::Rgb(255, 200, 80),
+            Self::Read => Color::Rgb(100, 180, 255),
         }
     }
 
@@ -38,6 +41,7 @@ impl ToolPanelKind {
         match self {
             Self::Write => Color::Rgb(210, 255, 225),
             Self::Cmd => Color::Rgb(180, 255, 180), // terminal green
+            Self::Read => Color::Rgb(200, 230, 255),
         }
     }
 }
@@ -68,8 +72,11 @@ impl ToolChip {
             ToolPanelKind::Write => {
                 let short = self.target.rsplit('/').next().unwrap_or(&self.target);
                 let lines = line_count(&self.body);
-                if self.tag_closed {
-                    format!(" [WRITE] {short} | {lines} lines > ")
+                if self.pending {
+                    // tag closed but waiting for user to press Y — NOT written yet
+                    format!(" [PENDING] {short} | {lines} lines > ")
+                } else if self.tag_closed {
+                    format!(" [WROTE] {short} | {lines} lines > ")
                 } else {
                     format!(" [WRITE] {short} | {lines} lines... > ")
                 }
@@ -83,6 +90,18 @@ impl ToolChip {
                     format!(" [RAN] `{cmd}` > ")
                 } else {
                     format!(" [RUN] `{cmd}` > ")
+                }
+            }
+            ToolPanelKind::Read => {
+                let short = self.target.rsplit('/').next().unwrap_or(&self.target);
+                let short = trunc(short, 36);
+                let lines = line_count(&self.body);
+                if self.tag_closed && !self.body.is_empty() {
+                    format!(" [READ] {short} | {lines} lines > ")
+                } else if self.tag_closed {
+                    format!(" [READ] {short} > ")
+                } else {
+                    format!(" [READ] {short}... > ")
                 }
             }
         }
@@ -286,19 +305,20 @@ pub fn normalize_target(kind: ToolPanelKind, target: &str) -> String {
     let t = clean_cmd(target);
     match kind {
         ToolPanelKind::Cmd => t.split_whitespace().collect::<Vec<_>>().join(" "),
-        ToolPanelKind::Write => t,
+        ToolPanelKind::Write | ToolPanelKind::Read => t,
     }
 }
 
-/// Same tool event? Used to upsert chips instead of spawning duplicates.
+/// Same tool event? Used to upsert chips *within one stream/turn* only.
+/// Callers must also match `anchor_msg` so past chips stay clickable.
 pub fn same_tool_target(kind: ToolPanelKind, a: &str, b: &str) -> bool {
     let na = normalize_target(kind, a);
     let nb = normalize_target(kind, b);
     if na == nb {
         return true;
     }
-    // path suffix / basename match for writes
-    if kind == ToolPanelKind::Write {
+    // path suffix / basename match for file tools
+    if matches!(kind, ToolPanelKind::Write | ToolPanelKind::Read) {
         let ba = na.rsplit('/').next().unwrap_or(&na);
         let bb = nb.rsplit('/').next().unwrap_or(&nb);
         if ba == bb && !ba.is_empty() {
@@ -358,12 +378,16 @@ pub struct StreamToolView {
 pub fn detect_all_stream_tools(response: &str) -> Vec<StreamToolView> {
     let text = flatten_for_tools(response);
     let mut out = Vec::new();
-    if let Some(w) = detect_write(&text) {
+    // Prefer the *active* write (last open, else last closed) so path renames
+    // mid-stream don't spawn a chip per intermediate filename.
+    if let Some(w) = detect_primary_write(&text) {
         out.push(w);
     }
     if let Some(c) = detect_cmd(&text) {
         out.push(c);
     }
+    // All <read> tags in the stream (not just first)
+    out.extend(detect_reads(&text));
     out
 }
 
@@ -381,46 +405,107 @@ fn flatten_for_tools(response: &str) -> String {
         }
     }
     let think = crate::agent::AgentEngine::strip_code_fences(&think);
-    if outside.contains("<write") || outside.contains("<cmd>") {
+    if outside.contains("<write")
+        || outside.contains("<cmd>")
+        || outside.contains("<read src=")
+    {
         outside
     } else {
         format!("{outside}\n{think}")
     }
 }
 
-fn detect_write(text: &str) -> Option<StreamToolView> {
+fn detect_reads(text: &str) -> Vec<StreamToolView> {
+    let outside = crate::agent::AgentEngine::strip_think_blocks(text);
+    let search_in = if outside.contains("<read src=") {
+        outside.as_str()
+    } else {
+        text
+    };
+    let mut out = Vec::new();
+    let mut rest = search_in;
+    while let Some(start) = rest.find("<read src=") {
+        let r = &rest[start..];
+        let Some(gt) = r.find('>') else { break };
+        let path = extract_attr(&r[..gt + 1], "src").unwrap_or_else(|| "unknown".into());
+        out.push(StreamToolView {
+            kind: ToolPanelKind::Read,
+            target: expand_path_display(&path),
+            body: String::new(),
+            tag_closed: true,
+        });
+        rest = &r[gt + 1..];
+    }
+    out
+}
+
+/// Pick one write for the live chip: last unclosed write, else the last closed write.
+fn detect_primary_write(text: &str) -> Option<StreamToolView> {
+    let writes = detect_all_writes(text);
+    if writes.is_empty() {
+        return None;
+    }
+    writes
+        .iter()
+        .rev()
+        .find(|w| !w.tag_closed)
+        .cloned()
+        .or_else(|| writes.last().cloned())
+}
+
+/// All `<write>` tags in order (for pending-accept multi-file).
+pub fn detect_all_writes(text: &str) -> Vec<StreamToolView> {
     let outside = crate::agent::AgentEngine::strip_think_blocks(text);
     let search_in = if outside.contains("<write") {
         outside.as_str()
     } else {
         text
     };
-    let start = search_in.find("<write src=")?;
-    let r = &search_in[start..];
-    let gt = r.find('>')?;
-    let path = extract_attr(&r[..gt + 1], "src").unwrap_or_else(|| "unknown".into());
-    let after = &r[gt + 1..];
-    if let Some(end) = after.find("</write") {
-        let body = after[..end]
-            .trim_matches(|c| c == '\n' || c == '\r')
-            .to_string();
-        let path = crate::agent::AgentEngine::normalize_write_path(&path, &body);
-        Some(StreamToolView {
-            kind: ToolPanelKind::Write,
-            target: expand_path_display(&path),
-            body,
-            tag_closed: true,
-        })
-    } else {
-        let body = after.to_string();
-        let path = crate::agent::AgentEngine::normalize_write_path(&path, &body);
-        Some(StreamToolView {
-            kind: ToolPanelKind::Write,
-            target: expand_path_display(&path),
-            body,
-            tag_closed: false,
-        })
+    let mut out = Vec::new();
+    let mut rest = search_in;
+    while let Some(start) = rest.find("<write src=") {
+        let r = &rest[start..];
+        let Some(gt) = r.find('>') else { break };
+        let path_raw = extract_attr(&r[..gt + 1], "src").unwrap_or_else(|| "unknown".into());
+        let after = &r[gt + 1..];
+        if let Some(end) = after.find("</write") {
+            let body = after[..end]
+                .trim_matches(|c| c == '\n' || c == '\r')
+                .to_string();
+            // Closed: safe to normalize path from full body once.
+            let path = crate::agent::AgentEngine::normalize_write_path(&path_raw, &body);
+            out.push(StreamToolView {
+                kind: ToolPanelKind::Write,
+                target: expand_path_display(&path),
+                body,
+                tag_closed: true,
+            });
+            // Advance past this write
+            if let Some(close_gt) = after[end..].find('>') {
+                rest = &after[end + close_gt + 1..];
+            } else {
+                break;
+            }
+        } else {
+            // Streaming: keep model path stable — do NOT re-infer from partial body
+            // (that produced file.txt → index.html → title_slug.html chips).
+            let body = after.to_string();
+            let path = if path_raw.contains('.') {
+                path_raw
+            } else {
+                // Directory-only src while streaming — soft default without body sniffing
+                format!("{}/index.html", path_raw.trim_end_matches('/'))
+            };
+            out.push(StreamToolView {
+                kind: ToolPanelKind::Write,
+                target: expand_path_display(&path),
+                body,
+                tag_closed: false,
+            });
+            break; // rest is incomplete tail of this write
+        }
     }
+    out
 }
 
 fn detect_cmd(text: &str) -> Option<StreamToolView> {
@@ -501,7 +586,26 @@ pub fn redact_tools_for_chat(content: &str) -> String {
             break;
         }
     }
+    // Keep short read tags visible in chat (they're the whole answer often)
     s.trim().to_string()
+}
+
+/// Classify tool activity in a model reply for UI labels / chips.
+pub fn classify_tool_hint(stream: &str) -> &'static str {
+    let t = stream;
+    if t.contains("<cmd>") {
+        "command"
+    } else if t.contains("<write src=") {
+        "write"
+    } else if t.contains("<read src=") {
+        "read"
+    } else if t.contains("<ls path=") || t.contains("<ls>") {
+        "list"
+    } else if t.contains("<memory") {
+        "memory"
+    } else {
+        "tool"
+    }
 }
 
 pub fn format_tool_output_for_chat(raw: &str) -> String {

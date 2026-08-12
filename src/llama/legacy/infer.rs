@@ -125,7 +125,10 @@ impl LlamaRsEngine {
         let mut all_tokens = tokens.clone();
         let mut full_text = String::new();
 
+        let total_prompt_tokens = tokens.len();
+        let mut buf = crate::llama::model::ForwardBuffers::new();
         let mut logits = Vec::new();
+
         for (pos, &tok) in tokens.iter().enumerate() {
             if let Some(ref flag) = is_generating {
                 if let Ok(g) = flag.lock() {
@@ -134,8 +137,31 @@ impl LlamaRsEngine {
                     }
                 }
             }
-            logits = forward_token(&self.model, &mut cache, tok, pos, self.compute.as_ref())?;
+
+            let pct = ((pos + 1) * 100) / total_prompt_tokens.max(1);
+            if let Some(ref target) = stream_target {
+                if let Ok(mut t) = target.lock() {
+                    t.clear();
+                    t.push_str(&format!(
+                        "[llama.rs] Prefilling prompt ({}/{} tokens - {}%)...\n",
+                        pos + 1,
+                        total_prompt_tokens,
+                        pct
+                    ));
+                }
+            }
+
+            logits = crate::llama::model::forward_token_with_buffers(
+                &self.model,
+                &mut cache,
+                tok,
+                pos,
+                self.compute.as_ref(),
+                &mut buf,
+            )?;
         }
+
+        let mut cleared_prefill_msg = false;
 
         for _ in 0..n_predict {
             if let Some(ref flag) = is_generating {
@@ -161,6 +187,12 @@ impl LlamaRsEngine {
             full_text.push_str(&piece);
             if let Some(ref target) = stream_target {
                 if let Ok(mut t) = target.lock() {
+                    if !cleared_prefill_msg {
+                        cleared_prefill_msg = true;
+                        if t.contains("[llama.rs] Prefilling") || t.contains("[llama.rs] Loading") {
+                            t.clear();
+                        }
+                    }
                     t.push_str(&piece);
                 }
             }
@@ -169,8 +201,14 @@ impl LlamaRsEngine {
             if pos >= h.n_ctx {
                 break;
             }
-            logits =
-                forward_token(&self.model, &mut cache, next, pos, self.compute.as_ref())?;
+            logits = crate::llama::model::forward_token_with_buffers(
+                &self.model,
+                &mut cache,
+                next,
+                pos,
+                self.compute.as_ref(),
+                &mut buf,
+            )?;
         }
 
         if full_text.is_empty() {
@@ -307,9 +345,9 @@ impl LlamaRsRuntime {
                         t.clear();
                     }
                 }
-                let system = crate::agent::AgentEngine::system_prompt_for_cwd();
-                // Truncate very long user transcripts so pure-Rust ctx fits
-                let user = truncate_user_for_ctx(&user_prompt, 3500);
+                let system = crate::agent::AgentEngine::system_prompt_compact_for_cwd();
+                // Truncate long user transcripts for fast pure-Rust prefill
+                let user = truncate_user_for_ctx(&user_prompt, 1800);
                 // Force-tool nudge on the last user turn for list/read/run
                 let user = crate::agent::AgentEngine::with_tool_nudge(&user);
                 engine.generate_stream(

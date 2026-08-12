@@ -259,6 +259,38 @@ fn pick_best_gguf(files: &[String]) -> String {
         .unwrap_or_else(|| files[0].clone())
 }
 
+/// Given a multi-part GGUF shard name (e.g. `Foo-Q4_K_M-00001-of-00013.gguf`)
+/// and the full file listing, return all sibling parts in order.
+/// For single-file GGUFs, returns `vec![name.to_string()]`.
+fn find_multipart_siblings(name: &str, all_files: &[String]) -> Vec<String> {
+    if !is_multipart_gguf(name) {
+        return vec![name.to_string()];
+    }
+    let lower = name.to_lowercase();
+    if let Some(idx) = lower.rfind("-of-") {
+        let before_of = &lower[..idx];
+        if let Some(dash_idx) = before_of.rfind('-') {
+            let stem = &name[..dash_idx];
+            let stem_lower = stem.to_lowercase();
+            let mut siblings: Vec<String> = all_files
+                .iter()
+                .filter(|f| {
+                    let fl = f.to_lowercase();
+                    fl.starts_with(&stem_lower)
+                        && fl.ends_with(".gguf")
+                        && fl.contains("-of-")
+                })
+                .cloned()
+                .collect();
+            siblings.sort();
+            if !siblings.is_empty() {
+                return siblings;
+            }
+        }
+    }
+    vec![name.to_string()]
+}
+
 // ---------------------------------------------------------------------------
 // Download lock / session
 // ---------------------------------------------------------------------------
@@ -758,7 +790,7 @@ impl ModelManager {
     /// 4. Prefer Q4_K_M / Q4_0 single-file quantizations
     ///
     /// Returns `(download_repo_id, filename)`. Never returns safetensors.
-    pub async fn resolve_gguf_file(&self, repo_id: &str) -> Result<(String, String), String> {
+    pub async fn resolve_gguf_file(&self, repo_id: &str) -> Result<(String, String, Vec<String>), String> {
         let clean_repo = repo_id
             .split('[')
             .next()
@@ -815,7 +847,8 @@ impl ModelManager {
             match self.list_gguf_files(&client, repo).await {
                 Ok(files) if !files.is_empty() => {
                     let best = pick_best_gguf(&files);
-                    return Ok((repo.clone(), best));
+                    let siblings = find_multipart_siblings(&best, &files);
+                    return Ok((repo.clone(), best, siblings));
                 }
                 Ok(_) => {}
                 Err(_) => {}
@@ -832,7 +865,8 @@ impl ModelManager {
                 if let Ok(files) = self.list_gguf_files(&client, &repo).await {
                     if !files.is_empty() {
                         let best = pick_best_gguf(&files);
-                        return Ok((repo, best));
+                        let siblings = find_multipart_siblings(&best, &files);
+                        return Ok((repo, best, siblings));
                     }
                 }
             }
@@ -901,7 +935,7 @@ impl ModelManager {
     /// Back-compat wrapper: returns filename only, or a diagnostic placeholder on failure.
     pub async fn get_model_weight_filename(&self, repo_id: &str) -> String {
         match self.resolve_gguf_file(repo_id).await {
-            Ok((_repo, file)) => file,
+            Ok((_repo, file, _siblings)) => file,
             Err(e) => format!("ERROR: {}", e),
         }
     }
@@ -984,6 +1018,7 @@ impl ModelManager {
         &self,
         repo_id: &str,
         filename: &str,
+        shard_files: &[String],
         progress: Arc<Mutex<Option<f64>>>,
         logs: Arc<Mutex<Vec<String>>>,
     ) -> Result<PathBuf, String> {
@@ -1015,13 +1050,15 @@ impl ModelManager {
             .to_string();
         let model_name = format!("{}/{}", clean_repo, base_name);
 
-        // Refuse multi-part GGUF shards (need all parts; bad for low-RAM + lock thrash)
-        if is_multipart_gguf(&base_name) {
-            return Err(format!(
-                "Refusing multi-part GGUF '{}'. Pick a single-file quant (Q4_K_M without -00001-of-). \
-                 Repos like TheBloke/*-GGUF usually have one file for small models.",
-                base_name
-            ));
+        // Log multi-part info
+        if shard_files.len() > 1 {
+            if let Ok(mut l) = logs.lock() {
+                l.push(format!(
+                    "[MULTI-PART] Downloading {} shard files for '{}'",
+                    shard_files.len(),
+                    base_name
+                ));
+            }
         }
 
         // Lock handling: stale / incomplete / different model → cancel previous and continue
@@ -1110,19 +1147,15 @@ impl ModelManager {
             ));
         }
 
-        let url = format!(
-            "https://huggingface.co/{}/resolve/main/{}",
-            clean_repo, filename
-        );
-        if let Ok(mut l) = logs.lock() {
-            l.push(format!("[HTTP] Connecting to {}", url));
-        }
+        let actual_shards = if shard_files.is_empty() {
+            vec![filename.to_string()]
+        } else {
+            shard_files.to_vec()
+        };
 
-        // Robust client: long timeouts, no short body timeout that kills slow HF links
         let client = reqwest::Client::builder()
             .user_agent("Hercules-CLI/1.0")
             .connect_timeout(Duration::from_secs(30))
-            // Long overall timeout so slow HF links are not killed mid-stream
             .timeout(Duration::from_secs(6 * 3600))
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(30))
@@ -1134,254 +1167,264 @@ impl ModelManager {
             })?;
 
         const MAX_ATTEMPTS: u32 = 8;
-        let mut downloaded = existing_bytes;
-        let mut total_size: Option<u64> = None;
-        let mut last_logged_pct = if existing_bytes > 0 {
-            // avoid spamming 0% again
-            -1.0f64
-        } else {
-            -1.0f64
-        };
-        let mut window_bytes: u64 = 0;
-        let mut window_start = std::time::Instant::now();
-        let mut last_lock_write = std::time::Instant::now();
-        *progress.lock().unwrap() = Some(0.0);
+        let mut total_downloaded_all = 0u64;
 
-        for attempt in 1..=MAX_ATTEMPTS {
-            // Open file for append (resume) or create
-            let mut file = match std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .append(true)
-                .open(&staging_file)
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    let msg = format!("Cannot open staging file: {}", e);
-                    lock.mark_incomplete(&msg);
-                    return Err(msg);
-                }
-            };
+        for (shard_idx, shard_name) in actual_shards.iter().enumerate() {
+            let shard_base = shard_name.rsplit('/').next().unwrap_or(shard_name).to_string();
+            let shard_url = format!(
+                "https://huggingface.co/{}/resolve/main/{}",
+                clean_repo, shard_name
+            );
+            let shard_staging = staging_dir.join(&shard_base);
 
-            // Sync downloaded to actual file size
-            downloaded = std::fs::metadata(&staging_file)
-                .map(|m| m.len())
-                .unwrap_or(downloaded);
-
-            let mut req = client.get(&url);
-            if downloaded > 0 {
-                req = req.header("Range", format!("bytes={}-", downloaded));
-                if let Ok(mut l) = logs.lock() {
-                    l.push(format!(
-                        "[HTTP] Attempt {}/{} — Range resume from byte {}",
-                        attempt, MAX_ATTEMPTS, downloaded
-                    ));
+            if let Ok(mut l) = logs.lock() {
+                if actual_shards.len() > 1 {
+                    l.push(format!("[MULTI-PART] Starting shard {}/{} -> {}", shard_idx + 1, actual_shards.len(), shard_base));
                 }
-            } else if attempt > 1 {
-                if let Ok(mut l) = logs.lock() {
-                    l.push(format!(
-                        "[HTTP] Attempt {}/{} — restarting stream",
-                        attempt, MAX_ATTEMPTS
-                    ));
-                }
+                l.push(format!("[HTTP] Connecting to {}", shard_url));
             }
 
-            let res = match req.send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    let msg = format!("Network failure (attempt {}): {}", attempt, e);
-                    if let Ok(mut l) = logs.lock() {
-                        l.push(format!("[WARN] {}", msg));
-                    }
-                    lock.touch_progress(downloaded, total_size);
-                    if attempt == MAX_ATTEMPTS {
+            let mut downloaded = std::fs::metadata(&shard_staging)
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            let mut total_size: Option<u64> = None;
+            let mut last_logged_pct = if downloaded > 0 { -1.0f64 } else { -1.0f64 };
+            let mut last_lock_write = std::time::Instant::now();
+
+            for attempt in 1..=MAX_ATTEMPTS {
+                let mut file = match std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .append(true)
+                    .open(&shard_staging)
+                {
+                    Ok(f) => f,
+                    Err(e) => {
+                        let msg = format!("Cannot open staging file {}: {}", shard_base, e);
                         lock.mark_incomplete(&msg);
+                        return Err(msg);
+                    }
+                };
+
+                downloaded = std::fs::metadata(&shard_staging)
+                    .map(|m| m.len())
+                    .unwrap_or(downloaded);
+
+                let mut req = client.get(&shard_url);
+                if downloaded > 0 {
+                    req = req.header("Range", format!("bytes={}-", downloaded));
+                    if let Ok(mut l) = logs.lock() {
+                        l.push(format!(
+                            "[HTTP] Attempt {}/{} — Range resume from byte {}",
+                            attempt, MAX_ATTEMPTS, downloaded
+                        ));
+                    }
+                } else if attempt > 1 {
+                    if let Ok(mut l) = logs.lock() {
+                        l.push(format!(
+                            "[HTTP] Attempt {}/{} — restarting stream",
+                            attempt, MAX_ATTEMPTS
+                        ));
+                    }
+                }
+
+                let res = match req.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let msg = format!("Network failure (attempt {}): {}", attempt, e);
+                        if let Ok(mut l) = logs.lock() {
+                            l.push(format!("[WARN] {}", msg));
+                        }
+                        lock.touch_progress(total_downloaded_all + downloaded, lock.bytes_total);
+                        if attempt == MAX_ATTEMPTS {
+                            lock.mark_incomplete(&msg);
+                            *progress.lock().unwrap() = None;
+                            return Err(msg);
+                        }
+                        tokio::time::sleep(Duration::from_secs(2u64.pow(attempt.min(4)))).await;
+                        continue;
+                    }
+                };
+
+                let status = res.status();
+                if !(status.is_success() || status.as_u16() == 206) {
+                    let err_msg = format!(
+                        "[HTTP ERROR {}] Download failed for '{}'",
+                        status, shard_url
+                    );
+                    if let Ok(mut l) = logs.lock() {
+                        l.push(err_msg.clone());
+                    }
+                    if attempt == MAX_ATTEMPTS {
+                        lock.mark_incomplete(&err_msg);
+                        *progress.lock().unwrap() = None;
+                        return Err(err_msg);
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+
+                if let Some(cr) = res.headers().get("content-range").and_then(|v| v.to_str().ok()) {
+                    if let Some(total_s) = cr.split('/').nth(1) {
+                        if let Ok(t) = total_s.parse::<u64>() {
+                            total_size = Some(t);
+                        }
+                    }
+                } else if let Some(cl) = res.content_length() {
+                    total_size = Some(if status.as_u16() == 206 {
+                        downloaded + cl
+                    } else {
+                        cl
+                    });
+                }
+
+                if attempt == 1 || total_size.is_some() {
+                    if let Ok(mut l) = logs.lock() {
+                        let mb = total_size.unwrap_or(0) as f64 / 1_000_000.0;
+                        l.push(format!(
+                            "[HTTP] {} | total ~{:.2} MB | have {:.1} MB",
+                            status,
+                            mb,
+                            downloaded as f64 / 1_000_000.0
+                        ));
+                    }
+                }
+
+                lock.touch_progress(total_downloaded_all + downloaded, lock.bytes_total);
+                lock.status = DownloadStatus::InProgress;
+                let _ = lock.save();
+
+                let mut stream = res.bytes_stream();
+                let mut stream_ok = true;
+                let mut window_bytes = 0u64;
+                let mut window_start = std::time::Instant::now();
+
+                while let Some(item) = stream.next().await {
+                    if last_lock_write.elapsed() >= Duration::from_secs(5) {
+                        lock.touch_progress(total_downloaded_all + downloaded, lock.bytes_total);
+                        last_lock_write = std::time::Instant::now();
+                    }
+
+                    let chunk = match item {
+                        Ok(c) => c,
+                        Err(e) => {
+                            if let Ok(mut l) = logs.lock() {
+                                l.push(format!(
+                                    "[WARN] Stream interrupted at {:.1} MB: {} — will resume",
+                                    downloaded as f64 / 1_000_000.0,
+                                    e
+                                ));
+                            }
+                            let _ = file.flush();
+                            lock.touch_progress(total_downloaded_all + downloaded, lock.bytes_total);
+                            lock.status = DownloadStatus::Incomplete;
+                            lock.error = Some(format!("stream: {}", e));
+                            let _ = lock.save();
+                            stream_ok = false;
+                            break;
+                        }
+                    };
+
+                    if let Err(e) = file.write_all(&chunk) {
+                        let msg = format!("Write error: {}", e);
+                        lock.mark_incomplete(&msg);
+                        *progress.lock().unwrap() = None;
+                        return Err(msg);
+                    }
+
+                    downloaded += chunk.len() as u64;
+                    window_bytes += chunk.len() as u64;
+
+                    let total_f = total_size.unwrap_or(downloaded.max(1)) as f64;
+                    let ratio = (downloaded as f64 / total_f).min(1.0);
+                    let pct = ratio * 100.0;
+
+                    let overall_ratio = if actual_shards.len() > 1 {
+                        ((shard_idx as f64) + ratio) / (actual_shards.len() as f64)
+                    } else {
+                        ratio
+                    };
+
+                    if pct - last_logged_pct >= 1.0 {
+                        last_logged_pct = pct;
+                        lock.touch_progress(total_downloaded_all + downloaded, lock.bytes_total);
+                        last_lock_write = std::time::Instant::now();
+                        let win_secs = window_start.elapsed().as_secs_f64().max(0.05);
+                        let inst_mbps = (window_bytes as f64 / 1_000_000.0) / win_secs;
+                        window_bytes = 0;
+                        window_start = std::time::Instant::now();
+                        if let Ok(mut l) = logs.lock() {
+                            let prefix = if actual_shards.len() > 1 {
+                                format!("[SHARD {}/{}] ", shard_idx + 1, actual_shards.len())
+                            } else {
+                                "[STREAM] ".to_string()
+                            };
+                            l.push(format!(
+                                "{}{:.1} MB/s (live) | {:.1}MB / {:.1}MB ({:.1}%)",
+                                prefix,
+                                inst_mbps,
+                                downloaded as f64 / 1_000_000.0,
+                                total_f / 1_000_000.0,
+                                pct
+                            ));
+                        }
+                    }
+                    *progress.lock().unwrap() = Some(overall_ratio);
+                }
+
+                let _ = file.flush();
+                drop(file);
+
+                if !stream_ok {
+                    if attempt == MAX_ATTEMPTS {
+                        let msg = format!(
+                            "Download failed after {} attempts (unstable network). Partial: {:.1} MB saved — run install again to resume.",
+                            MAX_ATTEMPTS,
+                            downloaded as f64 / 1_000_000.0
+                        );
+                        if let Ok(mut l) = logs.lock() {
+                            l.push(format!("[ERROR] {}", msg));
+                            l.push("[SESSION] Marked incomplete — finish time not set".to_string());
+                        }
                         *progress.lock().unwrap() = None;
                         return Err(msg);
                     }
                     tokio::time::sleep(Duration::from_secs(2u64.pow(attempt.min(4)))).await;
                     continue;
                 }
-            };
 
-            let status = res.status();
-            // 206 Partial Content or 200 OK both fine
-            if !(status.is_success() || status.as_u16() == 206) {
-                let err_msg = format!(
-                    "[HTTP ERROR {}] Download failed for '{}'",
-                    status, url
-                );
-                if let Ok(mut l) = logs.lock() {
-                    l.push(err_msg.clone());
-                }
-                if attempt == MAX_ATTEMPTS {
-                    lock.mark_incomplete(&err_msg);
-                    *progress.lock().unwrap() = None;
-                    return Err(err_msg);
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-
-            // Total size: Content-Range or Content-Length + offset
-            if let Some(cr) = res.headers().get("content-range").and_then(|v| v.to_str().ok()) {
-                // bytes start-end/total
-                if let Some(total_s) = cr.split('/').nth(1) {
-                    if let Ok(t) = total_s.parse::<u64>() {
-                        total_size = Some(t);
-                    }
-                }
-            } else if let Some(cl) = res.content_length() {
-                total_size = Some(if status.as_u16() == 206 {
-                    downloaded + cl
-                } else {
-                    cl
-                });
-            }
-
-            if attempt == 1 || total_size.is_some() {
-                if let Ok(mut l) = logs.lock() {
-                    let mb = total_size.unwrap_or(0) as f64 / 1_000_000.0;
-                    l.push(format!(
-                        "[HTTP] {} | total ~{:.2} MB | have {:.1} MB",
-                        status,
-                        mb,
-                        downloaded as f64 / 1_000_000.0
-                    ));
-                }
-            }
-
-            lock.bytes_total = total_size;
-            lock.touch_progress(downloaded, total_size);
-            lock.status = DownloadStatus::InProgress;
-            let _ = lock.save();
-
-            let mut stream = res.bytes_stream();
-            let mut stream_ok = true;
-            window_bytes = 0;
-            window_start = std::time::Instant::now();
-
-            while let Some(item) = stream.next().await {
-                if last_lock_write.elapsed() >= Duration::from_secs(5) {
-                    lock.touch_progress(downloaded, total_size);
-                    last_lock_write = std::time::Instant::now();
-                }
-
-                let chunk = match item {
-                    Ok(c) => c,
-                    Err(e) => {
-                        // Unstable network: keep partial file and retry with Range
+                if let Some(total) = total_size {
+                    if downloaded + 1024 < total {
                         if let Ok(mut l) = logs.lock() {
                             l.push(format!(
-                                "[WARN] Stream interrupted at {:.1} MB: {} — will resume",
+                                "[WARN] Short read {:.1}/{:.1} MB — resume attempt",
                                 downloaded as f64 / 1_000_000.0,
-                                e
+                                total as f64 / 1_000_000.0
                             ));
                         }
-                        let _ = file.flush();
-                        lock.touch_progress(downloaded, total_size);
-                        // do NOT set finish time
-                        lock.status = DownloadStatus::Incomplete;
-                        lock.error = Some(format!("stream: {}", e));
-                        let _ = lock.save();
-                        stream_ok = false;
-                        break;
-                    }
-                };
-
-                if let Err(e) = file.write_all(&chunk) {
-                    let msg = format!("Write error: {}", e);
-                    lock.mark_incomplete(&msg);
-                    *progress.lock().unwrap() = None;
-                    return Err(msg);
-                }
-
-                downloaded += chunk.len() as u64;
-                window_bytes += chunk.len() as u64;
-
-                let total_f = total_size.unwrap_or(downloaded.max(1)) as f64;
-                let ratio = (downloaded as f64 / total_f).min(1.0);
-                let pct = ratio * 100.0;
-
-                if pct - last_logged_pct >= 1.0 {
-                    last_logged_pct = pct;
-                    lock.touch_progress(downloaded, total_size);
-                    last_lock_write = std::time::Instant::now();
-                    // Instantaneous window speed (last ~1% interval), not lifetime average
-                    let win_secs = window_start.elapsed().as_secs_f64().max(0.05);
-                    let inst_mbps = (window_bytes as f64 / 1_000_000.0) / win_secs;
-                    window_bytes = 0;
-                    window_start = std::time::Instant::now();
-                    if let Ok(mut l) = logs.lock() {
-                        l.push(format!(
-                            "[STREAM] {:.1} MB/s (live) | {:.1}MB / {:.1}MB ({:.1}%)",
-                            inst_mbps,
-                            downloaded as f64 / 1_000_000.0,
-                            total_f / 1_000_000.0,
-                            pct
-                        ));
+                        lock.touch_progress(total_downloaded_all + downloaded, lock.bytes_total);
+                        if attempt == MAX_ATTEMPTS {
+                            let msg = format!("Incomplete download: got {} of {} bytes", downloaded, total);
+                            lock.status = DownloadStatus::Incomplete;
+                            lock.error = Some(msg.clone());
+                            lock.bytes_downloaded = total_downloaded_all + downloaded;
+                            let _ = lock.save();
+                            *progress.lock().unwrap() = None;
+                            return Err(msg);
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
                     }
                 }
-                *progress.lock().unwrap() = Some(ratio);
+
+                break;
             }
 
-            let _ = file.flush();
-            drop(file);
-
-            if !stream_ok {
-                if attempt == MAX_ATTEMPTS {
-                    let msg = format!(
-                        "Download failed after {} attempts (unstable network). Partial: {:.1} MB saved — run install again to resume.",
-                        MAX_ATTEMPTS,
-                        downloaded as f64 / 1_000_000.0
-                    );
-                    if let Ok(mut l) = logs.lock() {
-                        l.push(format!("[ERROR] {}", msg));
-                        l.push(
-                            "[SESSION] Marked incomplete — finish time not set".to_string(),
-                        );
-                    }
-                    *progress.lock().unwrap() = None;
-                    return Err(msg);
-                }
-                // backoff then resume
-                tokio::time::sleep(Duration::from_secs(2u64.pow(attempt.min(4)))).await;
-                continue;
-            }
-
-            // Stream finished cleanly — check size
-            if let Some(total) = total_size {
-                if downloaded + 1024 < total {
-                    // still short (allow 1KB slack)
-                    if let Ok(mut l) = logs.lock() {
-                        l.push(format!(
-                            "[WARN] Short read {:.1}/{:.1} MB — resume attempt",
-                            downloaded as f64 / 1_000_000.0,
-                            total as f64 / 1_000_000.0
-                        ));
-                    }
-                    lock.touch_progress(downloaded, total_size);
-                    if attempt == MAX_ATTEMPTS {
-                        let msg = format!(
-                            "Incomplete download: got {} of {} bytes",
-                            downloaded, total
-                        );
-                        lock.status = DownloadStatus::Incomplete;
-                        lock.error = Some(msg.clone());
-                        lock.bytes_downloaded = downloaded;
-                        let _ = lock.save();
-                        *progress.lock().unwrap() = None;
-                        return Err(msg);
-                    }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            }
-
-            // Success
-            break;
+            total_downloaded_all += downloaded;
         }
 
+        let downloaded = total_downloaded_all;
         // --- Success: mark complete, then promote to ~/.local/hercules/model ---
         lock.bytes_downloaded = downloaded;
         lock.mark_complete();
@@ -1394,23 +1437,37 @@ impl ModelManager {
             ));
         }
 
-        let installed_path = match self.promote_to_local(
-            &staging_file,
-            &model_name,
-            "huggingface",
-            &base_name,
-            downloaded,
-            &logs,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                if let Ok(mut l) = logs.lock() {
-                    l.push(format!("[ERROR] Promote failed: {}", e));
+        let mut first_installed_path = None;
+
+        for (shard_idx, shard_name) in actual_shards.iter().enumerate() {
+            let shard_base = shard_name.rsplit('/').next().unwrap_or(shard_name).to_string();
+            let shard_staging = staging_dir.join(&shard_base);
+            let size = std::fs::metadata(&shard_staging).map(|m| m.len()).unwrap_or(0);
+
+            let installed_path = match self.promote_to_local(
+                &shard_staging,
+                &model_name,
+                "huggingface",
+                &shard_base,
+                size,
+                &logs,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    if let Ok(mut l) = logs.lock() {
+                        l.push(format!("[ERROR] Promote failed for {}: {}", shard_base, e));
+                    }
+                    *progress.lock().unwrap() = None;
+                    return Err(e);
                 }
-                *progress.lock().unwrap() = None;
-                return Err(e);
+            };
+
+            if shard_idx == 0 {
+                first_installed_path = Some(installed_path);
             }
-        };
+        }
+
+        let installed_path = first_installed_path.unwrap();
 
         // Cleanup staging + lock after successful install
         let _ = std::fs::remove_dir_all(&staging_dir);

@@ -70,14 +70,13 @@ impl HttpInferenceClient {
         // Walk lines; multi-line content continues the current role until a new prefix.
         let mut cur_role: Option<String> = None;
         let mut cur_buf = String::new();
-        let flush = |turns: &mut Vec<(String, String)>,
-                     role: &mut Option<String>,
-                     buf: &mut String| {
-            if let Some(r) = role.take() {
-                push(turns, &r, buf);
-                buf.clear();
-            }
-        };
+        let flush =
+            |turns: &mut Vec<(String, String)>, role: &mut Option<String>, buf: &mut String| {
+                if let Some(r) = role.take() {
+                    push(turns, &r, buf);
+                    buf.clear();
+                }
+            };
 
         for line in prompt_or_history.lines() {
             let t = line.trim_end();
@@ -91,7 +90,6 @@ impl HttpInferenceClient {
                 cur_role = Some("assistant".into());
                 cur_buf = rest.to_string();
             } else if let Some(rest) = t.strip_prefix("Tool result:") {
-
                 flush(&mut turns, &mut cur_role, &mut cur_buf);
                 // Tool output must be a **user** turn for OpenAI/llama-server chat API
                 cur_role = Some("user".into());
@@ -171,6 +169,7 @@ impl HttpInferenceClient {
             "\nYou:",
             "\nUser:",
             "\n### Instruction",
+            "</write>",
             "\nCRITICAL —",
             "\nCRITICAL -"
         ]);
@@ -228,8 +227,7 @@ impl HttpInferenceClient {
                     return Err("[Generation Cancelled by User (CTRL+C)]".to_string());
                 }
             }
-            let chunk_bytes =
-                chunk_result.map_err(|e| format!("[HTTP Stream Error] {}", e))?;
+            let chunk_bytes = chunk_result.map_err(|e| format!("[HTTP Stream Error] {}", e))?;
             let chunk_str = String::from_utf8_lossy(&chunk_bytes);
             buffer.push_str(&chunk_str);
 
@@ -423,10 +421,7 @@ Tool result: dir contents here\n\n\
         let last = msgs.last().unwrap();
         assert_eq!(last["role"], "user");
         // no two consecutive assistants
-        let roles: Vec<&str> = msgs
-            .iter()
-            .filter_map(|m| m["role"].as_str())
-            .collect();
+        let roles: Vec<&str> = msgs.iter().filter_map(|m| m["role"].as_str()).collect();
         for w in roles.windows(2) {
             assert!(
                 !(w[0] == "assistant" && w[1] == "assistant"),
@@ -440,12 +435,13 @@ Tool result: dir contents here\n\n\
     fn chat_messages_merges_assistant_and_adds_user_tail() {
         let hist = "You: hi\n\nAgent: hello\n\nAgent: more";
         let msgs = HttpInferenceClient::chat_messages("sys", hist);
-        let roles: Vec<&str> = msgs
-            .iter()
-            .filter_map(|m| m["role"].as_str())
-            .collect();
+        let roles: Vec<&str> = msgs.iter().filter_map(|m| m["role"].as_str()).collect();
         assert_eq!(roles[0], "system");
         assert_eq!(*roles.last().unwrap(), "user");
-        assert!(!roles.windows(2).any(|w| w[0] == "assistant" && w[1] == "assistant"));
+        assert!(
+            !roles
+                .windows(2)
+                .any(|w| w[0] == "assistant" && w[1] == "assistant")
+        );
     }
 }

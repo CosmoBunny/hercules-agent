@@ -425,7 +425,13 @@ fn tail_log(path: &Path, max_chars: usize) -> String {
     if t.len() <= max_chars {
         return t.to_string();
     }
-    t[t.len() - max_chars..].to_string()
+    let start = t
+        .char_indices()
+        .rev()
+        .nth(max_chars - 1)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    t[start..].to_string()
 }
 
 /// Spawn once at a fixed ctx/ngl; success installs ManagedServer.

@@ -1,55 +1,53 @@
+use crate::agent::{
+    FolderScope, PermissionMode, ProposedAction, allow_session_tools, get_tool_permissions,
+    set_folder_scope, set_permission_mode,
+};
+use crate::backend::{AgentBackend, LlamaCppBackend, LlamaCppLibBackend, OllamaBackend};
+use crate::manager::ModelManager;
+use crate::task_manager::{QUICK_SECS, TaskEvent, TaskManager};
+use crate::tool_panel::{self, PanelChromeHit, ToolChip, ToolPanel, ToolPanelKind};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use kramaframe::prelude::{KeyFrameFunction, KeyList};
+use kramaframe::{BTclasslist, BTframelist, KramaFrame, keylist::TRES16Bits};
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
-    Frame,
 };
-use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, MouseButton};
-use std::time::Duration;
-use sysinfo::System;
 use std::sync::{Arc, Mutex};
-use crate::agent::{
-    allow_session_tools, get_tool_permissions, set_folder_scope, set_permission_mode, FolderScope,
-    PermissionMode, ProposedAction,
-};
-use crate::backend::{
-    AgentBackend, LlamaCppBackend, LlamaRsBackend, OllamaBackend,
-};
-use crate::manager::ModelManager;
-use crate::task_manager::{TaskEvent, TaskManager, QUICK_SECS};
-use crate::tool_panel::{self, ToolChip, ToolPanel, PanelChromeHit, ToolPanelKind};
-use kramaframe::{KramaFrame, BTclasslist, BTframelist, keylist::TRES16Bits};
-use kramaframe::prelude::{KeyFrameFunction, KeyList};
+use std::time::Duration;
 use std::time::Instant;
+use sysinfo::System;
 
 pub struct App {
     pub should_quit: bool,
     pub status_message: String,
-    
+
     // Chat state
     pub input: String,
     pub messages: Vec<String>,
     pub backend: AgentBackend,
-    
+
     // Registry state
     pub manager: ModelManager,
     pub registry_models: Vec<String>,
     pub registry_state: ListState,
-    
+
     // System stats
     pub sys: System,
-    
+
     // Config & Navigation
     pub theme_color: Color,
     pub show_menu: bool,
     pub menu_section: usize, // 0: Registry, 1: Installed Models, 2: Settings
     pub config_state: ListState,
-    
+
     // Installed Models state
     pub installed_models: Vec<String>,
     pub installed_state: ListState,
-    
+
     // Focus & Scroll state
     pub input_focused: bool,
     pub input_cursor_position: usize,
@@ -77,37 +75,43 @@ pub struct App {
     /// Estimated context tokens used / limit (for status)
     pub context_tokens_est: usize,
     pub context_compact_count: u32,
-    
+
     // Dynamic HF models & Search
     pub hf_models: Vec<String>,
     pub registry_search_query: String,
     pub search_results: Arc<Mutex<Option<Vec<String>>>>,
-    
+
     // Live Activity Logs (Split Pane Console)
     pub activity_logs: Arc<Mutex<Vec<String>>>,
     pub log_pane_collapsed: bool,
-    
+
     // Animation state using KramaFrame
     pub krama: KramaFrame<BTclasslist, BTframelist<TRES16Bits, i16>>,
     pub anim_tick: u64,
     pub current_log_pane_pct: f64,
     pub last_frame_time: std::time::Instant,
-    
+
     // Download progress
     pub download_progress: Arc<Mutex<Option<f64>>>,
     pub download_complete: Arc<Mutex<bool>>,
-    
+
     // Streaming response state
     pub streaming_response: Arc<Mutex<String>>,
     pub is_generating: Arc<Mutex<bool>>,
     pub generation_error: Arc<Mutex<Option<String>>>,
-    
+
     // Initialization & Auto loop state
     pub initialized: bool,
     pub init_triggered: bool,
     pub auto_tool_turns: usize,
+
+    /// Number of automatic continuations used to finish a truncated tool tag.
+    pub incomplete_tool_continuations: usize,
+
     pub recent_tool_calls: Vec<String>,
     pub repeat_count: usize,
+    /// Set on Ctrl+C so the completion path skips tool re-prompt / process races.
+    pub user_cancelled_gen: bool,
 
     // Input undo/redo (snapshots of full prompt text + cursor)
     pub input_undo: Vec<(String, usize)>,
@@ -140,6 +144,9 @@ pub struct App {
     pub gen_last_len: usize,
     /// TERM panel interactive input (when panel.interactive)
     pub term_input: String,
+    /// Targets already written mid-stream this turn (AlwaysAllow furious mode).
+    /// Prevents double-execution when the post-gen path also sees the same tags.
+    pub streamed_writes_done: Vec<String>,
 }
 
 impl App {
@@ -153,7 +160,7 @@ impl App {
                 // Prefer local GGUF with llama.rs (pure Rust); else llama.cpp if path exists
                 let mgr = ModelManager::new();
                 if let Some(path) = mgr.latest_gguf_path() {
-                    AgentBackend::LlamaRs(LlamaRsBackend::gguf(path))
+                    AgentBackend::LlamaCppLib(LlamaCppLibBackend::gguf(path))
                 } else {
                     AgentBackend::LlamaCpp(LlamaCppBackend::server(
                         "http://localhost:8080".into(),
@@ -163,6 +170,7 @@ impl App {
             },
             manager: ModelManager::new(),
             registry_models: Vec::new(),
+            incomplete_tool_continuations: 0,
             registry_state: ListState::default(),
             sys: System::new_all(),
             theme_color: Color::Rgb(0, 255, 128),
@@ -209,7 +217,10 @@ impl App {
             krama: {
                 let mut k = KramaFrame::default();
                 k.extend_iter_classlist([
-                    ("slide", KeyFrameFunction::new_cubic_bezier_f32(1.0, 0.0, 0.6, 1.0)),
+                    (
+                        "slide",
+                        KeyFrameFunction::new_cubic_bezier_f32(1.0, 0.0, 0.6, 1.0),
+                    ),
                     ("focus", KeyFrameFunction::EaseInOut),
                     ("pbar", KeyFrameFunction::Linear),
                     ("menu_fade", KeyFrameFunction::EaseOut),
@@ -251,6 +262,7 @@ impl App {
             auto_tool_turns: 0,
             recent_tool_calls: Vec::new(),
             repeat_count: 0,
+            user_cancelled_gen: false,
             input_undo: Vec::new(),
             input_redo: Vec::new(),
             show_shortcuts: false,
@@ -275,6 +287,7 @@ impl App {
             gen_last_progress: None,
             gen_last_len: 0,
             term_input: String::new(),
+            streamed_writes_done: Vec::new(),
         };
 
         let manager_clone = app.manager.clone();
@@ -298,6 +311,32 @@ impl App {
 
         app
     }
+    fn record_write_result(&mut self, action: &crate::agent::ProposedAction, result: &str) {
+        let pretty = tool_panel::format_tool_output_for_chat(result);
+
+        // Result is for the LLM/context, NOT the source-code chip body.
+        self.tool_result_context.push(pretty.clone());
+
+        if self.tool_result_context.len() > 8 {
+            let n = self.tool_result_context.len() - 8;
+            self.tool_result_context.drain(0..n);
+        }
+
+        // Update ONLY the chip that produced this result.
+        if let Some(chip_id) = action.chip_id {
+            if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
+                chip.pending = false;
+                chip.tag_closed = true;
+            }
+
+            self.force_open_panel_from_chip(chip_id);
+        }
+
+        let lines = pretty.lines().count();
+
+        self.messages
+            .push(format!("System: [OK] write finished ({lines} lines)"));
+    }
 
     /// Upsert bordered chips from stream (write + run). Auto-opens on new/update.
     /// Index of the latest Agent: message (chips stick under that turn).
@@ -315,24 +354,44 @@ impl App {
         let anchor = self.latest_agent_msg_idx();
         for view in tool_panel::detect_all_stream_tools(stream) {
             let target = tool_panel::normalize_target(view.kind, &view.target);
-            if let Some(chip) = self.tool_chips.iter_mut().find(|c| {
-                c.kind == view.kind && tool_panel::same_tool_target(view.kind, &c.target, &target)
-            }) {
+            // Only upsert within the *current* agent turn — never steal older chips.
+            // For WRITE: also coalesce path renames on the same turn (one streaming write
+            // must not become file.txt + index.html + title_slug.html chips).
+            let existing_idx = self
+                .tool_chips
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, c)| {
+                    if c.kind != view.kind || c.anchor_msg != anchor {
+                        return false;
+                    }
+                    if tool_panel::same_tool_target(view.kind, &c.target, &target) {
+                        return true;
+                    }
+                    // Same open write stream, path still settling
+                    view.kind == ToolPanelKind::Write && (!c.tag_closed || !view.tag_closed)
+                })
+                .map(|(i, _)| i);
+
+            if let Some(i) = existing_idx {
+                let chip = &mut self.tool_chips[i];
                 let was_open = !chip.tag_closed;
-                chip.target = target.clone();
-                // Don't wipe cmd terminal body with empty stream body
+                // Prefer longer / final path once closed; while open keep first stable path
+                // unless model path clearly has an extension and differs only by rename.
+                if view.tag_closed || chip.target.is_empty() || !chip.target.contains('.') {
+                    chip.target = target.clone();
+                } else if view.tag_closed {
+                    chip.target = target.clone();
+                }
                 if view.kind == ToolPanelKind::Write || !view.body.is_empty() {
                     chip.body = view.body;
                 }
                 chip.tag_closed = view.tag_closed;
-                // Keep / refresh anchor on the live agent turn
-                if chip.anchor_msg.is_none() {
-                    chip.anchor_msg = anchor;
-                } else if let Some(a) = anchor {
-                    // Streaming updates live on the current agent message
-                    chip.anchor_msg = Some(a);
-                }
-                if was_open || view.kind == ToolPanelKind::Write || view.tag_closed {
+                if was_open
+                    || matches!(view.kind, ToolPanelKind::Write | ToolPanelKind::Read)
+                    || view.tag_closed
+                {
                     auto_open = Some(chip.id);
                 }
             } else {
@@ -360,12 +419,14 @@ impl App {
         }
     }
 
-    /// Collapse chips that refer to the same write path / cmd string.
+    /// Collapse chips that refer to the same tool **within the same agent turn**.
+    /// Different turns keep separate chips so click opens that turn's panel, not the latest.
     fn dedupe_tool_chips(&mut self) {
         let mut kept: Vec<ToolChip> = Vec::new();
         for chip in self.tool_chips.drain(..) {
             if let Some(existing) = kept.iter_mut().find(|c| {
                 c.kind == chip.kind
+                    && c.anchor_msg == chip.anchor_msg
                     && tool_panel::same_tool_target(chip.kind, &c.target, &chip.target)
             }) {
                 if chip.body.len() >= existing.body.len() {
@@ -374,18 +435,13 @@ impl App {
                 existing.tag_closed = existing.tag_closed || chip.tag_closed;
                 existing.pending = existing.pending || chip.pending;
                 existing.target = tool_panel::normalize_target(chip.kind, &chip.target);
-                // Prefer earliest agent anchor (original call site)
-                existing.anchor_msg = match (existing.anchor_msg, chip.anchor_msg) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) => Some(a),
-                    (None, b) => b,
-                };
             } else {
                 kept.push(chip);
             }
         }
-        if kept.len() > 6 {
-            let n = kept.len() - 6;
+        // Keep more history so older RUN/READ/WRITE chips stay clickable
+        if kept.len() > 24 {
+            let n = kept.len() - 24;
             kept.drain(0..n);
         }
         self.tool_chips = kept;
@@ -521,9 +577,8 @@ impl App {
             p.scroll_to_end();
         }
         let id = self.task_manager.spawn_cmd(cmd.clone());
-        self.messages.push(format!(
-            "System: [TERM] Task #{id} `{cmd}` (interactive)"
-        ));
+        self.messages
+            .push(format!("System: [TERM] Task #{id} `{cmd}` (interactive)"));
         self.status_message = format!("TERM ran Task #{id}");
         if let Ok(mut l) = self.activity_logs.lock() {
             l.push(format!("[TERM interactive] Task #{id}: {cmd}"));
@@ -609,19 +664,37 @@ impl App {
     fn runtime_nudge_selected(&mut self, dir: i32) {
         use crate::settings::{
             format_context_tokens, get_settings, nudge_context_token_limit, nudge_repeat_threshold,
-            nudge_temperature, temperature,
         };
         let Some(i) = self.runtime_state.selected() else {
             return;
         };
         match i {
-            // Repeat threshold
+            // llama.cpp sub-backend
             3 => {
+                use crate::settings::cycle_llama_rs_sub_backend;
+                let b = cycle_llama_rs_sub_backend();
+                self.status_message = format!(
+                    "llama.cpp sub-backend: {} (HERCULES_COMPUTE_BACKEND={})",
+                    b.label(),
+                    b.env_val()
+                );
+            }
+            // Stall timeout
+            4 => {
+                use crate::settings::{format_stall_timeout, nudge_stall_timeout};
+                let t = nudge_stall_timeout(dir);
+                self.status_message = format!(
+                    "Stall timeout: {}  (+/− to adjust)",
+                    format_stall_timeout(t)
+                );
+            }
+            // Repeat threshold
+            5 => {
                 let n = nudge_repeat_threshold(dir);
                 self.status_message = format!("Repeat threshold: {n}  (+/− to adjust)");
             }
             // Context window
-            5 => {
+            7 => {
                 let n = nudge_context_token_limit(dir);
                 crate::llama::server::shutdown_managed_server();
                 self.status_message = format!(
@@ -629,14 +702,9 @@ impl App {
                     format_context_tokens(n)
                 );
             }
-            // Temperature
-            6 => {
-                let t = nudge_temperature(dir);
-                self.status_message = format!("Temperature: {t:.2}  (+/− step 0.05)");
-            }
             _ => {
                 self.status_message =
-                    "Select Repeat / Context / Temperature row, then press +/−".into();
+                    "Select Sub-Backend / Stall / Repeat / Context row, then press +/−".into();
                 return;
             }
         }
@@ -647,7 +715,7 @@ impl App {
                 "[RUNTIME] power={} ctx={} temp={:.2} repeat={} think={}",
                 s.power_mode.label(),
                 format_context_tokens(crate::settings::context_token_limit()),
-                temperature(),
+                crate::settings::temperature(),
                 s.repeat_threshold,
                 s.repeat_detect_thinking
             ));
@@ -699,8 +767,7 @@ impl App {
         if self.input.is_empty() {
             1
         } else {
-            self.input.lines().count().max(1)
-                + if self.input.ends_with('\n') { 1 } else { 0 }
+            self.input.lines().count().max(1) + if self.input.ends_with('\n') { 1 } else { 0 }
         }
     }
 
@@ -729,17 +796,19 @@ impl App {
     }
 
     /// Queue write/cmd for user accept; open preview panel.
-    fn propose_actions(&mut self, actions: Vec<ProposedAction>) {
+    fn propose_actions(&mut self, mut actions: Vec<ProposedAction>) {
         if actions.is_empty() {
             return;
         }
         // Ensure chips exist + mark pending; auto-open latest
         let mut open_id = None;
-        for a in &actions {
+        for a in &mut actions {
             let target = match a.kind {
-                crate::agent::ProposedKind::Write => crate::agent::AgentEngine::expand_path(&a.target)
-                    .display()
-                    .to_string(),
+                crate::agent::ProposedKind::Write => {
+                    crate::agent::AgentEngine::expand_path(&a.target)
+                        .display()
+                        .to_string()
+                }
                 crate::agent::ProposedKind::Cmd => a.target.clone(),
             };
             let kind = match a.kind {
@@ -749,19 +818,28 @@ impl App {
             let target = tool_panel::normalize_target(kind, &target);
             let anchor = self.latest_agent_msg_idx();
             if let Some(chip) = self.tool_chips.iter_mut().find(|c| {
-                c.kind == kind && tool_panel::same_tool_target(kind, &c.target, &target)
+                c.kind == kind
+                    && c.anchor_msg == anchor
+                    && tool_panel::same_tool_target(kind, &c.target, &target)
             }) {
-                chip.target = target;
+                chip.target = target.clone();
                 chip.body = a.body.clone();
                 chip.tag_closed = true;
                 chip.pending = true;
+
+                let chip_id = chip.id;
+
                 if chip.anchor_msg.is_none() {
                     chip.anchor_msg = anchor;
                 }
-                open_id = Some(chip.id);
+
+                a.chip_id = Some(chip_id);
+
+                open_id = Some(chip_id);
             } else {
                 let id = self.next_chip_id;
                 self.next_chip_id += 1;
+
                 self.tool_chips.push(ToolChip {
                     id,
                     kind,
@@ -772,6 +850,9 @@ impl App {
                     rect: None,
                     anchor_msg: anchor,
                 });
+
+                a.chip_id = Some(id);
+
                 open_id = Some(id);
             }
         }
@@ -800,12 +881,19 @@ impl App {
         } else {
             ""
         };
-        self.messages.push(format!(
-            "System: [PENDING] {n} action(s){think_note}: {summary}\n\
-             Press Y or Enter to ACCEPT | N to reject | A always-allow this session"
-        ));
-        self.status_message =
-            "Y/Enter=Accept | N=Reject | A=Always allow session".to_string();
+        // Only show the PENDING chat message when the AI has already finished.
+        // Mid-generation we stay silent so the stream is never interrupted.
+        let currently_generating = *self.is_generating.lock().unwrap();
+        if !currently_generating {
+            self.messages.push(format!(
+                "System: [PENDING] {n} action(s){think_note}: {summary}\n\
+                 Press Y or Enter to ACCEPT | N to reject | A always-allow this session"
+            ));
+            self.status_message = "Y/Enter=Accept | N=Reject | A=Always allow session".to_string();
+        } else {
+            // AI still streaming — update status bar only, no chat disruption
+            self.status_message = format!("Pending {n} write(s) — Y to accept after AI finishes");
+        }
         self.pending_actions = actions;
         self.input_focused = false; // so Y/N aren't typed into the prompt
     }
@@ -828,28 +916,36 @@ impl App {
         }
 
         if !writes.is_empty() {
-            let mut outs = Vec::new();
+            let mut written = Vec::new();
             for a in &writes {
-                outs.push(crate::agent::AgentEngine::execute_proposed(a));
-            }
-            let joined = outs.join("\n\n");
-            self.record_tool_result_ui("write", &joined);
-            for c in &mut self.tool_chips {
-                if c.kind == ToolPanelKind::Write {
-                    c.pending = false;
+                let result = crate::agent::AgentEngine::execute_proposed(a);
+
+                // Update the chip to [WROTE] without injecting a tool-result turn.
+                // We intentionally do NOT push to tool_result_context or
+                // trigger_generation_from_context — the AI continues uninterrupted.
+                if let Some(chip_id) = a.chip_id {
+                    if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
+                        chip.pending = false;
+                        chip.tag_closed = true;
+                    }
+                    self.force_open_panel_from_chip(chip_id);
                 }
+
+                let ok = !result.starts_with("Error");
+                written.push((a.target.rsplit('/').next().unwrap_or(&a.target).to_string(), ok));
             }
+            let summary = written
+                .iter()
+                .map(|(name, ok)| if *ok { format!("✓ {name}") } else { format!("✗ {name}") })
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.status_message = format!("Written: {summary}");
+            // Do NOT re-trigger generation — let AI finish its current response.
         }
 
         if !cmds.is_empty() {
             self.spawn_cmds_to_task_manager(cmds);
-            return; // wait for task events before re-prompting
-        }
-
-        self.status_message = "Write accepted.".to_string();
-        self.auto_tool_turns += 1;
-        if self.auto_tool_turns <= 8 {
-            self.trigger_generation_from_context();
+            // Cmds still trigger re-prompt so the AI sees the shell output
         }
     }
 
@@ -965,10 +1061,7 @@ impl App {
                         pretty.lines().count()
                     ));
                     if let Ok(mut l) = self.activity_logs.lock() {
-                        l.push(format!(
-                            "[TASK #{id}] {label} ({} bytes)",
-                            pretty.len()
-                        ));
+                        l.push(format!("[TASK #{id}] {label} ({} bytes)", pretty.len()));
                     }
                     self.status_message = format!("Task #{id} {label}");
                     if !killed && !*self.is_generating.lock().unwrap() {
@@ -1001,6 +1094,74 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Returns true when the latest tool tag was opened but never closed.
+    fn has_incomplete_tool_tag(stream: &str) -> bool {
+        let last_write = stream.rfind("<write src=");
+        let last_cmd = stream.rfind("<cmd>");
+
+        match (last_write, last_cmd) {
+            (None, None) => false,
+
+            (Some(w), None) => stream[w..].find("</write>").is_none(),
+
+            (None, Some(c)) => stream[c..].find("</cmd>").is_none(),
+
+            (Some(w), Some(c)) => {
+                if w > c {
+                    stream[w..].find("</write>").is_none()
+                } else {
+                    stream[c..].find("</cmd>").is_none()
+                }
+            }
+        }
+    }
+
+    fn continue_incomplete_tool(&mut self, partial: &str) -> bool {
+        const MAX_CONTINUATIONS: usize = 3;
+
+        if !Self::has_incomplete_tool_tag(partial) {
+            return false;
+        }
+
+        if self.incomplete_tool_continuations >= MAX_CONTINUATIONS {
+            self.messages.push(
+                "System: [ERROR] Tool generation remained incomplete after \
+             3 continuation attempts. Partial output was not executed."
+                    .into(),
+            );
+
+            self.status_message = "Incomplete tool — not executed.".into();
+            return false;
+        }
+
+        self.incomplete_tool_continuations += 1;
+
+        let last_write = partial.rfind("<write src=").unwrap_or(0);
+        let last_cmd = partial.rfind("<cmd>").unwrap_or(0);
+
+        let kind = if last_write > last_cmd {
+            "write"
+        } else {
+            "cmd"
+        };
+
+        self.messages.push(format!(
+            "You: Continue the incomplete {kind} tool from exactly where you stopped. \
+         Do NOT restart or repeat the previous content. \
+         Emit only the remaining content and make sure the closing \
+         </{kind}> tag is emitted."
+        ));
+
+        self.status_message = format!(
+            "Continuing incomplete {kind} ({}/3)…",
+            self.incomplete_tool_continuations
+        );
+
+        self.trigger_generation_from_context();
+
+        true
     }
 
     /// Close open write/cmd chips when stream dies mid-tag (error / stall / leave).
@@ -1061,11 +1222,11 @@ impl App {
         let loading = stream.is_empty()
             || stream.contains("Starting llama-server")
             || stream.contains("Loading model")
-            || stream.contains("loads GGUF once");
+            || stream.contains("loads GGUF once")
+            || stream.contains("[llama.rs]")
+            || stream.contains("Prefilling prompt");
         // Real model text (not only the loading banner)
-        let has_tokens = !loading
-            && !stream.trim().is_empty()
-            && !stream.starts_with("__HERCULES");
+        let has_tokens = !loading && !stream.trim().is_empty() && !stream.starts_with("__HERCULES");
 
         let now = Instant::now();
         if self.gen_last_progress.is_none() {
@@ -1082,16 +1243,19 @@ impl App {
         let limit_secs = if has_tokens {
             20u64 // idle mid-stream
         } else {
-            // First GGUF load on CPU can take several minutes — don't kill mid-load.
-            crate::settings::server_health_timeout_secs(crate::settings::context_token_limit())
-                .max(300)
+            crate::settings::get_settings().stall_timeout_secs
         };
 
-        let stalled = self
-            .gen_last_progress
-            .map(|t| t.elapsed().as_secs() >= limit_secs)
-            .unwrap_or(false);
-        if !stalled {
+        if limit_secs > 0 {
+            let stalled = self
+                .gen_last_progress
+                .map(|t| t.elapsed().as_secs() >= limit_secs)
+                .unwrap_or(false);
+            if !stalled {
+                return;
+            }
+        } else {
+            // limit_secs == 0 means Unlimited (watchdog disabled)
             return;
         }
         *self.is_generating.lock().unwrap() = false;
@@ -1117,9 +1281,8 @@ impl App {
             }
         }
         self.finalize_incomplete_tools(&format!("stall {limit_secs}s"));
-        self.status_message = format!(
-            "Generation stalled {limit_secs}s — interrupted (Ctrl+C cancels)"
-        );
+        self.status_message =
+            format!("Generation stalled {limit_secs}s — interrupted (Ctrl+C cancels)");
         self.messages.push(format!(
             "System: [STALL] No progress for {limit_secs}s — generation interrupted. \
              Partial WRITE/RUN recovered if any. Server load can take minutes on CPU."
@@ -1137,10 +1300,22 @@ impl App {
         }
         let n = self.pending_actions.len();
         self.pending_actions.clear();
+        // Reject = stop: interrupt any active generation so the model doesn't
+        // keep streaming after the user said no.
+        let was_gen = *self.is_generating.lock().unwrap();
+        if was_gen {
+            self.user_cancelled_gen = true;
+            self.auto_tool_turns = 0;
+            *self.is_generating.lock().unwrap() = false;
+            let partial = self.streaming_response.lock().unwrap().clone();
+            if !partial.is_empty() && !partial.starts_with("__HERCULES") {
+                self.finalize_incomplete_tools("rejected");
+            }
+        }
         self.messages.push(format!(
-            "System: [REJECTED] {n} pending action(s). File/command not applied."
+            "System: [REJECTED] {n} pending action(s). File not written."
         ));
-        self.status_message = "Action rejected.".to_string();
+        self.status_message = "Rejected — generation stopped.".to_string();
         self.close_tool_panel();
     }
 
@@ -1269,10 +1444,11 @@ impl App {
                 }
             })
             .collect();
-        for r in self.tool_result_context.iter().rev().take(4).rev() {
+        // Keep tool dumps small — full `ls` + history was > n_batch and crashed libllama.
+        for r in self.tool_result_context.iter().rev().take(2).rev() {
             chat.push(format!(
                 "Result:\n{}\n(Use this; do not re-run the same tool.)",
-                trunc_chars(r.trim(), 1_200)
+                trunc_chars(r.trim(), 800)
             ));
         }
         let start = chat.len().saturating_sub(24);
@@ -1282,11 +1458,47 @@ impl App {
         let mut out = body;
         if self.auto_tool_turns > 0 {
             out.push_str(
-                "\n\nInstruction: Tool results are above. Answer clearly. \
-                 Prefer tools for code/files when needed. Do not parrot Notes.",
+                "\n\nInstruction: Tool results are above (Result: blocks). \
+                 Reply in natural language only — tell the user what you found. \
+                 Do NOT emit any tool tags (<read>, <ls>, <write>, <cmd>). \
+                 Do NOT say you lack file access. Open chips already show full content.",
             );
         }
         out
+    }
+
+    /// When the model re-emits the same tool instead of answering, post a short host reply
+    /// from the last tool dump so the chat does not "flash then clear".
+    fn host_answer_from_prior_tools(&mut self) {
+        let Some(raw) = self.tool_result_context.last().cloned() else {
+            self.messages
+                .push("System: Tool already ran. Open the chip above for full output.".into());
+            return;
+        };
+        let preview = trunc_chars(raw.trim(), 900);
+        let lines = raw.lines().count();
+        // Replace empty / tool-only agent bubble if present
+        if let Some(last) = self.messages.last_mut() {
+            if last.starts_with("Agent: ") {
+                let body = last.strip_prefix("Agent: ").unwrap_or(last);
+                let only_tool = crate::agent::AgentEngine::response_has_tool_tags(body)
+                    && tool_panel::redact_tools_for_chat(body).trim().is_empty();
+                let emptyish = body.trim().is_empty()
+                    || body.contains("[Host recovered")
+                    || body.contains("[Interrupted");
+                if only_tool || emptyish {
+                    *last = format!(
+                        "Agent: Done — tool already finished ({lines} lines). \
+                         Open the chip for the full file/output. Preview:\n\n{preview}"
+                    );
+                    return;
+                }
+            }
+        }
+        self.messages.push(format!(
+            "Agent: Done — tool already finished ({lines} lines). \
+             Open the chip for the full file/output. Preview:\n\n{preview}"
+        ));
     }
 
     /// Full conversation size for meter/compact — excludes UI-only system lines.
@@ -1318,7 +1530,12 @@ impl App {
         let threshold = ((limit as f32) * settings.compact_ratio) as usize;
         // Also compact if message count is huge (hallucination / loop risk)
         let msg_pressure = self.messages.len() >= 40
-            || self.tool_result_context.iter().map(|s| s.len()).sum::<usize>() > 80_000;
+            || self
+                .tool_result_context
+                .iter()
+                .map(|s| s.len())
+                .sum::<usize>()
+                > 80_000;
         if est < threshold && !msg_pressure {
             return;
         }
@@ -1437,7 +1654,7 @@ impl App {
     }
 
     /// Store tool stdout for LLM + chip terminal; one short line in chat only.
-    /// Auto-opens the matching panel so run/write never stays closed.
+    /// Auto-opens the matching panel for that tool (specific chip, not a generic last one).
     fn record_tool_result_ui(&mut self, kind_hint: &str, full: &str) {
         let pretty = tool_panel::format_tool_output_for_chat(full);
         self.tool_result_context.push(pretty.clone());
@@ -1445,45 +1662,73 @@ impl App {
             let n = self.tool_result_context.len() - 8;
             self.tool_result_context.drain(0..n);
         }
-        let is_cmd = kind_hint.contains("command") || kind_hint.contains("cmd");
+
+        let want_kind = if kind_hint.contains("read") || kind_hint.contains("list") {
+            ToolPanelKind::Read
+        } else if kind_hint.contains("write") {
+            ToolPanelKind::Write
+        } else if kind_hint.contains("command") || kind_hint.contains("cmd") {
+            ToolPanelKind::Cmd
+        } else {
+            // Prefer most recent non-write chip, else write
+            ToolPanelKind::Cmd
+        };
+
+        let anchor = self.latest_agent_msg_idx();
         let mut open_id = None;
-        if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
-            if is_cmd {
-                c.kind == ToolPanelKind::Cmd
-            } else {
-                c.kind == ToolPanelKind::Write
-            }
-        }) {
-            if chip.kind == ToolPanelKind::Cmd {
-                chip.body = pretty.clone();
-            }
+
+        // Prefer chip on the current agent turn with matching kind; else any matching kind.
+        let chip_idx = self
+            .tool_chips
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, c)| c.kind == want_kind && c.anchor_msg == anchor)
+            .map(|(i, _)| i)
+            .or_else(|| {
+                self.tool_chips
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, c)| c.kind == want_kind)
+                    .map(|(i, _)| i)
+            });
+
+        if let Some(i) = chip_idx {
+            let chip = &mut self.tool_chips[i];
             chip.tag_closed = true;
             chip.pending = false;
+
             open_id = Some(chip.id);
-        } else if is_cmd {
-            // Result without a prior chip — create one RUN chip under last agent
+        } else {
+            // Result without a prior chip — create one under last agent
             let id = self.next_chip_id;
             self.next_chip_id += 1;
+            let target = match want_kind {
+                ToolPanelKind::Cmd => "command".into(),
+                ToolPanelKind::Read => "file".into(),
+                ToolPanelKind::Write => "file".into(),
+            };
             self.tool_chips.push(ToolChip {
                 id,
-                kind: ToolPanelKind::Cmd,
-                target: "command".into(),
+                kind: want_kind,
+                target,
                 body: pretty.clone(),
                 tag_closed: true,
                 pending: false,
                 rect: None,
-                anchor_msg: self.latest_agent_msg_idx(),
+                anchor_msg: anchor,
             });
             open_id = Some(id);
         }
+
         self.dedupe_tool_chips();
         if let Some(id) = open_id {
             self.force_open_panel_from_chip(id);
         }
         let lines = pretty.lines().count();
-        self.messages.push(format!(
-            "System: [OK] {kind_hint} finished ({lines} lines)"
-        ));
+        self.messages
+            .push(format!("System: [OK] {kind_hint} finished ({lines} lines)"));
     }
 
     /// Latest user message only (best for one-shot llama.cpp).
@@ -1561,10 +1806,7 @@ impl App {
         }
         self.push_input_undo();
         let chars: Vec<char> = self.input.chars().collect();
-        let new: String = chars[..start]
-            .iter()
-            .chain(chars[end..].iter())
-            .collect();
+        let new: String = chars[..start].iter().chain(chars[end..].iter()).collect();
         self.input = new;
         self.input_cursor_position = start;
     }
@@ -1602,15 +1844,20 @@ impl App {
         );
 
         match &self.backend {
-            AgentBackend::LlamaRs(backend) => {
+            AgentBackend::LlamaCppLib(backend) => {
                 let backend_clone = backend.clone();
                 let is_gen_task = is_gen.clone();
-                // Pure-Rust warm engine: must include tool outputs (context_prompt),
-                // not only the last You: line — otherwise it re-issues the same tool forever.
-                let prompt = if context_prompt.trim().is_empty() {
-                    self.last_user_message().unwrap_or_default()
-                } else {
+                // After tools run, must pass full context (incl. tool results). Using only
+                // last_user_message re-asks "read X" → same tool forever.
+                let prompt = if self.auto_tool_turns > 0
+                    || !self.tool_result_context.is_empty()
+                    || context_prompt.lines().count() > 1
+                {
                     context_prompt.clone()
+                } else {
+                    self.last_user_message()
+                        .filter(|m| !m.trim().is_empty())
+                        .unwrap_or_else(|| context_prompt.clone())
                 };
                 let stream_target2 = stream_target.clone();
                 tokio::spawn(async move {
@@ -1664,6 +1911,7 @@ impl App {
                     *is_gen.lock().unwrap() = false;
                 });
             }
+            #[cfg(feature = "gpu")]
             AgentBackend::BurnWgpu(_) => {
                 let backend_clone = self.backend.clone();
                 let stream_target_clone = stream_target.clone();
@@ -1680,24 +1928,47 @@ impl App {
         }
     }
 
+    fn input_insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        self.push_input_undo();
+
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+
+        let mut chars: Vec<char> = self.input.chars().collect();
+        let pos = self.input_cursor_position.min(chars.len());
+
+        let inserted_len = normalized.chars().count();
+
+        chars.splice(pos..pos, normalized.chars());
+
+        self.input = chars.into_iter().collect();
+        self.input_cursor_position = pos + inserted_len;
+    }
+
     pub async fn handle_events(&mut self) -> Result<(), std::io::Error> {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
-        
+
         let now = std::time::Instant::now();
         let delta = now.duration_since(self.last_frame_time);
         self.last_frame_time = now;
         let delta_ms = (delta.as_secs_f64() * 1000.0) as u16;
-        
+
         self.anim_tick = self.anim_tick.wrapping_add(1);
         self.typewriter_len = self.typewriter_len.saturating_add(3);
-        self.krama.update_progress(TRES16Bits::from_millis(delta_ms.max(1))); // 60 FPS display synced clock
+        self.krama
+            .update_progress(TRES16Bits::from_millis(delta_ms.max(1))); // 60 FPS display synced clock
 
         if let Some(ref mut panel) = self.tool_panel {
             if let Some(chip) = self.tool_chips.iter().find(|c| {
                 c.kind == panel.kind
                     && (c.target == panel.target
-                        || panel.target.ends_with(c.target.rsplit('/').next().unwrap_or("")))
+                        || panel
+                            .target
+                            .ends_with(c.target.rsplit('/').next().unwrap_or("")))
             }) {
                 if let Some(r) = chip.rect {
                     panel.chip_rect = Some(r);
@@ -1743,7 +2014,7 @@ impl App {
                 }
             }
         }
-        
+
         // Check for streaming response updates
         {
             let current_stream = self.streaming_response.lock().unwrap().clone();
@@ -1758,11 +2029,62 @@ impl App {
                 }
                 // Chips only while streaming (panel opens from chip click)
                 self.sync_tool_chips(&current_stream);
+
+                // ── Furious AlwaysAllow: execute complete writes the instant their
+                //    closing tag arrives, without interrupting the AI stream. ──────
+                let perms = crate::agent::get_tool_permissions();
+                let auto_ok = matches!(perms.mode, PermissionMode::AlwaysAllow) || perms.session_allow;
+                if auto_ok {
+                    let raw = crate::agent::AgentEngine::extract_proposed_actions(&current_stream);
+                    for action in raw {
+                        if action.kind != crate::agent::ProposedKind::Write {
+                            continue;
+                        }
+                        // Only act on targets we haven't already written this turn
+                        if self.streamed_writes_done.contains(&action.target) {
+                            continue;
+                        }
+                        let result = crate::agent::AgentEngine::execute_proposed(&action);
+                        self.streamed_writes_done.push(action.target.clone());
+                        // Update chip to [WROTE] without touching tool_result_context
+                        // or calling trigger_generation_from_context — AI keeps streaming.
+                        if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
+                            c.kind == crate::tool_panel::ToolPanelKind::Write
+                                && crate::tool_panel::same_tool_target(
+                                    crate::tool_panel::ToolPanelKind::Write,
+                                    &c.target,
+                                    &action.target,
+                                )
+                        }) {
+                            chip.pending = false;
+                            chip.tag_closed = true;
+                        }
+                        if let Ok(mut l) = self.activity_logs.lock() {
+                            let ok = !result.starts_with("Error");
+                            l.push(format!(
+                                "[FURIOUS] mid-stream write {} — {}",
+                                action.target,
+                                if ok { "OK" } else { &result }
+                            ));
+                        }
+                    }
+                }
             }
             if !is_gen {
                 // Generation finished
                 let gen_err = self.generation_error.lock().unwrap().take();
-                if let Some(err) = gen_err {
+                let cancelled = self.user_cancelled_gen;
+                if cancelled {
+                    self.user_cancelled_gen = false;
+                    self.auto_tool_turns = 0;
+                    *self.streaming_response.lock().unwrap() = String::new();
+                    self.gen_last_progress = None;
+                    if self.status_message.starts_with("Generating")
+                        || self.status_message.contains("via llama")
+                    {
+                        self.status_message = "Interrupted (CTRL+C).".into();
+                    }
+                } else if let Some(err) = gen_err {
                     // Recover mid-write / mid-cmd chips so UI is not stuck half-open
                     let partial = self.streaming_response.lock().unwrap().clone();
                     if !partial.is_empty() && !partial.starts_with("__HERCULES") {
@@ -1771,9 +2093,7 @@ impl App {
                         if let Some(last) = self.messages.last_mut() {
                             if last.starts_with("Agent: ") {
                                 let shown = tool_panel::redact_tools_for_chat(&partial);
-                                *last = format!(
-                                    "Agent: {shown}\n[Interrupted — {err}]"
-                                );
+                                *last = format!("Agent: {shown}\n[Interrupted — {err}]");
                             }
                         }
                     } else if let Some(last) = self.messages.last_mut() {
@@ -1784,9 +2104,7 @@ impl App {
                     self.status_message = "Generation failed — partial tools recovered.".into();
                     *self.streaming_response.lock().unwrap() = String::new();
                     self.gen_last_progress = None;
-                } else if !current_stream.is_empty()
-                    && !current_stream.starts_with("__HERCULES")
-                {
+                } else if !current_stream.is_empty() && !current_stream.starts_with("__HERCULES") {
                     if let Some(last) = self.messages.last_mut() {
                         if last.starts_with("Agent: ") {
                             let shown = tool_panel::redact_tools_for_chat(&current_stream);
@@ -1794,25 +2112,98 @@ impl App {
                             self.typewriter_len = 1000;
                         }
                     }
-                    
-                    // Final chips sync (also recovers incomplete </cmd>/</write>)
-                    self.sync_tool_chips(&current_stream);
-                    self.finalize_incomplete_tools("generation ended");
 
-                    let proposed =
+                    self.sync_tool_chips(&current_stream);
+
+                    let incomplete = Self::has_incomplete_tool_tag(&current_stream);
+
+                    if incomplete {
+                        if self.continue_incomplete_tool(&current_stream) {
+                            // Do not process the incomplete action in this turn.
+                            return Ok(());
+                        }
+
+                        self.finalize_incomplete_tools("continuation limit reached");
+                    } else {
+                        self.incomplete_tool_continuations = 0;
+                    }
+
+                    let proposed_raw =
                         crate::agent::AgentEngine::extract_proposed_actions(&current_stream);
+
+                    // Landing page / single HTML ask → one write, not file.txt + 3 html names
+                    let proposed = if let Some(user) = self.last_user_message() {
+                        crate::agent::AgentEngine::collapse_write_actions_for_user(
+                            &user,
+                            proposed_raw,
+                        )
+                    } else {
+                        proposed_raw
+                    };
                     let perms = get_tool_permissions();
-                    let auto_ok = matches!(perms.mode, PermissionMode::AlwaysAllow)
-                        || perms.session_allow;
+                    let auto_ok =
+                        matches!(perms.mode, PermissionMode::AlwaysAllow) || perms.session_allow;
                     let need_accept = !auto_ok && !proposed.is_empty();
 
                     // read/ls/memory/writes only — cmds never block here
-                    let tool_output_opt =
-                        crate::agent::AgentEngine::process_response(&current_stream);
+                    let mut effective_stream = current_stream.clone();
+                    let mut tool_output_opt =
+                        crate::agent::AgentEngine::process_response(&effective_stream);
+
+                    // Recover tools only on the *first* attempt. After we already have
+                    // tool results, recovery re-fires the same <read> and wipes the answer.
+                    let already_have_tools =
+                        !self.tool_result_context.is_empty() || self.auto_tool_turns > 0;
+                    if tool_output_opt.is_none() && !already_have_tools {
+                        if let Some(user) = self.last_user_message() {
+                            if let Some(tag) = crate::agent::AgentEngine::recover_tools_from_refusal(
+                                &user,
+                                &effective_stream,
+                            ) {
+                                if let Ok(mut l) = self.activity_logs.lock() {
+                                    l.push(format!(
+                                        "[HERCULES] tool recovery after model refusal → {tag}"
+                                    ));
+                                }
+                                if let Some(last) = self.messages.last_mut() {
+                                    if last.starts_with("Agent: ") {
+                                        *last = format!(
+                                            "Agent: {tag}\n[Host recovered tool after model refused filesystem access]"
+                                        );
+                                    }
+                                }
+                                effective_stream = tag;
+                                tool_output_opt =
+                                    crate::agent::AgentEngine::process_response(&effective_stream);
+                            }
+                        }
+                    }
+
                     *self.streaming_response.lock().unwrap() = String::new();
                     self.gen_last_progress = None;
 
-                    self.recent_tool_calls.push(current_stream.clone());
+                    // Identical tool tag twice in a row → stop (don't re-read forever)
+                    let same_as_prev = self
+                        .recent_tool_calls
+                        .last()
+                        .map(|prev| {
+                            crate::settings::normalize_for_repeat(prev)
+                                == crate::settings::normalize_for_repeat(&effective_stream)
+                        })
+                        .unwrap_or(false);
+
+                    let prose = tool_panel::redact_tools_for_chat(&effective_stream);
+                    let only_repeated_tool = same_as_prev
+                        && crate::agent::AgentEngine::response_has_tool_tags(&effective_stream);
+                    // After tools, model answered with empty / tool-only noise → host summary
+                    let needs_host_summary = already_have_tools
+                        && (only_repeated_tool
+                            || prose.trim().is_empty()
+                            || crate::agent::AgentEngine::looks_like_capability_refusal(&prose));
+
+                    if !only_repeated_tool {
+                        self.recent_tool_calls.push(effective_stream.clone());
+                    }
                     let max_hist = crate::settings::get_settings()
                         .repeat_threshold
                         .saturating_mul(3)
@@ -1836,7 +2227,22 @@ impl App {
                         .cloned()
                         .collect();
 
-                    if let Some(reason) = loop_hit {
+                    if needs_host_summary {
+                        // Do not re-run tools or leave an empty agent bubble.
+                        self.host_answer_from_prior_tools();
+                        self.auto_tool_turns = 0;
+                        self.status_message = "Ready.".to_string();
+                        if let Ok(mut l) = self.activity_logs.lock() {
+                            l.push("[HERCULES] host summary from prior tool (no re-run)".into());
+                        }
+                    } else if only_repeated_tool {
+                        self.host_answer_from_prior_tools();
+                        self.auto_tool_turns = 0;
+                        self.status_message = "Ready.".to_string();
+                        if let Ok(mut l) = self.activity_logs.lock() {
+                            l.push("[REPEAT] identical tool tag — host summary instead".into());
+                        }
+                    } else if let Some(reason) = loop_hit {
                         self.repeat_count = settings.repeat_threshold;
                         self.messages.push(format!(
                             "System: Repeat detector (threshold {}): {}. \
@@ -1851,34 +2257,45 @@ impl App {
                         self.recent_tool_calls.clear();
                         self.repeat_count = 0;
                     } else if need_accept {
+                        // Ask mode: queue the actions but do NOT interrupt the AI.
+                        // The PENDING system message is suppressed while generating;
+                        // propose_actions will show it once the stream is done.
                         self.propose_actions(proposed);
                         // Do not auto re-prompt until user accepts/rejects
                     } else {
-                        // AlwaysAllow / session: writes in process_response; cmds → task manager
+                        // AlwaysAllow / session: writes already executed mid-stream;
+                        // skip any target already in streamed_writes_done to avoid
+                        // double-writing, then clear the set for the next turn.
                         let had_cmds = !cmds.is_empty();
                         if had_cmds {
                             self.spawn_cmds_to_task_manager(cmds);
                         }
+                        // Only process read/ls/memory output (writes already handled mid-stream)
                         let mut had_tool_out = false;
                         if let Some(tool_output) = tool_output_opt {
-                            had_tool_out = true;
-                            let hint = if tool_output.lines().count() > 3 {
-                                "command/tool"
-                            } else {
-                                "tool"
-                            };
-                            self.record_tool_result_ui(hint, &tool_output);
-                            if let Ok(mut l) = self.activity_logs.lock() {
-                                l.push(format!(
-                                    "[HERCULES] tool done ({} bytes) → chip/terminal",
-                                    tool_output.len()
-                                ));
+                            // Suppress write-only results that were already applied mid-stream
+                            let is_write_only = tool_panel::classify_tool_hint(&effective_stream) == "write";
+                            let all_done = writes_pending
+                                .iter()
+                                .all(|w| self.streamed_writes_done.contains(&w.target));
+                            if !(is_write_only && all_done) {
+                                had_tool_out = true;
+                                let hint = tool_panel::classify_tool_hint(&effective_stream);
+                                self.record_tool_result_ui(hint, &tool_output);
+                                if let Ok(mut l) = self.activity_logs.lock() {
+                                    l.push(format!(
+                                        "[HERCULES] {hint} done ({} bytes) → chip/terminal",
+                                        tool_output.len()
+                                    ));
+                                }
                             }
                         }
-                        // Re-prompt only when nothing is waiting in task manager
-                        // (task Done/Parked events will re-prompt themselves)
+                        // Clear mid-stream dedup set for the next turn
+                        self.streamed_writes_done.clear();
+                        // Do NOT re-trigger generation for writes — they were already
+                        // applied silently. Only re-prompt when reads/cmds produce context.
                         if !had_cmds && self.task_manager.running_count() == 0 {
-                            if had_tool_out || !writes_pending.is_empty() {
+                            if had_tool_out {
                                 self.auto_tool_turns += 1;
                                 if self.auto_tool_turns <= 8 {
                                     self.trigger_generation_from_context();
@@ -1902,7 +2319,7 @@ impl App {
                 }
             }
         }
-        
+
         // Esc hold ≥1s → exit; released early → cancelled in key handler
         if let Some(start) = self.esc_hold_start {
             let pct = (start.elapsed().as_secs_f64() / 1.0).min(1.0);
@@ -1911,7 +2328,7 @@ impl App {
                     *g = false;
                 }
                 crate::llama::server::shutdown_managed_server();
-                crate::llama::infer::shutdown_warm_rs_engine();
+                crate::llama::libinfer::shutdown_warm_lib_engine();
                 self.should_quit = true;
             }
         }
@@ -1919,7 +2336,7 @@ impl App {
         let target_log_pct = if self.log_pane_collapsed { 0.0 } else { 32.0 };
         let factor = ((delta.as_secs_f64() * 18.0) as f64).min(1.0);
         self.current_log_pane_pct += (target_log_pct - self.current_log_pane_pct) * factor;
-        
+
         let new_results = self.search_results.lock().unwrap().take();
         if let Some(models) = new_results {
             if !models.is_empty() {
@@ -1939,7 +2356,7 @@ impl App {
                 self.krama.restart_progress("list_fade", 0);
             }
         }
-        
+
         let is_complete = *self.download_complete.lock().unwrap();
         if is_complete {
             *self.download_complete.lock().unwrap() = false;
@@ -1956,9 +2373,19 @@ impl App {
 
             // Prefer llama.cpp for installed GGUF (fast + low RAM vs pure-rust dequant)
             if let Some(path) = self.manager.latest_gguf_path() {
-                self.backend = AgentBackend::LlamaCpp(LlamaCppBackend::cli(path.clone()));
-                self.status_message =
-                    format!("Active Engine: llama.cpp ({})", path.display());
+                match self.backend {
+                    AgentBackend::LlamaCpp(_) => {
+                        self.backend = AgentBackend::LlamaCpp(LlamaCppBackend::cli(path.clone()));
+                        self.status_message =
+                            format!("Active Engine: llama.cpp ({})", path.display());
+                    }
+                    _ => {
+                        self.backend =
+                            AgentBackend::LlamaCppLib(LlamaCppLibBackend::gguf(path.clone()));
+                        self.status_message =
+                            format!("Active Engine: llama.cpp lib ({})", path.display());
+                    }
+                }
                 self.messages.push(format!(
                     "System: GGUF ready at {}. Activated llama.cpp via warm llama-server \
                      (first message loads weights once; later prompts stay hot). \
@@ -1971,8 +2398,12 @@ impl App {
                         path.display()
                     ));
                 }
-            } else if let Some(entry) =
-                self.manager.list_installed_entries().into_iter().rev().next()
+            } else if let Some(entry) = self
+                .manager
+                .list_installed_entries()
+                .into_iter()
+                .rev()
+                .next()
             {
                 if entry.path.starts_with("ollama://") {
                     let name = entry.path.trim_start_matches("ollama://").to_string();
@@ -1998,8 +2429,6 @@ impl App {
             }
         }
 
-
-        
         if event::poll(Duration::from_millis(16))? {
             match event::read()? {
                 Event::Mouse(mouse) => match mouse.kind {
@@ -2058,9 +2487,7 @@ impl App {
                             let chrome = self
                                 .tool_panel
                                 .as_ref()
-                                .map(|p| {
-                                    tool_panel::hit_test_chrome(p, mouse.column, mouse.row)
-                                })
+                                .map(|p| tool_panel::hit_test_chrome(p, mouse.column, mouse.row))
                                 .unwrap_or(PanelChromeHit::None);
                             let (panel_kind, in_body) = self
                                 .tool_panel
@@ -2128,8 +2555,7 @@ impl App {
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if self.is_selecting {
                             self.selection_end = Some((mouse.column, mouse.row));
-                            if let (Some(s), Some(e)) = (self.selection_start, self.selection_end)
-                            {
+                            if let (Some(s), Some(e)) = (self.selection_start, self.selection_end) {
                                 if s != e {
                                     self.selection_dragged = true;
                                     self.selection_pending_cancel = false;
@@ -2156,12 +2582,18 @@ impl App {
                     }
                     _ => {}
                 },
+
+                Event::Paste(text) => {
+                    if self.input_focused && !self.show_menu {
+                        self.input_insert_text(&text);
+                    }
+                }
+
                 Event::Key(key) => {
                     use crossterm::event::KeyEventKind;
 
                     // Esc released early → cancel exit glow (progress back to 0)
-                    let skip_key = if key.code == KeyCode::Esc
-                        && key.kind == KeyEventKind::Release
+                    let skip_key = if key.code == KeyCode::Esc && key.kind == KeyEventKind::Release
                     {
                         if self.esc_hold_start.is_some() {
                             self.esc_hold_start = None;
@@ -2176,777 +2608,940 @@ impl App {
                     };
 
                     if !skip_key {
-                    // TERM interactive: keys go to term input (not main prompt)
-                    if self.term_is_interactive()
-                        && !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && self.pending_actions.is_empty()
-                        && !self.show_menu
-                    {
-                        match key.code {
-                            KeyCode::Esc => {
-                                self.exit_term_interactive();
-                            }
-                            KeyCode::Enter => {
-                                let line = std::mem::take(&mut self.term_input);
-                                self.term_run_line(&line);
-                            }
-                            KeyCode::Backspace => {
-                                self.term_input.pop();
-                            }
-                            KeyCode::PageUp => {
-                                if let Some(ref mut p) = self.tool_panel {
-                                    p.scroll_by(-8);
-                                }
-                            }
-                            KeyCode::PageDown => {
-                                if let Some(ref mut p) = self.tool_panel {
-                                    p.scroll_by(8);
-                                }
-                            }
-                            KeyCode::Up => {
-                                if let Some(ref mut p) = self.tool_panel {
-                                    p.scroll_by(-1);
-                                }
-                            }
-                            KeyCode::Down => {
-                                if let Some(ref mut p) = self.tool_panel {
-                                    p.scroll_by(1);
-                                }
-                            }
-                            KeyCode::Char(c) => {
-                                self.term_input.push(c);
-                            }
-                            _ => {}
-                        }
-                        // skip rest of key handling (TERM owns keyboard)
-                    } else if self.tool_panel.is_some()
-                        && !self.input_focused
-                        && !self.show_menu
-                        && matches!(
-                            key.code,
-                            KeyCode::PageUp | KeyCode::PageDown | KeyCode::Up | KeyCode::Down
-                        )
-                        && !key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        // Scroll WRITE/TERM panel without entering interactive
-                        if let Some(ref mut p) = self.tool_panel {
+                        // TERM interactive: keys go to term input (not main prompt)
+                        if self.term_is_interactive()
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && self.pending_actions.is_empty()
+                            && !self.show_menu
+                        {
                             match key.code {
-                                KeyCode::PageUp => p.scroll_by(-8),
-                                KeyCode::PageDown => p.scroll_by(8),
-                                KeyCode::Up => p.scroll_by(-1),
-                                KeyCode::Down => p.scroll_by(1),
+                                KeyCode::Esc => {
+                                    self.exit_term_interactive();
+                                }
+                                KeyCode::Enter => {
+                                    let line = std::mem::take(&mut self.term_input);
+                                    self.term_run_line(&line);
+                                }
+                                KeyCode::Backspace => {
+                                    self.term_input.pop();
+                                }
+                                KeyCode::PageUp => {
+                                    if let Some(ref mut p) = self.tool_panel {
+                                        p.scroll_by(-8);
+                                    }
+                                }
+                                KeyCode::PageDown => {
+                                    if let Some(ref mut p) = self.tool_panel {
+                                        p.scroll_by(8);
+                                    }
+                                }
+                                KeyCode::Up => {
+                                    if let Some(ref mut p) = self.tool_panel {
+                                        p.scroll_by(-1);
+                                    }
+                                }
+                                KeyCode::Down => {
+                                    if let Some(ref mut p) = self.tool_panel {
+                                        p.scroll_by(1);
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    self.term_input.push(c);
+                                }
                                 _ => {}
                             }
-                        }
-                    } else if !self.pending_actions.is_empty()
-                        && !key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        match key.code {
-                            KeyCode::Char('y')
-                            | KeyCode::Char('Y')
-                            | KeyCode::Enter => {
-                                self.accept_pending_actions();
+                            // skip rest of key handling (TERM owns keyboard)
+                        } else if self.tool_panel.is_some()
+                            && !self.input_focused
+                            && !self.show_menu
+                            && matches!(
+                                key.code,
+                                KeyCode::PageUp | KeyCode::PageDown | KeyCode::Up | KeyCode::Down
+                            )
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            // Scroll WRITE/TERM panel without entering interactive
+                            if let Some(ref mut p) = self.tool_panel {
+                                match key.code {
+                                    KeyCode::PageUp => p.scroll_by(-8),
+                                    KeyCode::PageDown => p.scroll_by(8),
+                                    KeyCode::Up => p.scroll_by(-1),
+                                    KeyCode::Down => p.scroll_by(1),
+                                    _ => {}
+                                }
                             }
-                            KeyCode::Char('n') | KeyCode::Char('N') => {
-                                self.reject_pending_actions();
-                            }
-                            KeyCode::Char('a') | KeyCode::Char('A') => {
-                                set_permission_mode(PermissionMode::AlwaysAllow);
-                                allow_session_tools();
-                                self.accept_pending_actions();
-                                self.status_message =
+                        } else if !self.pending_actions.is_empty()
+                            && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                                    self.accept_pending_actions();
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('N') => {
+                                    self.reject_pending_actions();
+                                }
+                                KeyCode::Char('a') | KeyCode::Char('A') => {
+                                    set_permission_mode(PermissionMode::AlwaysAllow);
+                                    allow_session_tools();
+                                    self.accept_pending_actions();
+                                    self.status_message =
                                     "Always allow + accepted. Writes/cmds auto-run this session."
                                         .to_string();
-                            }
-                            _ => {}
-                        }
-                        // Don't also type Y into input / other handlers for these keys
-                        if matches!(
-                            key.code,
-                            KeyCode::Char('y')
-                                | KeyCode::Char('Y')
-                                | KeyCode::Char('n')
-                                | KeyCode::Char('N')
-                                | KeyCode::Char('a')
-                                | KeyCode::Char('A')
-                                | KeyCode::Enter
-                        ) {
-                            // fall through only for non-accept keys below — skip rest
-                        } else {
-                            // other keys while pending still work
-                        }
-                    }
-
-                    let pending_consumed = !self.pending_actions.is_empty()
-                        && matches!(
-                            key.code,
-                            KeyCode::Char('y')
-                                | KeyCode::Char('Y')
-                                | KeyCode::Char('n')
-                                | KeyCode::Char('N')
-                                | KeyCode::Char('a')
-                                | KeyCode::Char('A')
-                                | KeyCode::Enter
-                        )
-                        && !key.modifiers.contains(KeyModifiers::CONTROL);
-
-                    // Pressing anything else while not Esc cancels hold
-                    if key.code != KeyCode::Esc {
-                        self.esc_hold_start = None;
-                    }
-
-                    if pending_consumed {
-                        // already handled accept/reject
-                    } else {
-                    match key.code {
-                        KeyCode::Esc => {
-                            // Ctrl+Esc → exit immediately (no hold)
-                            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                self.esc_hold_start = None;
-                                if let Ok(mut g) = self.is_generating.lock() {
-                                    *g = false;
                                 }
-                                crate::llama::server::shutdown_managed_server();
-                                crate::llama::infer::shutdown_warm_rs_engine();
-                                self.should_quit = true;
-                                self.status_message = "Exiting…".to_string();
-                            } else if self.delete_confirm_model.is_some() {
-                                self.delete_confirm_model = None;
-                                self.esc_hold_start = None;
-                            } else if self.show_menu {
-                                self.show_menu = false;
-                                self.esc_hold_start = None;
+                                _ => {}
+                            }
+                            // Don't also type Y into input / other handlers for these keys
+                            if matches!(
+                                key.code,
+                                KeyCode::Char('y')
+                                    | KeyCode::Char('Y')
+                                    | KeyCode::Char('n')
+                                    | KeyCode::Char('N')
+                                    | KeyCode::Char('a')
+                                    | KeyCode::Char('A')
+                                    | KeyCode::Enter
+                            ) {
+                                // fall through only for non-accept keys below — skip rest
                             } else {
-                                // Start / continue hold-to-exit (1s)
-                                if self.esc_hold_start.is_none() {
-                                    self.esc_hold_start = Some(std::time::Instant::now());
-                                    self.status_message =
+                                // other keys while pending still work
+                            }
+                        }
+
+                        let pending_consumed = !self.pending_actions.is_empty()
+                            && matches!(
+                                key.code,
+                                KeyCode::Char('y')
+                                    | KeyCode::Char('Y')
+                                    | KeyCode::Char('n')
+                                    | KeyCode::Char('N')
+                                    | KeyCode::Char('a')
+                                    | KeyCode::Char('A')
+                                    | KeyCode::Enter
+                            )
+                            && !key.modifiers.contains(KeyModifiers::CONTROL);
+
+                        // Pressing anything else while not Esc cancels hold
+                        if key.code != KeyCode::Esc {
+                            self.esc_hold_start = None;
+                        }
+
+                        if pending_consumed {
+                            // already handled accept/reject
+                        } else {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    // Ctrl+Esc → exit immediately (no hold)
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                        self.esc_hold_start = None;
+                                        if let Ok(mut g) = self.is_generating.lock() {
+                                            *g = false;
+                                        }
+                                        crate::llama::server::shutdown_managed_server();
+                                        crate::llama::libinfer::shutdown_warm_lib_engine();
+                                        self.should_quit = true;
+                                        self.status_message = "Exiting…".to_string();
+                                    } else if self.delete_confirm_model.is_some() {
+                                        self.delete_confirm_model = None;
+                                        self.esc_hold_start = None;
+                                    } else if self.show_menu {
+                                        self.show_menu = false;
+                                        self.esc_hold_start = None;
+                                    } else {
+                                        // Start / continue hold-to-exit (1s)
+                                        if self.esc_hold_start.is_none() {
+                                            self.esc_hold_start = Some(std::time::Instant::now());
+                                            self.status_message =
                                         "Hold Esc to exit… (release to cancel) | Ctrl+Esc = quit now"
                                             .to_string();
-                                }
-                            }
-                        }
-                        KeyCode::Char('l') | KeyCode::Char('L') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.log_pane_collapsed = !self.log_pane_collapsed;
-                        }
-                        KeyCode::F(3) => {
-                            self.log_pane_collapsed = !self.log_pane_collapsed;
-                        }
-                        KeyCode::Char('f') | KeyCode::Char('F') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.input_focused = !self.input_focused;
-                        }
-                        KeyCode::Char('m') | KeyCode::Char('M') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.show_menu = !self.show_menu;
-                            if self.show_menu {
-                                self.krama.restart_progress("menu_fade", 0);
-                                self.krama.restart_progress("list_fade", 0);
-                                let manager_clone = self.manager.clone();
-                                let search_results_clone = self.search_results.clone();
-                                tokio::spawn(async move {
-                                    let mut combined = Vec::new();
-                                    if let Ok(ollama_models) = manager_clone.list_ollama_models().await {
-                                        for m in ollama_models {
-                                            let sz = if m.size > 0 {
-                        crate::manager::format_model_size(m.size)
-                    } else {
-                        "?".into()
-                    };
-                    combined.push(format!("Ollama Local: {} ({sz})", m.name));
                                         }
                                     }
-                                    let hf = manager_clone.search_all_models("deepseek").await;
-                                    combined.extend(hf);
-                                    *search_results_clone.lock().unwrap() = Some(combined);
-                                });
-                            }
-                        }
-                        KeyCode::F(2) => {
-                            self.show_menu = !self.show_menu;
-                            if self.show_menu {
-                                self.krama.restart_progress("menu_fade", 0);
-                                self.krama.restart_progress("list_fade", 0);
-                                let manager_clone = self.manager.clone();
-                                let search_results_clone = self.search_results.clone();
-                                tokio::spawn(async move {
-                                    let mut combined = Vec::new();
-                                    if let Ok(ollama_models) = manager_clone.list_ollama_models().await {
-                                        for m in ollama_models {
-                                            let sz = if m.size > 0 {
-                        crate::manager::format_model_size(m.size)
-                    } else {
-                        "?".into()
-                    };
-                    combined.push(format!("Ollama Local: {} ({sz})", m.name));
+                                }
+                                KeyCode::Char('l') | KeyCode::Char('L')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    self.log_pane_collapsed = !self.log_pane_collapsed;
+                                }
+                                KeyCode::F(3) => {
+                                    self.log_pane_collapsed = !self.log_pane_collapsed;
+                                }
+                                KeyCode::Char('f') | KeyCode::Char('F')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    self.input_focused = !self.input_focused;
+                                }
+                                KeyCode::Char('m') | KeyCode::Char('M')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    self.show_menu = !self.show_menu;
+                                    if self.show_menu {
+                                        self.krama.restart_progress("menu_fade", 0);
+                                        self.krama.restart_progress("list_fade", 0);
+                                        let manager_clone = self.manager.clone();
+                                        let search_results_clone = self.search_results.clone();
+                                        tokio::spawn(async move {
+                                            let mut combined = Vec::new();
+                                            if let Ok(ollama_models) =
+                                                manager_clone.list_ollama_models().await
+                                            {
+                                                for m in ollama_models {
+                                                    let sz = if m.size > 0 {
+                                                        crate::manager::format_model_size(m.size)
+                                                    } else {
+                                                        "?".into()
+                                                    };
+                                                    combined.push(format!(
+                                                        "Ollama Local: {} ({sz})",
+                                                        m.name
+                                                    ));
+                                                }
+                                            }
+                                            let hf =
+                                                manager_clone.search_all_models("deepseek").await;
+                                            combined.extend(hf);
+                                            *search_results_clone.lock().unwrap() = Some(combined);
+                                        });
+                                    }
+                                }
+                                KeyCode::F(2) => {
+                                    self.show_menu = !self.show_menu;
+                                    if self.show_menu {
+                                        self.krama.restart_progress("menu_fade", 0);
+                                        self.krama.restart_progress("list_fade", 0);
+                                        let manager_clone = self.manager.clone();
+                                        let search_results_clone = self.search_results.clone();
+                                        tokio::spawn(async move {
+                                            let mut combined = Vec::new();
+                                            if let Ok(ollama_models) =
+                                                manager_clone.list_ollama_models().await
+                                            {
+                                                for m in ollama_models {
+                                                    let sz = if m.size > 0 {
+                                                        crate::manager::format_model_size(m.size)
+                                                    } else {
+                                                        "?".into()
+                                                    };
+                                                    combined.push(format!(
+                                                        "Ollama Local: {} ({sz})",
+                                                        m.name
+                                                    ));
+                                                }
+                                            }
+                                            let hf =
+                                                manager_clone.search_all_models("deepseek").await;
+                                            combined.extend(hf);
+                                            *search_results_clone.lock().unwrap() = Some(combined);
+                                        });
+                                    }
+                                }
+                                KeyCode::F(1) => {
+                                    self.show_shortcuts = !self.show_shortcuts;
+                                    if self.show_shortcuts {
+                                        self.krama.restart_progress("help_fade", 0);
+                                        self.status_message =
+                                            "Key shortcuts visible (F1 to hide)".to_string();
+                                    } else {
+                                        self.status_message = "Key shortcuts hidden".to_string();
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    if self.show_menu {
+                                        self.menu_section = if self.menu_section == 0 {
+                                            4
+                                        } else {
+                                            self.menu_section - 1
+                                        };
+                                    } else if self.input_focused {
+                                        if key.modifiers.contains(KeyModifiers::ALT) {
+                                            self.input_cursor_position = self.cursor_word_left();
+                                        } else {
+                                            self.input_cursor_position =
+                                                self.input_cursor_position.saturating_sub(1);
                                         }
                                     }
-                                    let hf = manager_clone.search_all_models("deepseek").await;
-                                    combined.extend(hf);
-                                    *search_results_clone.lock().unwrap() = Some(combined);
-                                });
-                            }
-                        }
-                        KeyCode::F(1) => {
-                            self.show_shortcuts = !self.show_shortcuts;
-                            if self.show_shortcuts {
-                                self.krama.restart_progress("help_fade", 0);
-                                self.status_message =
-                                    "Key shortcuts visible (F1 to hide)".to_string();
-                            } else {
-                                self.status_message = "Key shortcuts hidden".to_string();
-                            }
-                        }
-                        KeyCode::Left => {
-                            if self.show_menu {
-                                self.menu_section = if self.menu_section == 0 {
-                                    4
-                                } else {
-                                    self.menu_section - 1
-                                };
-                            } else if self.input_focused {
-                                if key.modifiers.contains(KeyModifiers::ALT) {
-                                    self.input_cursor_position = self.cursor_word_left();
-                                } else {
-                                    self.input_cursor_position =
-                                        self.input_cursor_position.saturating_sub(1);
                                 }
-                            }
-                        }
-                        KeyCode::Right => {
-                            if self.show_menu {
-                                self.menu_section = (self.menu_section + 1) % 5;
-                            } else if self.input_focused {
-                                if key.modifiers.contains(KeyModifiers::ALT) {
-                                    self.input_cursor_position = self.cursor_word_right();
-                                } else {
-                                    self.input_cursor_position = (self.input_cursor_position + 1)
-                                        .min(self.input.chars().count());
+                                KeyCode::Right => {
+                                    if self.show_menu {
+                                        self.menu_section = (self.menu_section + 1) % 5;
+                                    } else if self.input_focused {
+                                        if key.modifiers.contains(KeyModifiers::ALT) {
+                                            self.input_cursor_position = self.cursor_word_right();
+                                        } else {
+                                            self.input_cursor_position =
+                                                (self.input_cursor_position + 1)
+                                                    .min(self.input.chars().count());
+                                        }
+                                    }
                                 }
-                            }
-                        }
-                        KeyCode::Home => {
-                            if self.input_focused && !self.show_menu {
-                                self.input_cursor_position = 0;
-                            }
-                        }
-                        KeyCode::End => {
-                            if self.input_focused && !self.show_menu {
-                                self.input_cursor_position = self.input.chars().count();
-                            }
-                        }
-                        KeyCode::Up => {
-                            if self.show_menu {
-                                if self.menu_section == 0 {
-                                    let total = self.registry_models.len() + self.hf_models.len();
-                                    let i = match self.registry_state.selected() {
-                                        Some(i) => if i == 0 { total.saturating_sub(1) } else { i - 1 },
-                                        None => 0,
-                                    };
-                                    self.registry_state.select(Some(i));
-                                } else if self.menu_section == 1 {
-                                    let i = match self.installed_state.selected() {
-                                        Some(i) => if i == 0 { self.installed_models.len().saturating_sub(1) } else { i - 1 },
-                                        None => 0,
-                                    };
-                                    self.installed_state.select(Some(i));
-                                } else if self.menu_section == 2 {
-                                    const CONFIG_LEN: usize = 3; // llama.rs | llama.cpp | Ollama
-                                    let i = match self.config_state.selected() {
-                                        Some(i) => {
-                                            if i == 0 {
-                                                CONFIG_LEN - 1
-                                            } else {
-                                                i - 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    self.config_state.select(Some(i));
-                                } else if self.menu_section == 3 {
-                                    const RT_LEN: usize = 7; // power×3 + repeat + think + ctx + temp
-                                    let i = match self.runtime_state.selected() {
-                                        Some(i) => {
-                                            if i == 0 {
-                                                RT_LEN - 1
-                                            } else {
-                                                i - 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    self.runtime_state.select(Some(i));
-                                } else {
-                                    // Permissions tab
-                                    const PERMS_LEN: usize = 4;
-                                    let i = match self.perms_state.selected() {
-                                        Some(i) => {
-                                            if i == 0 {
-                                                PERMS_LEN - 1
-                                            } else {
-                                                i - 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    self.perms_state.select(Some(i));
+                                KeyCode::Home => {
+                                    if self.input_focused && !self.show_menu {
+                                        self.input_cursor_position = 0;
+                                    }
                                 }
-                            } else if !self.input_focused {
-                                self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                                self.auto_scroll_enabled = false;
-                            }
-                        }
-                        KeyCode::Down => {
-                            if self.show_menu {
-                                if self.menu_section == 0 {
-                                    let total = self.registry_models.len() + self.hf_models.len();
-                                    let i = match self.registry_state.selected() {
-                                        Some(i) => if i >= total.saturating_sub(1) { 0 } else { i + 1 },
-                                        None => 0,
-                                    };
-                                    self.registry_state.select(Some(i));
-                                } else if self.menu_section == 1 {
-                                    let i = match self.installed_state.selected() {
-                                        Some(i) => if i >= self.installed_models.len().saturating_sub(1) { 0 } else { i + 1 },
-                                        None => 0,
-                                    };
-                                    self.installed_state.select(Some(i));
-                                } else if self.menu_section == 2 {
-                                    const CONFIG_LEN: usize = 3; // llama.rs | llama.cpp | Ollama
-                                    let i = match self.config_state.selected() {
-                                        Some(i) => {
-                                            if i >= CONFIG_LEN - 1 {
-                                                0
-                                            } else {
-                                                i + 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    self.config_state.select(Some(i));
-                                } else if self.menu_section == 3 {
-                                    const RT_LEN: usize = 7;
-                                    let i = match self.runtime_state.selected() {
-                                        Some(i) => {
-                                            if i >= RT_LEN - 1 {
-                                                0
-                                            } else {
-                                                i + 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    self.runtime_state.select(Some(i));
-                                } else {
-                                    const PERMS_LEN: usize = 4;
-                                    let i = match self.perms_state.selected() {
-                                        Some(i) => {
-                                            if i >= PERMS_LEN - 1 {
-                                                0
-                                            } else {
-                                                i + 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    self.perms_state.select(Some(i));
+                                KeyCode::End => {
+                                    if self.input_focused && !self.show_menu {
+                                        self.input_cursor_position = self.input.chars().count();
+                                    }
                                 }
-                            } else if !self.input_focused {
-                                self.scroll_offset = self.scroll_offset.saturating_add(1);
-                            }
-                        }
-                        KeyCode::PageUp if !self.input_focused => {
-                            self.scroll_offset = self.scroll_offset.saturating_sub(5);
-                        }
-                        KeyCode::PageDown if !self.input_focused => {
-                            self.scroll_offset = self.scroll_offset.saturating_add(5);
-                        }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            // Selection wins: Ctrl+C copies shaded text
-                            if self.selection_active() {
-                                if !self.copy_selection_to_clipboard() {
-                                    self.status_message = "Nothing to copy".into();
+                                KeyCode::Up => {
+                                    if self.show_menu {
+                                        if self.menu_section == 0 {
+                                            let total =
+                                                self.registry_models.len() + self.hf_models.len();
+                                            let i = match self.registry_state.selected() {
+                                                Some(i) => {
+                                                    if i == 0 {
+                                                        total.saturating_sub(1)
+                                                    } else {
+                                                        i - 1
+                                                    }
+                                                }
+                                                None => 0,
+                                            };
+                                            self.registry_state.select(Some(i));
+                                        } else if self.menu_section == 1 {
+                                            let i = match self.installed_state.selected() {
+                                                Some(i) => {
+                                                    if i == 0 {
+                                                        self.installed_models
+                                                            .len()
+                                                            .saturating_sub(1)
+                                                    } else {
+                                                        i - 1
+                                                    }
+                                                }
+                                                None => 0,
+                                            };
+                                            self.installed_state.select(Some(i));
+                                        } else if self.menu_section == 2 {
+                                            const CONFIG_LEN: usize = 3; // llama.rs | llama.cpp | Ollama
+                                            let i = match self.config_state.selected() {
+                                                Some(i) => {
+                                                    if i == 0 {
+                                                        CONFIG_LEN - 1
+                                                    } else {
+                                                        i - 1
+                                                    }
+                                                }
+                                                None => 0,
+                                            };
+                                            self.config_state.select(Some(i));
+                                        } else if self.menu_section == 3 {
+                                            const RT_LEN: usize = 8; // power×3 + sub_backend + repeat + think + ctx + temp
+                                            let i = match self.runtime_state.selected() {
+                                                Some(i) => {
+                                                    if i == 0 {
+                                                        RT_LEN - 1
+                                                    } else {
+                                                        i - 1
+                                                    }
+                                                }
+                                                None => 0,
+                                            };
+                                            self.runtime_state.select(Some(i));
+                                        } else {
+                                            // Permissions tab
+                                            const PERMS_LEN: usize = 4;
+                                            let i = match self.perms_state.selected() {
+                                                Some(i) => {
+                                                    if i == 0 {
+                                                        PERMS_LEN - 1
+                                                    } else {
+                                                        i - 1
+                                                    }
+                                                }
+                                                None => 0,
+                                            };
+                                            self.perms_state.select(Some(i));
+                                        }
+                                    } else if !self.input_focused {
+                                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                                        self.auto_scroll_enabled = false;
+                                    }
                                 }
-                            } else {
-                                // Interrupt generation + kill background tasks
-                                let was_gen = *self.is_generating.lock().unwrap();
-                                let n_tasks = self.task_manager.running_count();
-                                if was_gen {
-                                    *self.is_generating.lock().unwrap() = false;
-                                    let partial = {
-                                        let mut target = self.streaming_response.lock().unwrap();
-                                        if !target.starts_with("__HERCULES") {
-                                            target.push_str(
+                                KeyCode::Down => {
+                                    if self.show_menu {
+                                        if self.menu_section == 0 {
+                                            let total =
+                                                self.registry_models.len() + self.hf_models.len();
+                                            let i = match self.registry_state.selected() {
+                                                Some(i) => {
+                                                    if i >= total.saturating_sub(1) {
+                                                        0
+                                                    } else {
+                                                        i + 1
+                                                    }
+                                                }
+                                                None => 0,
+                                            };
+                                            self.registry_state.select(Some(i));
+                                        } else if self.menu_section == 1 {
+                                            let i = match self.installed_state.selected() {
+                                                Some(i) => {
+                                                    if i >= self
+                                                        .installed_models
+                                                        .len()
+                                                        .saturating_sub(1)
+                                                    {
+                                                        0
+                                                    } else {
+                                                        i + 1
+                                                    }
+                                                }
+                                                None => 0,
+                                            };
+                                            self.installed_state.select(Some(i));
+                                        } else if self.menu_section == 2 {
+                                            const CONFIG_LEN: usize = 3; // llama.rs | llama.cpp | Ollama
+                                            let i = match self.config_state.selected() {
+                                                Some(i) => {
+                                                    if i >= CONFIG_LEN - 1 {
+                                                        0
+                                                    } else {
+                                                        i + 1
+                                                    }
+                                                }
+                                                None => 0,
+                                            };
+                                            self.config_state.select(Some(i));
+                                        } else if self.menu_section == 3 {
+                                            const RT_LEN: usize = 8;
+                                            let i = match self.runtime_state.selected() {
+                                                Some(i) => {
+                                                    if i >= RT_LEN - 1 {
+                                                        0
+                                                    } else {
+                                                        i + 1
+                                                    }
+                                                }
+                                                None => 0,
+                                            };
+                                            self.runtime_state.select(Some(i));
+                                        } else {
+                                            const PERMS_LEN: usize = 4;
+                                            let i = match self.perms_state.selected() {
+                                                Some(i) => {
+                                                    if i >= PERMS_LEN - 1 {
+                                                        0
+                                                    } else {
+                                                        i + 1
+                                                    }
+                                                }
+                                                None => 0,
+                                            };
+                                            self.perms_state.select(Some(i));
+                                        }
+                                    } else if !self.input_focused {
+                                        self.scroll_offset = self.scroll_offset.saturating_add(1);
+                                    }
+                                }
+                                KeyCode::PageUp if !self.input_focused => {
+                                    self.scroll_offset = self.scroll_offset.saturating_sub(5);
+                                }
+                                KeyCode::PageDown if !self.input_focused => {
+                                    self.scroll_offset = self.scroll_offset.saturating_add(5);
+                                }
+                                KeyCode::Char('c')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    // Selection wins: Ctrl+C copies shaded text
+                                    if self.selection_active() {
+                                        if !self.copy_selection_to_clipboard() {
+                                            self.status_message = "Nothing to copy".into();
+                                        }
+                                    } else {
+                                        // Interrupt generation + kill background tasks
+                                        let was_gen = *self.is_generating.lock().unwrap();
+                                        let n_tasks = self.task_manager.running_count();
+                                        if was_gen {
+                                            // Signal cancel first; do not race process_response / re-prompt.
+                                            self.user_cancelled_gen = true;
+                                            self.auto_tool_turns = 0;
+                                            *self.is_generating.lock().unwrap() = false;
+                                            let partial = {
+                                                let mut target =
+                                                    self.streaming_response.lock().unwrap();
+                                                if !target.starts_with("__HERCULES") {
+                                                    target.push_str(
                                                 "\n[Generation Interrupted by User (CTRL+C)]",
                                             );
+                                                }
+                                                target.clone()
+                                            };
+                                            self.gen_last_progress = None;
+                                            if !partial.is_empty()
+                                                && !partial.starts_with("__HERCULES")
+                                            {
+                                                self.sync_tool_chips(&partial);
+                                                self.finalize_incomplete_tools("Ctrl+C");
+                                            }
                                         }
-                                        target.clone()
-                                    };
-                                    self.gen_last_progress = None;
-                                    if !partial.is_empty() && !partial.starts_with("__HERCULES") {
-                                        self.sync_tool_chips(&partial);
-                                        self.finalize_incomplete_tools("Ctrl+C");
-                                    }
-                                }
-                                if n_tasks > 0 {
-                                    self.task_manager.kill_all();
-                                    self.messages.push(format!(
+                                        if n_tasks > 0 {
+                                            self.task_manager.kill_all();
+                                            self.messages.push(format!(
                                         "System: [CTRL+C] killed {n_tasks} background task(s)"
                                     ));
+                                        }
+                                        self.auto_tool_turns = 0;
+                                        if was_gen || n_tasks > 0 {
+                                            self.status_message = format!(
+                                                "Interrupted (CTRL+C) — gen={} tasks_killed={}",
+                                                was_gen, n_tasks
+                                            );
+                                            if let Ok(mut l) = self.activity_logs.lock() {
+                                                l.push(format!(
+                                                    "[CANCEL] CTRL+C gen={was_gen} tasks={n_tasks}"
+                                                ));
+                                            }
+                                        } else {
+                                            self.input.clear();
+                                            self.input_cursor_position = 0;
+                                            self.status_message = "Input cleared.".to_string();
+                                        }
+                                    }
                                 }
-                                self.auto_tool_turns = 0;
-                                if was_gen || n_tasks > 0 {
+                                KeyCode::Char('t') | KeyCode::Char('T')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    self.thinking_collapsed = !self.thinking_collapsed;
                                     self.status_message = format!(
-                                        "Interrupted (CTRL+C) — gen={} tasks_killed={}",
-                                        was_gen, n_tasks
+                                        "Thinking block: {}",
+                                        if self.thinking_collapsed {
+                                            "Collapsed"
+                                        } else {
+                                            "Expanded"
+                                        }
                                     );
                                     if let Ok(mut l) = self.activity_logs.lock() {
                                         l.push(format!(
-                                            "[CANCEL] CTRL+C gen={was_gen} tasks={n_tasks}"
+                                            "[UI] Thinking block toggled to {}",
+                                            if self.thinking_collapsed {
+                                                "Collapsed"
+                                            } else {
+                                                "Expanded"
+                                            }
                                         ));
                                     }
-                                } else {
-                                    self.input.clear();
-                                    self.input_cursor_position = 0;
-                                    self.status_message = "Input cleared.".to_string();
                                 }
-                            }
-                        }
-                        KeyCode::Char('t') | KeyCode::Char('T') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.thinking_collapsed = !self.thinking_collapsed;
-                            self.status_message = format!("Thinking block: {}", if self.thinking_collapsed { "Collapsed" } else { "Expanded" });
-                            if let Ok(mut l) = self.activity_logs.lock() {
-                                l.push(format!("[UI] Thinking block toggled to {}", if self.thinking_collapsed { "Collapsed" } else { "Expanded" }));
-                            }
-                        }
-                        // Panel chrome only when input unfocused (mouse is primary open)
-                        KeyCode::Char('x') | KeyCode::Char('X')
-                            if self.tool_panel.is_some()
-                                && !self.input_focused
-                                && !self.show_menu
-                                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            self.close_tool_panel();
-                        }
-                        // Runtime menu: +/- adjust ctx / repeat threshold
-                        KeyCode::Char('+')
-                        | KeyCode::Char('=')
-                        | KeyCode::Char('-')
-                        | KeyCode::Char('_')
-                            if self.show_menu
-                                && self.menu_section == 3
-                                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            let inc = matches!(key.code, KeyCode::Char('+') | KeyCode::Char('='));
-                            self.runtime_nudge_selected(if inc { 1 } else { -1 });
-                        }
-                        KeyCode::Char('-') | KeyCode::Char('_')
-                            if self.tool_panel.is_some()
-                                && !self.input_focused
-                                && !self.show_menu
-                                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
-                            self.toggle_minimize_tool_panel();
-                        }
+                                // Panel chrome only when input unfocused (mouse is primary open)
+                                KeyCode::Char('x') | KeyCode::Char('X')
+                                    if self.tool_panel.is_some()
+                                        && !self.input_focused
+                                        && !self.show_menu
+                                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    self.close_tool_panel();
+                                }
+                                // Runtime menu: +/- adjust ctx / repeat threshold
+                                KeyCode::Char('+')
+                                | KeyCode::Char('=')
+                                | KeyCode::Char('-')
+                                | KeyCode::Char('_')
+                                    if self.show_menu
+                                        && self.menu_section == 3
+                                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    let inc =
+                                        matches!(key.code, KeyCode::Char('+') | KeyCode::Char('='));
+                                    self.runtime_nudge_selected(if inc { 1 } else { -1 });
+                                }
+                                KeyCode::Char('-') | KeyCode::Char('_')
+                                    if self.tool_panel.is_some()
+                                        && !self.input_focused
+                                        && !self.show_menu
+                                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    self.toggle_minimize_tool_panel();
+                                }
 
-                        KeyCode::Backspace | KeyCode::Char('h')
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                || key.modifiers.contains(KeyModifiers::ALT) =>
-                        {
-                            // Ctrl+Backspace or Alt+Backspace: delete previous word
-                            if self.input_focused && !self.show_menu {
-                                self.delete_word_backward();
-                            }
-                        }
-                        KeyCode::Char('z') | KeyCode::Char('Z')
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && !key.modifiers.contains(KeyModifiers::SHIFT) =>
-                        {
-                            if self.input_focused && !self.show_menu {
-                                self.input_undo_apply();
-                            }
-                        }
-                        KeyCode::Char('y') | KeyCode::Char('Y')
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && self.delete_confirm_model.is_none() =>
-                        {
-                            if self.input_focused && !self.show_menu {
-                                self.input_redo_apply();
-                            }
-                        }
-                        KeyCode::Char('z') | KeyCode::Char('Z')
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && key.modifiers.contains(KeyModifiers::SHIFT) =>
-                        {
-                            if self.input_focused && !self.show_menu {
-                                self.input_redo_apply();
-                            }
-                        }
-                        KeyCode::Char('y') | KeyCode::Char('Y') if self.delete_confirm_model.is_some() => {
-                            if let Some(target) = self.delete_confirm_model.take() {
-                                if target.contains("Local GGUF:") || target.contains(".gguf") {
-                                    if let Err(e) = self.manager.delete_local_model(&target) {
-                                        if let Ok(mut l) = self.activity_logs.lock() {
-                                            l.push(format!("[DELETE ERROR] {}", e));
-                                        }
-                                    } else if let Ok(mut l) = self.activity_logs.lock() {
-                                        l.push(format!(
+                                KeyCode::Backspace | KeyCode::Char('h')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        || key.modifiers.contains(KeyModifiers::ALT) =>
+                                {
+                                    // Ctrl+Backspace or Alt+Backspace: delete previous word
+                                    if self.input_focused && !self.show_menu {
+                                        self.delete_word_backward();
+                                    }
+                                }
+                                KeyCode::Char('z') | KeyCode::Char('Z')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                {
+                                    if self.input_focused && !self.show_menu {
+                                        self.input_undo_apply();
+                                    }
+                                }
+                                KeyCode::Char('y') | KeyCode::Char('Y')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && self.delete_confirm_model.is_none() =>
+                                {
+                                    if self.input_focused && !self.show_menu {
+                                        self.input_redo_apply();
+                                    }
+                                }
+                                KeyCode::Char('z') | KeyCode::Char('Z')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                {
+                                    if self.input_focused && !self.show_menu {
+                                        self.input_redo_apply();
+                                    }
+                                }
+                                KeyCode::Char('y') | KeyCode::Char('Y')
+                                    if self.delete_confirm_model.is_some() =>
+                                {
+                                    if let Some(target) = self.delete_confirm_model.take() {
+                                        if target.contains("Local GGUF:")
+                                            || target.contains(".gguf")
+                                        {
+                                            if let Err(e) = self.manager.delete_local_model(&target)
+                                            {
+                                                if let Ok(mut l) = self.activity_logs.lock() {
+                                                    l.push(format!("[DELETE ERROR] {}", e));
+                                                }
+                                            } else if let Ok(mut l) = self.activity_logs.lock() {
+                                                l.push(format!(
                                             "[DELETE] Removed from models.toml and disk: {}",
                                             target
                                         ));
+                                            }
+                                        }
+                                        self.installed_models.retain(|m| m != &target);
+                                        self.status_message =
+                                            format!("Model '{}' deleted successfully.", target);
+                                        if let Ok(mut l) = self.activity_logs.lock() {
+                                            l.push(format!(
+                                                "[DELETE] User confirmed deletion of model '{}'",
+                                                target
+                                            ));
+                                        }
                                     }
                                 }
-                                self.installed_models.retain(|m| m != &target);
-                                self.status_message = format!("Model '{}' deleted successfully.", target);
-                                if let Ok(mut l) = self.activity_logs.lock() {
-                                    l.push(format!("[DELETE] User confirmed deletion of model '{}'", target));
+                                KeyCode::Char('n') | KeyCode::Char('N')
+                                    if self.delete_confirm_model.is_some() =>
+                                {
+                                    self.delete_confirm_model = None;
                                 }
-                            }
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') if self.delete_confirm_model.is_some() => {
-                            self.delete_confirm_model = None;
-                        }
-                        // Ctrl+J = newline (classic terminal multiline)
-                        KeyCode::Char('j') | KeyCode::Char('J')
-                            if key.modifiers.contains(KeyModifiers::CONTROL)
-                                && self.input_focused
-                                && !self.show_menu =>
-                        {
-                            self.input_insert_char('\n');
-                        }
-                        KeyCode::Char(c) => {
-                            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                                && !key.modifiers.contains(KeyModifiers::ALT)
-                            {
-                                if self.show_menu && self.menu_section == 0 {
-                                    self.registry_search_query.push(c);
-                                    let query = self.registry_search_query.clone();
-                                    let manager = self.manager.clone();
-                                    let results = self.search_results.clone();
-                                    tokio::spawn(async move {
-                                        let matches = manager.search_all_models(&query).await;
-                                        *results.lock().unwrap() = Some(matches);
-                                    });
-                                } else if self.input_focused && !self.show_menu {
-                                    // Paste / typed text may include newlines
-                                    if c == '\n' || c == '\r' {
-                                        self.input_insert_char('\n');
-                                    } else {
-                                        self.input_insert_char(c);
-                                    }
+                                // Ctrl+J = newline (classic terminal multiline)
+                                KeyCode::Char('j') | KeyCode::Char('J')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && self.input_focused
+                                        && !self.show_menu =>
+                                {
+                                    self.input_insert_char('\n');
                                 }
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            if key.modifiers.contains(KeyModifiers::ALT)
-                                || key.modifiers.contains(KeyModifiers::CONTROL)
-                            {
-                                // handled above for word-delete
-                            } else if self.show_menu && self.menu_section == 0 {
-                                self.registry_search_query.pop();
-                                let query = self.registry_search_query.clone();
-                                let manager = self.manager.clone();
-                                let results = self.search_results.clone();
-                                tokio::spawn(async move {
-                                    let matches = manager.search_all_models(&query).await;
-                                    *results.lock().unwrap() = Some(matches);
-                                });
-                            } else if self.input_focused && !self.show_menu {
-                                if self.input_cursor_position > 0 && !self.input.is_empty() {
-                                    self.push_input_undo();
-                                    let pos =
-                                        self.input_cursor_position.min(self.input.chars().count());
-                                    let mut chars: Vec<char> = self.input.chars().collect();
-                                    chars.remove(pos - 1);
-                                    self.input = chars.into_iter().collect();
-                                    self.input_cursor_position -= 1;
-                                }
-                            }
-                        }
-                        KeyCode::Delete => {
-                            if self.show_menu && self.menu_section == 1 {
-                                if let Some(idx) = self.installed_state.selected() {
-                                    if idx < self.installed_models.len() {
-                                        self.delete_confirm_model =
-                                            Some(self.installed_models[idx].clone());
-                                    }
-                                }
-                            } else if self.input_focused && !self.show_menu {
-                                let len = self.input.chars().count();
-                                if self.input_cursor_position < len {
-                                    self.push_input_undo();
-                                    let mut chars: Vec<char> = self.input.chars().collect();
-                                    chars.remove(self.input_cursor_position);
-                                    self.input = chars.into_iter().collect();
-                                }
-                            }
-                        }
-                        KeyCode::Enter => {
-                            // Multiline: Shift+Enter / Alt+Enter → newline
-                            // Plain Enter → send · Ctrl+Enter → force send / interrupt
-                            // Ctrl+J also inserts newline (handled separately)
-                            let want_newline = self.input_focused
-                                && !self.show_menu
-                                && (key.modifiers.contains(KeyModifiers::SHIFT)
-                                    || key.modifiers.contains(KeyModifiers::ALT));
-
-                            if want_newline {
-                                self.input_insert_char('\n');
-                            } else if self.show_menu {
-                                if self.menu_section == 0 {
-                                    let all_items: Vec<String> = self.registry_models.iter().cloned().chain(self.hf_models.iter().cloned()).collect();
-                                    if let Some(i) = self.registry_state.selected() {
-                                        if i < all_items.len() {
-                                            let item_str = all_items[i].clone();
-                                            if item_str.starts_with("Ollama:") || item_str.starts_with("Ollama Local:") {
-                                                let ollama_name = item_str
-                                                    .replace("Ollama:", "")
-                                                    .replace("Ollama Local:", "")
-                                                    .split('(')
-                                                    .next()
-                                                    .unwrap_or(&item_str)
-                                                    .trim()
-                                                    .to_string();
-
-                                                self.status_message = format!("Pulling Ollama Model {}", ollama_name);
-                                                self.messages.push(format!("System: Pulling Ollama Model: {}", ollama_name));
-                                                if let Ok(mut l) = self.activity_logs.lock() {
-                                                    l.push(format!("[OLLAMA] Initiated pull stream for model: {}", ollama_name));
-                                                }
-                                                
-                                                let progress_clone = self.download_progress.clone();
-                                                let complete_clone = self.download_complete.clone();
-                                                let logs_clone = self.activity_logs.clone();
-                                                let manager_clone = self.manager.clone();
-                                                
-                                                tokio::spawn(async move {
-                                                    let res = manager_clone.download_ollama_model(&ollama_name, progress_clone, logs_clone).await;
-                                                    if res.is_ok() {
-                                                        *complete_clone.lock().unwrap() = true;
-                                                    } else {
-                                                        *complete_clone.lock().unwrap() = false;
-                                                    }
-                                                });
+                                KeyCode::Char(c) => {
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !key.modifiers.contains(KeyModifiers::ALT)
+                                    {
+                                        if self.show_menu && self.menu_section == 0 {
+                                            self.registry_search_query.push(c);
+                                            let query = self.registry_search_query.clone();
+                                            let manager = self.manager.clone();
+                                            let results = self.search_results.clone();
+                                            tokio::spawn(async move {
+                                                let matches =
+                                                    manager.search_all_models(&query).await;
+                                                *results.lock().unwrap() = Some(matches);
+                                            });
+                                        } else if self.input_focused && !self.show_menu {
+                                            // Paste / typed text may include newlines
+                                            if c == '\n' || c == '\r' {
+                                                self.input_insert_char('\n');
                                             } else {
-                                                // Strip "HuggingFace:" and size tags like "[~1.9 GB Q4 est.]"
-                                                let repo_id = {
-                                                    let s = item_str
-                                                        .replace("HuggingFace:", "")
-                                                        .trim()
-                                                        .to_string();
-                                                    let s = s.split('[').next().unwrap_or(&s).trim();
-                                                    s.split_whitespace()
-                                                        .next()
-                                                        .unwrap_or(s)
-                                                        .to_string()
-                                                };
+                                                self.input_insert_char(c);
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if key.modifiers.contains(KeyModifiers::ALT)
+                                        || key.modifiers.contains(KeyModifiers::CONTROL)
+                                    {
+                                        // handled above for word-delete
+                                    } else if self.show_menu && self.menu_section == 0 {
+                                        self.registry_search_query.pop();
+                                        let query = self.registry_search_query.clone();
+                                        let manager = self.manager.clone();
+                                        let results = self.search_results.clone();
+                                        tokio::spawn(async move {
+                                            let matches = manager.search_all_models(&query).await;
+                                            *results.lock().unwrap() = Some(matches);
+                                        });
+                                    } else if self.input_focused && !self.show_menu {
+                                        if self.input_cursor_position > 0 && !self.input.is_empty()
+                                        {
+                                            self.push_input_undo();
+                                            let pos = self
+                                                .input_cursor_position
+                                                .min(self.input.chars().count());
+                                            let mut chars: Vec<char> = self.input.chars().collect();
+                                            chars.remove(pos - 1);
+                                            self.input = chars.into_iter().collect();
+                                            self.input_cursor_position -= 1;
+                                        }
+                                    }
+                                }
+                                KeyCode::Delete => {
+                                    if self.show_menu && self.menu_section == 1 {
+                                        if let Some(idx) = self.installed_state.selected() {
+                                            if idx < self.installed_models.len() {
+                                                self.delete_confirm_model =
+                                                    Some(self.installed_models[idx].clone());
+                                            }
+                                        }
+                                    } else if self.input_focused && !self.show_menu {
+                                        let len = self.input.chars().count();
+                                        if self.input_cursor_position < len {
+                                            self.push_input_undo();
+                                            let mut chars: Vec<char> = self.input.chars().collect();
+                                            chars.remove(self.input_cursor_position);
+                                            self.input = chars.into_iter().collect();
+                                        }
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    // Multiline: Shift+Enter / Alt+Enter → newline
+                                    // Plain Enter → send · Ctrl+Enter → force send / interrupt
+                                    // Ctrl+J also inserts newline (handled separately)
+                                    let want_newline = self.input_focused
+                                        && !self.show_menu
+                                        && (key.modifiers.contains(KeyModifiers::SHIFT)
+                                            || key.modifiers.contains(KeyModifiers::ALT));
 
-                                                self.status_message = format!("Resolving weights for {}", repo_id);
-                                                self.messages.push(format!("System: Resolving model weights and initiating download for: {}", repo_id));
-                                                if let Ok(mut l) = self.activity_logs.lock() {
-                                                    l.push(format!("[USER] Initiated download for HuggingFace model: {}", repo_id));
-                                                }
-                                                
-                                                let progress_clone = self.download_progress.clone();
-                                                let complete_clone = self.download_complete.clone();
-                                                let logs_clone = self.activity_logs.clone();
-                                                let manager_clone = self.manager.clone();
-                                                
-                                                tokio::spawn(async move {
-                                                    // Resolve GGUF only (may remap repo to *-GGUF mirror)
-                                                    let resolved = manager_clone
-                                                        .resolve_gguf_file(&repo_id)
-                                                        .await;
-                                                    match resolved {
-                                                        Ok((dl_repo, weight_filename)) => {
-                                                            if let Ok(mut l) = logs_clone.lock() {
-                                                                if dl_repo != repo_id.split('[').next().unwrap_or(&repo_id).trim() {
-                                                                    l.push(format!(
+                                    if want_newline {
+                                        self.input_insert_char('\n');
+                                    } else if self.show_menu {
+                                        if self.menu_section == 0 {
+                                            let all_items: Vec<String> = self
+                                                .registry_models
+                                                .iter()
+                                                .cloned()
+                                                .chain(self.hf_models.iter().cloned())
+                                                .collect();
+                                            if let Some(i) = self.registry_state.selected() {
+                                                if i < all_items.len() {
+                                                    let item_str = all_items[i].clone();
+                                                    if item_str.starts_with("Ollama:")
+                                                        || item_str.starts_with("Ollama Local:")
+                                                    {
+                                                        let ollama_name = item_str
+                                                            .replace("Ollama:", "")
+                                                            .replace("Ollama Local:", "")
+                                                            .split('(')
+                                                            .next()
+                                                            .unwrap_or(&item_str)
+                                                            .trim()
+                                                            .to_string();
+
+                                                        self.status_message = format!(
+                                                            "Pulling Ollama Model {}",
+                                                            ollama_name
+                                                        );
+                                                        self.messages.push(format!(
+                                                            "System: Pulling Ollama Model: {}",
+                                                            ollama_name
+                                                        ));
+                                                        if let Ok(mut l) = self.activity_logs.lock()
+                                                        {
+                                                            l.push(format!("[OLLAMA] Initiated pull stream for model: {}", ollama_name));
+                                                        }
+
+                                                        let progress_clone =
+                                                            self.download_progress.clone();
+                                                        let complete_clone =
+                                                            self.download_complete.clone();
+                                                        let logs_clone = self.activity_logs.clone();
+                                                        let manager_clone = self.manager.clone();
+
+                                                        tokio::spawn(async move {
+                                                            let res = manager_clone
+                                                                .download_ollama_model(
+                                                                    &ollama_name,
+                                                                    progress_clone,
+                                                                    logs_clone,
+                                                                )
+                                                                .await;
+                                                            if res.is_ok() {
+                                                                *complete_clone.lock().unwrap() =
+                                                                    true;
+                                                            } else {
+                                                                *complete_clone.lock().unwrap() =
+                                                                    false;
+                                                            }
+                                                        });
+                                                    } else {
+                                                        // Strip "HuggingFace:" and size tags like "[~1.9 GB Q4 est.]"
+                                                        let repo_id = {
+                                                            let s = item_str
+                                                                .replace("HuggingFace:", "")
+                                                                .trim()
+                                                                .to_string();
+                                                            let s = s
+                                                                .split('[')
+                                                                .next()
+                                                                .unwrap_or(&s)
+                                                                .trim();
+                                                            s.split_whitespace()
+                                                                .next()
+                                                                .unwrap_or(s)
+                                                                .to_string()
+                                                        };
+
+                                                        self.status_message = format!(
+                                                            "Resolving weights for {}",
+                                                            repo_id
+                                                        );
+                                                        self.messages.push(format!("System: Resolving model weights and initiating download for: {}", repo_id));
+                                                        if let Ok(mut l) = self.activity_logs.lock()
+                                                        {
+                                                            l.push(format!("[USER] Initiated download for HuggingFace model: {}", repo_id));
+                                                        }
+
+                                                        let progress_clone =
+                                                            self.download_progress.clone();
+                                                        let complete_clone =
+                                                            self.download_complete.clone();
+                                                        let logs_clone = self.activity_logs.clone();
+                                                        let manager_clone = self.manager.clone();
+
+                                                        tokio::spawn(async move {
+                                                            // Resolve GGUF only (may remap repo to *-GGUF mirror)
+                                                            let resolved = manager_clone
+                                                                .resolve_gguf_file(&repo_id)
+                                                                .await;
+                                                            match resolved {
+                                                                Ok((
+                                                                    dl_repo,
+                                                                    weight_filename,
+                                                                    shard_files,
+                                                                )) => {
+                                                                    if let Ok(mut l) =
+                                                                        logs_clone.lock()
+                                                                    {
+                                                                        if dl_repo
+                                                                            != repo_id
+                                                                                .split('[')
+                                                                                .next()
+                                                                                .unwrap_or(&repo_id)
+                                                                                .trim()
+                                                                        {
+                                                                            l.push(format!(
                                                                         "[RESOLVE] No GGUF in '{}'; using mirror repo '{}'",
                                                                         repo_id, dl_repo
                                                                     ));
-                                                                }
-                                                                l.push(format!(
+                                                                        }
+                                                                        l.push(format!(
                                                                     "[RESOLVE] Selected GGUF: {}/{}",
                                                                     dl_repo, weight_filename
                                                                 ));
-                                                            }
-                                                            let progress_for_dl = progress_clone.clone();
-                                                            let res = manager_clone
-                                                                .download_hf_model(
-                                                                    &dl_repo,
-                                                                    &weight_filename,
-                                                                    progress_for_dl,
-                                                                    logs_clone.clone(),
-                                                                )
-                                                                .await;
-                                                            match res {
-                                                                Ok(path) => {
-                                                                    if let Ok(mut l) = logs_clone.lock() {
-                                                                        l.push(format!(
+                                                                    }
+                                                                    let progress_for_dl =
+                                                                        progress_clone.clone();
+                                                                    let res = manager_clone
+                                                                        .download_hf_model(
+                                                                            &dl_repo,
+                                                                            &weight_filename,
+                                                                            &shard_files,
+                                                                            progress_for_dl,
+                                                                            logs_clone.clone(),
+                                                                        )
+                                                                        .await;
+                                                                    match res {
+                                                                        Ok(path) => {
+                                                                            if let Ok(mut l) =
+                                                                                logs_clone.lock()
+                                                                            {
+                                                                                l.push(format!(
                                                                             "[SUCCESS] Installed GGUF at {}",
                                                                             path.display()
                                                                         ));
+                                                                            }
+                                                                            *complete_clone
+                                                                                .lock()
+                                                                                .unwrap() = true;
+                                                                        }
+                                                                        Err(e) => {
+                                                                            if let Ok(mut l) =
+                                                                                logs_clone.lock()
+                                                                            {
+                                                                                l.push(format!(
+                                                                                    "[ERROR] {}",
+                                                                                    e
+                                                                                ));
+                                                                            }
+                                                                            *complete_clone
+                                                                                .lock()
+                                                                                .unwrap() = false;
+                                                                            *progress_clone
+                                                                                .lock()
+                                                                                .unwrap() = None;
+                                                                        }
                                                                     }
-                                                                    *complete_clone.lock().unwrap() = true;
                                                                 }
                                                                 Err(e) => {
-                                                                    if let Ok(mut l) = logs_clone.lock() {
-                                                                        l.push(format!("[ERROR] {}", e));
+                                                                    if let Ok(mut l) =
+                                                                        logs_clone.lock()
+                                                                    {
+                                                                        l.push(format!(
+                                                                            "[RESOLVE ERROR] {}",
+                                                                            e
+                                                                        ));
                                                                     }
-                                                                    *complete_clone.lock().unwrap() = false;
-                                                                    *progress_clone.lock().unwrap() = None;
+                                                                    *complete_clone
+                                                                        .lock()
+                                                                        .unwrap() = false;
+                                                                    *progress_clone
+                                                                        .lock()
+                                                                        .unwrap() = None;
                                                                 }
                                                             }
-                                                        }
-                                                        Err(e) => {
-                                                            if let Ok(mut l) = logs_clone.lock() {
-                                                                l.push(format!("[RESOLVE ERROR] {}", e));
-                                                            }
-                                                            *complete_clone.lock().unwrap() = false;
-                                                            *progress_clone.lock().unwrap() = None;
-                                                        }
+                                                        });
                                                     }
-                                                });
+                                                    self.show_menu = false;
+                                                }
                                             }
-                                            self.show_menu = false;
-                                        }
-                                    }
-                                } else if self.menu_section == 1 {
-                                    if let Some(i) = self.installed_state.selected() {
-                                        if i < self.installed_models.len() {
-                                            let selected_model = self.installed_models[i].clone();
-                                            if selected_model.contains("Ollama") {
-                                                let model_name = selected_model
-                                                    .replace("Local Installed:", "")
-                                                    .replace("Ollama:", "")
-                                                    .replace("Ollama Local:", "")
-                                                    .split('(')
-                                                    .next()
-                                                    .unwrap_or("llama3.2")
-                                                    .trim()
-                                                    .to_string();
-                                                self.backend = AgentBackend::Ollama(
-                                                    OllamaBackend::new(model_name.clone()),
-                                                );
-                                                self.status_message =
-                                                    format!("Active Engine: Ollama ({})", model_name);
-                                            } else if selected_model.contains("Local GGUF:")
-                                                || selected_model
-                                                    .to_lowercase()
-                                                    .contains(".gguf")
-                                                || selected_model.contains("GGUF")
-                                            {
-                                                // Path is recorded in display as [...path] or in models.toml
-                                                let path = selected_model
-                                                    .rfind('[')
-                                                    .and_then(|i| {
-                                                        let rest = &selected_model[i + 1..];
-                                                        rest.strip_suffix(']')
-                                                            .map(|s| s.to_string())
-                                                    })
-                                                    .map(std::path::PathBuf::from)
-                                                    .filter(|p| p.exists())
-                                                    .or_else(|| {
-                                                        self.manager
+                                        } else if self.menu_section == 1 {
+                                            if let Some(i) = self.installed_state.selected() {
+                                                if i < self.installed_models.len() {
+                                                    let selected_model =
+                                                        self.installed_models[i].clone();
+                                                    if selected_model.contains("Ollama") {
+                                                        let model_name = selected_model
+                                                            .replace("Local Installed:", "")
+                                                            .replace("Ollama:", "")
+                                                            .replace("Ollama Local:", "")
+                                                            .split('(')
+                                                            .next()
+                                                            .unwrap_or("llama3.2")
+                                                            .trim()
+                                                            .to_string();
+                                                        self.backend = AgentBackend::Ollama(
+                                                            OllamaBackend::new(model_name.clone()),
+                                                        );
+                                                        self.status_message = format!(
+                                                            "Active Engine: Ollama ({})",
+                                                            model_name
+                                                        );
+                                                    } else if selected_model.contains("Local GGUF:")
+                                                        || selected_model
+                                                            .to_lowercase()
+                                                            .contains(".gguf")
+                                                        || selected_model.contains("GGUF")
+                                                    {
+                                                        // Path is recorded in display as [...path] or in models.toml
+                                                        let path =
+                                                            selected_model
+                                                                .rfind('[')
+                                                                .and_then(|i| {
+                                                                    let rest =
+                                                                        &selected_model[i + 1..];
+                                                                    rest.strip_suffix(']')
+                                                                        .map(|s| s.to_string())
+                                                                })
+                                                                .map(std::path::PathBuf::from)
+                                                                .filter(|p| p.exists())
+                                                                .or_else(|| {
+                                                                    self.manager
                                                             .list_installed_entries()
                                                             .into_iter()
                                                             .find(|e| {
@@ -2958,194 +3553,225 @@ impl App {
                                                                 std::path::PathBuf::from(e.path)
                                                             })
                                                             .filter(|p| p.exists())
-                                                    });
+                                                                });
 
-                                                if let Some(path) = path {
-                                                    // Prefer llama.cpp for real Q4_K models (llama.rs is educational/slow)
-                                                    self.backend = AgentBackend::LlamaCpp(
-                                                        LlamaCppBackend::cli(path.clone()),
-                                                    );
-                                                    self.status_message = format!(
-                                                        "Active Engine: llama.cpp ({})",
-                                                        path.display()
-                                                    );
-                                                } else {
-                                                    self.backend = AgentBackend::LlamaCpp(
-                                                        LlamaCppBackend::server(
-                                                            "http://localhost:8080".to_string(),
-                                                            selected_model.clone(),
-                                                        ),
-                                                    );
-                                                    self.status_message = format!(
-                                                        "Active Engine: llama.cpp server for '{}' (file not found on disk)",
-                                                        selected_model
-                                                    );
-                                                }
-                                            } else if let Some(path) =
-                                                self.manager.latest_gguf_path()
-                                            {
-                                                // Default activate as llama.rs pure-Rust
-                                                self.backend = AgentBackend::LlamaRs(
-                                                    LlamaRsBackend::gguf(path.clone()),
-                                                );
-                                                self.status_message = format!(
-                                                    "Active Engine: llama.rs ({})",
-                                                    path.display()
-                                                );
-                                            } else {
-                                                self.status_message = format!(
-                                                    "No local GGUF for '{}'",
-                                                    selected_model
-                                                );
-                                            }
-                                             self.messages.push(format!("System: Switched active engine model to '{}'", selected_model));
-                                             self.initialized = false;
-                                             self.init_triggered = false;
-                                             self.show_menu = false;
-                                        }
-                                    }
-                                } else if self.menu_section == 2 {
-                                    if let Some(i) = self.config_state.selected() {
-                                        match i {
-                                            0 => {
-                                                // llama.rs pure Rust
-                                                if let Some(path) = self.manager.latest_gguf_path() {
-                                                    self.backend = AgentBackend::LlamaRs(
-                                                        LlamaRsBackend::gguf(path.clone()),
-                                                    );
-                                                    self.status_message = format!(
-                                                        "Active Engine: llama.rs ({})",
-                                                        path.display()
-                                                    );
-                                                } else {
-                                                    self.backend = AgentBackend::LlamaRs(
-                                                        LlamaRsBackend::http(
-                                                            "http://localhost:8080".to_string(),
-                                                            "llama.rs".to_string(),
-                                                        ),
-                                                    );
-                                                    self.status_message = "Active Engine: llama.rs HTTP :8080 (download a GGUF first)".to_string();
+                                                        if let Some(path) = path {
+                                                            match self.backend {
+                                                                AgentBackend::LlamaCpp(_) => {
+                                                                    self.backend =
+                                                                        AgentBackend::LlamaCpp(
+                                                                            LlamaCppBackend::cli(
+                                                                                path.clone(),
+                                                                            ),
+                                                                        );
+                                                                    self.status_message = format!(
+                                                                        "Active Engine: llama.cpp ({})",
+                                                                        path.display()
+                                                                    );
+                                                                }
+                                                                _ => {
+                                                                    self.backend = AgentBackend::LlamaCppLib(
+                                                                LlamaCppLibBackend::gguf(path.clone()),
+                                                            );
+                                                                    self.status_message = format!(
+                                                                        "Active Engine: llama.cpp lib ({})",
+                                                                        path.display()
+                                                                    );
+                                                                }
+                                                            }
+                                                        } else {
+                                                            self.backend = AgentBackend::LlamaCpp(
+                                                                LlamaCppBackend::server(
+                                                                    "http://localhost:8080"
+                                                                        .to_string(),
+                                                                    selected_model.clone(),
+                                                                ),
+                                                            );
+                                                            self.status_message = format!(
+                                                                "Active Engine: llama.cpp server for '{}' (file not found on disk)",
+                                                                selected_model
+                                                            );
+                                                        }
+                                                    } else if let Some(path) =
+                                                        self.manager.latest_gguf_path()
+                                                    {
+                                                        // Default activate as llama.rs pure-Rust
+                                                        self.backend = AgentBackend::LlamaCppLib(
+                                                            LlamaCppLibBackend::gguf(path.clone()),
+                                                        );
+                                                        self.status_message = format!(
+                                                            "Active Engine: llama.cpp lib ({})",
+                                                            path.display()
+                                                        );
+                                                    } else {
+                                                        self.status_message = format!(
+                                                            "No local GGUF for '{}'",
+                                                            selected_model
+                                                        );
+                                                    }
+                                                    self.messages.push(format!("System: Switched active engine model to '{}'", selected_model));
+                                                    self.initialized = false;
+                                                    self.init_triggered = false;
+                                                    self.show_menu = false;
                                                 }
                                             }
-                                            1 => {
-                                                // llama.cpp
-                                                if let Some(path) = self.manager.latest_gguf_path() {
-                                                    self.backend = AgentBackend::LlamaCpp(
-                                                        LlamaCppBackend::cli(path.clone()),
-                                                    );
-                                                    self.status_message = format!(
-                                                        "Active Engine: llama.cpp ({})",
-                                                        path.display()
-                                                    );
-                                                } else {
-                                                    self.backend = AgentBackend::LlamaCpp(
-                                                        LlamaCppBackend::server(
-                                                            "http://localhost:8080".to_string(),
-                                                            "llama.cpp".to_string(),
-                                                        ),
-                                                    );
-                                                    self.status_message = "Active Engine: llama.cpp server :8080 (no local GGUF)".to_string();
-                                                }
-                                            }
-                                            _ => {
-                                                self.backend = AgentBackend::Ollama(
-                                                    OllamaBackend::new("llama3.2:latest".to_string()),
-                                                );
-                                                self.status_message =
+                                        } else if self.menu_section == 2 {
+                                            if let Some(i) = self.config_state.selected() {
+                                                let current_path = self
+                                                    .backend
+                                                    .current_model_path()
+                                                    .or_else(|| self.manager.latest_gguf_path());
+                                                match i {
+                                                    0 => {
+                                                        // llama.rs pure Rust
+                                                        if let Some(path) = current_path {
+                                                            self.backend =
+                                                                AgentBackend::LlamaCppLib(
+                                                                    LlamaCppLibBackend::gguf(
+                                                                        path.clone(),
+                                                                    ),
+                                                                );
+                                                            self.status_message = format!(
+                                                                "Active Engine: llama.cpp lib ({})",
+                                                                path.display()
+                                                            );
+                                                        } else {
+                                                            self.backend =
+                                                                AgentBackend::LlamaCppLib(
+                                                                    LlamaCppLibBackend::http(
+                                                                        "http://localhost:8080"
+                                                                            .to_string(),
+                                                                        "llama.rs".to_string(),
+                                                                    ),
+                                                                );
+                                                            self.status_message = "Active Engine: llama.cpp lib HTTP :8080 (download a GGUF first)".to_string();
+                                                        }
+                                                    }
+                                                    1 => {
+                                                        // llama.cpp
+                                                        if let Some(path) = current_path {
+                                                            self.backend = AgentBackend::LlamaCpp(
+                                                                LlamaCppBackend::cli(path.clone()),
+                                                            );
+                                                            self.status_message = format!(
+                                                                "Active Engine: llama.cpp ({})",
+                                                                path.display()
+                                                            );
+                                                        } else {
+                                                            self.backend = AgentBackend::LlamaCpp(
+                                                                LlamaCppBackend::server(
+                                                                    "http://localhost:8080"
+                                                                        .to_string(),
+                                                                    "llama.cpp".to_string(),
+                                                                ),
+                                                            );
+                                                            self.status_message = "Active Engine: llama.cpp server :8080 (no local GGUF)".to_string();
+                                                        }
+                                                    }
+                                                    _ => {
+                                                        self.backend = AgentBackend::Ollama(
+                                                            OllamaBackend::new(
+                                                                "llama3.2:latest".to_string(),
+                                                            ),
+                                                        );
+                                                        self.status_message =
                                                     "Active Engine: Ollama (http://localhost:11434)"
                                                         .to_string();
+                                                    }
+                                                }
+                                                self.messages.push(format!(
+                                                    "System: Backend switched to {}",
+                                                    self.backend.name()
+                                                ));
+                                                self.initialized = false;
+                                                self.init_triggered = false;
+                                                self.show_menu = false;
                                             }
-                                        }
-                                        self.messages.push(format!(
-                                            "System: Backend switched to {}",
-                                            self.backend.name()
-                                        ));
-                                        self.initialized = false;
-                                        self.init_triggered = false;
-                                        self.show_menu = false;
-                                    }
-                                } else if self.menu_section == 3 {
-                                    if let Some(i) = self.runtime_state.selected() {
-                                        use crate::settings::{
-                                            cycle_context_token_limit, cycle_repeat_threshold,
-                                            format_context_tokens, get_settings, set_power_mode,
-                                            toggle_repeat_thinking, PowerMode,
-                                        };
-                                        match i {
-                                            0 => {
-                                                set_power_mode(PowerMode::PowerSaver);
-                                                // llama.cpp managed server restarts on next use
-                                                crate::llama::server::shutdown_managed_server();
-                                                self.status_message =
+                                        } else if self.menu_section == 3 {
+                                            if let Some(i) = self.runtime_state.selected() {
+                                                use crate::settings::{
+                                                    PowerMode, cycle_context_token_limit,
+                                                    cycle_repeat_threshold, format_context_tokens,
+                                                    get_settings, set_power_mode,
+                                                    toggle_repeat_thinking,
+                                                };
+                                                match i {
+                                                    0 => {
+                                                        set_power_mode(PowerMode::PowerSaver);
+                                                        // llama.cpp managed server restarts on next use
+                                                        crate::llama::server::shutdown_managed_server();
+                                                        self.status_message =
                                                     "Power mode: Power Saver (llama.cpp restarts; llama.rs uses fewer tokens)"
                                                         .to_string();
-                                            }
-                                            1 => {
-                                                set_power_mode(PowerMode::Normal);
-                                                crate::llama::server::shutdown_managed_server();
-                                                self.status_message =
-                                                    "Power mode: Normal (default)".to_string();
-                                            }
-                                            2 => {
-                                                set_power_mode(PowerMode::Extreme);
-                                                crate::llama::server::shutdown_managed_server();
-                                                self.status_message =
+                                                    }
+                                                    1 => {
+                                                        set_power_mode(PowerMode::Normal);
+                                                        crate::llama::server::shutdown_managed_server();
+                                                        self.status_message =
+                                                            "Power mode: Normal (default)"
+                                                                .to_string();
+                                                    }
+                                                    2 => {
+                                                        set_power_mode(PowerMode::Extreme);
+                                                        crate::llama::server::shutdown_managed_server();
+                                                        self.status_message =
                                                     "Power mode: Extreme (llama.cpp max ngl; llama.rs more tokens)"
                                                         .to_string();
-                                            }
-                                            3 => {
-                                                cycle_repeat_threshold();
-                                                let s = get_settings();
-                                                self.status_message = format!(
-                                                    "Repeat threshold: {} consecutive hits",
-                                                    s.repeat_threshold
-                                                );
-                                            }
-                                            4 => {
-                                                toggle_repeat_thinking();
-                                                let s = get_settings();
-                                                self.status_message = format!(
-                                                    "Repeat detect on thinking: {}",
-                                                    if s.repeat_detect_thinking {
-                                                        "ON"
-                                                    } else {
-                                                        "OFF"
                                                     }
-                                                );
-                                            }
-                                            5 => {
-                                                let n = cycle_context_token_limit();
-                                                crate::llama::server::shutdown_managed_server();
-                                                self.status_message = format!(
-                                                    "Context limit: {} tokens (llama-server -c restarts on next gen)",
-                                                    format_context_tokens(n)
-                                                );
-                                            }
-                                            _ => {
-                                                // Temperature: Enter cycles common presets
-                                                use crate::settings::set_temperature;
-                                                let cur = crate::settings::temperature();
-                                                let next = if cur < 0.15 {
-                                                    0.2
-                                                } else if cur < 0.35 {
-                                                    0.5
-                                                } else if cur < 0.65 {
-                                                    0.7
-                                                } else if cur < 0.9 {
-                                                    1.0
-                                                } else {
-                                                    0.0
-                                                };
-                                                set_temperature(next);
-                                                self.status_message = format!(
-                                                    "Temperature: {next:.2}  (+/− fine step 0.05)"
-                                                );
-                                            }
-                                        }
-                                        // Status bar + activity log only (not chat / not model ctx)
-                                        let s = get_settings();
-                                        if let Ok(mut l) = self.activity_logs.lock() {
-                                            l.push(format!(
+                                                    3 => {
+                                                        use crate::settings::cycle_llama_rs_sub_backend;
+                                                        let b = cycle_llama_rs_sub_backend();
+                                                        self.status_message = format!(
+                                                            "llama.cpp sub-backend: {} (HERCULES_COMPUTE_BACKEND={})",
+                                                            b.label(),
+                                                            b.env_val()
+                                                        );
+                                                    }
+                                                    4 => {
+                                                        use crate::settings::{
+                                                            cycle_stall_timeout,
+                                                            format_stall_timeout,
+                                                        };
+                                                        let t = cycle_stall_timeout();
+                                                        self.status_message = format!(
+                                                            "Stall Watchdog Timeout: {}",
+                                                            format_stall_timeout(t)
+                                                        );
+                                                    }
+                                                    5 => {
+                                                        cycle_repeat_threshold();
+                                                        let s = get_settings();
+                                                        self.status_message = format!(
+                                                            "Repeat threshold: {} consecutive hits",
+                                                            s.repeat_threshold
+                                                        );
+                                                    }
+                                                    6 => {
+                                                        toggle_repeat_thinking();
+                                                        let s = get_settings();
+                                                        self.status_message = format!(
+                                                            "Repeat detect on thinking: {}",
+                                                            if s.repeat_detect_thinking {
+                                                                "ON"
+                                                            } else {
+                                                                "OFF"
+                                                            }
+                                                        );
+                                                    }
+                                                    7 => {
+                                                        let n = cycle_context_token_limit();
+                                                        crate::llama::server::shutdown_managed_server();
+                                                        self.status_message = format!(
+                                                            "Context limit: {} tokens (llama-server -c restarts on next gen)",
+                                                            format_context_tokens(n)
+                                                        );
+                                                    }
+                                                    _ => {}
+                                                }
+                                                // Status bar + activity log only (not chat / not model ctx)
+                                                let s = get_settings();
+                                                if let Ok(mut l) = self.activity_logs.lock() {
+                                                    l.push(format!(
                                                 "[RUNTIME] power={} ctx={} temp={:.2} repeat={} think={}",
                                                 s.power_mode.label(),
                                                 format_context_tokens(
@@ -3155,201 +3781,246 @@ impl App {
                                                 s.repeat_threshold,
                                                 s.repeat_detect_thinking
                                             ));
-                                        }
-                                    }
-                                } else if self.menu_section == 4 {
-                                    if let Some(i) = self.perms_state.selected() {
-                                        match i {
-                                            0 => {
-                                                set_permission_mode(PermissionMode::Ask);
-                                                self.status_message =
+                                                }
+                                            }
+                                        } else if self.menu_section == 4 {
+                                            if let Some(i) = self.perms_state.selected() {
+                                                match i {
+                                                    0 => {
+                                                        set_permission_mode(PermissionMode::Ask);
+                                                        self.status_message =
                                                     "Permissions: Ask user to allow (writes/cmd blocked until /allow)"
                                                         .to_string();
-                                            }
-                                            1 => {
-                                                set_permission_mode(PermissionMode::AlwaysAllow);
-                                                self.status_message =
+                                                    }
+                                                    1 => {
+                                                        set_permission_mode(
+                                                            PermissionMode::AlwaysAllow,
+                                                        );
+                                                        self.status_message =
                                                     "Permissions: Always allow tool writes & commands"
                                                         .to_string();
-                                            }
-                                            2 => {
-                                                set_folder_scope(FolderScope::CurrentDir);
-                                                self.status_message =
-                                                    "Safefolder: current directory only".to_string();
-                                            }
-                                            _ => {
-                                                set_folder_scope(FolderScope::AllDirs);
-                                                self.status_message =
-                                                    "Safefolder: all directories allowed".to_string();
+                                                    }
+                                                    2 => {
+                                                        set_folder_scope(FolderScope::CurrentDir);
+                                                        self.status_message =
+                                                            "Safefolder: current directory only"
+                                                                .to_string();
+                                                    }
+                                                    _ => {
+                                                        set_folder_scope(FolderScope::AllDirs);
+                                                        self.status_message =
+                                                            "Safefolder: all directories allowed"
+                                                                .to_string();
+                                                    }
+                                                }
+                                                let p = get_tool_permissions();
+                                                self.messages.push(format!(
+                                                    "System: Permissions → {} | {}",
+                                                    p.mode_label(),
+                                                    p.scope_label()
+                                                ));
+                                                if let Ok(mut l) = self.activity_logs.lock() {
+                                                    l.push(format!(
+                                                        "[PERMS] mode={} scope={}",
+                                                        p.mode_label(),
+                                                        p.scope_label()
+                                                    ));
+                                                }
                                             }
                                         }
-                                        let p = get_tool_permissions();
-                                        self.messages.push(format!(
-                                            "System: Permissions → {} | {}",
-                                            p.mode_label(),
-                                            p.scope_label()
-                                        ));
+                                    } else if self.input_focused && !self.input.trim().is_empty() {
+                                        let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                        if *self.is_generating.lock().unwrap() {
+                                            if is_ctrl {
+                                                // CTRL + Enter forces prompt submission and interrupts ongoing generation
+                                                *self.is_generating.lock().unwrap() = false;
+                                                if let Some(last) = self.messages.last_mut() {
+                                                    if last.starts_with("Agent: ") {
+                                                        last.push_str("\n[Interrupted by User]");
+                                                    }
+                                                }
+                                            } else {
+                                                self.status_message = "Generating... Shift+Enter=newline · CTRL+Enter=interrupt & send".to_string();
+                                                return Ok(());
+                                            }
+                                        }
+
+                                        let prompt = self.input.clone();
+                                        self.input.clear();
+                                        self.input_cursor_position = 0;
+                                        self.typewriter_len = 0;
+                                        self.auto_scroll_enabled = true;
+                                        self.auto_tool_turns = 0;
+
+                                        let backend = self.backend.name();
                                         if let Ok(mut l) = self.activity_logs.lock() {
                                             l.push(format!(
-                                                "[PERMS] mode={} scope={}",
-                                                p.mode_label(),
-                                                p.scope_label()
+                                                "[PROMPT] Processing: \"{}\" via {}",
+                                                prompt, backend
                                             ));
                                         }
-                                    }
-                                }
-                            } else if self.input_focused && !self.input.trim().is_empty() {
-                                let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                if *self.is_generating.lock().unwrap() {
-                                    if is_ctrl {
-                                        // CTRL + Enter forces prompt submission and interrupts ongoing generation
-                                        *self.is_generating.lock().unwrap() = false;
-                                        if let Some(last) = self.messages.last_mut() {
-                                            if last.starts_with("Agent: ") {
-                                                last.push_str("\n[Interrupted by User]");
-                                            }
-                                        }
-                                    } else {
-                                        self.status_message = "Generating... Shift+Enter=newline · CTRL+Enter=interrupt & send".to_string();
-                                        return Ok(());
-                                    }
-                                }
 
-                                let prompt = self.input.clone();
-                                self.input.clear();
-                                self.input_cursor_position = 0;
-                                self.typewriter_len = 0;
-                                self.auto_scroll_enabled = true;
-                                self.auto_tool_turns = 0;
-                                
-                                let backend = self.backend.name();
-                                if let Ok(mut l) = self.activity_logs.lock() {
-                                    l.push(format!("[PROMPT] Processing: \"{}\" via {}", prompt, backend));
-                                }
-
-                                if prompt.starts_with('/') {
-                                    self.messages.push(format!("You: {}", prompt));
-                                    let parts: Vec<&str> = prompt.split_whitespace().collect();
-                                    match parts[0] {
-                                        "/help" => {
-                                            self.messages.push(
-                                                "System: Press F1 for shortcut overlay.\n\
+                                        if prompt.starts_with('/') {
+                                            self.messages.push(format!("You: {}", prompt));
+                                            let parts: Vec<&str> =
+                                                prompt.split_whitespace().collect();
+                                            match parts[0] {
+                                                "/help" => {
+                                                    self.messages.push(
+                                                        "System: Press F1 for shortcut overlay.\n\
 /allow   — grant write/cmd for this session (Ask mode)\n\
 /compact — compress chat → memory, forget old turns\n\
 /cancel-download — clear stuck HF download lock so you can install another model\n\
 /download-status — show active download lock\n\
 /copy /theme /save /load — utilities"
-                                                    .to_string(),
-                                            );
-                                        }
-                                        "/allow" => {
-                                            allow_session_tools();
-                                            self.messages.push(
+                                                            .to_string(),
+                                                    );
+                                                }
+                                                "/allow" => {
+                                                    allow_session_tools();
+                                                    self.messages.push(
                                                 "System: Session tool permission granted (write/cmd allowed until restart)."
                                                     .to_string(),
                                             );
-                                        }
-                                        "/compact" | "/compact!" | "/gc" => {
-                                            let before = self.estimate_full_session_tokens();
-                                            let msgs = self.messages.len();
-                                            self.compact_context_to_memory(true);
-                                            self.messages.push(format!(
+                                                }
+                                                "/compact" | "/compact!" | "/gc" => {
+                                                    let before =
+                                                        self.estimate_full_session_tokens();
+                                                    let msgs = self.messages.len();
+                                                    self.compact_context_to_memory(true);
+                                                    self.messages.push(format!(
                                                 "System: [OK] /compact done — was ~{} tokens / {} messages → \
                                                  ~{} tokens now. Summary in memory. Type a new question.",
                                                 before,
                                                 msgs,
                                                 self.context_tokens_est
                                             ));
-                                        }
-                                        "/tasks" => {
-                                            let list = self.task_manager.list();
-                                            if list.is_empty() {
-                                                self.messages.push(
+                                                }
+                                                "/tasks" => {
+                                                    let list = self.task_manager.list();
+                                                    if list.is_empty() {
+                                                        self.messages.push(
                                                     "System: Task manager empty — no background jobs."
                                                         .into(),
                                                 );
-                                            } else {
-                                                let mut lines = vec![
-                                                    "System: Task manager:".to_string(),
-                                                ];
-                                                for t in list {
-                                                    let age = t.started.elapsed().as_secs();
-                                                    lines.push(format!(
-                                                        "  #{} [{:?}] {age}s  `{}`",
-                                                        t.id, t.status, t.cmd
-                                                    ));
+                                                    } else {
+                                                        let mut lines = vec![
+                                                            "System: Task manager:".to_string(),
+                                                        ];
+                                                        for t in list {
+                                                            let age = t.started.elapsed().as_secs();
+                                                            lines.push(format!(
+                                                                "  #{} [{:?}] {age}s  `{}`",
+                                                                t.id, t.status, t.cmd
+                                                            ));
+                                                        }
+                                                        lines.push(
+                                                            "  Ctrl+C kills all running tasks."
+                                                                .into(),
+                                                        );
+                                                        self.messages.push(lines.join("\n"));
+                                                    }
                                                 }
-                                                lines.push(
-                                                    "  Ctrl+C kills all running tasks.".into(),
-                                                );
-                                                self.messages.push(lines.join("\n"));
-                                            }
-                                        }
-                                        "/cancel-download" | "/cancel_download" | "/cdl" => {
-                                            let msg = self.manager.cancel_download();
-                                            self.messages.push(format!("System: {msg}"));
-                                            self.status_message = msg;
-                                            if let Ok(mut l) = self.activity_logs.lock() {
-                                                l.push("[DOWNLOAD] cancel-download".into());
-                                            }
-                                            // Clear stuck progress UI
-                                            *self.download_progress.lock().unwrap() = None;
-                                            *self.download_complete.lock().unwrap() = false;
-                                        }
-                                        "/download-status" | "/dlstatus" => {
-                                            let s = self.manager.download_status();
-                                            self.messages.push(format!("System: {s}"));
-                                            self.status_message = s;
-                                        }
-                                        "/copy" => {
-                                            let full_chat = self.messages.join("\n\n");
-                                            let ok = crate::clipboard::copy_text_silent(&full_chat);
-                                            let _ = std::fs::write(
-                                                "/tmp/hercules_chat_export.txt",
-                                                &full_chat,
-                                            );
-                                            self.messages.push(format!(
+                                                "/cancel-download" | "/cancel_download"
+                                                | "/cdl" => {
+                                                    let msg = self.manager.cancel_download();
+                                                    self.messages.push(format!("System: {msg}"));
+                                                    self.status_message = msg;
+                                                    if let Ok(mut l) = self.activity_logs.lock() {
+                                                        l.push("[DOWNLOAD] cancel-download".into());
+                                                    }
+                                                    // Clear stuck progress UI
+                                                    *self.download_progress.lock().unwrap() = None;
+                                                    *self.download_complete.lock().unwrap() = false;
+                                                }
+                                                "/download-status" | "/dlstatus" => {
+                                                    let s = self.manager.download_status();
+                                                    self.messages.push(format!("System: {s}"));
+                                                    self.status_message = s;
+                                                }
+                                                "/copy" => {
+                                                    let full_chat = self.messages.join("\n\n");
+                                                    let ok = crate::clipboard::copy_text_silent(
+                                                        &full_chat,
+                                                    );
+                                                    let _ = std::fs::write(
+                                                        "/tmp/hercules_chat_export.txt",
+                                                        &full_chat,
+                                                    );
+                                                    self.messages.push(format!(
                                                 "System: Chat exported to /tmp/hercules_chat_export.txt{}",
                                                 if ok { " (+ clipboard)" } else { "" }
                                             ));
-                                        }
-                                        "/theme" => {
-                                            if parts.len() > 1 {
-                                                match parts[1] {
-                                                    "blue" => self.theme_color = Color::Rgb(0, 150, 255),
-                                                    "red" => self.theme_color = Color::Rgb(255, 50, 50),
-                                                    "green" | _ => self.theme_color = Color::Rgb(0, 255, 128),
                                                 }
-                                                self.messages.push(format!("System: Theme changed to {}", parts[1]));
-                                            }
-                                        }
-                                        "/save" => {
-                                            if parts.len() > 1 {
-                                                let _ = std::fs::write(parts[1], self.messages.join("\n"));
-                                                self.messages.push(format!("System: Session saved to {}", parts[1]));
-                                            }
-                                        }
-                                        "/load" => {
-                                            if parts.len() > 1 {
-                                                if let Ok(data) = std::fs::read_to_string(parts[1]) {
-                                                    self.messages = data.split('\n').map(|s| s.to_string()).collect();
-                                                    self.messages.push(format!("System: Session loaded from {}", parts[1]));
-                                                } else {
-                                                    self.messages.push("System: Failed to load session".to_string());
+                                                "/theme" => {
+                                                    if parts.len() > 1 {
+                                                        match parts[1] {
+                                                            "blue" => {
+                                                                self.theme_color =
+                                                                    Color::Rgb(0, 150, 255)
+                                                            }
+                                                            "red" => {
+                                                                self.theme_color =
+                                                                    Color::Rgb(255, 50, 50)
+                                                            }
+                                                            "green" | _ => {
+                                                                self.theme_color =
+                                                                    Color::Rgb(0, 255, 128)
+                                                            }
+                                                        }
+                                                        self.messages.push(format!(
+                                                            "System: Theme changed to {}",
+                                                            parts[1]
+                                                        ));
+                                                    }
                                                 }
+                                                "/save" => {
+                                                    if parts.len() > 1 {
+                                                        let _ = std::fs::write(
+                                                            parts[1],
+                                                            self.messages.join("\n"),
+                                                        );
+                                                        self.messages.push(format!(
+                                                            "System: Session saved to {}",
+                                                            parts[1]
+                                                        ));
+                                                    }
+                                                }
+                                                "/load" => {
+                                                    if parts.len() > 1 {
+                                                        if let Ok(data) =
+                                                            std::fs::read_to_string(parts[1])
+                                                        {
+                                                            self.messages = data
+                                                                .split('\n')
+                                                                .map(|s| s.to_string())
+                                                                .collect();
+                                                            self.messages.push(format!(
+                                                                "System: Session loaded from {}",
+                                                                parts[1]
+                                                            ));
+                                                        } else {
+                                                            self.messages.push(
+                                                                "System: Failed to load session"
+                                                                    .to_string(),
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                _ => self.messages.push(format!(
+                                                    "System: Unknown command '{}'",
+                                                    parts[0]
+                                                )),
                                             }
+                                        } else {
+                                            self.messages.push(format!("You: {}", prompt));
+                                            self.trigger_generation_from_context();
                                         }
-                                        _ => self.messages.push(format!("System: Unknown command '{}'", parts[0])),
                                     }
-                                } else {
-                                    self.messages.push(format!("You: {}", prompt));
-                                    self.trigger_generation_from_context();
                                 }
+                                _ => {}
                             }
-                        }
-                        _ => {}
-                    }
-                    } // end if !pending_consumed
+                        } // end if !pending_consumed
                     } // end if !skip_key
                 }
                 _ => {}
@@ -3363,7 +4034,7 @@ impl App {
         let dark_gray = Color::Rgb(100, 100, 100);
         let light_blue = Color::Rgb(150, 180, 255);
         let white = Color::White;
-        
+
         let area = frame.area();
 
         // Grow input box with multiline content (3..=10 rows total including borders)
@@ -3381,12 +4052,15 @@ impl App {
         // Floor is one continuous string so arms always meet.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(input_box_h),
-                Constraint::Length(1),
-            ].as_ref())
+            .constraints(
+                [
+                    Constraint::Length(3),
+                    Constraint::Min(1),
+                    Constraint::Length(input_box_h),
+                    Constraint::Length(1),
+                ]
+                .as_ref(),
+            )
             .split(area);
 
         const BRAND_W: usize = 12;
@@ -3411,23 +4085,23 @@ impl App {
         for i in 0..8 {
             bar.push(if i < filled { '█' } else { '░' });
         }
-        let ctx_line = fit_width(
-            &format!("CTX {bar} {ctx_pct:.0}% {ctx_label}"),
-            LEFT_W,
-        );
+        let ctx_line = fit_width(&format!("CTX {bar} {ctx_pct:.0}% {ctx_label}"), LEFT_W);
 
         let top_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(LEFT_W as u16),
-                Constraint::Min(1),
-                Constraint::Length(STATS_W as u16),
-            ].as_ref())
+            .constraints(
+                [
+                    Constraint::Length(LEFT_W as u16),
+                    Constraint::Min(1),
+                    Constraint::Length(STATS_W as u16),
+                ]
+                .as_ref(),
+            )
             .split(chunks[0]);
 
-        let exit_hold_pct = self.esc_hold_start.map(|start| {
-            (start.elapsed().as_secs_f64() / 1.0).clamp(0.0, 1.0)
-        });
+        let exit_hold_pct = self
+            .esc_hold_start
+            .map(|start| (start.elapsed().as_secs_f64() / 1.0).clamp(0.0, 1.0));
         let exiting_text = if let Some(pct) = exit_hold_pct {
             format!(" EXIT {:.0}%", pct * 100.0)
         } else {
@@ -3436,7 +4110,11 @@ impl App {
         let exit_glow = if let Some(pct) = exit_hold_pct {
             let pulse = ((self.anim_tick as f64 * 0.35).sin() * 0.5 + 0.5) as f32;
             let r = (180.0 + 75.0 * pct as f32 + 20.0 * pulse) as u8;
-            Color::Rgb(r.min(255), (40.0 * (1.0 - pct as f32)) as u8, (40.0 * (1.0 - pct as f32)) as u8)
+            Color::Rgb(
+                r.min(255),
+                (40.0 * (1.0 - pct as f32)) as u8,
+                (40.0 * (1.0 - pct as f32)) as u8,
+            )
         } else {
             theme_color
         };
@@ -3479,7 +4157,9 @@ impl App {
             )),
             Line::from(Span::styled(
                 menu_line,
-                Style::default().fg(theme_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme_color)
+                    .add_modifier(Modifier::BOLD),
             )),
         ];
         frame.render_widget(
@@ -3494,8 +4174,7 @@ impl App {
             .clamp(0.0, 100.0);
         let mem_gb = self.sys.used_memory() as f64 / 1_073_741_824.0;
         let cpu_temp_c = cpu_package_temp_c(&self.sys);
-        let (c_line, m_line, s_bot) =
-            fixed_resource_box(cpu_usage, cpu_temp_c, mem_usage, mem_gb);
+        let (c_line, m_line, s_bot) = fixed_resource_box(cpu_usage, cpu_temp_c, mem_usage, mem_gb);
         debug_assert_eq!(c_line.chars().count(), STATS_W);
         debug_assert_eq!(m_line.chars().count(), STATS_W);
         debug_assert_eq!(s_bot.chars().count(), STATS_W);
@@ -3557,10 +4236,13 @@ impl App {
         } else {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(100 - log_pct), // Left Pane: Chat
-                    Constraint::Percentage(log_pct),      // Right Pane: Activity Console
-                ].as_ref())
+                .constraints(
+                    [
+                        Constraint::Percentage(100 - log_pct), // Left Pane: Chat
+                        Constraint::Percentage(log_pct),       // Right Pane: Activity Console
+                    ]
+                    .as_ref(),
+                )
                 .split(chunks[1])
         };
 
@@ -3598,7 +4280,7 @@ impl App {
         let is_generating_val = *self.is_generating.lock().unwrap();
         let anim_tick = self.anim_tick;
         let mut chat_lines: Vec<Line> = Vec::new();
-        /// (chip_id, logical chat_lines index where chip spacer starts)
+        // (chip_id, logical chat_lines index where chip spacer starts)
         let mut chip_line_starts: Vec<(u64, usize)> = Vec::new();
 
         for (m_idx, m) in self.messages.iter().enumerate() {
@@ -3606,12 +4288,21 @@ impl App {
 
             if m.starts_with("You:") {
                 chat_lines.push(Line::from(vec![
-                    Span::styled("You: ", Style::default().fg(theme_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "You: ",
+                        Style::default()
+                            .fg(theme_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(&m[5..], Style::default().fg(white)),
                 ]));
                 chat_lines.push(Line::from(""));
             } else if m.starts_with("Agent:") || m.starts_with("Error:") {
-                let content = if m.starts_with("Agent:") { &m[7..] } else { &m[7..] };
+                let content = if m.starts_with("Agent:") {
+                    &m[7..]
+                } else {
+                    &m[7..]
+                };
 
                 // Thinking UI only for real <think>…</think> (Ollama wraps its
                 // `thinking` stream field that way). llama.cpp / plain GGUF usually
@@ -3628,11 +4319,7 @@ impl App {
                             } else {
                                 format!("{}{}", before, rest)
                             };
-                            (
-                                Some(think.to_string()),
-                                out,
-                                "Model thinking",
-                            )
+                            (Some(think.to_string()), out, "Model thinking")
                         } else {
                             // Unclosed <think> while streaming (Ollama or explicit tags)
                             let think = &content[start_think + 7..];
@@ -3653,7 +4340,9 @@ impl App {
 
                 // 1. Render Thinking Process only when real <think> exists
                 if let Some(ref think_text) = think_part {
-                    if !think_text.trim().is_empty() || (is_generating_val && content.contains("<think>")) {
+                    if !think_text.trim().is_empty()
+                        || (is_generating_val && content.contains("<think>"))
+                    {
                         if self.thinking_collapsed {
                             chat_lines.push(Line::from(Span::styled(
                                 format!("[{think_label} · Collapsed — CTRL+T]"),
@@ -3683,7 +4372,8 @@ impl App {
                                 )));
                             } else {
                                 for raw_line in think_text.lines() {
-                                    let mut line_spans = vec![Span::styled("  │ ", Style::default().fg(dark_gray))];
+                                    let mut line_spans =
+                                        vec![Span::styled("  │ ", Style::default().fg(dark_gray))];
                                     for ch in raw_line.chars() {
                                         if global_think_ch >= visible_think {
                                             break;
@@ -3697,7 +4387,10 @@ impl App {
                                         let r = (35.0 + (190.0 - 35.0) * progress) as u8;
                                         let g = (30.0 + (150.0 - 30.0) * progress) as u8;
                                         let b = (50.0 + (255.0 - 50.0) * progress) as u8;
-                                        line_spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Rgb(r, g, b))));
+                                        line_spans.push(Span::styled(
+                                            ch.to_string(),
+                                            Style::default().fg(Color::Rgb(r, g, b)),
+                                        ));
                                         global_think_ch += 1;
                                     }
                                     global_think_ch += 1;
@@ -3731,7 +4424,7 @@ impl App {
                             agent_label,
                             Style::default().fg(light_blue).add_modifier(Modifier::BOLD),
                         )));
-                        
+
                         let mut in_code_block = false;
                         let total_lines = text_to_render.lines().count();
                         let mut global_out_ch = 0;
@@ -3741,8 +4434,17 @@ impl App {
 
                             if trimmed.starts_with("```") {
                                 in_code_block = !in_code_block;
-                                let tag = if in_code_block { " --- Code Block ---" } else { " --- End Code ---" };
-                                chat_lines.push(Line::from(Span::styled(tag, Style::default().fg(theme_color).add_modifier(Modifier::BOLD))));
+                                let tag = if in_code_block {
+                                    " --- Code Block ---"
+                                } else {
+                                    " --- End Code ---"
+                                };
+                                chat_lines.push(Line::from(Span::styled(
+                                    tag,
+                                    Style::default()
+                                        .fg(theme_color)
+                                        .add_modifier(Modifier::BOLD),
+                                )));
                                 global_out_ch += raw_line.chars().count() + 1;
                                 continue;
                             }
@@ -3754,17 +4456,31 @@ impl App {
                                 line_spans.push(Span::styled("  ", Style::default()));
                                 for cell in trimmed.split('|').filter(|s| !s.trim().is_empty()) {
                                     if cell.chars().all(|c| c == '-' || c == ':' || c == ' ') {
-                                        line_spans.push(Span::styled("─────┼─────", Style::default().fg(dark_gray)));
+                                        line_spans.push(Span::styled(
+                                            "─────┼─────",
+                                            Style::default().fg(dark_gray),
+                                        ));
                                     } else {
-                                        line_spans.push(Span::styled(format!(" {} │", cell.trim()), Style::default().fg(Color::Rgb(0, 230, 255)).add_modifier(Modifier::BOLD)));
+                                        line_spans.push(Span::styled(
+                                            format!(" {} │", cell.trim()),
+                                            Style::default()
+                                                .fg(Color::Rgb(0, 230, 255))
+                                                .add_modifier(Modifier::BOLD),
+                                        ));
                                     }
                                 }
                                 global_out_ch += raw_line.chars().count() + 1;
                             } else if trimmed.starts_with('#') {
-                                line_spans.push(Span::styled(format!("  {}", trimmed), Style::default().fg(theme_color).add_modifier(Modifier::BOLD)));
+                                line_spans.push(Span::styled(
+                                    format!("  {}", trimmed),
+                                    Style::default()
+                                        .fg(theme_color)
+                                        .add_modifier(Modifier::BOLD),
+                                ));
                                 global_out_ch += raw_line.chars().count() + 1;
                             } else if trimmed.starts_with('-') || trimmed.starts_with('*') {
-                                line_spans.push(Span::styled("  * ", Style::default().fg(theme_color)));
+                                line_spans
+                                    .push(Span::styled("  * ", Style::default().fg(theme_color)));
                                 for ch in trimmed[1..].chars() {
                                     if global_out_ch >= available_output {
                                         break;
@@ -3778,7 +4494,10 @@ impl App {
                                     let r = (40.0 + (240.0 - 40.0) * progress) as u8;
                                     let g = (55.0 + (245.0 - 55.0) * progress) as u8;
                                     let b = (65.0 + (255.0 - 65.0) * progress) as u8;
-                                    line_spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Rgb(r, g, b))));
+                                    line_spans.push(Span::styled(
+                                        ch.to_string(),
+                                        Style::default().fg(Color::Rgb(r, g, b)),
+                                    ));
                                     global_out_ch += 1;
                                 }
                                 global_out_ch += 1;
@@ -3797,7 +4516,10 @@ impl App {
                                     let r = (40.0 + (240.0 - 40.0) * progress) as u8;
                                     let g = (55.0 + (245.0 - 55.0) * progress) as u8;
                                     let b = (65.0 + (255.0 - 65.0) * progress) as u8;
-                                    line_spans.push(Span::styled(ch.to_string(), Style::default().fg(Color::Rgb(r, g, b))));
+                                    line_spans.push(Span::styled(
+                                        ch.to_string(),
+                                        Style::default().fg(Color::Rgb(r, g, b)),
+                                    ));
                                     global_out_ch += 1;
                                 }
                                 global_out_ch += 1;
@@ -3806,7 +4528,12 @@ impl App {
                             if is_last_message && is_generating_val && is_last_line {
                                 let pulse = (anim_tick as f64 * 0.3).sin() * 0.5 + 0.5;
                                 let b_val = (150.0 + 105.0 * pulse) as u8;
-                                line_spans.push(Span::styled(" █", Style::default().fg(Color::Rgb(0, 255, b_val)).add_modifier(Modifier::BOLD)));
+                                line_spans.push(Span::styled(
+                                    " █",
+                                    Style::default()
+                                        .fg(Color::Rgb(0, 255, b_val))
+                                        .add_modifier(Modifier::BOLD),
+                                ));
                             }
 
                             chat_lines.push(Line::from(line_spans));
@@ -3843,7 +4570,10 @@ impl App {
                 }
                 chat_lines.push(Line::from(""));
             } else {
-                chat_lines.push(Line::from(Span::styled(m.clone(), Style::default().fg(dark_gray))));
+                chat_lines.push(Line::from(Span::styled(
+                    m.clone(),
+                    Style::default().fg(dark_gray),
+                )));
             }
         }
 
@@ -3969,7 +4699,9 @@ impl App {
             let x = chat_area.x.saturating_add(3);
             let max_w = chat_area.width.saturating_sub(6);
             let chat_top = chat_area.y.saturating_add(1);
-            let chat_bot = chat_area.y.saturating_add(chat_area.height.saturating_sub(1));
+            let chat_bot = chat_area
+                .y
+                .saturating_add(chat_area.height.saturating_sub(1));
 
             for chip in &mut self.tool_chips {
                 chip.rect = None;
@@ -3998,7 +4730,12 @@ impl App {
         if let Some(ref mut panel) = self.tool_panel {
             let t = self.krama.get_progress_f32("panel_fly", 0).abs();
             // Sync chip origin every frame
-            if let Some(chip) = self.tool_chips.iter().find(|c| c.id == panel.chip_id).cloned() {
+            if let Some(chip) = self
+                .tool_chips
+                .iter()
+                .find(|c| c.id == panel.chip_id)
+                .cloned()
+            {
                 if let Some(r) = chip.rect {
                     panel.chip_rect = Some(r);
                 }
@@ -4047,11 +4784,18 @@ impl App {
         if let Some(ratio) = progress_val {
             let total_width = left_chunks[1].width.saturating_sub(22) as usize;
             let mut bar_spans = Vec::new();
-            bar_spans.push(Span::styled(" [DOWNLOADING] ", Style::default().fg(theme_color).add_modifier(Modifier::BOLD)));
-            
+            bar_spans.push(Span::styled(
+                " [DOWNLOADING] ",
+                Style::default()
+                    .fg(theme_color)
+                    .add_modifier(Modifier::BOLD),
+            ));
+
             let subblocks = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
             let total_subblocks = total_width * 8;
-            let filled_subblocks = ((ratio.clamp(0.0, 1.0) * total_subblocks as f64).round() as usize).min(total_subblocks);
+            let filled_subblocks = ((ratio.clamp(0.0, 1.0) * total_subblocks as f64).round()
+                as usize)
+                .min(total_subblocks);
             let full_blocks = filled_subblocks / 8;
             let partial_idx = filled_subblocks % 8;
 
@@ -4069,17 +4813,28 @@ impl App {
                 let g = 255;
                 let b = (255.0 * (1.0 - norm)) as u8;
                 let partial_str = subblocks[partial_idx].to_string();
-                bar_spans.push(Span::styled(partial_str, Style::default().fg(Color::Rgb(r, g, b))));
+                bar_spans.push(Span::styled(
+                    partial_str,
+                    Style::default().fg(Color::Rgb(r, g, b)),
+                ));
             }
 
             let rendered_blocks = full_blocks + if partial_idx > 0 { 1 } else { 0 };
             for _ in rendered_blocks..total_width {
                 bar_spans.push(Span::styled("░", Style::default().fg(dark_gray)));
             }
-            bar_spans.push(Span::styled(format!(" {:.1}% ", ratio * 100.0), Style::default().fg(white).add_modifier(Modifier::BOLD)));
+            bar_spans.push(Span::styled(
+                format!(" {:.1}% ", ratio * 100.0),
+                Style::default().fg(white).add_modifier(Modifier::BOLD),
+            ));
 
-            let pbar = Paragraph::new(Line::from(bar_spans))
-                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(theme_color)).title(" Dynamic Model Weights Progress Bar "));
+            let pbar = Paragraph::new(Line::from(bar_spans)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme_color))
+                    .title(" Dynamic Model Weights Progress Bar "),
+            );
             frame.render_widget(pbar, left_chunks[1]);
         }
 
@@ -4088,22 +4843,31 @@ impl App {
             let logs_text = logs_guard.join("\n");
             let log_lines_count = logs_guard.len() as u16;
             let console_scroll = log_lines_count.saturating_sub(15);
-            
+
             let console_box = Paragraph::new(logs_text)
                 .scroll((console_scroll, 0))
                 .wrap(ratatui::widgets::Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(light_blue)).title(" Live Activity Log [CTRL+L/F3: Collapse] "));
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(light_blue))
+                        .title(" Live Activity Log [CTRL+L/F3: Collapse] "),
+                );
             frame.render_widget(console_box, main_split[1]);
         }
 
         // --- Input Area ---
         let input_layout = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(2), // Padding
-                Constraint::Min(1),    // Input
-                Constraint::Length(2), // Padding
-            ].as_ref())
+            .constraints(
+                [
+                    Constraint::Length(2), // Padding
+                    Constraint::Min(1),    // Input
+                    Constraint::Length(2), // Padding
+                ]
+                .as_ref(),
+            )
             .split(chunks[2]);
 
         let title_text = if let Some(pct) = exit_hold_pct {
@@ -4112,14 +4876,16 @@ impl App {
                 pct * 100.0
             )
         } else if self.term_is_interactive() {
-            " [ TERM interactive · type command · Enter=run · Esc/click outside=leave ] ".to_string()
+            " [ TERM interactive · type command · Enter=run · Esc/click outside=leave ] "
+                .to_string()
         } else if !self.pending_actions.is_empty() {
             format!(
                 " [ {} pending - Y/Enter ACCEPT | N REJECT | A always-allow ] ",
                 self.pending_actions.len()
             )
         } else if self.input_focused {
-            " [ Prompt · Enter=send · Shift+Enter / Ctrl+J = newline · CTRL+F unfocus ] ".to_string()
+            " [ Prompt · Enter=send · Shift+Enter / Ctrl+J = newline · CTRL+F unfocus ] "
+                .to_string()
         } else {
             " [ Focus: Main Body | CTRL+F focus input | Y accept pending tools ] ".to_string()
         };
@@ -4162,7 +4928,10 @@ impl App {
                 })
                 .collect();
             if self.input.ends_with('\n') {
-                lines.push(Line::from(Span::styled(" ", Style::default().fg(theme_color))));
+                lines.push(Line::from(Span::styled(
+                    " ",
+                    Style::default().fg(theme_color),
+                )));
             }
             if lines.is_empty() {
                 lines.push(Line::from(""));
@@ -4238,7 +5007,7 @@ impl App {
             ),
         ]);
         frame.render_widget(Paragraph::new(footer_text), chunks[3]);
-        
+
         let is_downloading = self.download_progress.lock().unwrap().is_some();
         if self.input_focused && !self.show_menu && !is_downloading {
             let inner_w = input_layout[1].width.saturating_sub(2).max(1) as usize;
@@ -4252,31 +5021,49 @@ impl App {
             let max_y = input_layout[1].y + input_layout[1].height.saturating_sub(2);
             frame.set_cursor_position((cursor_x.min(max_x), cursor_y.min(max_y)));
         }
-        
+
         // --- Unified Menu Modal (Popup with KramaFrame Fade) ---
         if self.show_menu {
             let menu_fade_val = self.krama.get_progress_f32("menu_fade", 0);
-            let menu_border_color = Color::Rgb(0, (255.0 * menu_fade_val) as u8, (128.0 * menu_fade_val) as u8);
+            let menu_border_color = Color::Rgb(
+                0,
+                (255.0 * menu_fade_val) as u8,
+                (128.0 * menu_fade_val) as u8,
+            );
 
             let popup_layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(15), Constraint::Percentage(70), Constraint::Percentage(15)].as_ref())
+                .constraints(
+                    [
+                        Constraint::Percentage(15),
+                        Constraint::Percentage(70),
+                        Constraint::Percentage(15),
+                    ]
+                    .as_ref(),
+                )
                 .split(frame.area());
-            
+
             let center_layout = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(15), Constraint::Percentage(70), Constraint::Percentage(15)].as_ref())
+                .constraints(
+                    [
+                        Constraint::Percentage(15),
+                        Constraint::Percentage(70),
+                        Constraint::Percentage(15),
+                    ]
+                    .as_ref(),
+                )
                 .split(popup_layout[1]);
-            
+
             let area = center_layout[1];
             frame.render_widget(Clear, area);
-            
+
             let menu_block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(menu_border_color))
                 .title(" Menu Modal [ Tab / Left / Right: Switch Section | Esc: Close ] ");
-            
+
             let inner_menu = menu_block.inner(area);
             frame.render_widget(menu_block, area);
 
@@ -4286,11 +5073,46 @@ impl App {
                 .split(inner_menu);
 
             // Tab bar headers inside menu
-            let reg_style = if self.menu_section == 0 { Style::default().fg(Color::Black).bg(theme_color).add_modifier(Modifier::BOLD) } else { Style::default().fg(white) };
-            let inst_style = if self.menu_section == 1 { Style::default().fg(Color::Black).bg(theme_color).add_modifier(Modifier::BOLD) } else { Style::default().fg(white) };
-            let cfg_style = if self.menu_section == 2 { Style::default().fg(Color::Black).bg(theme_color).add_modifier(Modifier::BOLD) } else { Style::default().fg(white) };
-            let rt_style = if self.menu_section == 3 { Style::default().fg(Color::Black).bg(theme_color).add_modifier(Modifier::BOLD) } else { Style::default().fg(white) };
-            let perm_style = if self.menu_section == 4 { Style::default().fg(Color::Black).bg(theme_color).add_modifier(Modifier::BOLD) } else { Style::default().fg(white) };
+            let reg_style = if self.menu_section == 0 {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(white)
+            };
+            let inst_style = if self.menu_section == 1 {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(white)
+            };
+            let cfg_style = if self.menu_section == 2 {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(white)
+            };
+            let rt_style = if self.menu_section == 3 {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(white)
+            };
+            let perm_style = if self.menu_section == 4 {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(white)
+            };
 
             let tab_header = Paragraph::new(Line::from(vec![
                 Span::raw(" "),
@@ -4310,55 +5132,94 @@ impl App {
                     .split(menu_chunks[1]);
 
                 let search_text = if self.registry_search_query.is_empty() {
-                    Span::styled("Type to query HuggingFace / Ollama API live...", Style::default().fg(dark_gray))
+                    Span::styled(
+                        "Type to query HuggingFace / Ollama API live...",
+                        Style::default().fg(dark_gray),
+                    )
                 } else {
-                    Span::styled(format!(" {}", self.registry_search_query), Style::default().fg(theme_color))
+                    Span::styled(
+                        format!(" {}", self.registry_search_query),
+                        Style::default().fg(theme_color),
+                    )
                 };
-                let search_box = Paragraph::new(Line::from(search_text))
-                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" Live HuggingFace / Ollama Search Bar "));
+                let search_box = Paragraph::new(Line::from(search_text)).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(" Live HuggingFace / Ollama Search Bar "),
+                );
                 frame.render_widget(search_box, reg_chunks[0]);
 
                 let list_fade_val = self.krama.get_progress_f32("list_fade", 0);
-                let list_item_color = Color::Rgb(0, (255.0 * list_fade_val) as u8, (180.0 * list_fade_val) as u8);
+                let list_item_color = Color::Rgb(
+                    0,
+                    (255.0 * list_fade_val) as u8,
+                    (180.0 * list_fade_val) as u8,
+                );
 
-                let mut items: Vec<ListItem> = self.registry_models.iter().map(|m| {
-                    ListItem::new(Span::styled(m, Style::default().fg(list_item_color)))
-                }).collect();
-                
+                let mut items: Vec<ListItem> = self
+                    .registry_models
+                    .iter()
+                    .map(|m| ListItem::new(Span::styled(m, Style::default().fg(list_item_color))))
+                    .collect();
+
                 let hf_items = self.hf_models.iter().map(|m| {
                     let is_ollama = m.starts_with("Ollama:");
-                    let color = if is_ollama { list_item_color } else { Color::Rgb(150, (200.0 * list_fade_val) as u8, (255.0 * list_fade_val) as u8) };
+                    let color = if is_ollama {
+                        list_item_color
+                    } else {
+                        Color::Rgb(
+                            150,
+                            (200.0 * list_fade_val) as u8,
+                            (255.0 * list_fade_val) as u8,
+                        )
+                    };
                     ListItem::new(Span::styled(m, Style::default().fg(color)))
                 });
                 items.extend(hf_items);
-                
+
                 let list = List::new(items)
-                    .block(Block::default().borders(Borders::TOP).title(" Open Weights Registry [Up/Down: Navigate | Enter: Download & Install] "))
+                    .block(Block::default().borders(Borders::TOP).title(
+                        " Open Weights Registry [Up/Down: Navigate | Enter: Download & Install] ",
+                    ))
                     .highlight_style(Style::default().bg(theme_color).fg(Color::Black))
                     .highlight_symbol(">> ");
-                
+
                 frame.render_stateful_widget(list, reg_chunks[1], &mut self.registry_state);
             } else if self.menu_section == 1 {
                 // Installed Models Tab (Real Local Models with KramaFrame Fade)
                 let list_fade_val = self.krama.get_progress_f32("list_fade", 0);
-                let list_item_color = Color::Rgb(0, (255.0 * list_fade_val) as u8, (180.0 * list_fade_val) as u8);
+                let list_item_color = Color::Rgb(
+                    0,
+                    (255.0 * list_fade_val) as u8,
+                    (180.0 * list_fade_val) as u8,
+                );
 
-                let items: Vec<ListItem> = self.installed_models.iter().map(|m| {
-                    ListItem::new(Span::styled(format!("Local Installed: {}", m), Style::default().fg(list_item_color)))
-                }).collect();
-                
+                let items: Vec<ListItem> = self
+                    .installed_models
+                    .iter()
+                    .map(|m| {
+                        ListItem::new(Span::styled(
+                            format!("Local Installed: {}", m),
+                            Style::default().fg(list_item_color),
+                        ))
+                    })
+                    .collect();
+
                 let list = List::new(items)
-                    .block(Block::default().borders(Borders::TOP).title(" Installed Models [Up/Down: Navigate | Enter: Activate & Use Model] "))
+                    .block(Block::default().borders(Borders::TOP).title(
+                        " Installed Models [Up/Down: Navigate | Enter: Activate & Use Model] ",
+                    ))
                     .highlight_style(Style::default().bg(theme_color).fg(Color::Black))
                     .highlight_symbol(">> ");
-                
+
                 frame.render_stateful_widget(list, menu_chunks[1], &mut self.installed_state);
             } else if self.menu_section == 2 {
                 // Settings Configuration (no Burn/WGPU demo)
                 let active_backend_str = self.backend.name();
                 let options = vec![
                     ListItem::new(Span::styled(
-                        "llama.rs (pure Rust GGUF — warm in-process, no llama.cpp)",
+                        "llama.cpp (in-process libllama.so — fast, no subprocess)",
                         Style::default().fg(light_blue),
                     )),
                     ListItem::new(Span::styled(
@@ -4415,6 +5276,20 @@ impl App {
                     )),
                     ListItem::new(Span::styled(
                         format!(
+                            "llama.cpp Sub-Backend: {}  (Enter / +/− cycles Auto→SIMD→GPU→Scalar)",
+                            s.llama_rs_sub_backend.label()
+                        ),
+                        Style::default().fg(Color::Rgb(100, 200, 255)),
+                    )),
+                    ListItem::new(Span::styled(
+                        format!(
+                            "Stall Watchdog Timeout: {}  (Enter / +/− cycles 5m→10m→20m→Unlimited)",
+                            crate::settings::format_stall_timeout(s.stall_timeout_secs)
+                        ),
+                        Style::default().fg(Color::Rgb(255, 180, 80)),
+                    )),
+                    ListItem::new(Span::styled(
+                        format!(
                             "Repeat threshold: {}  (+/− step · Enter cycle)",
                             s.repeat_threshold
                         ),
@@ -4438,20 +5313,14 @@ impl App {
                         ),
                         Style::default().fg(Color::Rgb(180, 160, 255)),
                     )),
-                    ListItem::new(Span::styled(
-                        format!(
-                            "Temperature: {:.2}  (+/− 0.05 · Enter: 0→0.2→0.5→0.7→1.0)",
-                            crate::settings::temperature()
-                        ),
-                        Style::default().fg(Color::Rgb(255, 160, 200)),
-                    )),
                 ];
-                let list = List::new(options)
-                    .block(Block::default().borders(Borders::TOP).title(
-                        " Runtime [Power | Ctx | Temp | Repeat] Enter=apply · +/−=nudge ",
-                    ))
-                    .highlight_style(Style::default().bg(theme_color).fg(Color::Black))
-                    .highlight_symbol(">> ");
+                let list =
+                    List::new(options)
+                        .block(Block::default().borders(Borders::TOP).title(
+                            " Runtime [Power | Ctx | Temp | Repeat] Enter=apply · +/−=nudge ",
+                        ))
+                        .highlight_style(Style::default().bg(theme_color).fg(Color::Black))
+                        .highlight_symbol(">> ");
                 frame.render_stateful_widget(list, menu_chunks[1], &mut self.runtime_state);
             } else {
                 // Permissions tab
@@ -4559,15 +5428,13 @@ impl App {
                 "\n",
                 " Downloads resume after network drops (Range). Re-run install to continue.\n",
             );
-            let help_para = Paragraph::new(help)
-                .style(Style::default().fg(fg))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(border))
-                        .title(" Keyboard Shortcuts [F1 to close] "),
-                );
+            let help_para = Paragraph::new(help).style(Style::default().fg(fg)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(border))
+                    .title(" Keyboard Shortcuts [F1 to close] "),
+            );
             frame.render_widget(help_para, area);
         }
 
@@ -4575,37 +5442,67 @@ impl App {
         if let Some(ref target) = self.delete_confirm_model {
             let popup_layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(30), Constraint::Percentage(40), Constraint::Percentage(30)].as_ref())
+                .constraints(
+                    [
+                        Constraint::Percentage(30),
+                        Constraint::Percentage(40),
+                        Constraint::Percentage(30),
+                    ]
+                    .as_ref(),
+                )
                 .split(frame.area());
-            
+
             let center_layout = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(20), Constraint::Percentage(60), Constraint::Percentage(20)].as_ref())
+                .constraints(
+                    [
+                        Constraint::Percentage(20),
+                        Constraint::Percentage(60),
+                        Constraint::Percentage(20),
+                    ]
+                    .as_ref(),
+                )
                 .split(popup_layout[1]);
-            
+
             let area = center_layout[1];
             frame.render_widget(Clear, area);
-            
+
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Double)
                 .border_style(Style::default().fg(Color::Rgb(255, 80, 80)))
                 .title(" Confirm Model Deletion (Agreement Required) ");
-            
+
             let confirm_lines = vec![
-                Line::from(Span::styled("Model Deletion Confirmation", Style::default().fg(Color::Rgb(255, 80, 80)).add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled(
+                    "Model Deletion Confirmation",
+                    Style::default()
+                        .fg(Color::Rgb(255, 80, 80))
+                        .add_modifier(Modifier::BOLD),
+                )),
                 Line::from(""),
                 Line::from(format!("Target Model: {}", target)),
                 Line::from("Are you sure you want to delete this model weight from memory/disk?"),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled(" [Y] Confirm Delete ", Style::default().bg(Color::Rgb(255, 50, 50)).fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        " [Y] Confirm Delete ",
+                        Style::default()
+                            .bg(Color::Rgb(255, 50, 50))
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw("   "),
-                    Span::styled(" [N / Esc] Cancel ", Style::default().bg(dark_gray).fg(Color::White)),
+                    Span::styled(
+                        " [N / Esc] Cancel ",
+                        Style::default().bg(dark_gray).fg(Color::White),
+                    ),
                 ]),
             ];
-            
-            let dialog = Paragraph::new(confirm_lines).block(block).alignment(Alignment::Center);
+
+            let dialog = Paragraph::new(confirm_lines)
+                .block(block)
+                .alignment(Alignment::Center);
             frame.render_widget(dialog, area);
         }
     }
@@ -4652,7 +5549,9 @@ fn compress_transcript(archive: &str) -> String {
                     paths.push(rest[..j].to_string());
                 }
             }
-        } else if line.starts_with("[tool]") || line.starts_with("error:") || line.starts_with("warning:")
+        } else if line.starts_with("[tool]")
+            || line.starts_with("error:")
+            || line.starts_with("warning:")
         {
             if tool_bits.len() < 6 {
                 tool_bits.push(trunc_chars(line, 120));
@@ -4700,7 +5599,10 @@ fn trunc_chars(s: &str, max: usize) -> String {
     if n <= max {
         s.to_string()
     } else {
-        format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            s.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 
