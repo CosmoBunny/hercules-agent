@@ -6,26 +6,31 @@
 //   1. Locate source: $LLAMA_CPP_SRC env var  →  ./llama.cpp submodule  →
 //      clone from GitHub into OUT_DIR/llama.cpp-src.
 //   2. Run CMake (Release, static libs, CPU-only safe defaults).
-//   3. Emit cargo:rustc-link-* directives for every .a produced.
+//   3. Build only the library targets we need (llama + ggml stack) — NOT the
+//      llama-cli / llama-server executables that newer llama.cpp builds by
+//      default and that drag in missing -lllama-server-impl / -lllama-cli-impl.
+//   4. Emit cargo:rustc-link-* directives for every .a produced.
 //
 // The static build is gated behind the feature flag `llama-cpp-static`.
 // Without the flag the old runtime dlopen path (`llama-cpp-bindings`) is used
 // and this script is a no-op for that path.
+//
+// Environment variables:
+//   LLAMA_CPP_SRC   – path to an existing llama.cpp checkout with CMakeLists.txt
+//   LLAMA_CUDA=1    – enable CUDA backend
+//   LLAMA_VULKAN=1  – enable Vulkan backend
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // Re-run if build.rs itself changes or the relevant env var is set.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_SRC");
     println!("cargo:rerun-if-env-changed=LLAMA_CUDA");
     println!("cargo:rerun-if-env-changed=LLAMA_VULKAN");
 
-    // Only build statically when the feature is requested.
     if std::env::var("CARGO_FEATURE_LLAMA_CPP_STATIC").is_err() {
-        // Feature not enabled — nothing to do (runtime dlopen path is active).
-        return;
+        return; // runtime dlopen path; nothing to do
     }
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"));
@@ -33,7 +38,7 @@ fn main() {
     let build_dir = out_dir.join("llama-cpp-build");
 
     cmake_configure(&src_dir, &build_dir);
-    cmake_build(&build_dir);
+    cmake_build_libs(&build_dir);
     emit_link_directives(&build_dir);
 }
 
@@ -45,10 +50,19 @@ fn locate_or_fetch_source(out_dir: &Path) -> PathBuf {
     // 1. Explicit override — user points at a pre-cloned tree.
     if let Ok(p) = std::env::var("LLAMA_CPP_SRC") {
         let path = PathBuf::from(&p);
-        assert!(
-            path.join("CMakeLists.txt").exists(),
-            "LLAMA_CPP_SRC={p} does not contain CMakeLists.txt"
-        );
+        if !path.exists() {
+            panic!(
+                "LLAMA_CPP_SRC={p} does not exist.\n\
+                 Make sure the path is correct, or unset LLAMA_CPP_SRC to let\n\
+                 build.rs clone llama.cpp automatically."
+            );
+        }
+        if !path.join("CMakeLists.txt").exists() {
+            panic!(
+                "LLAMA_CPP_SRC={p} exists but has no CMakeLists.txt.\n\
+                 Is this a proper llama.cpp source tree?"
+            );
+        }
         println!("cargo:rerun-if-changed={p}/CMakeLists.txt");
         return path;
     }
@@ -63,7 +77,9 @@ fn locate_or_fetch_source(out_dir: &Path) -> PathBuf {
     // 3. Auto-clone into OUT_DIR (works in CI without pre-cloning).
     let clone_target = out_dir.join("llama.cpp-src");
     if !clone_target.join("CMakeLists.txt").exists() {
-        eprintln!("[build.rs] Cloning llama.cpp …");
+        eprintln!("[build.rs] llama.cpp source not found locally — cloning from GitHub …");
+        eprintln!("[build.rs] Tip: run  git submodule add https://github.com/ggerganov/llama.cpp.git");
+        eprintln!("[build.rs] or set LLAMA_CPP_SRC=/path/to/llama.cpp to skip the download.");
         let status = Command::new("git")
             .args([
                 "clone",
@@ -86,28 +102,33 @@ fn locate_or_fetch_source(out_dir: &Path) -> PathBuf {
 fn cmake_configure(src: &Path, build: &Path) {
     std::fs::create_dir_all(build).expect("create build dir");
 
-    // Optional GPU backends via environment.
-    let cuda    = std::env::var("LLAMA_CUDA").unwrap_or_default();
-    let vulkan  = std::env::var("LLAMA_VULKAN").unwrap_or_default();
+    let cuda   = std::env::var("LLAMA_CUDA").unwrap_or_default();
+    let vulkan = std::env::var("LLAMA_VULKAN").unwrap_or_default();
+
+    // Detect whether Ninja is available; fall back to the platform default.
+    let generator = if which("ninja") { "Ninja" } else { "Unix Makefiles" };
 
     let mut cmd = Command::new("cmake");
     cmd.current_dir(build)
         .arg(src)
-        // Build type
+        .arg(format!("-G{generator}"))
         .arg("-DCMAKE_BUILD_TYPE=Release")
-        // Always produce static libraries.
+        // ── Static libraries ──────────────────────────────────────────────
+        // Both variable names are used across llama.cpp versions.
         .arg("-DBUILD_SHARED_LIBS=OFF")
-        .arg("-DLLAMA_BUILD_SHARED_LIBS=OFF")
-        // Don't build llama.cpp's own examples / tests — saves minutes.
+        .arg("-DGGML_SHARED_LIBS=OFF")          // ggml CMake variable (newer)
+        // ── Disable ALL application targets ──────────────────────────────
+        // Newer llama.cpp (post b4000) has a top-level apps directory that
+        // builds llama-cli / llama-server and pulls in impl libs that only
+        // exist when linking those executables.  Disable everything.
         .arg("-DLLAMA_BUILD_TESTS=OFF")
         .arg("-DLLAMA_BUILD_EXAMPLES=OFF")
         .arg("-DLLAMA_BUILD_SERVER=OFF")
-        // Use Ninja if available for faster parallel builds.
-        .arg("-GNinja")
-        // Position-independent code required when linking into a Rust binary.
+        .arg("-DLLAMA_BUILD_TOOLS=OFF")         // post-b4500 variable
+        .arg("-DLLAMA_STANDALONE=OFF")
+        // ── PIC required when linking into a Rust binary ──────────────────
         .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON");
 
-    // GPU backends
     if cuda == "1" || cuda.eq_ignore_ascii_case("on") {
         cmd.arg("-DGGML_CUDA=ON");
     }
@@ -115,25 +136,55 @@ fn cmake_configure(src: &Path, build: &Path) {
         cmd.arg("-DGGML_VULKAN=ON");
     }
 
-    let status = cmd.status().expect("cmake configure failed — ensure cmake is in PATH");
+    let status = cmd.status().expect("cmake configure failed — is cmake installed?");
     assert!(status.success(), "CMake configure step failed");
 }
 
 // ---------------------------------------------------------------------------
-// CMake build
+// CMake build — library targets only
 // ---------------------------------------------------------------------------
 
-fn cmake_build(build: &Path) {
+fn cmake_build_libs(build: &Path) {
     let jobs = std::thread::available_parallelism()
         .map(|n| n.get().to_string())
         .unwrap_or_else(|_| "4".to_string());
 
-    let status = Command::new("cmake")
-        .args(["--build", ".", "--config", "Release", "--parallel", &jobs])
-        .current_dir(build)
-        .status()
-        .expect("cmake --build failed");
-    assert!(status.success(), "CMake build step failed");
+    // We build only the library targets we actually need, not the default `all`
+    // target that would drag in llama-cli / llama-server executables.
+    //
+    // Target names are stable across llama.cpp versions:
+    //   - `llama`    → src/libllama.a
+    //   - `ggml`     → ggml/src/libggml.a (meta-lib pulling in ggml-base, ggml-cpu)
+    //
+    // Building `llama` is sufficient: CMake's dependency graph automatically
+    // builds ggml, ggml-base, ggml-cpu etc. as transitive dependencies.
+    let targets = ["llama", "ggml"];
+
+    for target in &targets {
+        let status = Command::new("cmake")
+            .args([
+                "--build", ".",
+                "--config", "Release",
+                "--target", target,
+                "--parallel", &jobs,
+            ])
+            .current_dir(build)
+            .status()
+            .unwrap_or_else(|e| panic!("cmake --build --target {target} failed to spawn: {e}"));
+
+        // `ggml` as a standalone target may not exist in all versions (it might
+        // be a dependency-only interface).  Skip it gracefully; `llama` already
+        // pulled it in.
+        if !status.success() && *target == "ggml" {
+            eprintln!("[build.rs] Note: cmake --target ggml failed (may be interface-only) — skipping");
+        } else {
+            assert!(
+                status.success(),
+                "cmake --build --target {target} failed.\n\
+                 Tip: check the CMake output above for compiler or dependency errors."
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,14 +192,16 @@ fn cmake_build(build: &Path) {
 // ---------------------------------------------------------------------------
 
 /// Walk the build tree and emit `cargo:rustc-link-lib=static=<name>` for
-/// every `.a` found, plus the link-search path.
+/// every `.a` found (excluding CMake test/check archives), plus search paths.
 fn emit_link_directives(build: &Path) {
-    // Collect all static archives produced by the build.
     let archives = find_archives(build);
     assert!(
         !archives.is_empty(),
-        "No .a files found under {} — CMake build may have failed",
-        build.display()
+        "No .a files found under {} — CMake build may have produced nothing.\n\
+         Try running the build manually:\n\
+           cd {} && cmake --build . --target llama",
+        build.display(),
+        build.display(),
     );
 
     // Deduplicate library directories.
@@ -159,69 +212,67 @@ fn emit_link_directives(build: &Path) {
             lib_dirs.push(dir);
         }
     }
-
     for dir in &lib_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());
     }
 
-    // Link order matters: llama → ggml-* → ggml → system libs.
-    // Sort so llama.a comes first, then ggml libs, then the rest.
+    // Link order: llama first (references ggml symbols), then ggml-*, then ggml.
     let mut sorted = archives.clone();
     sorted.sort_by_key(|p| {
-        let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
-        // Lower number = linked earlier (higher priority).
-        if stem == "llama"            { 0u8 }
-        else if stem.starts_with("ggml-") { 2 }
-        else if stem == "ggml"        { 3 }
-        else                          { 1 }
+        let s = p.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
+        let s = s.strip_prefix("lib").unwrap_or(&s).to_string();
+        if s == "llama"           { 0u8 }
+        else if s.starts_with("ggml-") { 2 }
+        else if s == "ggml"       { 3 }
+        else                      { 1 }
     });
 
     for archive in &sorted {
-        // Strip leading "lib" from the stem (libllama.a → llama).
-        let stem = archive
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy();
+        let stem = archive.file_stem().unwrap_or_default().to_string_lossy();
         let name = stem.strip_prefix("lib").unwrap_or(&stem);
         println!("cargo:rustc-link-lib=static={name}");
     }
 
-    // System libraries llama.cpp needs.
     link_system_libs();
 }
 
+/// Recursively collect .a files, skipping CMake internal / test dirs.
 fn find_archives(dir: &Path) -> Vec<PathBuf> {
     let mut results = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                results.extend(find_archives(&path));
-            } else if path.extension().map(|e| e == "a").unwrap_or(false) {
-                results.push(path);
+    let Ok(entries) = std::fs::read_dir(dir) else { return results };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip CMake's own scratch directories.
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name == "CMakeFiles" || name == "_deps" || name == "Testing" {
+                continue;
             }
+            results.extend(find_archives(&path));
+        } else if path.extension().map(|e| e == "a").unwrap_or(false) {
+            results.push(path);
         }
     }
     results
 }
 
 fn link_system_libs() {
-    // C++ standard library — required on all platforms.
     #[cfg(target_os = "macos")]
     println!("cargo:rustc-link-lib=c++");
     #[cfg(not(target_os = "macos"))]
     println!("cargo:rustc-link-lib=stdc++");
-
-    // POSIX threading.
     #[cfg(unix)]
     println!("cargo:rustc-link-lib=pthread");
-
-    // Math library (needed by ggml on Linux).
     #[cfg(target_os = "linux")]
     println!("cargo:rustc-link-lib=m");
-
-    // Dynamic loading (needed only for the dlopen path, not static — kept for
-    // completeness in case ggml links it transitively).
     #[cfg(target_os = "linux")]
     println!("cargo:rustc-link-lib=dl");
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn which(bin: &str) -> bool {
+    Command::new("which").arg(bin).output().map(|o| o.status.success()).unwrap_or(false)
 }
