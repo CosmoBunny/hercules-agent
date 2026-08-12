@@ -4,17 +4,20 @@
 // Two modes, tried in order:
 //
 //   A) Pre-built install  (LLAMA_INSTALL_DIR)
-//      Point at a directory that already contains .so / .a files.
-//      If .a files are found   → static link (truly self-contained).
-//      If only .so files found → dynamic link + bake RPATH so the binary
-//                                finds the libs without LD_LIBRARY_PATH.
-//      Example:
-//        LLAMA_INSTALL_DIR=/opt/llama.cpp cargo build --features llama-cpp-static
+//      Point at a directory that already contains .so/.dll / .a/.lib files.
+//      If static archives are found → static link (truly self-contained).
+//      If only shared libs found    → dynamic link + bake RPATH/path hint.
+//      Examples:
+//        Linux/macOS:
+//          LLAMA_INSTALL_DIR=/opt/llama.cpp cargo build --features llama-cpp-static
+//        Windows (PowerShell):
+//          $env:LLAMA_INSTALL_DIR="C:\llama.cpp"
+//          cargo build --features llama-cpp-static
 //
 //   B) Build from source  (LLAMA_CPP_SRC / submodule / auto-clone)
-//      Requires cmake + a C++17 compiler.  Produces static .a files.
+//      Requires cmake + a C++17 compiler.  Produces static archives.
 //      Examples:
-//        # submodule (recommended for reproducible builds)
+//        # submodule (recommended)
 //        git submodule add https://github.com/ggerganov/llama.cpp.git
 //        cargo build --release --features llama-cpp-static
 //
@@ -25,8 +28,9 @@
 //        cargo build --release --features llama-cpp-static
 //
 // The feature flag `llama-cpp-static` must be enabled; without it the runtime
-// dlopen path is used and this script does nothing.
+// dlopen/LoadLibrary path is used and this script does nothing.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -38,7 +42,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LLAMA_VULKAN");
 
     if std::env::var("CARGO_FEATURE_LLAMA_CPP_STATIC").is_err() {
-        return; // runtime dlopen path; nothing to do
+        return; // runtime dlopen path active; nothing to do
     }
 
     // ── Mode A: pre-built install directory ──────────────────────────────────
@@ -47,7 +51,7 @@ fn main() {
         if !path.exists() {
             panic!(
                 "\nLLAMA_INSTALL_DIR={dir} does not exist.\n\
-                 Set it to the directory that contains libllama.so / libllama.a.\n"
+                 Set it to the directory containing libllama.so / llama.lib / libllama.a.\n"
             );
         }
         link_from_install_dir(&path);
@@ -69,12 +73,7 @@ fn main() {
 // ===========================================================================
 
 fn link_from_install_dir(dir: &Path) {
-    // Collect all relevant library files in the directory.
-    let archives = collect_libs(dir, "a");
-    let shared   = collect_libs(dir, shared_ext());
-
-    // Filter to just the llama.cpp / ggml libraries we actually need.
-    // Ignore openvino, tbb, hwloc etc. — they'll be pulled in transitively.
+    // llama.cpp core libraries we care about (ignores openvino, tbb, hwloc…)
     let core_names = [
         "llama", "ggml", "ggml-base", "ggml-cpu",
         "ggml-rpc", "ggml-cuda", "ggml-vulkan", "ggml-metal",
@@ -83,29 +82,37 @@ fn link_from_install_dir(dir: &Path) {
 
     println!("cargo:rustc-link-search=native={}", dir.display());
 
+    // Collect static archives: .a (Unix/MinGW) or .lib (MSVC)
+    let mut archives = collect_libs(dir, "a");
+    archives.extend(collect_libs(dir, "lib")); // MSVC static libs
+
+    // Collect shared libs: .so (Linux) / .dylib (macOS) / .dll.lib or .dll (Windows)
+    let shared = {
+        let mut s = collect_libs(dir, shared_ext());
+        // On Windows, also look for import libs (.dll.a for MinGW, handled above via "a")
+        s
+    };
+
     if !archives.is_empty() {
-        // Static archives available — prefer them.
-        eprintln!("[build.rs] Found {} static archive(s) in {} — static linking", archives.len(), dir.display());
-        let sorted = sort_libs(archives);
-        for path in &sorted {
+        eprintln!(
+            "[build.rs] {} static archive(s) in {} — static linking",
+            archives.len(), dir.display()
+        );
+        for path in sort_libs(archives) {
             let stem = lib_stem(&path);
             if core_names.iter().any(|n| stem == *n) {
                 println!("cargo:rustc-link-lib=static={stem}");
             }
         }
     } else if !shared.is_empty() {
-        // Only shared libraries — dynamic link + bake RPATH so the binary
-        // finds them without the user setting LD_LIBRARY_PATH.
         eprintln!(
-            "[build.rs] No static archives found in {} — dynamic linking with baked RPATH",
+            "[build.rs] No static archives in {} — dynamic linking with baked rpath",
             dir.display()
         );
-        let rpath = dir.to_string_lossy();
-        // Bake the install dir as an RPATH into the final binary.
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{rpath}");
+        // Bake the directory so the binary finds the libs without PATH/LD_LIBRARY_PATH.
+        bake_rpath(dir);
 
-        let sorted = sort_libs(shared);
-        for path in &sorted {
+        for path in sort_libs(shared) {
             let stem = lib_stem(&path);
             if core_names.iter().any(|n| stem == *n) {
                 println!("cargo:rustc-link-lib=dylib={stem}");
@@ -113,8 +120,8 @@ fn link_from_install_dir(dir: &Path) {
         }
     } else {
         panic!(
-            "\nLLAMA_INSTALL_DIR={} contains no libllama.{{a,so}} files.\n\
-             Is this the right directory?  Contents must include libllama.so or libllama.a.\n",
+            "\nLLAMA_INSTALL_DIR={} has no libllama.{{a,so,dylib,lib,dll}} files.\n\
+             Is this the correct directory?\n",
             dir.display()
         );
     }
@@ -122,33 +129,58 @@ fn link_from_install_dir(dir: &Path) {
     link_system_libs();
 }
 
+/// Bake the library directory into the binary so it is found at runtime
+/// without the user setting LD_LIBRARY_PATH / DYLD_LIBRARY_PATH.
+fn bake_rpath(dir: &Path) {
+    let d = dir.to_string_lossy();
+    #[cfg(target_os = "linux")]
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{d}");
+    #[cfg(target_os = "macos")]
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{d}");
+    // Windows uses PATH; there's no ELF rpath equivalent.
+    // The DLLs must be alongside the .exe or in a directory on PATH.
+    // We emit a warning so the packager knows.
+    #[cfg(target_os = "windows")]
+    eprintln!(
+        "[build.rs] Windows: DLLs from {d} must be in the same directory as hercules.exe \
+         or on the system PATH at runtime."
+    );
+}
+
 fn collect_libs(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else { return out };
     for entry in entries.flatten() {
         let p = entry.path();
-        if p.is_file() && p.extension().map(|e| e == ext).unwrap_or(false) {
-            // Only pick up files whose name starts with "lib"
-            let fname = p.file_name().unwrap_or_default().to_string_lossy();
-            if fname.starts_with("lib") {
-                out.push(p);
-            }
+        if !p.is_file() { continue; }
+        let ext_matches = p.extension().map(|e| e == ext).unwrap_or(false);
+        if !ext_matches { continue; }
+        let fname = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        // Unix: name starts with "lib". Windows MSVC: just "llama.lib" etc.
+        if fname.starts_with("lib") || fname.starts_with("llama") || fname.starts_with("ggml") {
+            out.push(p);
         }
     }
     out
 }
 
-#[cfg(target_os = "macos")]
-fn shared_ext() -> &'static str { "dylib" }
-#[cfg(not(target_os = "macos"))]
-fn shared_ext() -> &'static str { "so" }
+/// Platform-specific shared library extension.
+fn shared_ext() -> &'static str {
+    if cfg!(target_os = "windows") { "dll" }
+    else if cfg!(target_os = "macos") { "dylib" }
+    else { "so" }
+}
 
+/// Extract the logical library name from a path.
+///   libllama.so.0.0.1 → llama
+///   llama.lib          → llama
+///   libggml-cpu.a      → ggml-cpu
 fn lib_stem(p: &Path) -> String {
-    // libllama.so.0.0.1 → llama   (take the first component after "lib")
-    let fname = p.file_name().unwrap_or_default().to_string_lossy();
-    // Strip "lib" prefix then take up to first '.'
-    let without_prefix = fname.strip_prefix("lib").unwrap_or(&fname);
-    without_prefix.split('.').next().unwrap_or(without_prefix).to_string()
+    let fname = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+    // Strip "lib" prefix if present
+    let s = fname.strip_prefix("lib").unwrap_or(&fname);
+    // Take everything before the first '.'
+    s.split('.').next().unwrap_or(s).to_string()
 }
 
 fn sort_libs(mut libs: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -159,8 +191,8 @@ fn sort_libs(mut libs: Vec<PathBuf>) -> Vec<PathBuf> {
         else if s == "ggml"            { 3 }
         else                           { 1 }
     });
-    // Deduplicate by stem (e.g. libllama.so / libllama.so.0 / libllama.so.0.0.1)
-    let mut seen = std::collections::HashSet::new();
+    // Deduplicate by logical name (libllama.so / libllama.so.0 / libllama.so.0.0.1)
+    let mut seen = HashSet::new();
     libs.retain(|p| seen.insert(lib_stem(p)));
     libs
 }
@@ -170,61 +202,60 @@ fn sort_libs(mut libs: Vec<PathBuf>) -> Vec<PathBuf> {
 // ===========================================================================
 
 fn locate_or_fetch_source(out_dir: &Path) -> PathBuf {
-    // 1. Explicit source tree.
+    // 1. Explicit source tree override.
     if let Ok(p) = std::env::var("LLAMA_CPP_SRC") {
         let path = PathBuf::from(&p);
         if !path.exists() {
             panic!(
                 "\nLLAMA_CPP_SRC={p} does not exist.\n\
                  \n\
-                 If you have a pre-built llama.cpp install (with .so files), use:\n\
+                 If you have a pre-built llama.cpp install use LLAMA_INSTALL_DIR instead:\n\
                    LLAMA_INSTALL_DIR={p} cargo build --features llama-cpp-static\n\
                  \n\
                  To build from source, clone llama.cpp first:\n\
-                   git clone https://github.com/ggerganov/llama.cpp.git {p}\n"
+                   git clone https://github.com/ggerganov/llama.cpp.git \"{p}\"\n"
             );
         }
         if !path.join("CMakeLists.txt").exists() {
-            // Might be a binary install — give a helpful hint.
-            let has_so = path.read_dir()
-                .ok()
-                .map(|d| d.flatten().any(|e| {
-                    e.path().extension().map(|x| x == "so" || x == "dylib" || x == "dll").unwrap_or(false)
-                }))
-                .unwrap_or(false);
-            if has_so {
+            let has_binaries = path.read_dir().ok().map(|d| d.flatten().any(|e| {
+                let ext = e.path().extension().map(|x| x.to_string_lossy().to_lowercase());
+                matches!(ext.as_deref(), Some("so") | Some("dylib") | Some("dll") | Some("lib"))
+            })).unwrap_or(false);
+            if has_binaries {
                 panic!(
-                    "\nLLAMA_CPP_SRC={p} looks like a pre-built install (has .so files) not a source tree.\n\
+                    "\nLLAMA_CPP_SRC={p} looks like a pre-built install, not a source tree.\n\
                      Use LLAMA_INSTALL_DIR instead:\n\
                        LLAMA_INSTALL_DIR={p} cargo build --features llama-cpp-static\n"
                 );
             }
             panic!(
                 "\nLLAMA_CPP_SRC={p} exists but has no CMakeLists.txt.\n\
-                 Point LLAMA_CPP_SRC at a proper llama.cpp source checkout.\n"
+                 Point it at a proper llama.cpp source checkout.\n"
             );
         }
         println!("cargo:rerun-if-changed={p}/CMakeLists.txt");
         return path;
     }
 
-    // 2. Git submodule at ./llama.cpp.
-    let submodule = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("llama.cpp");
+    // 2. Git submodule at ./llama.cpp (preferred for reproducible builds).
+    let submodule = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set")
+    ).join("llama.cpp");
     if submodule.join("CMakeLists.txt").exists() {
         println!("cargo:rerun-if-changed=llama.cpp/CMakeLists.txt");
         return submodule;
     }
 
-    // 3. Auto-clone.
+    // 3. Auto-clone into OUT_DIR (works in CI without pre-cloning).
     let clone_target = out_dir.join("llama.cpp-src");
     if !clone_target.join("CMakeLists.txt").exists() {
-        eprintln!("[build.rs] No local llama.cpp source found — cloning from GitHub …");
-        eprintln!("[build.rs] Tip: set LLAMA_INSTALL_DIR=/opt/llama.cpp if you have a pre-built install.");
+        eprintln!("[build.rs] No local llama.cpp source — cloning from GitHub …");
+        eprintln!("[build.rs] Tip: set LLAMA_INSTALL_DIR if you have a pre-built install.");
         let status = Command::new("git")
             .args([
                 "clone", "--depth=1", "--branch", "master",
                 "https://github.com/ggerganov/llama.cpp.git",
-                clone_target.to_str().unwrap(),
+                clone_target.to_str().expect("non-UTF8 OUT_DIR"),
             ])
             .status()
             .expect("git clone failed — ensure git is in PATH");
@@ -234,25 +265,44 @@ fn locate_or_fetch_source(out_dir: &Path) -> PathBuf {
 }
 
 fn cmake_configure(src: &Path, build: &Path) {
-    std::fs::create_dir_all(build).expect("create build dir");
+    std::fs::create_dir_all(build).expect("create CMake build dir");
 
     let cuda   = std::env::var("LLAMA_CUDA").unwrap_or_default();
     let vulkan = std::env::var("LLAMA_VULKAN").unwrap_or_default();
-    let cmake_gen = if which("ninja") { "Ninja" } else { "Unix Makefiles" };
+
+    // Generator selection:
+    //   Linux/macOS: prefer Ninja, fall back to Unix Makefiles
+    //   Windows:     prefer Ninja, fall back to "Visual Studio" auto-detection
+    //                (CMake will pick the installed VS version automatically)
+    let cmake_gen: &str = if cmd_exists("ninja") {
+        "Ninja"
+    } else if cfg!(windows) {
+        ""   // empty = let CMake auto-detect the installed VS generator
+    } else {
+        "Unix Makefiles"
+    };
 
     let mut cmd = Command::new("cmake");
-    cmd.current_dir(build)
-        .arg(src)
-        .arg(format!("-G{cmake_gen}"))
+    cmd.current_dir(build).arg(src);
+
+    if !cmake_gen.is_empty() {
+        cmd.arg(format!("-G{cmake_gen}"));
+    }
+
+    cmd // Static libraries on all platforms
         .arg("-DCMAKE_BUILD_TYPE=Release")
         .arg("-DBUILD_SHARED_LIBS=OFF")
         .arg("-DGGML_SHARED_LIBS=OFF")
+        // Disable all application targets (avoids missing -lllama-server-impl etc.)
         .arg("-DLLAMA_BUILD_TESTS=OFF")
         .arg("-DLLAMA_BUILD_EXAMPLES=OFF")
         .arg("-DLLAMA_BUILD_SERVER=OFF")
         .arg("-DLLAMA_BUILD_TOOLS=OFF")
-        .arg("-DLLAMA_STANDALONE=OFF")
-        .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON");
+        .arg("-DLLAMA_STANDALONE=OFF");
+
+    // PIC: needed on Unix for linking into a Rust binary; harmless on Windows.
+    #[cfg(unix)]
+    cmd.arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON");
 
     if cuda == "1" || cuda.eq_ignore_ascii_case("on") {
         cmd.arg("-DGGML_CUDA=ON");
@@ -272,12 +322,19 @@ fn cmake_build_libs(build: &Path) {
 
     for target in &["llama", "ggml"] {
         let status = Command::new("cmake")
-            .args(["--build", ".", "--config", "Release", "--target", target, "--parallel", &jobs])
+            .args([
+                "--build", ".",
+                "--config", "Release",
+                "--target", target,
+                "--parallel", &jobs,
+            ])
             .current_dir(build)
             .status()
-            .unwrap_or_else(|e| panic!("cmake --build --target {target} failed: {e}"));
+            .unwrap_or_else(|e| panic!("cmake --build --target {target}: {e}"));
 
         if !status.success() && *target == "ggml" {
+            // ggml may be an interface-only target in some llama.cpp versions;
+            // building `llama` already pulled in the ggml stack transitively.
             eprintln!("[build.rs] cmake --target ggml skipped (may be interface-only)");
         } else {
             assert!(status.success(), "cmake --build --target {target} failed");
@@ -286,9 +343,14 @@ fn cmake_build_libs(build: &Path) {
 }
 
 fn emit_link_directives(build: &Path) {
-    let archives = find_archives(build);
-    assert!(!archives.is_empty(), "No .a files found under {}", build.display());
+    let mut archives = find_static_archives(build);
+    assert!(
+        !archives.is_empty(),
+        "No static archives found under {} — did CMake build succeed?",
+        build.display()
+    );
 
+    // Deduplicate lib dirs
     let mut lib_dirs: Vec<PathBuf> = Vec::new();
     for a in &archives {
         let d = a.parent().unwrap().to_path_buf();
@@ -298,9 +360,11 @@ fn emit_link_directives(build: &Path) {
         println!("cargo:rustc-link-search=native={}", d.display());
     }
 
+    // Emit in correct link order
     let sorted = sort_libs(archives);
     for a in &sorted {
         let stem = a.file_stem().unwrap_or_default().to_string_lossy();
+        // Unix: libllama.a → strip "lib"; Windows: llama.lib → no strip needed
         let name = stem.strip_prefix("lib").unwrap_or(&stem);
         println!("cargo:rustc-link-lib=static={name}");
     }
@@ -308,46 +372,98 @@ fn emit_link_directives(build: &Path) {
     link_system_libs();
 }
 
-fn find_archives(dir: &Path) -> Vec<PathBuf> {
+/// Recursively collect static archives (.a on Unix, .lib on Windows),
+/// skipping CMake internal directories.
+fn find_static_archives(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else { return out };
     for entry in entries.flatten() {
         let p = entry.path();
         if p.is_dir() {
             let n = p.file_name().unwrap_or_default().to_string_lossy();
-            if n == "CMakeFiles" || n == "_deps" || n == "Testing" { continue; }
-            out.extend(find_archives(&p));
-        } else if p.extension().map(|e| e == "a").unwrap_or(false) {
-            out.push(p);
+            if matches!(n.as_ref(), "CMakeFiles" | "_deps" | "Testing" | "Release" | "Debug") {
+                // On Windows, CMake puts the actual .lib files inside Release/ or Debug/
+                // sub-dirs, so we DO recurse into Release/ but skip CMakeFiles etc.
+                if n == "CMakeFiles" || n == "_deps" || n == "Testing" { continue; }
+            }
+            out.extend(find_static_archives(&p));
+        } else {
+            let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase());
+            // .a  → Unix/MinGW static lib
+            // .lib → MSVC static lib  (but NOT import libs — those are for .dll)
+            //   Heuristic: if a matching .dll exists, it's an import lib → skip it.
+            //   Otherwise treat it as a static lib.
+            match ext.as_deref() {
+                Some("a") => out.push(p),
+                Some("lib") => {
+                    let dll = p.with_extension("dll");
+                    if !dll.exists() { out.push(p); }
+                }
+                _ => {}
+            }
         }
     }
     out
 }
 
 // ===========================================================================
-// Shared helpers
+// System libraries
 // ===========================================================================
 
 fn link_system_libs() {
+    // ── C++ standard library ─────────────────────────────────────────────────
+    // MSVC: auto-linked via #pragma comment(lib, ...) in the CRT headers.
+    // MinGW / Linux: must be explicit.
     #[cfg(target_os = "macos")]
     println!("cargo:rustc-link-lib=c++");
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     println!("cargo:rustc-link-lib=stdc++");
+    // MinGW on Windows also needs stdc++ (MSVC links it automatically)
+    #[cfg(all(target_os = "windows", target_env = "gnu"))]
+    println!("cargo:rustc-link-lib=stdc++");
+
+    // ── POSIX threading ───────────────────────────────────────────────────────
     #[cfg(unix)]
     println!("cargo:rustc-link-lib=pthread");
+
+    // ── Math / DL ─────────────────────────────────────────────────────────────
     #[cfg(target_os = "linux")]
-    println!("cargo:rustc-link-lib=m");
-    #[cfg(target_os = "linux")]
-    println!("cargo:rustc-link-lib=dl");
-    // ggml-cpu is compiled with -fopenmp; the resulting .a references GOMP_*
-    // symbols from libgomp (GCC OpenMP runtime).  Always present alongside gcc.
-    // macOS uses libomp from LLVM/Homebrew instead.
+    {
+        println!("cargo:rustc-link-lib=m");
+        println!("cargo:rustc-link-lib=dl");
+    }
+
+    // ── OpenMP runtime ────────────────────────────────────────────────────────
+    // ggml-cpu is compiled with -fopenmp / /openmp and references GOMP_* or
+    // omp_* symbols.
+    //
+    //  Linux / MinGW:  libgomp  (GCC's OpenMP runtime, ships with gcc)
+    //  macOS:          omp      (llvm-openmp from Homebrew: brew install libomp)
+    //  Windows MSVC:   vcomp    (Visual C++ OpenMP runtime, part of MSVC)
     #[cfg(target_os = "linux")]
     println!("cargo:rustc-link-lib=gomp");
+
     #[cfg(target_os = "macos")]
     println!("cargo:rustc-link-lib=omp");
+
+    #[cfg(all(target_os = "windows", not(target_env = "gnu")))]
+    println!("cargo:rustc-link-lib=vcomp");  // MSVC OpenMP
+
+    #[cfg(all(target_os = "windows", target_env = "gnu"))]
+    println!("cargo:rustc-link-lib=gomp");   // MinGW OpenMP
 }
 
-fn which(bin: &str) -> bool {
-    Command::new("which").arg(bin).output().map(|o| o.status.success()).unwrap_or(false)
+// ===========================================================================
+// Helpers
+// ===========================================================================
+
+/// Cross-platform "is this binary on PATH?".
+fn cmd_exists(bin: &str) -> bool {
+    // `which` on Unix, `where` on Windows
+    let checker = if cfg!(windows) { "where" } else { "which" };
+    Command::new(checker)
+        .arg(bin)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
