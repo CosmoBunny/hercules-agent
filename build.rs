@@ -339,6 +339,13 @@ fn link_system_libs() {
     println!("cargo:rustc-link-lib=m");
     #[cfg(target_os = "linux")]
     println!("cargo:rustc-link-lib=dl");
+    // ggml-cpu is compiled with -fopenmp; the resulting .a references GOMP_*
+    // symbols from libgomp (GCC OpenMP runtime).  Always present alongside gcc.
+    // macOS uses libomp from LLVM/Homebrew instead.
+    #[cfg(target_os = "linux")]
+    println!("cargo:rustc-link-lib=gomp");
+    #[cfg(target_os = "macos")]
+    println!("cargo:rustc-link-lib=omp");
 }
 
 fn which(bin: &str) -> bool {
