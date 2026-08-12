@@ -2,11 +2,12 @@
 name = "hercules-agent"
 version = "0.1.0"
 edition = "2024"
-description = "Hercules Agent — local coding TUI agent (llama.cpp in-process via libllama.so)"
+description = "Hercules Agent — local AI coding TUI (llama.cpp statically linked or in-process via libllama.so)"
 license = "MIT"
 readme = "README.md"
 keywords = ["llm", "tui", "agent", "llama", "local"]
 categories = ["command-line-utilities", "development-tools"]
+build = "build.rs"
 
 [lib]
 name = "hercules_agent"
@@ -28,7 +29,14 @@ gpu = ["dep:burn"]
 full = ["simd", "parallel", "gpu"]
 # Tighter defaults: single-thread, no rayon preference.
 embedded = []
-# Legacy: in-process llama.cpp shared library bindings — now the primary path.
+# Build llama.cpp as static libs (no shared library needed at runtime).
+# Requires cmake + a C++17 compiler. Either:
+#   a) Add as a git submodule:  git submodule add https://github.com/ggerganov/llama.cpp.git
+#   b) Set LLAMA_CPP_SRC=/path/to/llama.cpp before building.
+#   c) Nothing — build.rs will auto-clone into $OUT_DIR (needs internet on first build).
+# Enable with:  cargo build --features llama-cpp-static
+llama-cpp-static = []
+# Legacy: in-process llama.cpp shared library bindings — still the default path.
 llama-cpp-bindings = []
 # Legacy pure-Rust GGUF engine (kept for reference; not activated at runtime).
 llama-rs = []

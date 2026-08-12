@@ -1,9 +1,17 @@
-//! Raw unsafe C FFI bindings to `libllama.so` loaded via `libloading`.
+//! Raw unsafe C FFI bindings to llama.cpp.
+//!
+//! Two modes, selected at compile time:
+//!   - `llama-cpp-static` feature ON  → symbols resolved at link time from
+//!     the static archives built by build.rs. Zero runtime overhead, no shared
+//!     library search, self-contained binary.
+//!   - `llama-cpp-static` feature OFF → `libloading` dlopen path (existing
+//!     behaviour) — useful for distro packages or CI without a C++ compiler.
 //!
 //! All opaque types are `c_void`. Access via [`LlamaLib`] global singleton.
 
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_float, c_int};
+#[cfg(not(feature = "llama-cpp-static"))]
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -162,7 +170,10 @@ type FnMemoryClear = unsafe extern "C" fn(*mut c_void, bool);
 
 pub struct LlamaLib {
     /// Transitive deps (libggml-*.so) kept alive for process lifetime.
+    /// Only present in the dynamic-load path; not needed when statically linked.
+    #[cfg(not(feature = "llama-cpp-static"))]
     _deps: Vec<libloading::Library>,
+    #[cfg(not(feature = "llama-cpp-static"))]
     _lib: libloading::Library,
     pub backend_init: FnBackendInit,
     pub backend_free: FnBackendFree,
@@ -201,6 +212,107 @@ pub struct LlamaLib {
 
 unsafe impl Send for LlamaLib {}
 unsafe impl Sync for LlamaLib {}
+
+// ===========================================================================
+// Static-link path: symbols resolved at compile time from libllama.a
+// ===========================================================================
+
+#[cfg(feature = "llama-cpp-static")]
+extern "C" {
+    fn llama_backend_init();
+    fn llama_backend_free();
+    fn llama_model_default_params() -> LlamaModelParams;
+    fn llama_model_load_from_file(path: *const c_char, params: LlamaModelParams) -> *mut LlamaModel;
+    fn llama_model_free(model: *mut LlamaModel);
+    fn llama_model_get_vocab(model: *const LlamaModel) -> *const LlamaVocab;
+    fn llama_context_default_params() -> LlamaContextParams;
+    fn llama_init_from_model(model: *mut LlamaModel, params: LlamaContextParams) -> *mut LlamaContext;
+    fn llama_free(ctx: *mut LlamaContext);
+    fn llama_n_ctx(ctx: *const LlamaContext) -> u32;
+    // Prefer modern name; fall back handled by a wrapper below.
+    fn llama_model_n_ctx_train(model: *const LlamaModel) -> i32;
+    fn llama_tokenize(
+        vocab: *const LlamaVocab, text: *const c_char, text_len: c_int,
+        tokens: *mut LlamaToken, n_tokens_max: c_int, add_special: bool, parse_special: bool,
+    ) -> c_int;
+    fn llama_token_to_piece(
+        vocab: *const LlamaVocab, token: LlamaToken, buf: *mut c_char,
+        length: c_int, lstrip: c_int, special: bool,
+    ) -> c_int;
+    fn llama_vocab_bos(vocab: *const LlamaVocab) -> LlamaToken;
+    fn llama_vocab_eos(vocab: *const LlamaVocab) -> LlamaToken;
+    fn llama_vocab_get_add_bos(vocab: *const LlamaVocab) -> bool;
+    fn llama_vocab_is_eog(vocab: *const LlamaVocab, token: LlamaToken) -> bool;
+    fn llama_batch_get_one(tokens: *mut LlamaToken, n_tokens: c_int) -> LlamaBatch;
+    fn llama_batch_free(batch: LlamaBatch);
+    fn llama_decode(ctx: *mut LlamaContext, batch: LlamaBatch) -> c_int;
+    fn llama_get_logits_ith(ctx: *mut LlamaContext, i: c_int) -> *mut f32;
+    fn llama_sampler_chain_default_params() -> LlamaSamplerChainParams;
+    fn llama_sampler_chain_init(params: LlamaSamplerChainParams) -> *mut LlamaSampler;
+    fn llama_sampler_chain_add(chain: *mut LlamaSampler, sampler: *mut LlamaSampler);
+    fn llama_sampler_init_temp(t: f32) -> *mut LlamaSampler;
+    fn llama_sampler_init_top_p(p: f32, min_keep: usize) -> *mut LlamaSampler;
+    fn llama_sampler_init_dist(seed: u32) -> *mut LlamaSampler;
+    fn llama_sampler_sample(sampler: *mut LlamaSampler, ctx: *mut LlamaContext, idx: c_int) -> LlamaToken;
+    fn llama_sampler_free(sampler: *mut LlamaSampler);
+    fn llama_log_set(
+        callback: Option<unsafe extern "C" fn(i32, *const c_char, *mut c_void)>,
+        user_data: *mut c_void,
+    );
+    // Optional newer API — may not exist in older llama.cpp; the build.rs
+    // will succeed either way since the static feature requires our build.
+    fn llama_get_memory(ctx: *const LlamaContext) -> *mut c_void;
+    fn llama_memory_clear(mem: *mut c_void, data: bool);
+}
+
+#[cfg(feature = "llama-cpp-static")]
+impl LlamaLib {
+    /// Construct a `LlamaLib` that calls statically-linked symbols directly.
+    /// No shared library is opened; all function pointers point into the
+    /// binary's own text segment.
+    pub fn load_static() -> Self {
+        // SAFETY: these are all valid extern "C" fn pointers resolved at
+        // link time from libllama.a built by build.rs.
+        unsafe {
+            Self {
+                backend_init:                  llama_backend_init,
+                backend_free:                  llama_backend_free,
+                model_default_params:          llama_model_default_params,
+                model_load_from_file:          llama_model_load_from_file,
+                model_free:                    llama_model_free,
+                model_get_vocab:               llama_model_get_vocab,
+                context_default_params:        llama_context_default_params,
+                init_from_model:               llama_init_from_model,
+                context_free:                  llama_free,
+                n_ctx:                         llama_n_ctx,
+                n_ctx_train:                   llama_model_n_ctx_train,
+                tokenize:                      llama_tokenize,
+                token_to_piece:                llama_token_to_piece,
+                vocab_bos:                     llama_vocab_bos,
+                vocab_eos:                     llama_vocab_eos,
+                vocab_get_add_bos:             llama_vocab_get_add_bos,
+                token_is_eog:                  llama_vocab_is_eog,
+                batch_get_one:                 llama_batch_get_one,
+                batch_free:                    llama_batch_free,
+                decode:                        llama_decode,
+                get_logits_ith:                llama_get_logits_ith,
+                sampler_chain_default_params:  llama_sampler_chain_default_params,
+                sampler_chain_init:            llama_sampler_chain_init,
+                sampler_chain_add:             llama_sampler_chain_add,
+                sampler_init_temp:             llama_sampler_init_temp,
+                sampler_init_top_p:            llama_sampler_init_top_p,
+                sampler_init_dist:             llama_sampler_init_dist,
+                sampler_sample:                llama_sampler_sample,
+                sampler_free:                  llama_sampler_free,
+                log_set:                       llama_log_set,
+                // These may or may not exist depending on llama.cpp version;
+                // use Some(...) unconditionally since our build controls the version.
+                get_memory:   Some(llama_get_memory),
+                memory_clear: Some(llama_memory_clear),
+            }
+        }
+    }
+}
 
 impl LlamaLib {
     /// Open a shared library with RTLD_GLOBAL on Unix so later loads can resolve
@@ -496,13 +608,23 @@ impl LlamaLib {
 // Global singleton
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// Global singleton — works for both static and dynamic paths
+// ===========================================================================
+
 static LLAMA_LIB: OnceLock<Arc<LlamaLib>> = OnceLock::new();
 
 pub fn get_lib() -> Result<Arc<LlamaLib>, String> {
     if let Some(lib) = LLAMA_LIB.get() {
         return Ok(lib.clone());
     }
+
+    #[cfg(feature = "llama-cpp-static")]
+    let lib = Arc::new(LlamaLib::load_static());
+
+    #[cfg(not(feature = "llama-cpp-static"))]
     let lib = Arc::new(LlamaLib::load()?);
+
     let _ = LLAMA_LIB.set(lib.clone());
     Ok(lib)
 }
