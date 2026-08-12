@@ -11,7 +11,6 @@
 
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_float, c_int};
-#[cfg(not(feature = "llama-cpp-static"))]
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -218,7 +217,7 @@ unsafe impl Sync for LlamaLib {}
 // ===========================================================================
 
 #[cfg(feature = "llama-cpp-static")]
-extern "C" {
+unsafe extern "C" {
     fn llama_backend_init();
     fn llama_backend_free();
     fn llama_model_default_params() -> LlamaModelParams;
@@ -229,7 +228,6 @@ extern "C" {
     fn llama_init_from_model(model: *mut LlamaModel, params: LlamaContextParams) -> *mut LlamaContext;
     fn llama_free(ctx: *mut LlamaContext);
     fn llama_n_ctx(ctx: *const LlamaContext) -> u32;
-    // Prefer modern name; fall back handled by a wrapper below.
     fn llama_model_n_ctx_train(model: *const LlamaModel) -> i32;
     fn llama_tokenize(
         vocab: *const LlamaVocab, text: *const c_char, text_len: c_int,
@@ -259,8 +257,6 @@ extern "C" {
         callback: Option<unsafe extern "C" fn(i32, *const c_char, *mut c_void)>,
         user_data: *mut c_void,
     );
-    // Optional newer API — may not exist in older llama.cpp; the build.rs
-    // will succeed either way since the static feature requires our build.
     fn llama_get_memory(ctx: *const LlamaContext) -> *mut c_void;
     fn llama_memory_clear(mem: *mut c_void, data: bool);
 }
@@ -314,6 +310,8 @@ impl LlamaLib {
     }
 }
 
+// Dynamic-load impl only compiled when the static feature is OFF.
+#[cfg(not(feature = "llama-cpp-static"))]
 impl LlamaLib {
     /// Open a shared library with RTLD_GLOBAL on Unix so later loads can resolve
     /// NEEDED deps from absolute paths we already loaded (no LD_LIBRARY_PATH).
