@@ -1457,12 +1457,33 @@ impl App {
 
         let mut out = body;
         if self.auto_tool_turns > 0 {
-            out.push_str(
-                "\n\nInstruction: Tool results are above (Result: blocks). \
-                 Reply in natural language only — tell the user what you found. \
-                 Do NOT emit any tool tags (<read>, <ls>, <write>, <cmd>). \
-                 Do NOT say you lack file access. Open chips already show full content.",
-            );
+            let last_user = self
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| m.strip_prefix("You: ").map(|s| s.to_string()))
+                .unwrap_or_default();
+            if crate::agent::AgentEngine::wants_plan_first(&last_user) {
+                out.push_str(
+                    "\n\nInstruction: Give a clear multi-step PLAN in natural language. \
+                     Do NOT emit tool tags. Do NOT ls again.",
+                );
+            } else if crate::agent::AgentEngine::wants_implement(&last_user)
+                || last_user.to_ascii_lowercase().contains("start coding")
+            {
+                out.push_str(
+                    "\n\nInstruction: Directory listing (if any) is above. \
+                     Now IMPLEMENT: emit <write src=\"...\"> with full file content. \
+                     Do NOT emit <ls> again. One primary app file is fine to start.",
+                );
+            } else {
+                out.push_str(
+                    "\n\nInstruction: Tool results are above (Result: blocks). \
+                     Reply in natural language only — tell the user what you found. \
+                     Do NOT emit any tool tags (<read>, <ls>, <write>, <cmd>). \
+                     Do NOT say you lack file access. Open chips already show full content.",
+                );
+            }
         }
         out
     }
@@ -2195,8 +2216,25 @@ impl App {
                     let prose = tool_panel::redact_tools_for_chat(&effective_stream);
                     let only_repeated_tool = same_as_prev
                         && crate::agent::AgentEngine::response_has_tool_tags(&effective_stream);
+                    let last_user = self.last_user_message().unwrap_or_default();
+                    let only_ls = effective_stream.contains("<ls")
+                        && !effective_stream.contains("<write")
+                        && !effective_stream.contains("<read src=");
+                    // After a useless ls loop on a create/plan task, re-prompt to plan/write
+                    // instead of "Done — tool already finished" (that felt like spam).
+                    let wants_plan = crate::agent::AgentEngine::wants_plan_first(&last_user);
+                    let wants_code = crate::agent::AgentEngine::wants_implement(&last_user)
+                        || last_user.to_ascii_lowercase().contains("start coding");
+                    let ls_spam_on_create = already_have_tools
+                        && only_ls
+                        && (wants_plan || wants_code || only_repeated_tool);
+
                     // After tools, model answered with empty / tool-only noise → host summary
+                    // (skip when user still needs a plan or code — re-prompt instead).
                     let needs_host_summary = already_have_tools
+                        && !ls_spam_on_create
+                        && !wants_plan
+                        && !wants_code
                         && (only_repeated_tool
                             || prose.trim().is_empty()
                             || crate::agent::AgentEngine::looks_like_capability_refusal(&prose));
@@ -2227,7 +2265,29 @@ impl App {
                         .cloned()
                         .collect();
 
-                    if needs_host_summary {
+                    if ls_spam_on_create {
+                        // Drop ls-only history so the model is not primed to ls again
+                        self.tool_result_context.clear();
+                        self.recent_tool_calls.clear();
+                        self.messages.push(
+                            "System: [Host] Skip further <ls>. \
+                             Next reply: plan in prose OR <write> code — not directory listing."
+                                .into(),
+                        );
+                        self.auto_tool_turns = self.auto_tool_turns.saturating_add(1).max(1);
+                        if self.auto_tool_turns <= 4 {
+                            if let Ok(mut l) = self.activity_logs.lock() {
+                                l.push(
+                                    "[HERCULES] ls-spam on create/plan → re-prompt write/plan"
+                                        .into(),
+                                );
+                            }
+                            self.trigger_generation_from_context();
+                        } else {
+                            self.auto_tool_turns = 0;
+                            self.status_message = "Ready.".into();
+                        }
+                    } else if needs_host_summary {
                         // Do not re-run tools or leave an empty agent bubble.
                         self.host_answer_from_prior_tools();
                         self.auto_tool_turns = 0;
@@ -2235,7 +2295,7 @@ impl App {
                         if let Ok(mut l) = self.activity_logs.lock() {
                             l.push("[HERCULES] host summary from prior tool (no re-run)".into());
                         }
-                    } else if only_repeated_tool {
+                    } else if only_repeated_tool && !wants_code && !wants_plan {
                         self.host_answer_from_prior_tools();
                         self.auto_tool_turns = 0;
                         self.status_message = "Ready.".to_string();
@@ -3573,6 +3633,7 @@ impl App {
                                                                     self.backend = AgentBackend::LlamaCppLib(
                                                                 LlamaCppLibBackend::gguf(path.clone()),
                                                             );
+                                                                    self.manager.set_active_gguf_path(path.display().to_string());
                                                                     self.status_message = format!(
                                                                         "Active Engine: llama.cpp lib ({})",
                                                                         path.display()
@@ -3599,6 +3660,7 @@ impl App {
                                                         self.backend = AgentBackend::LlamaCppLib(
                                                             LlamaCppLibBackend::gguf(path.clone()),
                                                         );
+                                                        self.manager.set_active_gguf_path(path.display().to_string());
                                                         self.status_message = format!(
                                                             "Active Engine: llama.cpp lib ({})",
                                                             path.display()

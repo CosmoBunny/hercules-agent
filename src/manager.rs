@@ -450,6 +450,8 @@ pub struct InstalledModel {
 pub struct ModelsRegistry {
     #[serde(default)]
     pub models: Vec<InstalledModel>,
+    #[serde(default)]
+    pub active_model_path: Option<String>,
 }
 
 impl ModelsRegistry {
@@ -476,6 +478,14 @@ impl ModelsRegistry {
         } else {
             self.models.push(entry);
         }
+    }
+
+    pub fn get_active_model_path(&self) -> Option<String> {
+        self.active_model_path.clone()
+    }
+
+    pub fn set_active_model_path(&mut self, path: String) {
+        self.active_model_path = Some(path);
     }
 
     pub fn remove_by_name(&mut self, name: &str) -> Option<InstalledModel> {
@@ -990,8 +1000,22 @@ impl ModelManager {
         Ok(ggufs)
     }
 
+    pub fn set_active_gguf_path(&self, path: impl Into<String>) {
+        let mut reg = ModelsRegistry::load();
+        reg.active_model_path = Some(path.into());
+        let _ = reg.save();
+    }
+
     /// Most recently installed local GGUF path, if any.
     pub fn latest_gguf_path(&self) -> Option<PathBuf> {
+        let reg = ModelsRegistry::load();
+        if let Some(ref path) = reg.active_model_path {
+            let p = PathBuf::from(path);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        
         self.list_installed_entries()
             .into_iter()
             .rev()

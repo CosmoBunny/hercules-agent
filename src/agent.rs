@@ -225,12 +225,13 @@ full file body
 
 Rules:
 - Greetings / small talk → short natural reply. Do NOT reprint these instructions.
+- User asks for a PLAN first → natural language plan only. No <ls>/<read>/<write> until they say start coding.
 - User names a file (e.g. "read myconfig.yaml") → ONLY <read src="$CURRENT/myconfig.yaml">. Never invent a different filename.
 - User says "read a file" / "read file" with NO name → ONLY <ls path="$CURRENT"> (do not invent any filename).
-- Write/create file → ONE <write>…</write> with full body and a real filename.
+- Create/build a page or app → ONE (or few) <write>…</write> with full code. Do NOT only <ls>.
 - Landing page / HTML+CSS page → ONE file only (e.g. $CURRENT/dummy_folder/index.html)
   with CSS/JS inlined. Do NOT also write file.txt or extra HTML names.
-- List/dir → <ls …> first. Run/build/test → <cmd>…</cmd>.
+- List/dir only when they ask to list — not before every coding task.
 - NEVER say "I don't have the ability to read files" or "I cannot access your system".
 - Never invent directory listings or invent file paths. Never echo system/rules text as the answer.
 - No destructive shell (rm -rf /) unless user demands it.
@@ -330,20 +331,77 @@ impl AgentEngine {
         hits >= 2 || (t.contains("you are hercules") && t.contains("<ls path="))
     }
 
+    /// User asked for a plan / design first — pure chat, no forced tools.
+    pub fn wants_plan_first(user_text: &str) -> bool {
+        let t = user_text.to_ascii_lowercase();
+        let planish = t.contains("plan")
+            || t.contains("approach")
+            || t.contains("outline")
+            || t.contains("steps before");
+        let before_code = t.contains("before coding")
+            || t.contains("before you code")
+            || t.contains("before writing")
+            || t.contains("don't code yet")
+            || t.contains("do not code")
+            || t.contains("without coding")
+            || t.contains("tell me your plan")
+            || t.contains("what's your plan")
+            || t.contains("what is your plan");
+        (planish && (before_code || t.contains("before") || t.contains("first")))
+            || before_code
+            || t.contains("just plan")
+            || t.contains("only plan")
+    }
+
+    /// User wants implementation / file creation (write), not directory listing.
+    pub fn wants_implement(user_text: &str) -> bool {
+        let t = user_text.to_ascii_lowercase();
+        if Self::wants_plan_first(user_text) {
+            return false;
+        }
+        t.contains("start coding")
+            || t.contains("start writing")
+            || t.contains("implement")
+            || t.contains("write the code")
+            || t.contains("write code")
+            || t.contains("begin coding")
+            || t.contains("go ahead and code")
+            || t.contains("now code")
+            || (t.contains("create")
+                && (t.contains("page")
+                    || t.contains("app")
+                    || t.contains("site")
+                    || t.contains("store")
+                    || t.contains("component")
+                    || t.contains("project")
+                    || t.contains("html")
+                    || t.contains("svelte")
+                    || t.contains("react")
+                    || t.contains("file")))
+            || (t.contains("build") && (t.contains("page") || t.contains("app") || t.contains("ui")))
+    }
+
     /// True when the user text looks like a filesystem / shell request that needs tools.
+    /// Intentionally does NOT match bare "create a store page" — that is implement/write,
+    /// and forcing tools made the model spam `<ls>` forever.
     pub fn user_needs_tools(user_text: &str) -> bool {
+        if Self::wants_plan_first(user_text) {
+            return false;
+        }
         let t = user_text.to_lowercase();
         const KEYS: &[&str] = &[
-            "list",
+            "list files",
+            "list dir",
+            "list the",
             "ls ",
-            "dir",
+            "ls\n",
+            "dir ",
             "folder",
             "directory",
             "cwd",
             "current dir",
             "working dir",
             "show file",
-            "show ",
             "read ",
             "read\n",
             "open ",
@@ -356,20 +414,14 @@ impl AgentEngine {
             "pwd",
             "run ",
             "cargo ",
-            "build",
-            "test",
-            "write ",
             "create file",
-            "create ",
-            "introduction",
-            ".md",
+            "write file",
+            "write a file",
             ".toml",
-            ".rs",
-            ".json",
             "edit ",
             "save ",
         ];
-        KEYS.iter().any(|k| t.contains(k))
+        KEYS.iter().any(|k| t.contains(k)) || Self::wants_implement(user_text)
     }
 
     /// Model replied in natural language claiming no file/shell access (ignore tools).
@@ -530,6 +582,22 @@ impl AgentEngine {
     /// Short host force line for tool-needed turns (kept tiny for 1.5B models).
     /// Paths come only from the user message when recoverable — never a fixed demo file.
     pub fn tool_force_suffix(user_text: &str) -> Option<String> {
+        // Plan-first: never force tools (that caused endless `<ls>`).
+        if Self::wants_plan_first(user_text) {
+            return Some(
+                "[Host] User asked for a PLAN first. Reply in natural language only. \
+                 No tool tags (<ls>, <read>, <write>, <cmd>) until they say to code."
+                    .into(),
+            );
+        }
+        // Implement / create page → write, never list-only.
+        if Self::wants_implement(user_text) {
+            let path = Self::suggested_path_from_user_text(user_text);
+            return Some(format!(
+                "[Host] Implement now. Emit ONE <write src=\"{path}\">…full content…</write> \
+                 (or a few real project files). Do NOT only <ls>. Do NOT re-list the directory."
+            ));
+        }
         if !Self::user_needs_tools(user_text) {
             return None;
         }
@@ -537,21 +605,21 @@ impl AgentEngine {
             return Some(
                 "[Host] No filename was given. Emit ONLY:\n\
                  <ls path=\"$CURRENT\">\n\
-                 Do NOT invent filenames (not requirements.txt, not any other guess)."
+                 Do NOT invent filenames."
                     .into(),
             );
         }
         if let Some(tag) = Self::synthesize_tool_from_user(user_text) {
+            // Never force-feed bare <ls> for non-list asks
+            if tag.contains("<ls") && !user_text.to_ascii_lowercase().contains("list") {
+                return None;
+            }
             return Some(format!(
                 "[Host] Emit ONLY this tool tag (path taken from the user message):\n{tag}"
             ));
         }
-        Some(
-            "[Host] Emit ONLY a tool tag. Use the exact path/name from the user if any.\n\
-             No path? Use <ls path=\"$CURRENT\">. Never invent a filename.\n\
-             Do not refuse — tools work on this machine."
-                .into(),
-        )
+        // Concrete read/list/run only — do NOT default to ls
+        None
     }
 
     /// Append a short tool-force line when the user clearly needs filesystem/shell tools.
@@ -569,17 +637,24 @@ impl AgentEngine {
         if Self::response_has_tool_tags(assistant_text) {
             return None;
         }
+        if Self::wants_plan_first(user_text) || Self::wants_implement(user_text) {
+            // Don't inject <ls> for plan/create — that is the spam loop.
+            return None;
+        }
         if !Self::user_needs_tools(user_text) {
             return None;
         }
-        // Recover on refusal, or when the user clearly asked for a concrete file/list
-        // and the model gave prose without any tags.
+        // Recover only for explicit read/list with a recoverable tag.
         let should = Self::looks_like_capability_refusal(assistant_text)
             || Self::synthesize_tool_from_user(user_text).is_some();
         if !should {
             return None;
         }
-        Self::synthesize_tool_from_user(user_text)
+        let tag = Self::synthesize_tool_from_user(user_text)?;
+        if tag.contains("<ls") && !user_text.to_ascii_lowercase().contains("list") {
+            return None;
+        }
+        Some(tag)
     }
 
     /// Strip `<think>...</think>` blocks from response text.
@@ -1970,5 +2045,25 @@ mod tests {
         assert!(nudged.contains("[Host]"));
         // greetings stay plain
         assert_eq!(AgentEngine::with_tool_nudge("hello"), "hello");
+    }
+
+    #[test]
+    fn test_plan_first_and_implement_no_ls_spam() {
+        let plan = "create a store with svelte, tell me your plan before coding";
+        assert!(AgentEngine::wants_plan_first(plan));
+        assert!(!AgentEngine::wants_implement(plan));
+        let sfx = AgentEngine::tool_force_suffix(plan).unwrap();
+        assert!(sfx.to_ascii_lowercase().contains("plan"));
+        assert!(!sfx.contains("<ls path")); // must not force an ls tool call
+
+        let go = "start coding";
+        assert!(AgentEngine::wants_implement(go));
+        let sfx2 = AgentEngine::tool_force_suffix(go).unwrap();
+        assert!(sfx2.contains("<write"));
+        assert!(!sfx2.contains("<ls path"));
+
+        // Must not recover ls for create/plan
+        assert!(AgentEngine::recover_tools_from_refusal(plan, "sure").is_none());
+        assert!(AgentEngine::recover_tools_from_refusal(go, "ok").is_none());
     }
 }

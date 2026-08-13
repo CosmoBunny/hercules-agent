@@ -399,6 +399,9 @@ pub fn ensure_warm_lib_engine(path: &Path) -> Result<Arc<LlamaCppLib>, String> {
         }
     }
 
+    // Explicitly drop the old engine to free RAM/VRAM before allocating the new one.
+    *guard = None;
+
     let engine = Arc::new(LlamaCppLib::new(path.to_path_buf())?);
     *guard = Some(WarmEntry {
         path: path.to_path_buf(),
