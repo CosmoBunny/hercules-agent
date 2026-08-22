@@ -78,7 +78,7 @@ jobs:
 
       - name: Install CUDA Toolkit
         if: matrix.flavor == 'nvidia'
-        uses: Jimver/cuda-toolkit@v0.2.18
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: '12.6.0'
 
@@ -88,7 +88,7 @@ jobs:
 
       - name: Install Vulkan SDK (Windows)
         if: matrix.flavor == 'amd' && runner.os == 'Windows'
-        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
           vulkan-query-version: 1.3.268.0
           vulkan-components: Vulkan-Headers, Vulkan-Loader
