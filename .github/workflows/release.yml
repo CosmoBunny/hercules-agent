@@ -89,6 +89,10 @@ jobs:
           install_runtime: true
           stripdown: true
 
+      - name: Setup MSVC Environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 

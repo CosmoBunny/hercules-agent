@@ -278,12 +278,10 @@ fn cmake_configure(src: &Path, build: &Path) {
         .unwrap_or_else(|_| std::env::var("CARGO_FEATURE_CUDA").unwrap_or_default());
 
     // Generator selection:
-    let cmake_gen: &str = if cfg!(windows) && std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() == "msvc" {
-        // Empty string forces CMake to auto-detect the newest Visual Studio generator
-        // instead of falling back to Ninja (which might pick up MinGW gcc).
-        ""
-    } else if cmd_exists("ninja") {
+    let cmake_gen: &str = if cmd_exists("ninja") {
         "Ninja"
+    } else if cfg!(windows) {
+        ""
     } else {
         "Unix Makefiles"
     };
@@ -455,11 +453,15 @@ fn link_system_libs() {
             #[cfg(target_os = "windows")]
             println!("cargo:rustc-link-search=native={}/lib/x64", cuda_path);
             #[cfg(not(target_os = "windows"))]
-            println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
+            {
+                println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
+                println!("cargo:rustc-link-search=native={}/lib64/stubs", cuda_path);
+            }
         }
         println!("cargo:rustc-link-lib=cudart");
         println!("cargo:rustc-link-lib=cublas");
         println!("cargo:rustc-link-lib=cublasLt");
+        println!("cargo:rustc-link-lib=cuda");
     }
 
     // ── Vulkan runtime ──────────────────────────────────────────────────────
