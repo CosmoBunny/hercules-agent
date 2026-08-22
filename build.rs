@@ -279,8 +279,9 @@ fn cmake_configure(src: &Path, build: &Path) {
 
     // Generator selection:
     let cmake_gen: &str = if cfg!(windows) && std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() == "msvc" {
-        // Force Visual Studio on MSVC to avoid CMake picking up MinGW's gcc in Git Bash when using Ninja
-        "Visual Studio 17 2022"
+        // Empty string forces CMake to auto-detect the newest Visual Studio generator
+        // instead of falling back to Ninja (which might pick up MinGW gcc).
+        ""
     } else if cmd_exists("ninja") {
         "Ninja"
     } else {
@@ -450,11 +451,33 @@ fn link_system_libs() {
     let cuda = std::env::var("LLAMA_CUDA")
         .unwrap_or_else(|_| std::env::var("CARGO_FEATURE_CUDA").unwrap_or_default());
     if cuda == "1" || cuda.eq_ignore_ascii_case("on") {
+        if let Ok(cuda_path) = std::env::var("CUDA_PATH").or_else(|_| std::env::var("CUDA_HOME")) {
+            #[cfg(target_os = "windows")]
+            println!("cargo:rustc-link-search=native={}/lib/x64", cuda_path);
+            #[cfg(not(target_os = "windows"))]
+            println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
+        }
         println!("cargo:rustc-link-lib=cudart");
         println!("cargo:rustc-link-lib=cublas");
         println!("cargo:rustc-link-lib=cublasLt");
-        // For static linking of CUDA runtime on Linux/Windows, sometimes -lcudart_static is needed,
-        // but dynamic linking (-lcudart) is safer and avoids duplicate symbols.
+    }
+
+    // ── Vulkan runtime ──────────────────────────────────────────────────────
+    let vulkan = std::env::var("LLAMA_VULKAN")
+        .unwrap_or_else(|_| std::env::var("CARGO_FEATURE_VULKAN").unwrap_or_default());
+    if vulkan == "1" || vulkan.eq_ignore_ascii_case("on") {
+        // We might also need a search path for VULKAN_SDK, if it's set
+        if let Ok(vk_sdk) = std::env::var("VULKAN_SDK") {
+            #[cfg(target_os = "windows")]
+            println!("cargo:rustc-link-search=native={}/Lib", vk_sdk);
+            #[cfg(not(target_os = "windows"))]
+            println!("cargo:rustc-link-search=native={}/lib", vk_sdk);
+        }
+        
+        #[cfg(target_os = "windows")]
+        println!("cargo:rustc-link-lib=vulkan-1");
+        #[cfg(not(target_os = "windows"))]
+        println!("cargo:rustc-link-lib=vulkan");
     }
 
     // ── OpenMP runtime ────────────────────────────────────────────────────────
@@ -471,7 +494,13 @@ fn link_system_libs() {
     {
         println!("cargo:rustc-link-search=native=/opt/homebrew/opt/libomp/lib");
         println!("cargo:rustc-link-lib=omp");
+        // Metal backend requirements
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=MetalKit");
+        println!("cargo:rustc-link-lib=framework=Accelerate");
     }
+
+
 
     #[cfg(all(target_os = "windows", not(target_env = "gnu")))]
     println!("cargo:rustc-link-lib=vcomp");  // MSVC OpenMP

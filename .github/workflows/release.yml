@@ -74,7 +74,7 @@ jobs:
 
       - name: Install macOS system deps
         if: runner.os == 'macOS'
-        run: brew install cmake ninja libomp llvm || true
+        run: brew install cmake ninja libomp llvm
 
       - name: Install CUDA Toolkit
         if: matrix.flavor == 'nvidia'
