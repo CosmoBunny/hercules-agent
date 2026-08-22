@@ -1,5 +1,0 @@
---- src/tool_panel.rs
-+++ src/tool_panel.rs
-@@ -77,0 +78,2 @@
-+    /// True if an async/instant spawn has already kicked off this tool.
-+    pub spawned: bool,

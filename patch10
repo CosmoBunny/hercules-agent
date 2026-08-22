@@ -1,9 +1,0 @@
---- src/agent.rs
-+++ src/agent.rs
-@@ -1600,0 +1601,6 @@
-+            ProposedKind::Mcp => {
-+                format!("{}/tools\ntoolname: example_tool\nDescription: MOCK - Matches query '{}'", action.target, action.body)
-+            }
-+            ProposedKind::Skill => {
-+                format!("{}/tools\ntoolname: example_skill\nDescription: MOCK - Matches query '{}'", action.target, action.body)
-+            }

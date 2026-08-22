@@ -1,7 +1,0 @@
---- src/app.rs
-+++ src/app.rs
-@@ -957,2 +957,2 @@
--                crate::agent::ProposedKind::Mcp => writes.push(a),
--                crate::agent::ProposedKind::Skill => writes.push(a),
-+                crate::agent::ProposedKind::Mcp => cmds.push(a),
-+                crate::agent::ProposedKind::Skill => cmds.push(a),
