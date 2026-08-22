@@ -38,15 +38,15 @@ jobs:
             flavor: normal
             
           # --- Windows x86_64 ---
-          - runner: windows-latest
+          - runner: windows-2022
             platform: windows
             arch: x86_64
             flavor: normal
-          - runner: windows-latest
+          - runner: windows-2022
             platform: windows
             arch: x86_64
             flavor: nvidia
-          - runner: windows-latest
+          - runner: windows-2022
             platform: windows
             arch: x86_64
             flavor: amd
