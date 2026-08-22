@@ -1,57 +1,61 @@
-# Build Hercules Agent release CLI binaries, bundle them, and publish downloadable archives.
-# Artifacts land under release/ (via packaging/make_release.sh) and are
-# uploaded for download. On version tags (v*), they are attached to a GitHub Release.
-#
-# IMPORTANT: "Re-run failed jobs" reuses the same commit. After workflow fixes,
-# start a NEW run (Actions → Release → Run workflow) on latest main.
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      features:
-        description: "Cargo features to enable (e.g. 'default', 'full', 'llama-cpp-static', 'full,llama-cpp-static')"
-        type: string
-        default: "default"
-      with_llama_static:
-        description: "Enable llama-cpp-static feature (builds llama.cpp from source/submodule)"
-        type: boolean
-        default: false
-      with_gpu:
-        description: "Enable GPU feature (WGPU via burn)"
-        type: boolean
-        default: false
-      with_cuda:
-        description: "Enable CUDA support (requires CUDA toolkit on runner)"
-        type: boolean
-        default: false
   push:
     tags:
       - "v*"
-  release:
-    types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
 jobs:
   build:
-    name: ${{ matrix.platform }} (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.flavor }} - ${{ matrix.platform }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          # --- Linux x86_64 ---
+          - runner: ubuntu-24.04
             platform: linux
-          - os: windows-latest
+            arch: x86_64
+            flavor: normal
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x86_64
+            flavor: nvidia
+          - runner: ubuntu-24.04
+            platform: linux
+            arch: x86_64
+            flavor: amd
+            
+          # --- Linux ARM64 ---
+          - runner: ubuntu-24.04-arm
+            platform: linux
+            arch: aarch64
+            flavor: normal
+            
+          # --- Windows x86_64 ---
+          - runner: windows-latest
             platform: windows
-          - os: macos-14
+            arch: x86_64
+            flavor: normal
+          - runner: windows-latest
+            platform: windows
+            arch: x86_64
+            flavor: nvidia
+          - runner: windows-latest
+            platform: windows
+            arch: x86_64
+            flavor: amd
+            
+          # --- macOS ARM64 ---
+          - runner: macos-14
             platform: macos
+            arch: aarch64
+            flavor: normal
 
     steps:
       - name: Checkout
@@ -62,27 +66,32 @@ jobs:
       - name: Install Linux system deps
         if: runner.os == 'Linux'
         run: |
-          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            pkg-config \
-            cmake \
-            ninja-build \
-            clang \
-            libclang-dev \
-            llvm-dev \
-            libxcb-render0-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
-            libxkbcommon-dev \
-            libx11-dev
+            build-essential pkg-config cmake ninja-build clang \
+            libclang-dev llvm-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxkbcommon-dev libx11-dev
 
       - name: Install macOS system deps
         if: runner.os == 'macOS'
-        run: |
-          set -euo pipefail
-          brew install cmake ninja libomp llvm || true
+        run: brew install cmake ninja libomp llvm || true
+
+      - name: Install CUDA Toolkit
+        if: matrix.flavor == 'nvidia'
+        uses: Jimver/cuda-toolkit@v0.2.18
+        with:
+          cuda: '12.6.0'
+
+      - name: Install Vulkan SDK (Linux)
+        if: matrix.flavor == 'amd' && runner.os == 'Linux'
+        run: sudo apt-get install -y libvulkan-dev vulkan-tools
+
+      - name: Install Vulkan SDK (Windows)
+        if: matrix.flavor == 'amd' && runner.os == 'Windows'
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-query-version: 1.3.268.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -90,70 +99,28 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: hercules-release-${{ matrix.platform }}
+          shared-key: hercules-release-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.flavor }}
           cache-on-failure: true
 
-      - name: Resolve build flags
-        id: flags
+      - name: Build and Bundle
         shell: bash
         run: |
           set -euo pipefail
-          FEATURES_ARG=""
-          
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            FEATS="${{ inputs.features }}"
-            if [ "$FEATS" != "default" ] && [ -n "$FEATS" ]; then
-              FEATURES_ARG="$FEATS"
-            fi
-            if [ "${{ inputs.with_llama_static }}" = "true" ]; then
-              if [ -n "$FEATURES_ARG" ]; then
-                FEATURES_ARG="${FEATURES_ARG},llama-cpp-static"
-              else
-                FEATURES_ARG="llama-cpp-static"
-              fi
-            fi
-            if [ "${{ inputs.with_gpu }}" = "true" ]; then
-              if [ -n "$FEATURES_ARG" ]; then
-                FEATURES_ARG="${FEATURES_ARG},gpu"
-              else
-                FEATURES_ARG="gpu"
-              fi
-            fi
-            if [ "${{ inputs.with_cuda }}" = "true" ]; then
-              if [ -n "$FEATURES_ARG" ]; then
-                FEATURES_ARG="${FEATURES_ARG},cuda"
-              else
-                FEATURES_ARG="cuda"
-              fi
-            fi
-          else
-            # For tag pushes (actual releases), explicitly ensure llama-cpp-static is built
-            FEATURES_ARG="llama-cpp-static"
-          fi
-          
-          echo "features=$FEATURES_ARG" >> "$GITHUB_OUTPUT"
-
-      - name: Build, bundle, copy to release/
-        shell: bash
-        run: |
-          set -euo pipefail
-
           chmod +x packaging/make_release.sh
-          EXTRA=()
-          if [ -n "${{ steps.flags.outputs.features }}" ]; then
-            EXTRA+=(--features "${{ steps.flags.outputs.features }}")
+          
+          FEATURES="llama-cpp-static"
+          if [ "${{ matrix.flavor }}" = "nvidia" ]; then
+            FEATURES="$FEATURES,cuda"
+          elif [ "${{ matrix.flavor }}" = "amd" ]; then
+            FEATURES="$FEATURES,vulkan"
           fi
           
-          ./packaging/make_release.sh "${EXTRA[@]}"
+          ./packaging/make_release.sh --flavor "${{ matrix.flavor }}" --features "$FEATURES"
           
-          echo "---- release/ ----"
-          ls -lah release/
-
-      - name: Upload release archives (workflow artifact)
+      - name: Upload release archives
         uses: actions/upload-artifact@v4
         with:
-          name: hercules-agent-${{ matrix.platform }}-${{ runner.arch }}
+          name: hercules-${{ matrix.flavor }}-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
             release/*.tar.gz
             release/*.zip
@@ -162,21 +129,18 @@ jobs:
           retention-days: 30
 
   publish:
-    name: Publish GitHub Release assets
+    name: Publish GitHub Release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Download all platform artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: hercules-agent-*
+          pattern: hercules-*
           merge-multiple: true
-
-      - name: List downloadable files
-        run: find artifacts -type f | sort
-
+          
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:

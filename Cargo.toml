@@ -27,6 +27,8 @@ parallel = ["dep:rayon"]
 gpu = ["dep:burn"]
 # CUDA acceleration for llama.cpp backend.
 cuda = []
+# Vulkan (AMD/Intel) acceleration for llama.cpp backend.
+vulkan = []
 # Full desktop feature set: SIMD + rayon + GPU.
 full = ["simd", "parallel", "gpu", "llama-cpp-static"]
 # Tighter defaults: single-thread, no rayon preference.
