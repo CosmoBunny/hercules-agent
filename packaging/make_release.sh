@@ -88,7 +88,7 @@ else
   echo "▶ Skipping build (--no-build)"
 fi
 
-REL_BIN_DIR="$ROOT/target/release"
+REL_BIN_DIR="${CARGO_TARGET_DIR:-$ROOT/target}/release"
 if [[ ! -f "$REL_BIN_DIR/$EXE_NAME" ]]; then
   echo "✗ Missing binary: $REL_BIN_DIR/$EXE_NAME" >&2
   exit 1

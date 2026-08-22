@@ -72,6 +72,12 @@ jobs:
             libclang-dev llvm-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxkbcommon-dev libx11-dev
 
+      - name: Enable Win32 long paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+
       - name: Install macOS system deps
         if: runner.os == 'macOS'
         run: brew install cmake ninja libomp llvm
@@ -106,6 +112,8 @@ jobs:
           # Git for Windows ships a coreutils `link.exe` which shadows MSVC's linker.
           if [ "$RUNNER_OS" == "Windows" ]; then
             rm -f /usr/bin/link.exe || true
+            export CARGO_TARGET_DIR="C:/t"
+            git config --system core.longpaths true
           fi
           
           chmod +x packaging/make_release.sh
