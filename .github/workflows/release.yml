@@ -96,11 +96,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: hercules-release-${{ matrix.platform }}-${{ matrix.arch }}-${{ matrix.flavor }}
-          cache-on-failure: true
+
 
       - name: Build and Bundle
         shell: bash
