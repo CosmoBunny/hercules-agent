@@ -102,6 +102,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          
+          # Git for Windows ships a coreutils `link.exe` which shadows MSVC's linker.
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            rm -f /usr/bin/link.exe || true
+          fi
+          
           chmod +x packaging/make_release.sh
           
           FEATURES="llama-cpp-static"
