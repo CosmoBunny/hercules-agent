@@ -328,17 +328,31 @@ fn cmake_build_libs(build: &Path) {
         .map(|n| n.get().to_string())
         .unwrap_or_else(|_| "4".to_string());
 
+    let mut args = vec![
+        "--build".to_string(),
+        ".".to_string(),
+        "--config".to_string(),
+        "Release".to_string(),
+        "--parallel".to_string(),
+        jobs,
+    ];
+    
+    // By explicitly targeting libraries, we avoid building `llama-app` 
+    // which has a known Ninja dependency race condition for build-info.h
+    for t in ["llama", "ggml", "ggml-base"] {
+        args.push("--target".to_string());
+        args.push(t.to_string());
+    }
+
     let status = Command::new("cmake")
-        .args([
-            "--build", ".",
-            "--config", "Release",
-            "--parallel", &jobs,
-        ])
+        .args(&args)
         .current_dir(build)
         .status()
         .unwrap_or_else(|e| panic!("cmake --build failed: {e}"));
 
-    assert!(status.success(), "cmake --build failed");
+    // Note: ggml-base might be interface only in very old versions, but 
+    // we require it for modern llama.cpp. If it fails, let it crash.
+    assert!(status.success(), "cmake --build failed for static libraries");
 }
 
 fn emit_link_directives(build: &Path) {
