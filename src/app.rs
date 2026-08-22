@@ -162,7 +162,7 @@ impl App {
                 if let Some(path) = mgr.latest_gguf_path() {
                     AgentBackend::LlamaCppLib(LlamaCppLibBackend::gguf(path))
                 } else {
-                    AgentBackend::LlamaCpp(LlamaCppBackend::server(
+                    AgentBackend::LlamaCppLib(LlamaCppLibBackend::http(
                         "http://localhost:8080".into(),
                         "llama.cpp".into(),
                     ))
@@ -403,7 +403,7 @@ impl App {
                     target,
                     body: view.body,
                     tag_closed: view.tag_closed,
-                    pending: false,
+                    pending: false, spawned: false,
                     rect: None,
                     anchor_msg: anchor,
                 });
@@ -411,6 +411,51 @@ impl App {
             }
         }
         self.dedupe_tool_chips();
+
+        let mut instant_cmds = Vec::new();
+        let mut instant_mcps = Vec::new();
+        let perms = crate::agent::get_tool_permissions();
+        let can_instant = perms.session_allow || perms.mode == crate::agent::PermissionMode::AlwaysAllow;
+        if can_instant {
+            for chip in self.tool_chips.iter_mut() {
+                if chip.kind == tool_panel::ToolPanelKind::Cmd && chip.tag_closed && !chip.spawned {
+                    chip.spawned = true;
+                    instant_cmds.push(crate::agent::ProposedAction {
+                        kind: crate::agent::ProposedKind::Cmd,
+                        target: chip.target.clone(),
+                        body: String::new(),
+                        line_attr: None,
+                        from_think: false,
+                        chip_id: Some(chip.id),
+                    });
+                } else if matches!(chip.kind, tool_panel::ToolPanelKind::Mcp | tool_panel::ToolPanelKind::Skill | tool_panel::ToolPanelKind::WebSearch) && chip.tag_closed && !chip.spawned {
+                    chip.spawned = true;
+                    let pkind = if chip.kind == tool_panel::ToolPanelKind::Mcp { crate::agent::ProposedKind::Mcp } else if chip.kind == tool_panel::ToolPanelKind::Skill { crate::agent::ProposedKind::Skill } else { crate::agent::ProposedKind::WebSearch };
+                    instant_mcps.push(crate::agent::ProposedAction {
+                        kind: pkind,
+                        target: chip.target.clone(),
+                        body: chip.body.clone(),
+                        line_attr: None,
+                        from_think: false,
+                        chip_id: Some(chip.id),
+                    });
+                }
+            }
+        }
+        if !instant_cmds.is_empty() {
+            self.spawn_cmds_to_task_manager(instant_cmds);
+        }
+        if !instant_mcps.is_empty() {
+            for a in instant_mcps {
+                let result = crate::agent::AgentEngine::execute_proposed(&a);
+                if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == a.chip_id.unwrap()) {
+                    chip.pending = false;
+                    chip.body = result.clone();
+                }
+                self.tool_result_context.push(format!("[{} result]\n{}", a.kind.label(), result));
+            }
+        }
+
         if let Some(id) = auto_open {
             if self.panel_closing {
                 self.panel_closing = false;
@@ -576,7 +621,7 @@ impl App {
             p.body.push_str(&format!("$ {cmd}\n"));
             p.scroll_to_end();
         }
-        let id = self.task_manager.spawn_cmd(cmd.clone());
+        let id = self.task_manager.spawn_cmd(cmd.clone(), 0);
         self.messages
             .push(format!("System: [TERM] Task #{id} `{cmd}` (interactive)"));
         self.status_message = format!("TERM ran Task #{id}");
@@ -671,13 +716,7 @@ impl App {
         match i {
             // llama.cpp sub-backend
             3 => {
-                use crate::settings::cycle_llama_rs_sub_backend;
-                let b = cycle_llama_rs_sub_backend();
-                self.status_message = format!(
-                    "llama.cpp sub-backend: {} (HERCULES_COMPUTE_BACKEND={})",
-                    b.label(),
-                    b.env_val()
-                );
+                // Feature removed
             }
             // Stall timeout
             4 => {
@@ -800,6 +839,27 @@ impl App {
         if actions.is_empty() {
             return;
         }
+
+        actions.retain(|a| {
+            let pkind = match a.kind {
+                crate::agent::ProposedKind::Cmd => tool_panel::ToolPanelKind::Cmd,
+                crate::agent::ProposedKind::Write => tool_panel::ToolPanelKind::Write,
+                crate::agent::ProposedKind::Mcp => tool_panel::ToolPanelKind::Mcp,
+                crate::agent::ProposedKind::Skill => tool_panel::ToolPanelKind::Skill,
+                crate::agent::ProposedKind::WebSearch => tool_panel::ToolPanelKind::WebSearch,
+                crate::agent::ProposedKind::Agent => tool_panel::ToolPanelKind::Agent,
+            };
+            !self.tool_chips.iter().any(|c| {
+                c.kind == pkind
+                && tool_panel::same_tool_target(c.kind, &c.target, &a.target)
+                && c.spawned
+            })
+        });
+
+        if actions.is_empty() {
+            return;
+        }
+
         // Ensure chips exist + mark pending; auto-open latest
         let mut open_id = None;
         for a in &mut actions {
@@ -809,11 +869,15 @@ impl App {
                         .display()
                         .to_string()
                 }
-                crate::agent::ProposedKind::Cmd => a.target.clone(),
+                _ => a.target.clone(),
             };
             let kind = match a.kind {
                 crate::agent::ProposedKind::Write => ToolPanelKind::Write,
                 crate::agent::ProposedKind::Cmd => ToolPanelKind::Cmd,
+                crate::agent::ProposedKind::Mcp => ToolPanelKind::Mcp,
+                crate::agent::ProposedKind::Skill => ToolPanelKind::Skill,
+                crate::agent::ProposedKind::WebSearch => ToolPanelKind::WebSearch,
+                crate::agent::ProposedKind::Agent => ToolPanelKind::Agent,
             };
             let target = tool_panel::normalize_target(kind, &target);
             let anchor = self.latest_agent_msg_idx();
@@ -846,7 +910,7 @@ impl App {
                     target,
                     body: a.body.clone(),
                     tag_closed: true,
-                    pending: true,
+                    pending: true, spawned: false,
                     rect: None,
                     anchor_msg: anchor,
                 });
@@ -907,11 +971,16 @@ impl App {
         self.status_message = "Running accepted action…".to_string();
 
         let mut writes = Vec::new();
+        let mut mcps = Vec::new();
         let mut cmds = Vec::new();
         for a in actions {
             match a.kind {
                 crate::agent::ProposedKind::Write => writes.push(a),
                 crate::agent::ProposedKind::Cmd => cmds.push(a),
+                crate::agent::ProposedKind::Mcp => mcps.push(a),
+                crate::agent::ProposedKind::Skill => mcps.push(a),
+                crate::agent::ProposedKind::WebSearch => mcps.push(a),
+                crate::agent::ProposedKind::Agent => mcps.push(a),
             }
         }
 
@@ -943,6 +1012,25 @@ impl App {
             // Do NOT re-trigger generation — let AI finish its current response.
         }
 
+
+        if !mcps.is_empty() {
+            for a in &mcps {
+                let result = crate::agent::AgentEngine::execute_proposed(a);
+                if let Some(chip_id) = a.chip_id {
+                    if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
+                        chip.pending = false;
+                        chip.tag_closed = true;
+                        chip.body = result.clone();
+                    }
+                    self.force_open_panel_from_chip(chip_id);
+                }
+                self.tool_result_context.push(format!("[{} result]\n{}", a.kind.label(), result));
+            }
+            if !*self.is_generating.lock().unwrap() {
+                self.trigger_generation_from_context();
+            }
+        }
+
         if !cmds.is_empty() {
             self.spawn_cmds_to_task_manager(cmds);
             // Cmds still trigger re-prompt so the AI sees the shell output
@@ -953,7 +1041,7 @@ impl App {
     fn spawn_cmds_to_task_manager(&mut self, cmds: Vec<ProposedAction>) {
         for a in cmds {
             let cmd = a.target.clone();
-            let id = self.task_manager.spawn_cmd(cmd.clone());
+            let id = self.task_manager.spawn_cmd(cmd.clone(), 0);
             // Update chip body with task id
             if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
                 c.kind == ToolPanelKind::Cmd
@@ -971,7 +1059,7 @@ impl App {
                     target: cmd.clone(),
                     body: format!("[Task #{id} running]\n$ {cmd}\n…"),
                     tag_closed: true,
-                    pending: false,
+                    pending: false, spawned: false,
                     rect: None,
                     anchor_msg: self.latest_agent_msg_idx(),
                 });
@@ -983,7 +1071,7 @@ impl App {
                 self.force_open_panel_from_chip(chip.id);
             }
             self.messages.push(format!(
-                "System: [Task #{id}] started: `{cmd}` (if >{QUICK_SECS}s → task manager; Ctrl+C kills)"
+                "System: [Task #{id} (Agent 0)] started: `{cmd}` (if >{QUICK_SECS}s → task manager; Ctrl+C kills)"
             ));
             if let Ok(mut l) = self.activity_logs.lock() {
                 l.push(format!("[TASK #{id}] started: {cmd}"));
@@ -1000,15 +1088,15 @@ impl App {
         let events = self.task_manager.take_events();
         for ev in events {
             match ev {
-                TaskEvent::Parked { id, cmd } => {
+                TaskEvent::Parked { id, cmd, spawned_by } => {
                     self.messages.push(format!(
-                        "System: [Task #{id}] still running after {QUICK_SECS}s — pushed to task manager. \
+                        "System: [Task #{id} (Agent {spawned_by})] still running after {QUICK_SECS}s — pushed to task manager. \
                          Command: `{cmd}`. Agent may continue; output arrives when finished. \
                          Ctrl+C kills running tasks."
                     ));
                     self.tool_result_context.push(format!(
                         "[Task #{id} PARKED — still running]\ncmd: {cmd}\n\
-                         Do not re-run this command. Wait for [Task #{id} DONE] or start other work."
+                         Do not re-run this command. Wait for [Task #{id} DONE (Agent {spawned_by})] or start other work."
                     ));
                     if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
                         c.kind == ToolPanelKind::Cmd
@@ -1035,6 +1123,7 @@ impl App {
                     cmd,
                     output,
                     killed,
+                    spawned_by,
                 } => {
                     let label = if killed { "KILLED" } else { "DONE" };
                     let pretty = tool_panel::format_tool_output_for_chat(&output);
@@ -1042,14 +1131,14 @@ impl App {
                         c.kind == ToolPanelKind::Cmd
                             && tool_panel::same_tool_target(ToolPanelKind::Cmd, &c.target, &cmd)
                     }) {
-                        chip.body = format!("[Task #{id} {label}]\n$ {cmd}\n{pretty}");
+                        chip.body = format!("[Task #{id} {label} (Agent {spawned_by})]\n$ {cmd}\n{pretty}");
                         chip.tag_closed = true;
                         chip.pending = false;
                         let cid = chip.id;
                         self.force_open_panel_from_chip(cid);
                     }
                     self.tool_result_context.push(format!(
-                        "[Task #{id} {label}]\ncmd: {cmd}\n\n{pretty}\n\n\
+                        "[Task #{id} {label} (Agent {spawned_by})]\ncmd: {cmd}\n\n{pretty}\n\n\
                          Use this output. Do not re-run the same command unless needed."
                     ));
                     if self.tool_result_context.len() > 8 {
@@ -1057,13 +1146,13 @@ impl App {
                         self.tool_result_context.drain(0..n);
                     }
                     self.messages.push(format!(
-                        "System: [Task #{id} {label}] `{cmd}` ({} lines) — result sent to agent",
+                        "System: [Task #{id} {label} (Agent {spawned_by})] `{cmd}` ({} lines) — result sent to agent",
                         pretty.lines().count()
                     ));
                     if let Ok(mut l) = self.activity_logs.lock() {
                         l.push(format!("[TASK #{id}] {label} ({} bytes)", pretty.len()));
                     }
-                    self.status_message = format!("Task #{id} {label}");
+                    self.status_message = format!("Task #{id} {label} (Agent {spawned_by})");
                     if !killed && !*self.is_generating.lock().unwrap() {
                         self.auto_tool_turns += 1;
                         if self.auto_tool_turns <= 8 {
@@ -1729,6 +1818,7 @@ impl App {
                 ToolPanelKind::Cmd => "command".into(),
                 ToolPanelKind::Read => "file".into(),
                 ToolPanelKind::Write => "file".into(),
+                _ => String::new(),
             };
             self.tool_chips.push(ToolChip {
                 id,
@@ -1736,7 +1826,7 @@ impl App {
                 target,
                 body: pretty.clone(),
                 tag_closed: true,
-                pending: false,
+                pending: false, spawned: false,
                 rect: None,
                 anchor_msg: anchor,
             });
@@ -1884,28 +1974,6 @@ impl App {
                 tokio::spawn(async move {
                     match backend_clone
                         .generate_stream(&prompt, stream_target2.clone(), is_gen_task)
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            *gen_err.lock().unwrap() = Some(e);
-                        }
-                    }
-                    *is_gen.lock().unwrap() = false;
-                });
-            }
-            AgentBackend::LlamaCpp(backend) => {
-                let backend_clone = backend.clone();
-                let is_gen_task = is_gen.clone();
-                // Warm server + chat API: pass You:/Agent: history (system injected by HTTP client)
-                let prompt = if context_prompt.trim().is_empty() {
-                    self.last_user_message().unwrap_or_default()
-                } else {
-                    context_prompt.clone()
-                };
-                tokio::spawn(async move {
-                    match backend_clone
-                        .generate_stream(&prompt, stream_target, is_gen_task)
                         .await
                     {
                         Ok(_) => {}
@@ -2434,8 +2502,8 @@ impl App {
             // Prefer llama.cpp for installed GGUF (fast + low RAM vs pure-rust dequant)
             if let Some(path) = self.manager.latest_gguf_path() {
                 match self.backend {
-                    AgentBackend::LlamaCpp(_) => {
-                        self.backend = AgentBackend::LlamaCpp(LlamaCppBackend::cli(path.clone()));
+                    AgentBackend::LlamaCppLib(_) => {
+                        self.backend = AgentBackend::LlamaCppLib(LlamaCppLibBackend::gguf(path.clone()));
                         self.status_message =
                             format!("Active Engine: llama.cpp ({})", path.display());
                     }
@@ -3390,6 +3458,9 @@ impl App {
                                                             .split('(')
                                                             .next()
                                                             .unwrap_or(&item_str)
+                                                            .split('[')
+                                                            .next()
+                                                            .unwrap_or(&item_str)
                                                             .trim()
                                                             .to_string();
 
@@ -3617,10 +3688,10 @@ impl App {
 
                                                         if let Some(path) = path {
                                                             match self.backend {
-                                                                AgentBackend::LlamaCpp(_) => {
+                                                                AgentBackend::LlamaCppLib(_) => {
                                                                     self.backend =
-                                                                        AgentBackend::LlamaCpp(
-                                                                            LlamaCppBackend::cli(
+                                                                        AgentBackend::LlamaCppLib(
+LlamaCppLibBackend::gguf(
                                                                                 path.clone(),
                                                                             ),
                                                                         );
@@ -3641,8 +3712,8 @@ impl App {
                                                                 }
                                                             }
                                                         } else {
-                                                            self.backend = AgentBackend::LlamaCpp(
-                                                                LlamaCppBackend::server(
+                                                            self.backend = AgentBackend::LlamaCppLib(
+LlamaCppLibBackend::http(
                                                                     "http://localhost:8080"
                                                                         .to_string(),
                                                                     selected_model.clone(),
@@ -3712,16 +3783,16 @@ impl App {
                                                     1 => {
                                                         // llama.cpp
                                                         if let Some(path) = current_path {
-                                                            self.backend = AgentBackend::LlamaCpp(
-                                                                LlamaCppBackend::cli(path.clone()),
+                                                            self.backend = AgentBackend::LlamaCppLib(
+LlamaCppLibBackend::gguf(path.clone()),
                                                             );
                                                             self.status_message = format!(
                                                                 "Active Engine: llama.cpp ({})",
                                                                 path.display()
                                                             );
                                                         } else {
-                                                            self.backend = AgentBackend::LlamaCpp(
-                                                                LlamaCppBackend::server(
+                                                            self.backend = AgentBackend::LlamaCppLib(
+LlamaCppLibBackend::http(
                                                                     "http://localhost:8080"
                                                                         .to_string(),
                                                                     "llama.cpp".to_string(),
@@ -3780,15 +3851,15 @@ impl App {
                                                     "Power mode: Extreme (llama.cpp max ngl; llama.rs more tokens)"
                                                         .to_string();
                                                     }
-                                                    3 => {
-                                                        use crate::settings::cycle_llama_rs_sub_backend;
-                                                        let b = cycle_llama_rs_sub_backend();
-                                                        self.status_message = format!(
-                                                            "llama.cpp sub-backend: {} (HERCULES_COMPUTE_BACKEND={})",
-                                                            b.label(),
-                                                            b.env_val()
-                                                        );
-                                                    }
+
+
+
+
+
+
+
+
+
                                                     4 => {
                                                         use crate::settings::{
                                                             cycle_stall_timeout,
@@ -3931,6 +4002,7 @@ impl App {
                                                     self.messages.push(
                                                         "System: Press F1 for shortcut overlay.\n\
 /allow   — grant write/cmd for this session (Ask mode)\n\
+/swarm   — initialize swarm orchestrator mode and spawn sub-agents\n\
 /compact — compress chat → memory, forget old turns\n\
 /cancel-download — clear stuck HF download lock so you can install another model\n\
 /download-status — show active download lock\n\
@@ -3944,6 +4016,16 @@ impl App {
                                                 "System: Session tool permission granted (write/cmd allowed until restart)."
                                                     .to_string(),
                                             );
+                                                }
+                                                "/swarm" => {
+                                                    let instruction = if parts.len() > 1 {
+                                                        prompt[7..].trim()
+                                                    } else {
+                                                        "accomplish this task"
+                                                    };
+                                                    self.messages.push(
+                                                        format!("System: You are the Swarm Orchestrator (H0). Use the `<agent action=\"spawn\" role=\"...\">task description</agent>` tag to spawn specialized sub-agents to {}. Do not write code yourself. Delegate all complex work to sub-agents. When a sub-agent replies with `<agent action=\"reply\">`, evaluate their work.", instruction)
+                                                    );
                                                 }
                                                 "/compact" | "/compact!" | "/gc" => {
                                                     let before =
@@ -5339,7 +5421,7 @@ impl App {
                     ListItem::new(Span::styled(
                         format!(
                             "llama.cpp Sub-Backend: {}  (Enter / +/− cycles Auto→SIMD→GPU→Scalar)",
-                            s.llama_rs_sub_backend.label()
+                            "LlamaCppLib"
                         ),
                         Style::default().fg(Color::Rgb(100, 200, 255)),
                     )),

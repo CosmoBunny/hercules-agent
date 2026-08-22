@@ -18,6 +18,10 @@ pub enum ToolPanelKind {
     Write,
     Cmd,
     Read,
+    Mcp,
+    Skill,
+    WebSearch,
+    Agent,
 }
 
 impl ToolPanelKind {
@@ -26,6 +30,10 @@ impl ToolPanelKind {
             Self::Write => "WRITE",
             Self::Cmd => "TERM",
             Self::Read => "READ",
+            Self::Mcp => "MCP",
+            Self::Skill => "SKILL",
+            Self::WebSearch => "SEARCH",
+            Self::Agent => "AGENT",
         }
     }
 
@@ -34,6 +42,10 @@ impl ToolPanelKind {
             Self::Write => Color::Rgb(80, 220, 140),
             Self::Cmd => Color::Rgb(255, 200, 80),
             Self::Read => Color::Rgb(100, 180, 255),
+            Self::Mcp => Color::Rgb(200, 100, 255),
+            Self::Skill => Color::Rgb(255, 180, 50),
+            Self::WebSearch => Color::Rgb(100, 255, 180),
+            Self::Agent => Color::Rgb(255, 100, 200),
         }
     }
 
@@ -42,6 +54,10 @@ impl ToolPanelKind {
             Self::Write => Color::Rgb(210, 255, 225),
             Self::Cmd => Color::Rgb(180, 255, 180), // terminal green
             Self::Read => Color::Rgb(200, 230, 255),
+            Self::Mcp => Color::Rgb(220, 150, 255),
+            Self::Skill => Color::Rgb(255, 200, 100),
+            Self::WebSearch => Color::Rgb(150, 255, 200),
+            Self::Agent => Color::Rgb(255, 150, 200),
         }
     }
 }
@@ -58,6 +74,7 @@ pub struct ToolChip {
     pub body: String,
     pub tag_closed: bool,
     pub pending: bool,
+    pub spawned: bool,
     pub rect: Option<Rect>,
     /// `messages` index of the Agent turn that emitted this tool (scrolls with chat).
     pub anchor_msg: Option<usize>,
@@ -104,6 +121,7 @@ impl ToolChip {
                     format!(" [READ] {short}... > ")
                 }
             }
+            ToolPanelKind::Mcp | ToolPanelKind::Skill | ToolPanelKind::WebSearch | ToolPanelKind::Agent => format!(" [{}] ", self.target),
         }
     }
 
@@ -305,8 +323,8 @@ pub fn normalize_target(kind: ToolPanelKind, target: &str) -> String {
     let t = clean_cmd(target);
     match kind {
         ToolPanelKind::Cmd => t.split_whitespace().collect::<Vec<_>>().join(" "),
-        ToolPanelKind::Write | ToolPanelKind::Read => t,
-    }
+        ToolPanelKind::Write | ToolPanelKind::Read | ToolPanelKind::Mcp | ToolPanelKind::Skill | ToolPanelKind::WebSearch | ToolPanelKind::Agent => t,
+        }
 }
 
 /// Same tool event? Used to upsert chips *within one stream/turn* only.
@@ -375,6 +393,119 @@ pub struct StreamToolView {
     pub tag_closed: bool,
 }
 
+
+fn detect_mcp(text: &str) -> Vec<StreamToolView> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<mcp ") {
+        let r = &rest[start..];
+        if let Some(close_bracket) = r.find('>') {
+            let header = &r[..close_bracket + 1];
+            let action = crate::agent::AgentEngine::extract_attribute(header, "action").unwrap_or_else(|| "search".to_string());
+            let end = r.find("</mcp>").unwrap_or(r.len());
+            let body = r[close_bracket + 1..end].trim().to_string();
+            out.push(StreamToolView {
+                kind: ToolPanelKind::Mcp,
+                target: action,
+                body,
+                tag_closed: r.find("</mcp>").is_some(),
+            });
+            rest = if r.find("</mcp>").is_some() { &r[end + 6..] } else { "" };
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn detect_skill(text: &str) -> Vec<StreamToolView> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<skill ") {
+        let r = &rest[start..];
+        if let Some(close_bracket) = r.find('>') {
+            let header = &r[..close_bracket + 1];
+            let action = crate::agent::AgentEngine::extract_attribute(header, "action").unwrap_or_else(|| "search".to_string());
+            let end = r.find("</skill>").unwrap_or(r.len());
+            let body = r[close_bracket + 1..end].trim().to_string();
+            out.push(StreamToolView {
+                kind: ToolPanelKind::Skill,
+                target: action,
+                body,
+                tag_closed: r.find("</skill>").is_some(),
+            });
+            rest = if r.find("</skill>").is_some() { &r[end + 8..] } else { "" };
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+
+
+fn detect_websearch(text: &str) -> Vec<StreamToolView> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<websearch ") {
+        let r = &rest[start..];
+        if let Some(close_bracket) = r.find('>') {
+            let header = &r[..close_bracket + 1];
+            let action = crate::agent::AgentEngine::extract_attribute(header, "query").unwrap_or_else(|| "search".to_string());
+            let end = r.find("</websearch>").unwrap_or(r.len());
+            let body = r[close_bracket + 1..end].trim().to_string();
+            out.push(StreamToolView {
+                kind: ToolPanelKind::WebSearch,
+                target: action,
+                body,
+                tag_closed: r.find("</websearch>").is_some(),
+            });
+            rest = if r.find("</websearch>").is_some() { &r[end + 12..] } else { "" };
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+
+
+fn detect_agent(text: &str) -> Vec<StreamToolView> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<agent ") {
+        let r = &rest[start..];
+        if let Some(close_bracket) = r.find('>') {
+            let header = &r[..close_bracket + 1];
+            let action = crate::agent::AgentEngine::extract_attribute(header, "action").unwrap_or_else(|| "spawn".to_string());
+            let role = crate::agent::AgentEngine::extract_attribute(header, "role").unwrap_or_default();
+            let to = crate::agent::AgentEngine::extract_attribute(header, "to").unwrap_or_default();
+            
+            let mut target_label = action.clone();
+            if !role.is_empty() {
+                target_label.push_str(&format!(" role={role}"));
+            }
+            if !to.is_empty() {
+                target_label.push_str(&format!(" to={to}"));
+            }
+            
+            let end = r.find("</agent>").unwrap_or(r.len());
+            let body = r[close_bracket + 1..end].trim().to_string();
+            out.push(StreamToolView {
+                kind: ToolPanelKind::Agent,
+                target: target_label,
+                body,
+                tag_closed: r.find("</agent>").is_some(),
+            });
+            rest = if r.find("</agent>").is_some() { &r[end + 8..] } else { "" };
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+
 pub fn detect_all_stream_tools(response: &str) -> Vec<StreamToolView> {
     let text = flatten_for_tools(response);
     let mut out = Vec::new();
@@ -388,6 +519,10 @@ pub fn detect_all_stream_tools(response: &str) -> Vec<StreamToolView> {
     }
     // All <read> tags in the stream (not just first)
     out.extend(detect_reads(&text));
+    out.extend(detect_mcp(&text));
+    out.extend(detect_skill(&text));
+    out.extend(detect_websearch(&text));
+    out.extend(detect_agent(&text));
     out
 }
 
@@ -408,6 +543,10 @@ fn flatten_for_tools(response: &str) -> String {
     if outside.contains("<write")
         || outside.contains("<cmd>")
         || outside.contains("<read src=")
+        || outside.contains("<mcp")
+        || outside.contains("<skill")
+        || outside.contains("<websearch")
+        || outside.contains("<agent")
     {
         outside
     } else {

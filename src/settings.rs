@@ -112,32 +112,24 @@ pub const CONTEXT_COMPACT_RATIO: f32 = 0.80;
 pub const DEFAULT_TEMPERATURE: f32 = 0.2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LlamaRsSubBackend {
-    Auto,
-    ParallelSimd,
-    GpuWgpu,
-    SimdOnly,
-    Scalar,
+pub enum WebSearchProvider {
+    DuckDuckGo,
+    Google,
+    Brave,
+    Tavily,
+    Searxng,
+    Arxiv,
 }
 
-impl LlamaRsSubBackend {
+impl WebSearchProvider {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Auto => "Auto (Parallel SIMD / GPU)",
-            Self::ParallelSimd => "Parallel SIMD (Rayon + AVX2)",
-            Self::GpuWgpu => "GPU Acceleration (WGPU / Vulkan)",
-            Self::SimdOnly => "Single-Thread SIMD",
-            Self::Scalar => "Scalar Fallback",
-        }
-    }
-
-    pub fn env_val(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::ParallelSimd => "parallel",
-            Self::GpuWgpu => "gpu",
-            Self::SimdOnly => "simd",
-            Self::Scalar => "scalar",
+            Self::DuckDuckGo => "DuckDuckGo (Default, Zero Config)",
+            Self::Google => "Google Search",
+            Self::Brave => "Brave Search",
+            Self::Tavily => "Tavily AI",
+            Self::Searxng => "SearXNG",
+            Self::Arxiv => "ArXiv Papers",
         }
     }
 }
@@ -145,7 +137,9 @@ impl LlamaRsSubBackend {
 #[derive(Debug, Clone)]
 pub struct RuntimeSettings {
     pub power_mode: PowerMode,
-    pub llama_rs_sub_backend: LlamaRsSubBackend,
+    pub web_search_provider: WebSearchProvider,
+    pub max_subagents: usize,
+    pub max_subagent_depth: usize,
     pub stall_timeout_secs: u64,
     /// Consecutive identical / pattern hits before we intervene.
     pub repeat_threshold: usize,
@@ -157,19 +151,33 @@ pub struct RuntimeSettings {
     pub compact_ratio: f32,
     /// Sampling temperature for llama.cpp / HTTP / (hint for llama.rs).
     pub temperature: f32,
+    /// Send recent sub-agent response back to main agent on finish.
+    pub subagent_quick_response: bool,
+    /// OCR model / engine (auto, llava, qwen2-vl, tesseract).
+    pub ocr_model: String,
+    /// Image generative model / engine (auto, sd-webui, ollama, diffusers).
+    pub image_gen_model: String,
+    /// Video generative model / engine (auto, animatediff, cogvideox).
+    pub video_gen_model: String,
 }
 
 impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
             power_mode: PowerMode::Normal,
-            llama_rs_sub_backend: LlamaRsSubBackend::Auto,
+            web_search_provider: WebSearchProvider::DuckDuckGo,
+            max_subagents: 4,
+            max_subagent_depth: 3,
             stall_timeout_secs: 300, // 5m default
             repeat_threshold: 10,
             repeat_detect_thinking: true,
             context_token_limit: context_limit_from_env(),
             compact_ratio: CONTEXT_COMPACT_RATIO,
             temperature: DEFAULT_TEMPERATURE,
+            subagent_quick_response: true,
+            ocr_model: "none".to_string(),
+            image_gen_model: "none".to_string(),
+            video_gen_model: "none".to_string(),
         }
     }
 }
@@ -218,22 +226,29 @@ pub fn nudge_stall_timeout(dir: i32) -> u64 {
     next
 }
 
-pub fn cycle_llama_rs_sub_backend() -> LlamaRsSubBackend {
-    let next = match get_settings().llama_rs_sub_backend {
-        LlamaRsSubBackend::Auto => LlamaRsSubBackend::ParallelSimd,
-        LlamaRsSubBackend::ParallelSimd => LlamaRsSubBackend::GpuWgpu,
-        LlamaRsSubBackend::GpuWgpu => LlamaRsSubBackend::SimdOnly,
-        LlamaRsSubBackend::SimdOnly => LlamaRsSubBackend::Scalar,
-        LlamaRsSubBackend::Scalar => LlamaRsSubBackend::Auto,
+pub fn cycle_web_search_provider() -> WebSearchProvider {
+    let next = match get_settings().web_search_provider {
+        WebSearchProvider::DuckDuckGo => WebSearchProvider::Google,
+        WebSearchProvider::Google => WebSearchProvider::Brave,
+        WebSearchProvider::Brave => WebSearchProvider::Tavily,
+        WebSearchProvider::Tavily => WebSearchProvider::Searxng,
+        WebSearchProvider::Searxng => WebSearchProvider::Arxiv,
+        WebSearchProvider::Arxiv => WebSearchProvider::DuckDuckGo,
     };
     if let Ok(mut g) = SETTINGS.lock() {
         let s = g.get_or_insert_with(RuntimeSettings::default);
-        s.llama_rs_sub_backend = next;
-    }
-    unsafe {
-        std::env::set_var("HERCULES_COMPUTE_BACKEND", next.env_val());
+        s.web_search_provider = next;
     }
     next
+}
+
+pub fn toggle_subagent_quick_response() -> bool {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.subagent_quick_response = !s.subagent_quick_response;
+        return s.subagent_quick_response;
+    }
+    true
 }
 
 fn context_limit_from_env() -> usize {
@@ -277,6 +292,120 @@ pub fn set_context_token_limit(n: usize) {
         let s = g.get_or_insert_with(RuntimeSettings::default);
         s.context_token_limit = n.clamp(2048, MAX_CONTEXT_TOKEN_LIMIT);
     }
+}
+
+pub fn get_ocr_model() -> String {
+    get_settings().ocr_model
+}
+
+pub fn set_ocr_model(m: String) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.ocr_model = m;
+    }
+}
+
+pub fn get_image_gen_model() -> String {
+    get_settings().image_gen_model
+}
+
+pub fn set_image_gen_model(m: String) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.image_gen_model = m;
+    }
+}
+
+pub fn get_video_gen_model() -> String {
+    get_settings().video_gen_model
+}
+
+pub fn set_video_gen_model(m: String) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.video_gen_model = m;
+    }
+}
+
+fn is_command_available(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn detect_ollama_vision_models() -> Vec<String> {
+    let mut models = Vec::new();
+    if let Ok(output) = std::process::Command::new("ollama").arg("list").output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines().skip(1) {
+                let name = line.split_whitespace().next().unwrap_or("");
+                let lower = name.to_lowercase();
+                if lower.contains("llava") || lower.contains("vision") || lower.contains("qwen2-vl") || lower.contains("bakllava") {
+                    models.push(name.to_string());
+                }
+            }
+        }
+    }
+    models
+}
+
+pub fn get_available_ocr_engines() -> Vec<String> {
+    let mut engines = vec!["none".to_string(), "auto".to_string(), "integrated".to_string()];
+    if is_command_available("tesseract") {
+        engines.push("tesseract".to_string());
+    }
+    for m in detect_ollama_vision_models() {
+        if !engines.contains(&m) {
+            engines.push(m);
+        }
+    }
+    engines
+}
+
+pub fn get_available_image_gen_engines() -> Vec<String> {
+    let mut engines = vec!["none".to_string(), "auto".to_string(), "integrated".to_string()];
+    if is_command_available("python3") {
+        engines.push("python-pil".to_string());
+    }
+    engines
+}
+
+pub fn get_available_video_gen_engines() -> Vec<String> {
+    let mut engines = vec!["none".to_string(), "auto".to_string(), "integrated".to_string()];
+    if is_command_available("ffmpeg") || is_command_available("python3") {
+        engines.push("ffmpeg".to_string());
+    }
+    engines
+}
+
+pub fn cycle_ocr_model() -> String {
+    let available = get_available_ocr_engines();
+    let cur = get_ocr_model();
+    let idx = available.iter().position(|r| r == &cur).unwrap_or(0);
+    let next = available[(idx + 1) % available.len()].clone();
+    set_ocr_model(next.clone());
+    next
+}
+
+pub fn cycle_image_gen_model() -> String {
+    let available = get_available_image_gen_engines();
+    let cur = get_image_gen_model();
+    let idx = available.iter().position(|r| r == &cur).unwrap_or(0);
+    let next = available[(idx + 1) % available.len()].clone();
+    set_image_gen_model(next.clone());
+    next
+}
+
+pub fn cycle_video_gen_model() -> String {
+    let available = get_available_video_gen_engines();
+    let cur = get_video_gen_model();
+    let idx = available.iter().position(|r| r == &cur).unwrap_or(0);
+    let next = available[(idx + 1) % available.len()].clone();
+    set_video_gen_model(next.clone());
+    next
 }
 
 /// Menu presets for context window (tokens). Enter / +/− step these.

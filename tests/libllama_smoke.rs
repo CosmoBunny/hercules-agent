@@ -11,7 +11,7 @@
 //! ```
 //! Do **not** set `LD_LIBRARY_PATH` — resolution must be automatic.
 
-use hercules_agent::llama::ffi::{self, LlamaLib};
+use hercules_agent::llama::ffi;
 use hercules_agent::llama::libinfer::LlamaCppLib;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -37,9 +37,7 @@ fn require_gguf() -> PathBuf {
 
 #[test]
 fn libllama_loads_without_user_ld_library_path() {
-    // User must not need to export LD_LIBRARY_PATH=$HOME/.local/lib.
-    // We preload ggml deps by absolute path + RTLD_GLOBAL inside LlamaLib::load.
-    let lib = LlamaLib::load().expect("LlamaLib::load should find libllama + ggml automatically");
+    let lib = ffi::get_lib().expect("ffi::get_lib should resolve statically or automatically");
     unsafe {
         (lib.backend_init)();
     }
@@ -49,7 +47,7 @@ fn libllama_loads_without_user_ld_library_path() {
 
 #[test]
 fn context_params_layout_has_outputs_fields() {
-    let lib = LlamaLib::load().expect("load libllama");
+    let lib = ffi::get_lib().expect("load libllama");
     let p = unsafe { (lib.context_default_params)() };
     // Defaults from current llama.cpp: n_ctx=512, n_batch=2048 typically.
     assert!(p.n_ctx > 0, "n_ctx default should be > 0, got {}", p.n_ctx);

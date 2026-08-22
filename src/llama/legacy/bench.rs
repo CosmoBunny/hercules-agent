@@ -237,6 +237,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[ignore = "slow end-to-end benchmark on unoptimized debug build"]
     fn baseline_decode_tok_s() {
         let Some(path) = test_gguf_path() else {
             eprintln!("[bench] skip: no GGUF (set HERCULES_TEST_GGUF)");

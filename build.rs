@@ -87,11 +87,7 @@ fn link_from_install_dir(dir: &Path) {
     archives.extend(collect_libs(dir, "lib")); // MSVC static libs
 
     // Collect shared libs: .so (Linux) / .dylib (macOS) / .dll.lib or .dll (Windows)
-    let shared = {
-        let mut s = collect_libs(dir, shared_ext());
-        // On Windows, also look for import libs (.dll.a for MinGW, handled above via "a")
-        s
-    };
+    let shared = collect_libs(dir, shared_ext());
 
     if !archives.is_empty() {
         eprintln!(
@@ -265,6 +261,15 @@ fn locate_or_fetch_source(out_dir: &Path) -> PathBuf {
 }
 
 fn cmake_configure(src: &Path, build: &Path) {
+    let cache_file = build.join("CMakeCache.txt");
+    if cache_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&cache_file) {
+            let src_str = src.to_string_lossy();
+            if !content.contains(&*src_str) {
+                let _ = std::fs::remove_dir_all(build);
+            }
+        }
+    }
     std::fs::create_dir_all(build).expect("create CMake build dir");
 
     let cuda   = std::env::var("LLAMA_CUDA").unwrap_or_default();
@@ -343,7 +348,7 @@ fn cmake_build_libs(build: &Path) {
 }
 
 fn emit_link_directives(build: &Path) {
-    let mut archives = find_static_archives(build);
+    let archives = find_static_archives(build);
     assert!(
         !archives.is_empty(),
         "No static archives found under {} — did CMake build succeed?",

@@ -253,6 +253,10 @@ pub struct ProposedAction {
 pub enum ProposedKind {
     Write,
     Cmd,
+    Mcp,
+    Skill,
+    WebSearch,
+    Agent,
 }
 
 impl ProposedKind {
@@ -260,6 +264,10 @@ impl ProposedKind {
         match self {
             Self::Write => "WRITE",
             Self::Cmd => "RUN",
+            Self::Mcp => "MCP",
+            Self::Skill => "SKILL",
+            Self::WebSearch => "WEBSEARCH",
+            Self::Agent => "AGENT",
         }
     }
 }
@@ -721,6 +729,7 @@ impl AgentEngine {
     pub fn extract_proposed_actions(response: &str) -> Vec<ProposedAction> {
         let outside = Self::strip_code_fences(&Self::strip_think_blocks(response));
         let mut from_out = Self::parse_write_cmd_actions(&outside, false);
+        from_out.extend(Self::parse_mcp_skill_actions(&outside, false));
         from_out.retain(|a| Self::action_is_sane(a));
         if !from_out.is_empty() {
             return from_out;
@@ -738,6 +747,7 @@ impl AgentEngine {
             Self::strip_code_fences(&t)
         };
         let mut from_think = Self::parse_write_cmd_actions(&think, true);
+        from_think.extend(Self::parse_mcp_skill_actions(&think, true));
         // From think: only accept fully closed, sane write/cmd (no prose dumps)
         from_think.retain(|a| Self::action_is_sane(a) && Self::think_action_ok(a));
         from_think
@@ -752,6 +762,7 @@ impl AgentEngine {
                     && !a.body.to_ascii_lowercase().contains("i should emit")
             }
             ProposedKind::Cmd => Self::looks_like_shell_cmd(&a.target),
+            ProposedKind::Mcp | ProposedKind::Skill | ProposedKind::WebSearch | ProposedKind::Agent => true,
         }
     }
 
@@ -765,6 +776,7 @@ impl AgentEngine {
                     && !t.to_ascii_lowercase().contains("maybe")
             }
             ProposedKind::Cmd => Self::looks_like_shell_cmd(&a.target),
+            ProposedKind::Mcp | ProposedKind::Skill | ProposedKind::WebSearch | ProposedKind::Agent => true,
         }
     }
 
@@ -1322,6 +1334,58 @@ impl AgentEngine {
     /// concatenating their bodies. This prevents a second `<write>` for the same
     /// file (e.g. model writes HTML then CSS into same `index.html`) from
     /// clobbering the first write.
+
+    fn parse_mcp_skill_actions(text: &str, from_think: bool) -> Vec<ProposedAction> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while let Some(start_tag) = rest.find("<mcp ") {
+            let r = &rest[start_tag..];
+            if let Some(close_bracket) = r.find('>') {
+                let header = &r[..close_bracket + 1];
+                let action = Self::extract_attribute(header, "action").unwrap_or_else(|| "search".to_string());
+                let after = &r[close_bracket + 1..];
+                if let Some(end_tag) = after.find("</mcp>") {
+                    let body = after[..end_tag].trim().to_string();
+                    out.push(ProposedAction {
+                        kind: ProposedKind::Mcp,
+                        target: action,
+                        body,
+                        line_attr: None,
+                        from_think,
+                        chip_id: None,
+                    });
+                    rest = &after[end_tag + 6..];
+                    continue;
+                }
+            }
+            break;
+        }
+        rest = text;
+        while let Some(start_tag) = rest.find("<skill ") {
+            let r = &rest[start_tag..];
+            if let Some(close_bracket) = r.find('>') {
+                let header = &r[..close_bracket + 1];
+                let action = Self::extract_attribute(header, "action").unwrap_or_else(|| "search".to_string());
+                let after = &r[close_bracket + 1..];
+                if let Some(end_tag) = after.find("</skill>") {
+                    let body = after[..end_tag].trim().to_string();
+                    out.push(ProposedAction {
+                        kind: ProposedKind::Skill,
+                        target: action,
+                        body,
+                        line_attr: None,
+                        from_think,
+                        chip_id: None,
+                    });
+                    rest = &after[end_tag + 8..];
+                    continue;
+                }
+            }
+            break;
+        }
+        out
+    }
+
     fn merge_duplicate_writes(actions: Vec<ProposedAction>) -> Vec<ProposedAction> {
         let mut merged: Vec<ProposedAction> = Vec::new();
         for action in actions {
@@ -1434,7 +1498,10 @@ impl AgentEngine {
                 let path = Self::normalize_write_path(&action.target, &action.body);
                 Self::execute_write(&path, action.line_attr.as_deref(), &action.body)
             }
+ 
+            ProposedKind::Mcp | ProposedKind::Skill | ProposedKind::WebSearch | ProposedKind::Agent => String::new(), // handled elsewhere
             ProposedKind::Cmd => {
+ 
                 if !Self::looks_like_shell_cmd(&action.target) {
                     return format!(
                         "Error: Rejected non-command text in <cmd>: {}",
@@ -1602,7 +1669,7 @@ impl AgentEngine {
         result
     }
 
-    fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
+    pub fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
         let pattern = format!("{}=", attr_name);
         if let Some(idx) = tag.find(&pattern) {
             let rest = &tag[idx + pattern.len()..];

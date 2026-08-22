@@ -365,10 +365,22 @@ impl LlamaCppLib {
 
 impl Drop for LlamaCppLib {
     fn drop(&mut self) {
+        // NOTE: Do NOT acquire GEN_LOCK here. Drop is only called when the last
+        // Arc<LlamaCppLib> is released, which means generate_stream has already
+        // finished and released its Arc clone. Acquiring GEN_LOCK here while
+        // shutdown_warm_lib_engine holds it causes a deadlock (Mutex is not reentrant).
         if let Ok(lib) = get_lib() {
             unsafe {
-                (lib.context_free)(self.ctx);
-                (lib.model_free)(self.model);
+                if !self.ctx.is_null() {
+                    let ctx = self.ctx;
+                    self.ctx = std::ptr::null_mut();
+                    (lib.context_free)(ctx);
+                }
+                if !self.model.is_null() {
+                    let model = self.model;
+                    self.model = std::ptr::null_mut();
+                    (lib.model_free)(model);
+                }
             }
         }
     }
@@ -412,9 +424,21 @@ pub fn ensure_warm_lib_engine(path: &Path) -> Result<Arc<LlamaCppLib>, String> {
 
 /// Unload the cached model from memory.
 pub fn shutdown_warm_lib_engine() {
-    if let Ok(mut g) = WARM_ENGINE.lock() {
-        *g = None;
-    }
+    // Take the engine out while holding GEN_LOCK so no new generation starts.
+    // Drop it AFTER releasing GEN_LOCK — otherwise Drop tries to re-acquire
+    // GEN_LOCK on the same thread → deadlock (Mutex is not reentrant).
+    let engine_to_drop = {
+        let _guard = GEN_LOCK.lock();
+        WARM_ENGINE.lock().ok().and_then(|mut g| g.take())
+        // GEN_LOCK released here before engine_to_drop is dropped
+    };
+    drop(engine_to_drop); // Drop (llama_context_free / llama_model_free) runs here, outside GEN_LOCK
+}
+
+/// Retrieve the currently active cached engine if loaded.
+pub fn get_warm_lib_engine() -> Option<Arc<LlamaCppLib>> {
+    let guard = WARM_ENGINE.lock().ok()?;
+    guard.as_ref().map(|e| e.engine.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +468,14 @@ impl LlamaCppLibRuntime {
             model_path: Some(path.into()),
             endpoint: String::new(),
             model_name: "llama.cpp-lib-local".into(),
+        }
+    }
+
+    pub fn with_gguf_name(path: impl Into<PathBuf>, model_name: impl Into<String>) -> Self {
+        Self {
+            model_path: Some(path.into()),
+            endpoint: String::new(),
+            model_name: model_name.into(),
         }
     }
 

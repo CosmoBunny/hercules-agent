@@ -73,14 +73,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Ok(mut g) = app.is_generating.lock() {
         *g = false;
     }
-    cleanup_engines();
+
+    // Restore terminal first so the user's shell is usable immediately.
     restore_terminal(&mut terminal);
 
     if let Err(err) = res {
         eprintln!("{:?}", err);
     }
 
-    std::process::exit(0);
+    // Use _exit() instead of process::exit() to bypass llama.cpp's atexit
+    // handlers. Those handlers call llama_backend_free / context/model free
+    // which can block for several seconds freeing a 1-2GB model on slow
+    // hardware, causing the process to hang visibly at 99% exit.
+    // The OS reclaims all memory immediately on _exit — no cleanup needed.
+    unsafe { libc::_exit(0) };
 }
 
 async fn run_app(
@@ -93,7 +99,8 @@ async fn run_app(
             if let Ok(mut g) = app.is_generating.lock() {
                 *g = false;
             }
-            cleanup_engines();
+            // Spawn cleanup off the event loop — don't block here.
+            std::thread::spawn(cleanup_engines);
             return Ok(());
         }
         terminal.draw(|f| app.draw(f))?;
@@ -102,7 +109,8 @@ async fn run_app(
             if let Ok(mut g) = app.is_generating.lock() {
                 *g = false;
             }
-            cleanup_engines();
+            // Spawn cleanup so we don't block exit on GEN_LOCK held by a generate thread.
+            std::thread::spawn(cleanup_engines);
             return Ok(());
         }
     }

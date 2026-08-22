@@ -1,0 +1,179 @@
+# Build Hercules Agent release CLI binaries, bundle them, and publish downloadable archives.
+# Artifacts land under release/ (via packaging/make_release.sh) and are
+# uploaded for download. On version tags (v*), they are attached to a GitHub Release.
+#
+# IMPORTANT: "Re-run failed jobs" reuses the same commit. After workflow fixes,
+# start a NEW run (Actions → Release → Run workflow) on latest main.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      features:
+        description: "Cargo features to enable (e.g. 'default', 'full', 'llama-cpp-static', 'full,llama-cpp-static')"
+        type: string
+        default: "default"
+      with_llama_static:
+        description: "Enable llama-cpp-static feature (builds llama.cpp from source/submodule)"
+        type: boolean
+        default: false
+      with_gpu:
+        description: "Enable GPU feature (WGPU via burn)"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: ${{ matrix.platform }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+          - os: windows-latest
+            platform: windows
+          - os: macos-14
+            platform: macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            cmake \
+            ninja-build \
+            clang \
+            libclang-dev \
+            llvm-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libx11-dev
+
+      - name: Install macOS system deps
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew install cmake ninja libomp llvm || true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hercules-release-${{ matrix.platform }}
+          cache-on-failure: true
+
+      - name: Resolve build flags
+        id: flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          FEATURES_ARG=""
+          
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            FEATS="${{ inputs.features }}"
+            if [ "$FEATS" != "default" ] && [ -n "$FEATS" ]; then
+              FEATURES_ARG="$FEATS"
+            fi
+            if [ "${{ inputs.with_llama_static }}" = "true" ]; then
+              if [ -n "$FEATURES_ARG" ]; then
+                FEATURES_ARG="${FEATURES_ARG},llama-cpp-static"
+              else
+                FEATURES_ARG="llama-cpp-static"
+              fi
+            fi
+            if [ "${{ inputs.with_gpu }}" = "true" ]; then
+              if [ -n "$FEATURES_ARG" ]; then
+                FEATURES_ARG="${FEATURES_ARG},gpu"
+              else
+                FEATURES_ARG="gpu"
+              fi
+            fi
+          else
+            # For tag pushes (actual releases), explicitly ensure llama-cpp-static is built
+            FEATURES_ARG="llama-cpp-static"
+          fi
+          
+          echo "features=$FEATURES_ARG" >> "$GITHUB_OUTPUT"
+
+      - name: Build, bundle, copy to release/
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x packaging/make_release.sh
+          EXTRA=()
+          if [ -n "${{ steps.flags.outputs.features }}" ]; then
+            EXTRA+=(--features "${{ steps.flags.outputs.features }}")
+          fi
+          
+          ./packaging/make_release.sh "${EXTRA[@]}"
+          
+          echo "---- release/ ----"
+          ls -lah release/
+
+      - name: Upload release archives (workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: hercules-agent-${{ matrix.platform }}-${{ runner.arch }}
+          path: |
+            release/*.tar.gz
+            release/*.zip
+            release/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release assets
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: hercules-agent-*
+          merge-multiple: true
+
+      - name: List downloadable files
+        run: find artifacts -type f | sort
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/*.sha256
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

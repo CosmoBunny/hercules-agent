@@ -8,16 +8,14 @@ use burn::tensor::Tensor;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::llama::{HttpInferenceClient, LlamaCppRuntime, LlamaCppLibRuntime};
+use crate::llama::{HttpInferenceClient, LlamaCppLibRuntime};
 
 #[derive(Clone)]
 pub enum AgentBackend {
     #[cfg(feature = "gpu")]
     BurnWgpu(BurnWgpuBackend),
-    /// In-process libllama.so engine (C FFI — no subprocess).
+    /// In-process static libllama engine (C FFI / static — no subprocess).
     LlamaCppLib(LlamaCppLibBackend),
-    /// Official llama.cpp via CLI or managed llama-server.
-    LlamaCpp(LlamaCppBackend),
     Ollama(OllamaBackend),
 }
 
@@ -27,7 +25,6 @@ impl AgentBackend {
             #[cfg(feature = "gpu")]
             Self::BurnWgpu(backend) => backend.generate(prompt).await,
             Self::LlamaCppLib(backend) => backend.generate(prompt).await,
-            Self::LlamaCpp(backend) => backend.generate(prompt).await,
             Self::Ollama(backend) => backend.generate(prompt).await,
         }
     }
@@ -41,11 +38,6 @@ impl AgentBackend {
     ) -> Result<String, String> {
         match self {
             Self::LlamaCppLib(backend) => {
-                backend
-                    .generate_stream(prompt, stream_target, is_generating)
-                    .await
-            }
-            Self::LlamaCpp(backend) => {
                 backend
                     .generate_stream(prompt, stream_target, is_generating)
                     .await
@@ -69,7 +61,6 @@ impl AgentBackend {
     pub fn current_model_path(&self) -> Option<PathBuf> {
         match self {
             Self::LlamaCppLib(b) => b.runtime.model_path.clone(),
-            Self::LlamaCpp(b) => b.runtime.model_path(),
             _ => None,
         }
     }
@@ -79,14 +70,13 @@ impl AgentBackend {
             #[cfg(feature = "gpu")]
             Self::BurnWgpu(b) => format!("Burn/WGPU ({})", b.model_name),
             Self::LlamaCppLib(b) => b.name(),
-            Self::LlamaCpp(b) => b.runtime.name(),
             Self::Ollama(b) => format!("Ollama ({})", b.model),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// llama.cpp in-process (libllama.so via C FFI)
+// llama.cpp in-process (static link / libllama via C FFI)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -107,16 +97,27 @@ impl LlamaCppLibBackend {
         }
     }
 
+    pub fn gguf_with_name(path: impl Into<PathBuf>, name: impl Into<String>) -> Self {
+        Self {
+            runtime: LlamaCppLibRuntime::with_gguf_name(path, name),
+        }
+    }
+
     pub fn name(&self) -> String {
-        if let Some(ref p) = self.runtime.model_path {
+        if !self.runtime.model_name.is_empty()
+            && self.runtime.model_name != "llama.cpp-lib-local"
+            && self.runtime.model_name != "llama.cpp-lib"
+        {
+            format!("llama.cpp ({})", self.runtime.model_name)
+        } else if let Some(ref p) = self.runtime.model_path {
             format!(
-                "llama.cpp lib ({})",
+                "llama.cpp ({})",
                 p.file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| p.display().to_string())
             )
         } else {
-            format!("llama.cpp lib HTTP ({})", self.runtime.endpoint)
+            format!("llama.cpp HTTP ({})", self.runtime.endpoint)
         }
     }
 
@@ -136,48 +137,9 @@ impl LlamaCppLibBackend {
     }
 }
 
-// Backward compat alias — old code may reference LlamaRsBackend
+// Backward compat alias
 pub type LlamaRsBackend = LlamaCppLibBackend;
-
-// ---------------------------------------------------------------------------
-// llama.cpp — C/C++ server/CLI runtime
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct LlamaCppBackend {
-    pub runtime: LlamaCppRuntime,
-}
-
-impl LlamaCppBackend {
-    pub fn server(endpoint: String, model_name: String) -> Self {
-        Self {
-            runtime: LlamaCppRuntime::server(endpoint, model_name),
-        }
-    }
-
-    pub fn cli(model_path: impl Into<PathBuf>) -> Self {
-        Self {
-            runtime: LlamaCppRuntime::cli(model_path),
-        }
-    }
-
-    pub async fn generate(&self, prompt: &str) -> Result<String, String> {
-        self.runtime.generate(prompt).await
-    }
-
-    pub async fn generate_stream(
-        &self,
-        prompt: &str,
-        stream_target: Arc<Mutex<String>>,
-        is_generating: Arc<Mutex<bool>>,
-    ) -> Result<String, String> {
-        self.runtime
-            .generate_stream(prompt, stream_target, is_generating)
-            .await
-    }
-}
-
-// Keep old name working for any external references during transition.
+pub type LlamaCppBackend = LlamaCppLibBackend;
 pub type LlamaServerBackend = LlamaCppLibBackend;
 
 // ---------------------------------------------------------------------------
@@ -349,6 +311,7 @@ impl BurnWgpuBackend {
 fn _http_type(_: HttpInferenceClient) {}
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
 

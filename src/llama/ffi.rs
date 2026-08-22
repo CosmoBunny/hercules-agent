@@ -11,6 +11,7 @@
 
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_float, c_int};
+#[cfg(not(feature = "llama-cpp-static"))]
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -264,48 +265,40 @@ unsafe extern "C" {
 #[cfg(feature = "llama-cpp-static")]
 impl LlamaLib {
     /// Construct a `LlamaLib` that calls statically-linked symbols directly.
-    /// No shared library is opened; all function pointers point into the
-    /// binary's own text segment.
     pub fn load_static() -> Self {
-        // SAFETY: these are all valid extern "C" fn pointers resolved at
-        // link time from libllama.a built by build.rs.
-        unsafe {
-            Self {
-                backend_init:                  llama_backend_init,
-                backend_free:                  llama_backend_free,
-                model_default_params:          llama_model_default_params,
-                model_load_from_file:          llama_model_load_from_file,
-                model_free:                    llama_model_free,
-                model_get_vocab:               llama_model_get_vocab,
-                context_default_params:        llama_context_default_params,
-                init_from_model:               llama_init_from_model,
-                context_free:                  llama_free,
-                n_ctx:                         llama_n_ctx,
-                n_ctx_train:                   llama_model_n_ctx_train,
-                tokenize:                      llama_tokenize,
-                token_to_piece:                llama_token_to_piece,
-                vocab_bos:                     llama_vocab_bos,
-                vocab_eos:                     llama_vocab_eos,
-                vocab_get_add_bos:             llama_vocab_get_add_bos,
-                token_is_eog:                  llama_vocab_is_eog,
-                batch_get_one:                 llama_batch_get_one,
-                batch_free:                    llama_batch_free,
-                decode:                        llama_decode,
-                get_logits_ith:                llama_get_logits_ith,
-                sampler_chain_default_params:  llama_sampler_chain_default_params,
-                sampler_chain_init:            llama_sampler_chain_init,
-                sampler_chain_add:             llama_sampler_chain_add,
-                sampler_init_temp:             llama_sampler_init_temp,
-                sampler_init_top_p:            llama_sampler_init_top_p,
-                sampler_init_dist:             llama_sampler_init_dist,
-                sampler_sample:                llama_sampler_sample,
-                sampler_free:                  llama_sampler_free,
-                log_set:                       llama_log_set,
-                // These may or may not exist depending on llama.cpp version;
-                // use Some(...) unconditionally since our build controls the version.
-                get_memory:   Some(llama_get_memory),
-                memory_clear: Some(llama_memory_clear),
-            }
+        Self {
+            backend_init:                  llama_backend_init,
+            backend_free:                  llama_backend_free,
+            model_default_params:          llama_model_default_params,
+            model_load_from_file:          llama_model_load_from_file,
+            model_free:                    llama_model_free,
+            model_get_vocab:               llama_model_get_vocab,
+            context_default_params:        llama_context_default_params,
+            init_from_model:               llama_init_from_model,
+            context_free:                  llama_free,
+            n_ctx:                         llama_n_ctx,
+            n_ctx_train:                   llama_model_n_ctx_train,
+            tokenize:                      llama_tokenize,
+            token_to_piece:                llama_token_to_piece,
+            vocab_bos:                     llama_vocab_bos,
+            vocab_eos:                     llama_vocab_eos,
+            vocab_get_add_bos:             llama_vocab_get_add_bos,
+            token_is_eog:                  llama_vocab_is_eog,
+            batch_get_one:                 llama_batch_get_one,
+            batch_free:                    llama_batch_free,
+            decode:                        llama_decode,
+            get_logits_ith:                llama_get_logits_ith,
+            sampler_chain_default_params:  llama_sampler_chain_default_params,
+            sampler_chain_init:            llama_sampler_chain_init,
+            sampler_chain_add:             llama_sampler_chain_add,
+            sampler_init_temp:             llama_sampler_init_temp,
+            sampler_init_top_p:            llama_sampler_init_top_p,
+            sampler_init_dist:             llama_sampler_init_dist,
+            sampler_sample:                llama_sampler_sample,
+            sampler_free:                  llama_sampler_free,
+            log_set:                       llama_log_set,
+            get_memory:                    Some(llama_get_memory),
+            memory_clear:                  Some(llama_memory_clear),
         }
     }
 }
@@ -633,7 +626,7 @@ mod tests {
 
     #[test]
     fn load_libllama_auto_deps() {
-        let lib = LlamaLib::load().expect("auto-load libllama without user LD_LIBRARY_PATH");
+        let lib = get_lib().expect("auto-load libllama without user LD_LIBRARY_PATH");
         let cparams = unsafe { (lib.context_default_params)() };
         assert!(cparams.n_ctx > 0);
         assert!(cparams.n_threads > 0);

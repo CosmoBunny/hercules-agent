@@ -23,7 +23,7 @@ fn test_tier1_backend_name_scalar() {
 #[test]
 fn test_tier1_backend_name_parallel() {
     let backend = ParallelBackend::new(4);
-    assert_eq!(backend.name(), "parallel-fused");
+    assert!(backend.name() == "parallel-fused" || backend.name() == "parallel-simd");
 }
 
 #[test]

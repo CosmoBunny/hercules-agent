@@ -18,6 +18,8 @@ pub mod manager;
 pub mod settings;
 pub mod task_manager;
 pub mod tool_panel;
+pub mod diagram;
+pub mod graphic;
 
 // TUI lives with the binary but is part of the crate so `app` can use `crate::`.
 pub mod app;

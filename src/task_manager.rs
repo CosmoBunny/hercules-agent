@@ -33,18 +33,20 @@ pub struct ManagedTask {
     pub output: String,
     /// True once we told the UI/agent this was parked as a long task.
     pub parked_notified: bool,
+    pub spawned_by: u32,
 }
 
 #[derive(Debug, Clone)]
 pub enum TaskEvent {
     /// Cmd exceeded QUICK_SECS — still running as task #id
-    Parked { id: u32, cmd: String },
+    Parked { id: u32, cmd: String, spawned_by: u32 },
     /// Process finished (or killed)
     Done {
         id: u32,
         cmd: String,
         output: String,
         killed: bool,
+        spawned_by: u32,
     },
 }
 
@@ -62,11 +64,25 @@ struct TaskManagerInner {
     kills: Vec<(u32, Arc<AtomicBool>)>,
 }
 
+static GLOBAL_TASK_MGR: Mutex<Option<TaskManager>> = Mutex::new(None);
+
+pub fn set_global_task_manager(mgr: TaskManager) {
+    if let Ok(mut g) = GLOBAL_TASK_MGR.lock() {
+        *g = Some(mgr);
+    }
+}
+
+pub fn get_global_task_manager() -> Option<TaskManager> {
+    GLOBAL_TASK_MGR.lock().ok()?.clone()
+}
+
 impl TaskManager {
     pub fn new() -> Self {
-        Self {
+        let mgr = Self {
             inner: Arc::new(Mutex::new(TaskManagerInner::default())),
-        }
+        };
+        set_global_task_manager(mgr.clone());
+        mgr
     }
 
     pub fn list(&self) -> Vec<ManagedTask> {
@@ -112,9 +128,36 @@ impl TaskManager {
         }
     }
 
+    pub fn get_task_output(&self, id: u32) -> Option<(String, TaskStatus)> {
+        let g = self.inner.lock().ok()?;
+        let task = g.tasks.iter().find(|t| t.id == id)?;
+        Some((task.output.clone(), task.status))
+    }
+
+    pub fn kill_task(&self, id: u32) -> bool {
+        if let Ok(mut g) = self.inner.lock() {
+            let mut found = false;
+            for (tid, flag) in &g.kills {
+                if *tid == id {
+                    flag.store(true, Ordering::SeqCst);
+                    found = true;
+                }
+            }
+            if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
+                if t.status == TaskStatus::Running {
+                    t.status = TaskStatus::Killed;
+                    found = true;
+                }
+            }
+            found
+        } else {
+            false
+        }
+    }
+
     /// Spawn `cmd` in the background. Returns task id immediately.
     /// Completion / park events are queued for the main loop.
-    pub fn spawn_cmd(&self, cmd: String) -> u32 {
+    pub fn spawn_cmd(&self, cmd: String, spawned_by: u32) -> u32 {
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         let kill = Arc::new(AtomicBool::new(false));
         {
@@ -126,6 +169,7 @@ impl TaskManager {
                     started: Instant::now(),
                     output: String::new(),
                     parked_notified: false,
+                    spawned_by,
                 });
                 g.kills.push((id, kill.clone()));
             }
@@ -138,7 +182,9 @@ impl TaskManager {
             .spawn(move || {
                 let result = run_cmd_managed(&cmd_for_thread, id, kill, mgr.clone());
                 if let Ok(mut g) = mgr.inner.lock() {
+                    let mut sby = 0;
                     if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
+                        sby = t.spawned_by;
                         match &result {
                             Ok((out, killed)) => {
                                 t.output = out.clone();
@@ -163,6 +209,7 @@ impl TaskManager {
                         cmd: cmd_for_thread,
                         output,
                         killed,
+                        spawned_by: sby,
                     });
                     g.kills.retain(|(i, _)| *i != id);
                 }
@@ -174,15 +221,18 @@ impl TaskManager {
 
     fn mark_parked(&self, id: u32, cmd: &str) {
         if let Ok(mut g) = self.inner.lock() {
+            let mut sby = 0;
             if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
                 if t.parked_notified {
                     return;
                 }
                 t.parked_notified = true;
+                sby = t.spawned_by;
             }
             g.events.push(TaskEvent::Parked {
                 id,
                 cmd: cmd.to_string(),
+                spawned_by: sby,
             });
         }
     }

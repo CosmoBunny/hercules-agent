@@ -18,7 +18,7 @@ name = "hercules"
 path = "src/main.rs"
 
 [features]
-default = ["simd", "parallel"]
+default = ["simd", "parallel", "llama-cpp-static"]
 # std::arch SIMD kernels for desktop CPUs (still pure Rust).
 simd = []
 # Multi-thread GEMV via rayon (desktop/server; disable for embedded).
@@ -26,17 +26,13 @@ parallel = ["dep:rayon"]
 # GPU acceleration via wgpu (Vulkan/Metal/DX12/WebGPU). Adds burn dependency.
 gpu = ["dep:burn"]
 # Full desktop feature set: SIMD + rayon + GPU.
-full = ["simd", "parallel", "gpu"]
+full = ["simd", "parallel", "gpu", "llama-cpp-static"]
 # Tighter defaults: single-thread, no rayon preference.
 embedded = []
 # Build llama.cpp as static libs (no shared library needed at runtime).
-# Requires cmake + a C++17 compiler. Either:
-#   a) Add as a git submodule:  git submodule add https://github.com/ggerganov/llama.cpp.git
-#   b) Set LLAMA_CPP_SRC=/path/to/llama.cpp before building.
-#   c) Nothing — build.rs will auto-clone into $OUT_DIR (needs internet on first build).
-# Enable with:  cargo build --features llama-cpp-static
+# Enabled by default.
 llama-cpp-static = []
-# Legacy: in-process llama.cpp shared library bindings — still the default path.
+# Legacy: in-process llama.cpp shared library bindings — fallback path.
 llama-cpp-bindings = []
 # Legacy pure-Rust GGUF engine (kept for reference; not activated at runtime).
 llama-rs = []
@@ -60,3 +56,4 @@ tokio = { version = "1.53.1", features = ["full"] }
 arboard = "3.4.0"
 toml = "1.1.2"
 rayon = { version = "1.10", optional = true }
+websearch = "0.1.1"

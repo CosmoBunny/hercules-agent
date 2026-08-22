@@ -8,6 +8,7 @@
 //! | **HTTP**      | `http`            | OpenAI-compatible client          |
 //! | **Server**    | `server`, `cpp`   | Managed llama-server process      |
 
+#[allow(dead_code, unused)]
 pub mod cpp;
 pub mod ffi;
 pub mod http;
@@ -54,32 +55,30 @@ pub use legacy::compute::{
     ComputeBackend, ComputeError, ComputePrefs, ScalarBackend, SimdBackend,
     build_default_backend, default_backend, default_rms_norm,
 };
+#[allow(unused_imports)]
+pub use legacy::infer::{ensure_warm_rs_engine, shutdown_warm_rs_engine, LlamaRsEngine};
 #[cfg(feature = "parallel")]
 #[allow(unused_imports)]
 pub use legacy::compute::ParallelBackend;
 
 // Active public API
-pub use cpp::LlamaCppRuntime;
 pub use http::HttpInferenceClient;
 pub use libinfer::{
-    ensure_warm_lib_engine, shutdown_warm_lib_engine,
+    ensure_warm_lib_engine, get_warm_lib_engine, shutdown_warm_lib_engine,
     LlamaCppLib, LlamaCppLibRuntime,
 };
 
 /// Engine choice exposed to the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlamaEngineKind {
-    /// In-process libllama.so (C FFI) — primary path.
+    /// In-process libllama engine (C FFI / static link) — primary path.
     LlamaCppLib,
-    /// Official llama.cpp via CLI or managed server.
-    LlamaCpp,
 }
 
 impl LlamaEngineKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::LlamaCppLib => "llama.cpp (in-process libllama.so)",
-            Self::LlamaCpp => "llama.cpp (C/C++ server)",
+            Self::LlamaCppLib => "llama.cpp (in-process static engine)",
         }
     }
 }

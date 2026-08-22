@@ -576,48 +576,9 @@ impl ModelManager {
             }
         }
 
-        let ollama_catalog = vec![
-            ("deepseek-r1:1.5b", "1.1 GB"),
-            ("deepseek-r1:7b", "4.1 GB"),
-            ("deepseek-r1:8b", "4.9 GB"),
-            ("deepseek-r1:14b", "9.0 GB"),
-            ("deepseek-r1:32b", "20.0 GB"),
-            ("deepseek-r1:70b", "42.0 GB"),
-            ("deepseek-coder-v2:16b", "8.9 GB"),
-            ("deepseek-coder:6.7b", "3.8 GB"),
-            ("deepseek-llm:7b", "4.1 GB"),
-            ("gemma2:2b", "1.6 GB"),
-            ("gemma2:9b", "5.4 GB"),
-            ("gemma2:27b", "16.0 GB"),
-            ("gemma:2b", "1.4 GB"),
-            ("gemma:7b", "4.8 GB"),
-            ("llama3.2:1b", "1.3 GB"),
-            ("llama3.2:3b", "2.0 GB"),
-            ("llama3.1:8b", "4.7 GB"),
-            ("llama3.1:70b", "40.0 GB"),
-            ("llama3.3:70b", "42.0 GB"),
-            ("llama3:8b", "4.7 GB"),
-            ("mistral:7b", "4.1 GB"),
-            ("mixtral:8x7b", "26.0 GB"),
-            ("mistral-nemo:12b", "7.1 GB"),
-            ("qwen2.5:0.5b", "398 MB"),
-            ("qwen2.5:1.5b", "986 MB"),
-            ("qwen2.5:3b", "1.9 GB"),
-            ("qwen2.5:7b", "4.7 GB"),
-            ("qwen2.5:14b", "9.0 GB"),
-            ("qwen2.5:32b", "20.0 GB"),
-            ("qwen2.5-coder:1.5b", "986 MB"),
-            ("qwen2.5-coder:7b", "4.7 GB"),
-            ("phi4:14b", "9.1 GB"),
-            ("phi3:3.8b", "2.3 GB"),
-            ("codellama:7b", "3.8 GB"),
-            ("codellama:13b", "7.4 GB"),
-        ];
-
-        for (omod, size_label) in ollama_catalog {
-            if query_lower.is_empty() || omod.contains(&query_lower) || query_lower.contains("ollama")
-            {
-                let entry = format!("Ollama: {} [{}]", omod, size_label);
+        if let Ok(ollama_remote_models) = self.fetch_ollama_models(search).await {
+            for m in ollama_remote_models {
+                let entry = format!("Ollama: {}", m);
                 if !results.contains(&entry) {
                     results.push(entry);
                 }
@@ -663,11 +624,14 @@ impl ModelManager {
                 )
             }
         } else {
-            let query = if trimmed.is_empty() { "gguf" } else { trimmed };
-            format!(
-                "https://huggingface.co/api/models?search={}&full=true&limit=25",
-                query
-            )
+            if trimmed.is_empty() {
+                "https://huggingface.co/api/models?tags=gguf&sort=downloads&direction=-1&limit=25".to_string()
+            } else {
+                format!(
+                    "https://huggingface.co/api/models?search={}&full=true&limit=25",
+                    trimmed
+                )
+            }
         };
 
         let client = reqwest::Client::new();
@@ -740,6 +704,72 @@ impl ModelManager {
             }
         }
         Ok(models)
+    }
+
+    pub async fn fetch_ollama_models(&self, search: &str) -> Result<Vec<String>, String> {
+        let client = reqwest::Client::new();
+        let url = if search.trim().is_empty() {
+            "https://ollama.com/search".to_string()
+        } else {
+            format!("https://ollama.com/search?q={}", search.trim())
+        };
+        let res = client
+            .get(&url)
+            .header("User-Agent", "Hercules-CLI/1.0")
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let text = res.text().await.map_err(|e| e.to_string())?;
+        
+        
+        let mut models = Vec::new();
+        let parts = text.split("href=\"/library/");
+        let mut first = true;
+        for part in parts {
+            if first {
+                first = false;
+                continue;
+            }
+            if let Some(idx) = part.find('"') {
+                let model = &part[..idx];
+                
+                // Extract sizes/tags
+                let mut tags = Vec::new();
+                let mut rest = part;
+                while let Some(start) = rest.find("text-blue-600") {
+                    rest = &rest[start..];
+                    if let Some(close) = rest.find('>') {
+                        rest = &rest[close + 1..];
+                        if let Some(end) = rest.find("</span>") {
+                            let tag_text = rest[..end].trim();
+                            if !tag_text.is_empty() && !tag_text.contains('<') {
+                                tags.push(tag_text.to_string());
+                            }
+                            rest = &rest[end..];
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                
+                if tags.is_empty() {
+                    let entry = model.to_string();
+                    if !models.contains(&entry) {
+                        models.push(entry);
+                    }
+                } else {
+                    for tag in tags {
+                        let entry = format!("{}:{}", model, tag);
+                        if !models.contains(&entry) {
+                            models.push(entry);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(models)
+
     }
 
     /// Abandon incomplete downloads whose last update is older than 10 minutes.
@@ -1073,6 +1103,35 @@ impl ModelManager {
             .unwrap_or(filename)
             .to_string();
         let model_name = format!("{}/{}", clean_repo, base_name);
+
+        // Check if model is ALREADY installed on disk
+        let installed_dest = models_dir().join(&base_name);
+        if installed_dest.exists() {
+            let meta_len = std::fs::metadata(&installed_dest).map(|m| m.len()).unwrap_or(0);
+            if meta_len > 1_000_000 {
+                let mut reg = ModelsRegistry::load();
+                reg.upsert(InstalledModel {
+                    name: model_name.clone(),
+                    path: installed_dest.display().to_string(),
+                    source: "huggingface".to_string(),
+                    filename: base_name.clone(),
+                    installed_at: now_unix(),
+                    size_bytes: meta_len,
+                });
+                let _ = reg.save();
+
+                if let Ok(mut l) = logs.lock() {
+                    l.push(format!(
+                        "[ALREADY INSTALLED] Model '{}' already exists at {} ({:.1} MB) — skipping download",
+                        model_name,
+                        installed_dest.display(),
+                        meta_len as f64 / 1_000_000.0
+                    ));
+                }
+                *progress.lock().unwrap() = Some(1.0);
+                return Ok(installed_dest);
+            }
+        }
 
         // Log multi-part info
         if shard_files.len() > 1 {
@@ -1642,19 +1701,9 @@ impl ModelManager {
                             let ratio = (completed as f64) / (total.max(1) as f64);
                             *progress.lock().unwrap() = Some(ratio.min(1.0));
                             lock.touch_progress(completed, Some(total));
-                            if let Ok(mut l) = logs.lock() {
-                                l.push(format!(
-                                    "[OLLAMA STREAM] {} ({:.1}%)",
-                                    status.message,
-                                    ratio * 100.0
-                                ));
-                            }
                         }
                     } else {
                         lock.touch_progress(lock.bytes_downloaded, None);
-                        if let Ok(mut l) = logs.lock() {
-                            l.push(format!("[OLLAMA STREAM] Message: {}", status.message));
-                        }
                     }
                 }
                 Err(e) => {
