@@ -1,0 +1,27 @@
+--- src/app.rs
++++ src/app.rs
+@@ -953,0 +954,1 @@
++        let mut mcps = Vec::new();
+@@ -958,2 +959,2 @@
+-                crate::agent::ProposedKind::Mcp => (),
+-                crate::agent::ProposedKind::Skill => (),
++                crate::agent::ProposedKind::Mcp => mcps.push(a),
++                crate::agent::ProposedKind::Skill => mcps.push(a),
+@@ -992,0 +993,17 @@
++        if !mcps.is_empty() {
++            for a in &mcps {
++                let result = crate::agent::AgentEngine::execute_proposed(a);
++                if let Some(chip_id) = a.chip_id {
++                    if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
++                        chip.pending = false;
++                        chip.tag_closed = true;
++                        chip.body = result.clone();
++                    }
++                    self.force_open_panel_from_chip(chip_id);
++                }
++                self.tool_result_context.push(format!("[{} result]\n{}", a.kind.label(), result));
++            }
++            if !*self.is_generating.lock().unwrap() {
++                self.trigger_generation_from_context();
++            }
++        }

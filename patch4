@@ -1,0 +1,25 @@
+--- src/app.rs
++++ src/app.rs
+@@ -608,0 +609,21 @@
++
++        let mut instant_cmds = Vec::new();
++        let perms = get_tool_permissions();
++        let can_instant = perms.session_allow || perms.mode == PermissionMode::AlwaysAllow;
++        if can_instant {
++            for chip in self.tool_chips.iter_mut() {
++                if chip.kind == tool_panel::ToolPanelKind::Cmd && chip.tag_closed && !chip.spawned {
++                    chip.spawned = true;
++                    instant_cmds.push(ProposedAction {
++                        kind: crate::agent::ProposedKind::Cmd,
++                        target: chip.target.clone(),
++                        body: String::new(),
++                        line_attr: None,
++                        from_think: false,
++                        chip_id: Some(chip.id),
++                    });
++                }
++            }
++        }
++        if !instant_cmds.is_empty() {
++            self.spawn_cmds_to_task_manager(instant_cmds);
++        }

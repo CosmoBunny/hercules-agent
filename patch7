@@ -1,0 +1,54 @@
+--- src/tool_panel.rs
++++ src/tool_panel.rs
+@@ -476,0 +477,2 @@
++    out.extend(detect_mcp(&text_no_spawn));
++    out.extend(detect_skill(&text_no_spawn));
+@@ -528,0 +531,34 @@
++fn detect_mcp(text: &str) -> Vec<StreamToolView> {
++    let mut out = Vec::new();
++    let mut rest = text;
++    while let Some(start) = rest.find("<mcp ") {
++        let r = &rest[start..];
++        if let Some(close_bracket) = r.find('>') {
++            let header = &r[..close_bracket + 1];
++            let action = crate::agent::AgentEngine::extract_attribute(header, "action").unwrap_or_else(|| "search".to_string());
++            let end = r.find("</mcp>").unwrap_or(r.len());
++            let body = r[close_bracket + 1..end].trim().to_string();
++            out.push(StreamToolView {
++                kind: ToolPanelKind::Mcp,
++                target: action,
++                body,
++                tag_closed: r.find("</mcp>").is_some(),
++            });
++            rest = if r.find("</mcp>").is_some() { &r[end + 6..] } else { "" };
++        } else {
++            break;
++        }
++    }
++    out
++}
++
++fn detect_skill(text: &str) -> Vec<StreamToolView> {
++    let mut out = Vec::new();
++    let mut rest = text;
++    while let Some(start) = rest.find("<skill ") {
++        let r = &rest[start..];
++        if let Some(close_bracket) = r.find('>') {
++            let header = &r[..close_bracket + 1];
++            let action = crate::agent::AgentEngine::extract_attribute(header, "action").unwrap_or_else(|| "search".to_string());
++            let end = r.find("</skill>").unwrap_or(r.len());
++            let body = r[close_bracket + 1..end].trim().to_string();
++            out.push(StreamToolView {
++                kind: ToolPanelKind::Skill,
++                target: action,
++                body,
++                tag_closed: r.find("</skill>").is_some(),
++            });
++            rest = if r.find("</skill>").is_some() { &r[end + 8..] } else { "" };
++        } else {
++            break;
++        }
++    }
++    out
++}
++

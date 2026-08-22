@@ -1,0 +1,14 @@
+--- src/tool_panel.rs
++++ src/tool_panel.rs
+@@ -24,0 +25,2 @@
++    Mcp,
++    Skill,
+@@ -37,0 +40,2 @@
++            Self::Mcp => "MCP",
++            Self::Skill => "SKILL",
+@@ -51,0 +56,2 @@
++            Self::Mcp => Color::Rgb(200, 100, 255),
++            Self::Skill => Color::Rgb(255, 180, 50),
+@@ -62,0 +69,2 @@
++            Self::Mcp => Color::Rgb(220, 150, 255),
++            Self::Skill => Color::Rgb(255, 200, 100),

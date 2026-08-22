@@ -1,0 +1,24 @@
+--- src/manager.rs
++++ src/manager.rs
+@@ -1001,8 +1001,21 @@
+     }
+ 
++    pub fn set_active_gguf_path(&self, path: impl Into<String>) {
++        let mut reg = ModelsRegistry::load();
++        reg.active_model_path = Some(path.into());
++        let _ = reg.save();
++    }
++
+     /// Most recently installed local GGUF path, if any.
+     pub fn latest_gguf_path(&self) -> Option<PathBuf> {
++        let reg = ModelsRegistry::load();
++        if let Some(ref path) = reg.active_model_path {
++            let p = PathBuf::from(path);
++            if p.exists() {
++                return Some(p);
++            }
++        }
++        
+         self.list_installed_entries()
+             .into_iter()
+             .rev()

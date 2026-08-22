@@ -1,0 +1,19 @@
+--- src/task_manager.rs
++++ src/task_manager.rs
+@@ -32,0 +33,2 @@
++    /// Who spawned this (e.g. subagent ID)
++    pub spawned_by: u32,
+@@ -38,2 +40,2 @@
+-    Parked { id: u32, cmd: String },
++    Parked { id: u32, cmd: String, spawned_by: u32 },
+@@ -44,0 +47,1 @@
++        spawned_by: u32,
+@@ -58,2 +62,2 @@
+-    pub fn spawn_cmd(&self, cmd: String) -> u32 {
++    pub fn spawn_cmd(&self, cmd: String, spawned_by: u32) -> u32 {
+@@ -70,0 +75,1 @@
++                    spawned_by,
+@@ -107,0 +113,1 @@
++                        spawned_by: t.spawned_by,
+@@ -124,0 +131,1 @@
++                    spawned_by: t.spawned_by,

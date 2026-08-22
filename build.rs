@@ -278,13 +278,11 @@ fn cmake_configure(src: &Path, build: &Path) {
         .unwrap_or_else(|_| std::env::var("CARGO_FEATURE_CUDA").unwrap_or_default());
 
     // Generator selection:
-    //   Linux/macOS: prefer Ninja, fall back to Unix Makefiles
-    //   Windows:     prefer Ninja, fall back to "Visual Studio" auto-detection
-    //                (CMake will pick the installed VS version automatically)
-    let cmake_gen: &str = if cmd_exists("ninja") {
+    let cmake_gen: &str = if cfg!(windows) && std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() == "msvc" {
+        // Force Visual Studio on MSVC to avoid CMake picking up MinGW's gcc in Git Bash when using Ninja
+        "Visual Studio 17 2022"
+    } else if cmd_exists("ninja") {
         "Ninja"
-    } else if cfg!(windows) {
-        ""   // empty = let CMake auto-detect the installed VS generator
     } else {
         "Unix Makefiles"
     };
@@ -313,6 +311,9 @@ fn cmake_configure(src: &Path, build: &Path) {
 
     if cuda == "1" || cuda.eq_ignore_ascii_case("on") {
         cmd.arg("-DGGML_CUDA=ON");
+        if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
+            cmd.arg(format!("-DCUDAToolkit_ROOT={}", cuda_path));
+        }
     }
     if vulkan == "1" || vulkan.eq_ignore_ascii_case("on") {
         cmd.arg("-DGGML_VULKAN=ON");
@@ -327,26 +328,17 @@ fn cmake_build_libs(build: &Path) {
         .map(|n| n.get().to_string())
         .unwrap_or_else(|_| "4".to_string());
 
-    for target in &["llama", "ggml"] {
-        let status = Command::new("cmake")
-            .args([
-                "--build", ".",
-                "--config", "Release",
-                "--target", target,
-                "--parallel", &jobs,
-            ])
-            .current_dir(build)
-            .status()
-            .unwrap_or_else(|e| panic!("cmake --build --target {target}: {e}"));
+    let status = Command::new("cmake")
+        .args([
+            "--build", ".",
+            "--config", "Release",
+            "--parallel", &jobs,
+        ])
+        .current_dir(build)
+        .status()
+        .unwrap_or_else(|e| panic!("cmake --build failed: {e}"));
 
-        if !status.success() && *target == "ggml" {
-            // ggml may be an interface-only target in some llama.cpp versions;
-            // building `llama` already pulled in the ggml stack transitively.
-            eprintln!("[build.rs] cmake --target ggml skipped (may be interface-only)");
-        } else {
-            assert!(status.success(), "cmake --build --target {target} failed");
-        }
-    }
+    assert!(status.success(), "cmake --build failed");
 }
 
 fn emit_link_directives(build: &Path) {
@@ -440,6 +432,17 @@ fn link_system_libs() {
         println!("cargo:rustc-link-lib=dl");
     }
 
+    // ── CUDA runtime ────────────────────────────────────────────────────────
+    let cuda = std::env::var("LLAMA_CUDA")
+        .unwrap_or_else(|_| std::env::var("CARGO_FEATURE_CUDA").unwrap_or_default());
+    if cuda == "1" || cuda.eq_ignore_ascii_case("on") {
+        println!("cargo:rustc-link-lib=cudart");
+        println!("cargo:rustc-link-lib=cublas");
+        println!("cargo:rustc-link-lib=cublasLt");
+        // For static linking of CUDA runtime on Linux/Windows, sometimes -lcudart_static is needed,
+        // but dynamic linking (-lcudart) is safer and avoids duplicate symbols.
+    }
+
     // ── OpenMP runtime ────────────────────────────────────────────────────────
     // ggml-cpu is compiled with -fopenmp / /openmp and references GOMP_* or
     // omp_* symbols.
@@ -451,7 +454,10 @@ fn link_system_libs() {
     println!("cargo:rustc-link-lib=gomp");
 
     #[cfg(target_os = "macos")]
-    println!("cargo:rustc-link-lib=omp");
+    {
+        println!("cargo:rustc-link-search=native=/opt/homebrew/opt/libomp/lib");
+        println!("cargo:rustc-link-lib=omp");
+    }
 
     #[cfg(all(target_os = "windows", not(target_env = "gnu")))]
     println!("cargo:rustc-link-lib=vcomp");  // MSVC OpenMP

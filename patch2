@@ -1,0 +1,9 @@
+--- src/app.rs
++++ src/app.rs
+@@ -3013 +3013,2 @@
+-                                    if in_body {
++                                    if in_body {
++                                        handled = true;
+@@ -3030 +3031 @@
+-                                }
++                                }

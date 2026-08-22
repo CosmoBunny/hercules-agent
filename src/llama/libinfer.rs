@@ -150,7 +150,7 @@ impl LlamaCppLib {
         };
         let mut buf = vec![0u8; 64];
         let n = unsafe {
-            (lib.token_to_piece)(self.vocab, token, buf.as_mut_ptr() as *mut i8, 64, 0, false)
+            (lib.token_to_piece)(self.vocab, token, buf.as_mut_ptr() as *mut std::ffi::c_char, 64, 0, false)
         };
         if n <= 0 {
             return String::new();
