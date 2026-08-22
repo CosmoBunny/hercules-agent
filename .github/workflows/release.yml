@@ -21,6 +21,10 @@ on:
         description: "Enable GPU feature (WGPU via burn)"
         type: boolean
         default: false
+      with_cuda:
+        description: "Enable CUDA support (requires CUDA toolkit on runner)"
+        type: boolean
+        default: false
   push:
     tags:
       - "v*"
@@ -114,6 +118,13 @@ jobs:
                 FEATURES_ARG="${FEATURES_ARG},gpu"
               else
                 FEATURES_ARG="gpu"
+              fi
+            fi
+            if [ "${{ inputs.with_cuda }}" = "true" ]; then
+              if [ -n "$FEATURES_ARG" ]; then
+                FEATURES_ARG="${FEATURES_ARG},cuda"
+              else
+                FEATURES_ARG="cuda"
               fi
             fi
           else

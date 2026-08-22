@@ -370,7 +370,7 @@ pub unsafe fn gemv_q5_k_neon(
         return Ok(());
     }
 
-    gemv_quant_fused(quant, raw, rows, cols, n, x, y)
+    gemv_quant_fused(GgmlType::Q5_K, raw, rows, cols, n, x, y)
 }
 
 /// ARM NEON accelerated RMSNorm: `out[i] = x[i] / rms(x) * weight[i]`.

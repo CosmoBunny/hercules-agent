@@ -272,8 +272,9 @@ fn cmake_configure(src: &Path, build: &Path) {
     }
     std::fs::create_dir_all(build).expect("create CMake build dir");
 
-    let cuda   = std::env::var("LLAMA_CUDA").unwrap_or_default();
     let vulkan = std::env::var("LLAMA_VULKAN").unwrap_or_default();
+    let cuda = std::env::var("LLAMA_CUDA")
+        .unwrap_or_else(|_| std::env::var("CARGO_FEATURE_CUDA").unwrap_or_default());
 
     // Generator selection:
     //   Linux/macOS: prefer Ninja, fall back to Unix Makefiles

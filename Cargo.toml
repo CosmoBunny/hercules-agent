@@ -25,6 +25,8 @@ simd = []
 parallel = ["dep:rayon"]
 # GPU acceleration via wgpu (Vulkan/Metal/DX12/WebGPU). Adds burn dependency.
 gpu = ["dep:burn"]
+# CUDA acceleration for llama.cpp backend.
+cuda = []
 # Full desktop feature set: SIMD + rayon + GPU.
 full = ["simd", "parallel", "gpu", "llama-cpp-static"]
 # Tighter defaults: single-thread, no rayon preference.
