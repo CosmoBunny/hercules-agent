@@ -87,7 +87,7 @@ jobs:
         uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
           vulkan-query-version: 1.3.268.0
-          vulkan-components: Vulkan-Headers, Vulkan-Loader, glslc
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang, Shaderc
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
