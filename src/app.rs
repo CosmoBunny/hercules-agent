@@ -802,13 +802,7 @@ impl App {
     }
 
     /// Logical lines of the prompt (split on `\n`).
-    fn input_line_count(&self) -> usize {
-        if self.input.is_empty() {
-            1
-        } else {
-            self.input.lines().count().max(1) + if self.input.ends_with('\n') { 1 } else { 0 }
-        }
-    }
+
 
     /// Map char cursor index → (col, row) inside the input box content width.
     fn input_cursor_col_row(&self, content_width: usize) -> (u16, u16) {
@@ -4182,7 +4176,26 @@ LlamaCppLibBackend::http(
         let area = frame.area();
 
         // Grow input box with multiline content (3..=10 rows total including borders)
-        let input_lines = self.input_line_count();
+        let inner_w = area.width.saturating_sub(6).max(1) as usize;
+        let mut input_lines = 0;
+        for (i, row) in self.input.split('\n').enumerate() {
+            let mut col = if i == 0 { 1 } else { 0 };
+            for _ in row.chars() {
+                if col >= inner_w {
+                    input_lines += 1;
+                    col = 0;
+                }
+                col += 1;
+            }
+            input_lines += 1;
+        }
+        if self.input.ends_with('\n') {
+            input_lines += 1;
+        }
+        if input_lines == 0 {
+            input_lines = 1;
+        }
+        
         let input_inner_h = (input_lines as u16).clamp(1, 8);
         let input_box_h = (input_inner_h + 2).clamp(3, 10); // borders
 
