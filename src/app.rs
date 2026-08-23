@@ -53,6 +53,7 @@ pub struct App {
     pub input_cursor_position: usize,
     pub scroll_offset: u16,
     pub auto_scroll_enabled: bool,
+    pub table_scroll_x: usize,
     pub typewriter_len: usize,
     pub thinking_collapsed: bool,
     pub delete_confirm_model: Option<String>,
@@ -191,6 +192,7 @@ impl App {
             input_cursor_position: 0,
             scroll_offset: 0,
             auto_scroll_enabled: true,
+            table_scroll_x: 0,
             typewriter_len: 1000,
             thinking_collapsed: false,
             delete_confirm_model: None,
@@ -428,9 +430,9 @@ impl App {
                         from_think: false,
                         chip_id: Some(chip.id),
                     });
-                } else if matches!(chip.kind, tool_panel::ToolPanelKind::Mcp | tool_panel::ToolPanelKind::Skill | tool_panel::ToolPanelKind::WebSearch) && chip.tag_closed && !chip.spawned {
+                } else if matches!(chip.kind, tool_panel::ToolPanelKind::Mcp | tool_panel::ToolPanelKind::Skill | tool_panel::ToolPanelKind::WebSearch | tool_panel::ToolPanelKind::Agent) && chip.tag_closed && !chip.spawned {
                     chip.spawned = true;
-                    let pkind = if chip.kind == tool_panel::ToolPanelKind::Mcp { crate::agent::ProposedKind::Mcp } else if chip.kind == tool_panel::ToolPanelKind::Skill { crate::agent::ProposedKind::Skill } else { crate::agent::ProposedKind::WebSearch };
+                    let pkind = if chip.kind == tool_panel::ToolPanelKind::Mcp { crate::agent::ProposedKind::Mcp } else if chip.kind == tool_panel::ToolPanelKind::Skill { crate::agent::ProposedKind::Skill } else if chip.kind == tool_panel::ToolPanelKind::Agent { crate::agent::ProposedKind::Agent } else { crate::agent::ProposedKind::WebSearch };
                     instant_mcps.push(crate::agent::ProposedAction {
                         kind: pkind,
                         target: chip.target.clone(),
@@ -447,6 +449,24 @@ impl App {
         }
         if !instant_mcps.is_empty() {
             for a in instant_mcps {
+                if a.kind == crate::agent::ProposedKind::Agent {
+                    let role = crate::agent::AgentEngine::extract_attribute(&a.target, "role").unwrap_or_default();
+                    let to = crate::agent::AgentEngine::extract_attribute(&a.target, "to").unwrap_or_default();
+                    let instruction = a.body.clone();
+                    let agent_id = self.task_manager.spawn_agent(
+                        self.backend.clone(),
+                        role,
+                        to,
+                        instruction,
+                        0 // spawned_by host/orchestrator
+                    );
+                    if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == a.chip_id.unwrap()) {
+                        chip.pending = false;
+                        chip.body = format!("[Agent Task #{agent_id} spawning]\n(waiting for reply…)");
+                    }
+                    continue;
+                }
+                
                 let result = crate::agent::AgentEngine::execute_proposed(&a);
                 if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == a.chip_id.unwrap()) {
                     chip.pending = false;
@@ -1008,7 +1028,30 @@ impl App {
 
 
         if !mcps.is_empty() {
+            let mut agent_ids = Vec::new();
             for a in &mcps {
+                if a.kind == crate::agent::ProposedKind::Agent {
+                    let role = crate::agent::AgentEngine::extract_attribute(&a.target, "role").unwrap_or_default();
+                    let to = crate::agent::AgentEngine::extract_attribute(&a.target, "to").unwrap_or_default();
+                    let instruction = a.body.clone();
+                    let agent_id = self.task_manager.spawn_agent(
+                        self.backend.clone(),
+                        role,
+                        to,
+                        instruction,
+                        0 // spawned_by host/orchestrator
+                    );
+                    agent_ids.push(agent_id);
+                    if let Some(chip_id) = a.chip_id {
+                        if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
+                            chip.pending = false;
+                            chip.tag_closed = true;
+                            chip.body = format!("[Agent Task #{agent_id} spawning]\n(waiting for reply…)");
+                        }
+                    }
+                    continue;
+                }
+
                 let result = crate::agent::AgentEngine::execute_proposed(a);
                 if let Some(chip_id) = a.chip_id {
                     if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
@@ -1020,7 +1063,7 @@ impl App {
                 }
                 self.tool_result_context.push(format!("[{} result]\n{}", a.kind.label(), result));
             }
-            if !*self.is_generating.lock().unwrap() {
+            if !*self.is_generating.lock().unwrap() && agent_ids.is_empty() {
                 self.trigger_generation_from_context();
             }
         }
@@ -2979,6 +3022,8 @@ impl App {
                                             self.input_cursor_position =
                                                 self.input_cursor_position.saturating_sub(1);
                                         }
+                                    } else {
+                                        self.table_scroll_x = self.table_scroll_x.saturating_sub(4);
                                     }
                                 }
                                 KeyCode::Right => {
@@ -2992,6 +3037,8 @@ impl App {
                                                 (self.input_cursor_position + 1)
                                                     .min(self.input.chars().count());
                                         }
+                                    } else {
+                                        self.table_scroll_x = self.table_scroll_x.saturating_add(4);
                                     }
                                 }
                                 KeyCode::Home => {
@@ -3978,6 +4025,8 @@ LlamaCppLibBackend::http(
                                         self.typewriter_len = 0;
                                         self.auto_scroll_enabled = true;
                                         self.auto_tool_turns = 0;
+                                        self.recent_tool_calls.clear();
+                                        self.tool_result_context.clear();
 
                                         let backend = self.backend.name();
                                         if let Ok(mut l) = self.activity_logs.lock() {
@@ -4563,11 +4612,12 @@ LlamaCppLibBackend::http(
                 if !output_part.trim().is_empty()
                     || (think_part.is_none() && (is_generating_val || !content.trim().is_empty()))
                 {
-                    let text_to_render = if output_part.is_empty() && think_part.is_none() {
+                    let raw_text = if output_part.is_empty() && think_part.is_none() {
                         content
                     } else {
                         output_part.as_str()
                     };
+                    let text_to_render = crate::agent::AgentEngine::format_markdown_tables(raw_text, chat_area.width as usize, self.table_scroll_x);
                     let think_len = think_part.as_ref().map(|t| t.chars().count()).unwrap_or(0);
                     let available_output = reveal_limit.saturating_sub(think_len);
 

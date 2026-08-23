@@ -214,7 +214,58 @@ impl TaskManager {
                     g.kills.retain(|(i, _)| *i != id);
                 }
             })
-            .ok();
+            .unwrap();
+
+        id
+    }
+
+    pub fn spawn_agent(&self, backend: crate::backend::AgentBackend, role: String, to: String, instruction: String, spawned_by: u32) -> u32 {
+        let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+        let kill = Arc::new(AtomicBool::new(false));
+        let cmd = format!("agent role=\"{role}\" to=\"{to}\"");
+        {
+            if let Ok(mut g) = self.inner.lock() {
+                g.tasks.push(ManagedTask {
+                    id,
+                    cmd: cmd.clone(),
+                    status: TaskStatus::Running,
+                    started: Instant::now(),
+                    output: String::new(),
+                    parked_notified: false,
+                    spawned_by,
+                });
+                g.kills.push((id, kill.clone()));
+            }
+        }
+
+        let mgr = self.clone();
+        std::thread::Builder::new()
+            .name(format!("hercules-agent-{id}"))
+            .spawn(move || {
+                let prompt = format!("You are an AI sub-agent. Role: {role}\nInstruction: {instruction}");
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let output = match rt.block_on(backend.generate(&prompt)) {
+                    Ok(res) => format!("<agent action=\"reply\" to=\"{spawned_by}\">\n{}\n</agent>", res),
+                    Err(e) => format!("<agent action=\"error\">\n{}\n</agent>", e),
+                };
+
+                if let Ok(mut g) = mgr.inner.lock() {
+                    let mut sby = 0;
+                    if let Some(t) = g.tasks.iter_mut().find(|t| t.id == id) {
+                        t.status = TaskStatus::Done;
+                        t.output = output.clone();
+                        sby = t.spawned_by;
+                    }
+                    g.events.push(TaskEvent::Done {
+                        id,
+                        output,
+                        killed: false,
+                        cmd,
+                        spawned_by: sby,
+                    });
+                }
+            })
+            .unwrap();
 
         id
     }

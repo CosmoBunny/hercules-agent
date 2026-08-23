@@ -519,6 +519,7 @@ pub fn detect_all_stream_tools(response: &str) -> Vec<StreamToolView> {
     }
     // All <read> tags in the stream (not just first)
     out.extend(detect_reads(&text));
+    out.extend(detect_ls(&text));
     out.extend(detect_mcp(&text));
     out.extend(detect_skill(&text));
     out.extend(detect_websearch(&text));
@@ -552,6 +553,30 @@ fn flatten_for_tools(response: &str) -> String {
     } else {
         format!("{outside}\n{think}")
     }
+}
+
+fn detect_ls(text: &str) -> Vec<StreamToolView> {
+    let outside = crate::agent::AgentEngine::strip_think_blocks(text);
+    let search_in = if outside.contains("<ls") {
+        outside.as_str()
+    } else {
+        text
+    };
+    let mut out = Vec::new();
+    let mut rest = search_in;
+    while let Some(start) = rest.find("<ls") {
+        let r = &rest[start..];
+        let Some(gt) = r.find('>') else { break };
+        let path = extract_attr(&r[..gt + 1], "path").unwrap_or_else(|| "$CURRENT".into());
+        out.push(StreamToolView {
+            kind: ToolPanelKind::Read,
+            target: expand_path_display(&path),
+            body: String::new(),
+            tag_closed: true,
+        });
+        rest = &r[gt + 1..];
+    }
+    out
 }
 
 fn detect_reads(text: &str) -> Vec<StreamToolView> {
@@ -949,14 +974,37 @@ pub fn draw_tool_panel(
         let mut char_i = 0usize;
         for raw in vis.split_inclusive('\n') {
             let mut spans = Vec::new();
+            
+            let mut line_fg = None;
+            if panel.kind == ToolPanelKind::Write {
+                if raw.starts_with('+') {
+                    line_fg = Some(Color::Green);
+                } else if raw.starts_with('-') {
+                    line_fg = Some(Color::Red);
+                }
+            }
+
             for ch in raw.chars() {
                 if ch == '\n' {
                     char_i += 1;
                     continue;
                 }
+                
+                let mut fg = panel.char_color(char_i, now);
+                // Override base color with diff color, but keep fade logic if it's very dim?
+                // Actually if line_fg is present, just use it directly, but maybe multiply by fade?
+                // Ratatui doesn't easily multiply colors, so just use line_fg if it's revealed, else use char_color (which handles the fade).
+                // If char_color is near white/gray (revealed), we override it.
+                // Since char_color returns the exact color, we can check if it's the bright end.
+                // But it's easier to just use line_fg and ignore the fade for diff lines, or just use it always.
+                // Let's just use line_fg directly.
+                if let Some(c) = line_fg {
+                    fg = c;
+                }
+                
                 spans.push(Span::styled(
                     ch.to_string(),
-                    Style::default().fg(panel.char_color(char_i, now)),
+                    Style::default().fg(fg),
                 ));
                 char_i += 1;
             }
@@ -979,7 +1027,7 @@ pub fn draw_tool_panel(
     let view_h = inner.height.max(1);
     panel.max_scroll = content_lines.saturating_sub(view_h);
     // Writing cursor autoscroll: pin to bottom while streaming / follow_end
-    if panel.follow_end || panel.live_stream {
+    if panel.follow_end {
         panel.scroll = panel.max_scroll;
     } else if panel.scroll > panel.max_scroll {
         panel.scroll = panel.max_scroll;
@@ -1009,7 +1057,7 @@ pub fn draw_tool_panel(
 
     frame.render_widget(
         Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
+            
             .scroll((panel.scroll, 0))
             .style(if is_term {
                 Style::default().bg(Color::Rgb(10, 12, 14))

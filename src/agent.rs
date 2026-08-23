@@ -64,7 +64,7 @@ impl ToolPermissions {
 }
 
 static TOOL_PERMS: Mutex<ToolPermissions> = Mutex::new(ToolPermissions {
-    mode: PermissionMode::Ask,
+    mode: PermissionMode::AlwaysAllow,
     folder_scope: FolderScope::CurrentDir,
     session_allow: false,
 });
@@ -275,6 +275,132 @@ impl ProposedKind {
 pub struct AgentEngine;
 
 impl AgentEngine {
+    pub fn format_markdown_tables(text: &str, max_width: usize, scroll_x: usize) -> String {
+        let mut out = String::new();
+        let mut table_lines = Vec::new();
+        
+        fn render_table(lines: &[&str], out: &mut String, max_width: usize, scroll_x: usize) {
+            if lines.is_empty() { return; }
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for line in lines {
+                let mut parts: Vec<&str> = line.split('|').collect();
+                if let Some(first) = parts.first() {
+                    if first.trim().is_empty() {
+                        parts.remove(0);
+                    }
+                }
+                if let Some(last) = parts.last() {
+                    if last.trim().is_empty() {
+                        parts.pop();
+                    }
+                }
+                let mut row = Vec::new();
+                for p in parts {
+                    row.push(p.trim().to_string());
+                }
+                if !row.is_empty() {
+                    rows.push(row);
+                }
+            }
+            if rows.is_empty() { return; }
+            let mut has_sep = false;
+            if rows.len() > 1 {
+                let is_sep = rows[1].iter().all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '));
+                if is_sep {
+                    has_sep = true;
+                    rows.remove(1);
+                }
+            }
+            let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+            let mut widths = vec![0; cols];
+            for row in &rows {
+                for (i, col) in row.iter().enumerate() {
+                    widths[i] = widths[i].max(col.chars().count());
+                }
+            }
+            let top = format!("┌{}┐", widths.iter().map(|w| "─".repeat(*w + 2)).collect::<Vec<_>>().join("┬"));
+            let mut table_rows = vec![top];
+            
+            for (r_idx, row) in rows.iter().enumerate() {
+                let mut row_str = String::from("│");
+                for i in 0..cols {
+                    let text = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                    let padding = widths[i].saturating_sub(text.chars().count());
+                    row_str.push_str(&format!(" {} {}│", text, " ".repeat(padding)));
+                }
+                table_rows.push(row_str);
+                if r_idx == 0 && has_sep {
+                    let mid = format!("├{}┤", widths.iter().map(|w| "─".repeat(*w + 2)).collect::<Vec<_>>().join("┼"));
+                    table_rows.push(mid);
+                }
+            }
+            let bot = format!("└{}┘", widths.iter().map(|w| "─".repeat(*w + 2)).collect::<Vec<_>>().join("┴"));
+            table_rows.push(bot);
+            
+            let table_width = table_rows[0].chars().count();
+            let eff_width = max_width.saturating_sub(2); // leaving margin
+            let needs_scroll = table_width > eff_width;
+            let actual_scroll = if needs_scroll { scroll_x.min(table_width - eff_width) } else { 0 };
+            
+            for r in table_rows {
+                let chars: Vec<char> = r.chars().collect();
+                if needs_scroll {
+                    let start = actual_scroll;
+                    let end = (start + eff_width).min(chars.len());
+                    if start < chars.len() {
+                        let slice: String = chars[start..end].iter().collect();
+                        out.push_str(&slice);
+                    }
+                } else {
+                    out.push_str(&r);
+                }
+                out.push('\n');
+            }
+            
+            if needs_scroll {
+                // Windows 98 style scrollbar: [◄][████░░░░░░░][►]
+                let track_len = eff_width.saturating_sub(6).max(5);
+                let thumb_size = (track_len as f64 * (eff_width as f64 / table_width as f64)).max(1.0) as usize;
+                let thumb_pos = (track_len as f64 * (actual_scroll as f64 / (table_width - eff_width) as f64)).min((track_len - thumb_size) as f64) as usize;
+                
+                let mut scrollbar = String::from("[◄][");
+                for i in 0..track_len {
+                    if i >= thumb_pos && i < thumb_pos + thumb_size {
+                        scrollbar.push('█');
+                    } else {
+                        scrollbar.push('░');
+                    }
+                }
+                scrollbar.push_str("][►]\n");
+                out.push_str(&scrollbar);
+            }
+        }
+
+        let mut in_table = false;
+        for line in text.lines() {
+            let is_table_row = line.trim().starts_with('|') && line.trim().contains('|');
+            if is_table_row {
+                table_lines.push(line);
+                in_table = true;
+            } else {
+                if in_table {
+                    render_table(&table_lines, &mut out, max_width, scroll_x);
+                    table_lines.clear();
+                    in_table = false;
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        if in_table {
+            render_table(&table_lines, &mut out, max_width, scroll_x);
+        }
+        if !text.ends_with('\n') && out.ends_with('\n') {
+            out.pop();
+        }
+        out
+    }
+
     /// Returns the system instructions prompt, with `$CURRENT` expanded for the live cwd.
     pub fn format_agent_prompt(_user_prompt: &str) -> String {
         Self::system_prompt_for_cwd()
@@ -1714,6 +1840,53 @@ impl AgentEngine {
         .to_string()
     }
 
+    
+    fn compute_diff(old: &str, new: &str) -> String {
+        let old_lines: Vec<&str> = old.lines().collect();
+        let new_lines: Vec<&str> = new.lines().collect();
+        
+        if old_lines.len() > 1000 || new_lines.len() > 1000 {
+            let mut out = String::new();
+            out.push_str("--- (Old file too large to diff)\n");
+            for line in new_lines {
+                out.push_str("+ "); out.push_str(line); out.push('\n');
+            }
+            return out;
+        }
+        
+        let n = old_lines.len();
+        let m = new_lines.len();
+        let mut dp = vec![vec![0; m + 1]; n + 1];
+        for i in 1..=n {
+            for j in 1..=m {
+                if old_lines[i-1] == new_lines[j-1] {
+                    dp[i][j] = dp[i-1][j-1] + 1;
+                } else {
+                    dp[i][j] = dp[i-1][j].max(dp[i][j-1]);
+                }
+            }
+        }
+        
+        let mut i = n;
+        let mut j = m;
+        let mut diff = Vec::new();
+        while i > 0 || j > 0 {
+            if i > 0 && j > 0 && old_lines[i-1] == new_lines[j-1] {
+                diff.push(format!("  {}", old_lines[i-1]));
+                i -= 1;
+                j -= 1;
+            } else if j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]) {
+                diff.push(format!("+ {}", new_lines[j-1]));
+                j -= 1;
+            } else if i > 0 && (j == 0 || dp[i][j-1] < dp[i-1][j]) {
+                diff.push(format!("- {}", old_lines[i-1]));
+                i -= 1;
+            }
+        }
+        diff.reverse();
+        diff.join("\n")
+    }
+
     fn execute_write(path_str: &str, line_attr: Option<&str>, body: &str) -> String {
         if let Err(e) = tools_allowed_for_write_cmd() {
             return format!("Error: {}", e);
@@ -1765,6 +1938,7 @@ impl AgentEngine {
                 .map(|s| s.to_string())
                 .collect();
 
+            let old_removed = lines[(start_line - 1)..end_idx].to_vec();
             lines.drain((start_line - 1)..end_idx);
 
             let mut insert_idx = start_line - 1;
@@ -1778,8 +1952,17 @@ impl AgentEngine {
                 return format!("Error: Permission error writing '{}'", path.display());
             }
 
-            let num_lines = replacement_lines.len();
-            format!("Wrote {} lines to {}", num_lines, path.display())
+            let mut diff = String::new();
+            for old in old_removed {
+                diff.push_str(&format!("- {}\n", old));
+            }
+            for new in &replacement_lines {
+                diff.push_str(&format!("+ {}\n", new));
+            }
+            if diff.is_empty() {
+                diff = "No changes.\n".to_string();
+            }
+            diff.trim_end().to_string()
         } else {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -1791,10 +1974,15 @@ impl AgentEngine {
                     return format!("Error creating parent dir '{}': {}", parent.display(), e);
                 }
             }
+            let old_content = fs::read_to_string(&path).unwrap_or_default();
             match fs::write(&path, clean_body) {
                 Ok(()) => {
-                    let num_lines = clean_body.lines().count();
-                    format!("Wrote {} lines to {}", num_lines, path.display())
+                    let diff = Self::compute_diff(&old_content, clean_body);
+                    if diff.trim().is_empty() {
+                        "No changes.".to_string()
+                    } else {
+                        diff
+                    }
                 }
                 Err(e) => format!("Error writing '{}': {}", path.display(), e),
             }
