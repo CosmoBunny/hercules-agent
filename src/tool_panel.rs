@@ -820,20 +820,28 @@ pub fn draw_tool_panel(
     let w = lerp(chip.width as f32, dock.width as f32, t);
     let h = lerp(chip.height as f32, dock.height as f32, t);
 
+    let max_w = frame.size().width;
+    let max_h = frame.size().height;
+
+    let rx = (x.round().max(0.0) as u16).min(max_w);
+    let ry = (y.round().max(0.0) as u16).min(max_h);
+    let rw = (w.round().max(4.0) as u16).min(max_w.saturating_sub(rx));
+    let rh = (h.round().max(3.0) as u16).min(max_h.saturating_sub(ry));
+
     let rect = Rect {
-        x: x.round().max(0.0) as u16,
-        y: y.round().max(0.0) as u16,
-        width: w.round().max(4.0) as u16,
-        height: h.round().max(3.0) as u16,
+        x: rx,
+        y: ry,
+        width: rw,
+        height: rh,
     };
 
     // Clear previous footprint + union so reverse leave no ghost borders
     if let Some(prev) = panel.drawn_rect {
         if prev != rect {
-            let ux = prev.x.min(rect.x);
-            let uy = prev.y.min(rect.y);
-            let ur = (prev.x + prev.width).max(rect.x + rect.width);
-            let ub = (prev.y + prev.height).max(rect.y + rect.height);
+            let ux = prev.x.min(rect.x).min(max_w);
+            let uy = prev.y.min(rect.y).min(max_h);
+            let ur = (prev.x + prev.width).max(rect.x + rect.width).min(max_w);
+            let ub = (prev.y + prev.height).max(rect.y + rect.height).min(max_h);
             frame.render_widget(
                 Clear,
                 Rect {
