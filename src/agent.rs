@@ -64,7 +64,7 @@ impl ToolPermissions {
 }
 
 static TOOL_PERMS: Mutex<ToolPermissions> = Mutex::new(ToolPermissions {
-    mode: PermissionMode::AlwaysAllow,
+    mode: PermissionMode::Ask,
     folder_scope: FolderScope::CurrentDir,
     session_allow: false,
 });

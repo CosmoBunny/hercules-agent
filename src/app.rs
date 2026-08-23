@@ -4617,7 +4617,7 @@ LlamaCppLibBackend::http(
                     } else {
                         output_part.as_str()
                     };
-                    let text_to_render = crate::agent::AgentEngine::format_markdown_tables(raw_text, chat_area.width as usize, self.table_scroll_x);
+                    let text_to_render = raw_text.to_string();
                     let think_len = think_part.as_ref().map(|t| t.chars().count()).unwrap_or(0);
                     let available_output = reveal_limit.saturating_sub(think_len);
 
