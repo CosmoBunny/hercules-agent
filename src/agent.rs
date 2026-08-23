@@ -1625,7 +1625,34 @@ impl AgentEngine {
                 Self::execute_write(&path, action.line_attr.as_deref(), &action.body)
             }
  
-            ProposedKind::Mcp | ProposedKind::Skill | ProposedKind::WebSearch | ProposedKind::Agent => String::new(), // handled elsewhere
+            ProposedKind::WebSearch => {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let provider = websearch::providers::duckduckgo::DuckDuckGoProvider::new();
+                        let options = websearch::SearchOptions {
+                            query: action.target.clone(),
+                            max_results: Some(3),
+                            provider: Box::new(provider),
+                            ..Default::default()
+                        };
+                        match websearch::web_search(options).await {
+                            Ok(res) => {
+                                let mut out = String::new();
+                                for r in res {
+                                    out.push_str(&format!("Title: {}\nURL: {}\nSnippet: {}\n\n", r.title, r.url, r.snippet.unwrap_or_default()));
+                                }
+                                if out.is_empty() {
+                                    "No results found.".to_string()
+                                } else {
+                                    out.trim().to_string()
+                                }
+                            }
+                            Err(e) => format!("Error searching web: {}", e),
+                        }
+                    })
+                })
+            }
+            ProposedKind::Mcp | ProposedKind::Skill | ProposedKind::Agent => String::new(), // handled elsewhere
             ProposedKind::Cmd => {
  
                 if !Self::looks_like_shell_cmd(&action.target) {
