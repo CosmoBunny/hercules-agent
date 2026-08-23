@@ -820,8 +820,8 @@ pub fn draw_tool_panel(
     let w = lerp(chip.width as f32, dock.width as f32, t);
     let h = lerp(chip.height as f32, dock.height as f32, t);
 
-    let max_w = frame.size().width;
-    let max_h = frame.size().height;
+    let max_w = frame.area().width;
+    let max_h = frame.area().height;
 
     let rx = (x.round().max(0.0) as u16).min(max_w);
     let ry = (y.round().max(0.0) as u16).min(max_h);
