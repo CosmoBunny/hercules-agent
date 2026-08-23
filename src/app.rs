@@ -5058,19 +5058,33 @@ LlamaCppLibBackend::http(
                 Style::default().fg(dark_gray),
             ))]
         } else {
-            // Preserve empty trailing line after final \n
-            let mut lines: Vec<Line> = self
-                .input
-                .split('\n')
-                .enumerate()
-                .map(|(i, row)| {
-                    let prefix = if i == 0 { " " } else { " " };
-                    Line::from(Span::styled(
-                        format!("{prefix}{row}"),
-                        Style::default().fg(theme_color),
-                    ))
-                })
-                .collect();
+            // Manually chunk the string to match `input_cursor_col_row` exactly.
+            let inner_w = input_layout[1].width.saturating_sub(2).max(1) as usize;
+            let mut lines: Vec<Line> = Vec::new();
+            
+            for (i, row) in self.input.split('\n').enumerate() {
+                let mut current_line = String::new();
+                let mut col = if i == 0 { 1 } else { 0 };
+                if i == 0 {
+                    current_line.push(' ');
+                }
+                for ch in row.chars() {
+                    if col >= inner_w {
+                        lines.push(Line::from(Span::styled(
+                            current_line.clone(),
+                            Style::default().fg(theme_color),
+                        )));
+                        current_line.clear();
+                        col = 0;
+                    }
+                    current_line.push(ch);
+                    col += 1;
+                }
+                lines.push(Line::from(Span::styled(
+                    current_line,
+                    Style::default().fg(theme_color),
+                )));
+            }
             if self.input.ends_with('\n') {
                 lines.push(Line::from(Span::styled(
                     " ",
@@ -5099,8 +5113,7 @@ LlamaCppLibBackend::http(
             ));
 
         let input_box = Paragraph::new(input_lines_ui)
-            .block(input_block)
-            .wrap(ratatui::widgets::Wrap { trim: false });
+            .block(input_block);
         frame.render_widget(input_box, input_layout[1]);
 
         // --- Footer Status Bar (status_message truncated so it never collides with input) ---
