@@ -4677,43 +4677,46 @@ LlamaCppLibBackend::http(
                                     }
                                 }
                                 global_out_ch += raw_line.chars().count() + 1;
-                            } else if trimmed.starts_with('#') {
+                            } else if trimmed.starts_with('#') && trimmed.chars().take_while(|c| *c == '#').count() > 0 && trimmed[trimmed.chars().take_while(|c| *c == '#').count()..].starts_with(' ') {
+                                let level = trimmed.chars().take_while(|c| *c == '#').count();
+                                let h_color = match level {
+                                    1 => Color::Rgb(0, 255, 0),
+                                    2 => Color::Rgb(0, 150, 255),
+                                    3 => Color::Rgb(255, 255, 0),
+                                    _ => Color::Rgb(255, 50, 50),
+                                };
                                 line_spans.push(Span::styled(
                                     format!("  {}", trimmed),
                                     Style::default()
-                                        .fg(theme_color)
+                                        .fg(h_color)
                                         .add_modifier(Modifier::BOLD),
                                 ));
                                 global_out_ch += raw_line.chars().count() + 1;
-                            } else if trimmed.starts_with('-') || trimmed.starts_with('*') {
-                                line_spans
-                                    .push(Span::styled("  * ", Style::default().fg(theme_color)));
-                                for ch in trimmed[1..].chars() {
-                                    if global_out_ch >= available_output {
-                                        break;
-                                    }
-                                    let age = available_output.saturating_sub(global_out_ch);
-                                    let progress = if is_generating_val && is_last_message {
-                                        (age as f64 / 10.0).clamp(0.1, 1.0)
-                                    } else {
-                                        1.0
-                                    };
-                                    let r = (40.0 + (240.0 - 40.0) * progress) as u8;
-                                    let g = (55.0 + (245.0 - 55.0) * progress) as u8;
-                                    let b = (65.0 + (255.0 - 65.0) * progress) as u8;
-                                    line_spans.push(Span::styled(
-                                        ch.to_string(),
-                                        Style::default().fg(Color::Rgb(r, g, b)),
-                                    ));
-                                    global_out_ch += 1;
-                                }
-                                global_out_ch += 1;
                             } else {
-                                line_spans.push(Span::styled("  ", Style::default()));
-                                for ch in raw_line.chars() {
+                                let is_bullet = trimmed.starts_with("- ") || trimmed.starts_with("* ");
+                                if is_bullet {
+                                    line_spans.push(Span::styled("  ● ", Style::default().fg(theme_color)));
+                                    global_out_ch += raw_line.chars().count() - trimmed.chars().count() + 2;
+                                } else {
+                                    line_spans.push(Span::styled("  ", Style::default()));
+                                }
+                                
+                                let text_to_parse = if is_bullet { &trimmed[2..] } else { raw_line };
+                                
+                                let mut chars = text_to_parse.chars().peekable();
+                                let mut is_bold = false;
+                                
+                                while let Some(ch) = chars.next() {
                                     if global_out_ch >= available_output {
                                         break;
                                     }
+                                    if ch == '*' && chars.peek() == Some(&'*') {
+                                        chars.next();
+                                        is_bold = !is_bold;
+                                        global_out_ch += 2;
+                                        continue;
+                                    }
+                                    
                                     let age = available_output.saturating_sub(global_out_ch);
                                     let progress = if is_generating_val && is_last_message {
                                         (age as f64 / 10.0).clamp(0.1, 1.0)
@@ -4723,10 +4726,13 @@ LlamaCppLibBackend::http(
                                     let r = (40.0 + (240.0 - 40.0) * progress) as u8;
                                     let g = (55.0 + (245.0 - 55.0) * progress) as u8;
                                     let b = (65.0 + (255.0 - 65.0) * progress) as u8;
-                                    line_spans.push(Span::styled(
-                                        ch.to_string(),
-                                        Style::default().fg(Color::Rgb(r, g, b)),
-                                    ));
+                                    
+                                    let mut style = Style::default().fg(Color::Rgb(r, g, b));
+                                    if is_bold || in_code_block {
+                                        style = style.add_modifier(Modifier::BOLD);
+                                    }
+                                    
+                                    line_spans.push(Span::styled(ch.to_string(), style));
                                     global_out_ch += 1;
                                 }
                                 global_out_ch += 1;
