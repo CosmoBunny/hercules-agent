@@ -8,7 +8,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, BorderType, Clear, Paragraph},
     Frame,
 };
 use std::time::Instant;
@@ -747,9 +747,8 @@ pub fn redact_tools_for_chat(content: &str) -> String {
         while let Some(start) = s.find(tag) {
             if let Some(rel_end) = s[start..].find(&close_tag) {
                 s.replace_range(start..start + rel_end + close_tag.len(), "");
-            } else if let Some(gt) = s[start..].find('>') {
-                s.replace_range(start..start + gt + 1, "");
             } else {
+                // Partial/streaming tool tag: strip from tag opening to end of string
                 s = s[..start].to_string();
                 break;
             }

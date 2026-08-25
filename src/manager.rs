@@ -143,43 +143,58 @@ fn format_byte_size(bytes: u64) -> String {
 /// Used when HuggingFace API omits LFS sizes (common for large files).
 fn estimate_q4_size_label(model_id: &str) -> String {
     let lower = model_id.to_lowercase();
-    // Order matters: match longer tags first (1.5b before 1b, 70b before 7b)
-    let (params_b, mb) = if lower.contains("405b") {
-        (405.0, 220_000.0)
+    
+    // Extract parameter count using regex-like token boundaries (e.g. -27b, _27b, -4b, :4b, -0.5b)
+    let mut param_val: Option<f32> = None;
+    for part in lower.split(|c: char| !c.is_alphanumeric() && c != '.') {
+        if part.ends_with('b') && part.len() > 1 {
+            let num_str = &part[..part.len() - 1];
+            if let Ok(val) = num_str.parse::<f32>() {
+                if val > 0.1 && val <= 1000.0 {
+                    param_val = Some(val);
+                    break;
+                }
+            }
+        } else if part.ends_with('m') && part.len() > 1 {
+            let num_str = &part[..part.len() - 1];
+            if let Ok(val) = num_str.parse::<f32>() {
+                if val >= 50.0 {
+                    param_val = Some(val / 1000.0);
+                    break;
+                }
+            }
+        }
+    }
+
+    let (params_b, mb) = if let Some(p) = param_val {
+        // ~0.55 GB per 1 Billion parameters for Q4_K_M + 300MB overhead
+        let mb = p * 580.0 + 150.0;
+        (p, mb)
+    } else if lower.contains("405b") {
+        (405.0, 230_000.0)
     } else if lower.contains("236b") || lower.contains("235b") {
-        (235.0, 130_000.0)
+        (235.0, 135_000.0)
     } else if lower.contains("70b") || lower.contains("72b") {
-        (70.0, 40_000.0)
+        (70.0, 42_000.0)
     } else if lower.contains("34b") || lower.contains("33b") || lower.contains("32b") {
-        (32.0, 19_000.0)
+        (32.0, 19_500.0)
     } else if lower.contains("27b") {
         (27.0, 16_000.0)
-    } else if lower.contains("22b") {
-        (22.0, 13_000.0)
     } else if lower.contains("14b") || lower.contains("13b") {
-        (14.0, 8_500.0)
-    } else if lower.contains("12b") {
-        (12.0, 7_200.0)
-    } else if lower.contains("9b") {
-        (9.0, 5_400.0)
-    } else if lower.contains("8b") {
-        (8.0, 4_700.0)
+        (14.0, 8_800.0)
+    } else if lower.contains("9b") || lower.contains("8b") {
+        (8.0, 4_900.0)
     } else if lower.contains("7b") || lower.contains("6.7b") {
-        (7.0, 4_200.0)
-    } else if lower.contains("4b") || lower.contains("3.8b") {
-        (4.0, 2_400.0)
+        (7.0, 4_300.0)
+    } else if lower.contains("4b") {
+        (4.0, 2_500.0)
     } else if lower.contains("3b") {
         (3.0, 1_900.0)
-    } else if lower.contains("2b") {
-        (2.0, 1_300.0)
-    } else if lower.contains("1.5b") || lower.contains("1.7b") {
-        (1.5, 1_000.0)
-    } else if lower.contains("1b") {
-        (1.0, 700.0)
-    } else if lower.contains("0.5b") || lower.contains("500m") {
-        (0.5, 400.0)
+    } else if lower.contains("2b") || lower.contains("1.5b") {
+        (1.5, 1_100.0)
+    } else if lower.contains("1b") || lower.contains("0.5b") {
+        (0.5, 450.0)
     } else {
-        // Unknown — do not invent a fake precise GB
         return "size unknown".into();
     };
     let _ = params_b;
@@ -614,21 +629,21 @@ impl ModelManager {
             let sub_query = parts.get(1).unwrap_or(&"");
             if sub_query.is_empty() {
                 format!(
-                    "https://huggingface.co/api/models?author={}&full=true&limit=25",
+                    "https://huggingface.co/api/models?author={}&blobs=true&full=true&limit=25",
                     author
                 )
             } else {
                 format!(
-                    "https://huggingface.co/api/models?author={}&search={}&full=true&limit=25",
+                    "https://huggingface.co/api/models?author={}&search={}&blobs=true&full=true&limit=25",
                     author, sub_query
                 )
             }
         } else {
             if trimmed.is_empty() {
-                "https://huggingface.co/api/models?tags=gguf&sort=downloads&direction=-1&limit=25".to_string()
+                "https://huggingface.co/api/models?tags=gguf&sort=downloads&direction=-1&blobs=true&full=true&limit=25".to_string()
             } else {
                 format!(
-                    "https://huggingface.co/api/models?search={}&full=true&limit=25",
+                    "https://huggingface.co/api/models?search={}&tags=gguf&sort=downloads&direction=-1&blobs=true&full=true&limit=25",
                     trimmed
                 )
             }
@@ -644,65 +659,72 @@ impl ModelManager {
 
         let text = res.text().await.map_err(|e| e.to_string())?;
         let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        let mut models = Vec::new();
+        let mut model_ids = Vec::new();
         if let Some(arr) = json.as_array() {
             for item in arr {
                 if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                    // Only count GGUF siblings — summing every repo file (safetensors+tokenizer+…)
-                    // was the main cause of wildly wrong "size" labels in the registry.
-                    let mut gguf_sizes: Vec<(String, u64)> = Vec::new();
-                    if let Some(siblings) = item.get("siblings").and_then(|s| s.as_array()) {
-                        for f in siblings {
-                            let rfilename = f
-                                .get("rfilename")
-                                .or_else(|| f.get("filename"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let lower = rfilename.to_lowercase();
-                            if !lower.ends_with(".gguf") {
-                                continue;
-                            }
-                            if let Some(sz) = f.get("size").and_then(|s| s.as_u64()) {
-                                if sz > 0 {
-                                    gguf_sizes.push((rfilename.to_string(), sz));
-                                }
-                            }
-                        }
-                    }
-
-                    let size_tag = if !gguf_sizes.is_empty() {
-                        // Prefer Q4_K_M (or best ranked) single-file size for the label
-                        let names: Vec<String> =
-                            gguf_sizes.iter().map(|(n, _)| n.clone()).collect();
-                        let best = pick_best_gguf(&names);
-                        let best_sz = gguf_sizes
-                            .iter()
-                            .find(|(n, _)| n == &best)
-                            .map(|(_, s)| *s)
-                            .or_else(|| gguf_sizes.iter().map(|(_, s)| *s).min())
-                            .unwrap_or(0);
-                        let min_sz = gguf_sizes.iter().map(|(_, s)| *s).min().unwrap_or(0);
-                        let max_sz = gguf_sizes.iter().map(|(_, s)| *s).max().unwrap_or(0);
-                        if gguf_sizes.len() == 1 || min_sz == max_sz {
-                            format!("[{} GGUF]", format_byte_size(best_sz))
-                        } else {
-                            // Show preferred quant + range of available quants
-                            format!(
-                                "[{} typ · {}–{}]",
-                                format_byte_size(best_sz),
-                                format_byte_size(min_sz),
-                                format_byte_size(max_sz)
-                            )
-                        }
-                    } else {
-                        // No sibling sizes from API — estimate Q4_K_M from param count in id
-                        format!("[~{} Q4 est.]", estimate_q4_size_label(id))
-                    };
-
-                    models.push(format!("{} {}", id, size_tag));
+                    model_ids.push(id.to_string());
                 }
             }
         }
+
+        // Concurrently fetch exact file/repo sizes via /api/models/{id}?blobs=true
+        let mut fetch_futs = Vec::new();
+        for id in model_ids {
+            let client = client.clone();
+            fetch_futs.push(async move {
+                let single_url = format!("https://huggingface.co/api/models/{}?blobs=true", id);
+                let mut size_tag = "[-]".to_string();
+                if let Ok(res) = client.get(&single_url).header("User-Agent", "Hercules-CLI/1.0").send().await {
+                    if let Ok(t) = res.text().await {
+                        if let Ok(item_json) = serde_json::from_str::<serde_json::Value>(&t) {
+                            let mut gguf_sizes: Vec<(String, u64)> = Vec::new();
+                            let mut total_weight_size: u64 = 0;
+                            if let Some(siblings) = item_json.get("siblings").and_then(|s| s.as_array()) {
+                                for f in siblings {
+                                    let rfilename = f
+                                        .get("rfilename")
+                                        .or_else(|| f.get("filename"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let sz = f.get("size")
+                                        .and_then(|s| s.as_u64())
+                                        .or_else(|| f.get("lfs").and_then(|l| l.get("size")).and_then(|s| s.as_u64()))
+                                        .unwrap_or(0);
+                                    if sz > 0 {
+                                        total_weight_size = total_weight_size.saturating_add(sz);
+                                        if rfilename.to_lowercase().ends_with(".gguf") {
+                                            gguf_sizes.push((rfilename.to_string(), sz));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !gguf_sizes.is_empty() {
+                                let names: Vec<String> = gguf_sizes.iter().map(|(n, _)| n.clone()).collect();
+                                let best = pick_best_gguf(&names);
+                                let best_sz = gguf_sizes
+                                    .iter()
+                                    .find(|(n, _)| n == &best)
+                                    .map(|(_, s)| *s)
+                                    .or_else(|| gguf_sizes.iter().map(|(_, s)| *s).min())
+                                    .unwrap_or(0);
+                                if best_sz > 0 {
+                                    size_tag = format!("[{}]", format_byte_size(best_sz));
+                                } else {
+                                    size_tag = format!("[{}]", format_byte_size(total_weight_size));
+                                }
+                            } else if total_weight_size > 0 {
+                                size_tag = format!("[{}]", format_byte_size(total_weight_size));
+                            }
+                        }
+                    }
+                }
+                format!("{} {}", id, size_tag)
+            });
+        }
+
+        let models = futures_util::future::join_all(fetch_futs).await;
         Ok(models)
     }
 

@@ -2,7 +2,7 @@ use crate::agent::{
     FolderScope, PermissionMode, ProposedAction, allow_session_tools, get_tool_permissions,
     set_folder_scope, set_permission_mode,
 };
-use crate::backend::{AgentBackend, LlamaCppBackend, LlamaCppLibBackend, OllamaBackend};
+use crate::backend::{AgentBackend, LlamaCppLibBackend, OllamaBackend};
 use crate::manager::ModelManager;
 use crate::task_manager::{QUICK_SECS, TaskEvent, TaskManager};
 use crate::tool_panel::{self, PanelChromeHit, ToolChip, ToolPanel, ToolPanelKind};
@@ -144,7 +144,17 @@ pub struct App {
     // Config & Navigation
     pub theme_color: Color,
     pub show_menu: bool,
-    pub menu_section: usize, // 0: Registry, 1: Installed Models, 2: Settings
+    pub menu_section: usize, // 0: Help, 1: Registry, 2: Modal (Installed), 3: Settings
+    pub header_dropdown_open: bool,
+    pub header_anim_progress: f32, // 0.0 = top header at row 0, 1.0 = top header at row 1 (revealing menu on row 0)
+    pub menu_anim_progress: f32,   // 0.0 = closed, 1.0 = fully open (fade up/down)
+    pub menu_closing: bool,        // true during closing animation
+    pub header_bar_hit: Option<(u16, u16, u16)>, // (row, start_col, end_col)
+    pub menu_tab_hits: Vec<(usize, u16, u16)>,   // (section_idx, start_col, end_col) on row 0
+    pub container_close_hit: Option<(u16, u16, u16)>, // (row, start_col, end_col) for " x " close button
+    pub settings_col: usize,       // 0 = left category tabs, 1 = right values
+    pub settings_tab: usize,       // 0: Power, 1: Stall, 2: Repeat, 3: Context, 4: Permissions
+    pub registry_tab: usize,       // 0: HuggingFace, 1: Ollama
     pub config_state: ListState,
 
     // Installed Models state
@@ -302,6 +312,16 @@ impl App {
             theme_color: Color::Rgb(0, 255, 128),
             show_menu: false,
             menu_section: 0,
+            header_dropdown_open: false,
+            header_anim_progress: 0.0,
+            menu_anim_progress: 0.0,
+            menu_closing: false,
+            header_bar_hit: None,
+            menu_tab_hits: Vec::new(),
+            container_close_hit: None,
+            settings_col: 0,
+            settings_tab: 0,
+            registry_tab: 0,
             config_state: {
                 let mut st = ListState::default();
                 st.select(Some(0)); // llama.rs first
@@ -1164,7 +1184,6 @@ impl App {
         }
 
         // Ensure chips exist + mark pending; auto-open latest
-        let mut open_id = None;
         for a in &mut actions {
             let target = match a.kind {
                 crate::agent::ProposedKind::Write => {
@@ -1201,8 +1220,6 @@ impl App {
                 }
 
                 a.chip_id = Some(chip_id);
-
-                open_id = Some(chip_id);
             } else {
                 let id = self.next_chip_id;
                 self.next_chip_id += 1;
@@ -1221,8 +1238,6 @@ impl App {
                 });
 
                 a.chip_id = Some(id);
-
-                open_id = Some(id);
             }
         }
         self.dedupe_tool_chips();
@@ -2148,7 +2163,6 @@ impl App {
         };
 
         let anchor = self.latest_agent_msg_idx();
-        let mut open_id = None;
 
         // Prefer chip on the current agent turn with matching kind; else any matching kind.
         let chip_idx = self
@@ -2171,8 +2185,6 @@ impl App {
             let chip = &mut self.tool_chips[i];
             chip.tag_closed = true;
             chip.pending = false;
-
-            open_id = Some(chip.id);
         } else {
             // Result without a prior chip — create one under last agent
             let id = self.next_chip_id;
@@ -2195,7 +2207,6 @@ impl App {
                 expanded: false,
                 anim_start: None,
             });
-            open_id = Some(id);
         }
 
         self.dedupe_tool_chips();
@@ -2297,7 +2308,7 @@ impl App {
         self.gen_last_progress = Some(Instant::now());
         self.gen_last_len = 0;
 
-        self.messages.push("Agent: \u{258d}".to_string());
+        self.messages.push("Agent: ".to_string());
         self.typewriter_len = 0;
         let limit = crate::settings::context_token_limit();
         let pct = if limit > 0 {
@@ -2373,6 +2384,85 @@ impl App {
                     *is_gen_clone.lock().unwrap() = false;
                 });
             }
+        }
+    }
+
+    pub fn adjust_setting_value(&mut self, dir: i32) {
+        use crate::settings::{
+            PowerMode, cycle_context_token_limit, cycle_repeat_threshold,
+            cycle_stall_timeout, format_context_tokens, format_stall_timeout,
+            get_settings, set_power_mode, toggle_repeat_thinking,
+        };
+        use crate::app::{
+            get_tool_permissions, set_permission_mode, set_folder_scope,
+            PermissionMode, FolderScope,
+        };
+        match self.settings_tab {
+            0 => {
+                // Power mode
+                let s = get_settings();
+                let next_mode = if dir > 0 {
+                    match s.power_mode {
+                        PowerMode::PowerSaver => PowerMode::Normal,
+                        PowerMode::Normal => PowerMode::Extreme,
+                        PowerMode::Extreme => PowerMode::PowerSaver,
+                    }
+                } else {
+                    match s.power_mode {
+                        PowerMode::PowerSaver => PowerMode::Extreme,
+                        PowerMode::Normal => PowerMode::PowerSaver,
+                        PowerMode::Extreme => PowerMode::Normal,
+                    }
+                };
+                set_power_mode(next_mode);
+                crate::llama::server::shutdown_managed_server();
+                self.status_message = format!("Power mode: {}", next_mode.label());
+            }
+            1 => {
+                // Stall time
+                let t = cycle_stall_timeout();
+                self.status_message = format!("Stall Watchdog Timeout: {}", format_stall_timeout(t));
+            }
+            2 => {
+                // Repeat detector
+                if dir != 0 {
+                    cycle_repeat_threshold();
+                } else {
+                    toggle_repeat_thinking();
+                }
+                let s = get_settings();
+                self.status_message = format!(
+                    "Repeat threshold: {} | Think detect: {}",
+                    s.repeat_threshold,
+                    if s.repeat_detect_thinking { "ON" } else { "OFF" }
+                );
+            }
+            3 => {
+                // Context window
+                let n = cycle_context_token_limit();
+                crate::llama::server::shutdown_managed_server();
+                self.status_message = format!("Context limit: {}", format_context_tokens(n));
+            }
+            4 => {
+                // Permissions
+                let p = get_tool_permissions();
+                if dir > 0 {
+                    let next_mode = match p.mode {
+                        PermissionMode::Ask => PermissionMode::AlwaysAllow,
+                        PermissionMode::AlwaysAllow => PermissionMode::Ask,
+                    };
+                    set_permission_mode(next_mode);
+                } else {
+                    let next_scope = match p.folder_scope {
+                        FolderScope::CurrentDir => FolderScope::AllDirs,
+                        FolderScope::AllDirs => FolderScope::CurrentDir,
+                    };
+                    set_folder_scope(next_scope);
+                }
+                let p2 = get_tool_permissions();
+                self.status_message = format!("Permissions: {} | {}", p2.mode_label(), p2.scope_label());
+            }
+            _ => {}
         }
     }
 
@@ -2877,18 +2967,37 @@ impl App {
         if let Some(models) = new_results {
             if !models.is_empty() {
                 let mut installed = self.manager.list_installed_local();
-                let mut search_items = Vec::new();
+                let mut hf_items = Vec::new();
+                let mut ollama_items = Vec::new();
                 for m in models {
                     if m.starts_with("Ollama Local:") || m.starts_with("Local GGUF:") {
                         if !installed.contains(&m) {
                             installed.push(m.clone());
                         }
+                    } else if m.starts_with("Ollama: ") {
+                        let stripped = m.trim_start_matches("Ollama: ").to_string();
+                        if !ollama_items.contains(&stripped) {
+                            ollama_items.push(stripped);
+                        }
+                    } else if m.starts_with("HuggingFace: ") {
+                        let stripped = m.trim_start_matches("HuggingFace: ").to_string();
+                        if !hf_items.contains(&stripped) {
+                            hf_items.push(stripped);
+                        }
+                    } else if m.starts_with("Ollama:") {
+                        let stripped = m.trim_start_matches("Ollama:").trim().to_string();
+                        if !ollama_items.contains(&stripped) {
+                            ollama_items.push(stripped);
+                        }
                     } else {
-                        search_items.push(m);
+                        if !hf_items.contains(&m) {
+                            hf_items.push(m);
+                        }
                     }
                 }
                 self.installed_models = installed;
-                self.hf_models = search_items;
+                self.hf_models = hf_items;
+                self.registry_models = ollama_items;
                 self.krama.restart_progress("list_fade", 0);
             }
         }
@@ -2965,14 +3074,84 @@ impl App {
             }
         }
 
+        // Check hold-to-exit (1s duration)
+        let _esc_hold_progress = if let Some(start) = self.esc_hold_start {
+            let elapsed = start.elapsed().as_secs_f32();
+            let p = (elapsed / 1.0).clamp(0.0, 1.0);
+            if p >= 1.0 {
+                self.esc_hold_start = None;
+                if let Ok(mut g) = self.is_generating.lock() {
+                    *g = false;
+                }
+                crate::llama::server::shutdown_managed_server();
+                crate::llama::libinfer::shutdown_warm_lib_engine();
+                self.should_quit = true;
+                self.status_message = "Exiting…".to_string();
+            }
+            Some(p)
+        } else {
+            None
+        };
+
+        // Animation state updates for header dropdown and menu modal via KramaFrame
+        if self.show_menu {
+            if self.menu_closing {
+                if !self.krama.is_reversed("menu_fade", 0) {
+                    self.krama.reverse_animate("menu_fade", 0);
+                }
+                let t = self.krama.get_progress_f32("menu_fade", 0).abs();
+                self.menu_anim_progress = t;
+                if !self.krama.is_animating("menu_fade", 0) || t == 0.0 {
+                    self.show_menu = false;
+                    self.menu_closing = false;
+                    self.menu_anim_progress = 0.0;
+                    self.krama.restart_progress("menu_fade", 0);
+                }
+            } else {
+                if self.krama.is_reversed("menu_fade", 0) {
+                    self.krama.reverse_animate("menu_fade", 0);
+                }
+                self.menu_anim_progress = self.krama.get_progress_f32("menu_fade", 0).abs();
+            }
+        } else {
+            self.menu_anim_progress = 0.0;
+        }
+
+        if self.header_dropdown_open {
+            if self.krama.is_reversed("slide", 0) {
+                self.krama.reverse_animate("slide", 0);
+            }
+            self.header_anim_progress = self.krama.get_progress_f32("slide", 0).abs();
+        } else {
+            if !self.krama.is_reversed("slide", 0) && self.header_anim_progress > 0.0 {
+                self.krama.reverse_animate("slide", 0);
+            }
+            let t = self.krama.get_progress_f32("slide", 0).abs();
+            self.header_anim_progress = t;
+            if !self.krama.is_animating("slide", 0) {
+                self.header_anim_progress = 0.0;
+            }
+        }
+
         let is_generating_val = *self.is_generating.lock().unwrap();
         let is_downloading = self.download_progress.lock().unwrap().is_some();
+        let is_krama_animating = self.krama.is_animating("menu_fade", 0)
+            || self.krama.is_animating("slide", 0)
+            || self.krama.is_animating("panel_fly", 0)
+            || self.krama.is_animating("focus", 0)
+            || self.krama.is_animating("list_fade", 0);
+
         let is_animating = is_generating_val
             || is_downloading
-            || !self.code_block_anims.is_empty();
+            || !self.code_block_anims.is_empty()
+            || is_krama_animating
+            || self.esc_hold_start.is_some()
+            || self.menu_closing
+            || self.panel_closing
+            || (self.input_anim_height - (if self.input_focused { 1.0 } else { 1.0 })).abs() > 0.05;
 
         let poll_dur = if is_animating {
-            Duration::from_millis(16)
+            Duration::from_millis(8)
         } else {
             Duration::from_millis(100)
         };
@@ -3000,6 +3179,9 @@ impl App {
                             self.auto_scroll_enabled = false;
                             self.scroll_offset = self.scroll_offset.saturating_sub(2);
                             self.input_focused = false;
+                            if self.header_dropdown_open {
+                                self.header_dropdown_open = false;
+                            }
                         }
                     }
                     MouseEventKind::ScrollDown => {
@@ -3021,13 +3203,63 @@ impl App {
                         } else {
                             self.scroll_offset = self.scroll_offset.saturating_add(2);
                             self.input_focused = false;
+                            if self.header_dropdown_open {
+                                self.header_dropdown_open = false;
+                            }
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
+                        // Check container close button " x " hit
+                        if let Some((close_y, close_x0, close_x1)) = self.container_close_hit {
+                            if mouse.row == close_y && mouse.column >= close_x0 && mouse.column <= close_x1 {
+                                self.menu_closing = true;
+                                self.clear_selection();
+                                self.exit_term_interactive();
+                                return Ok(true);
+                            }
+                        }
+
+                        // Check row 0 menu tab hits
+                        if self.header_dropdown_open && mouse.row == 0 {
+                            for (sec_idx, x0, x1) in &self.menu_tab_hits {
+                                if mouse.column >= *x0 && mouse.column <= *x1 {
+                                    self.menu_section = *sec_idx;
+                                    self.show_menu = true;
+                                    self.menu_closing = false;
+                                    self.header_dropdown_open = false; // slide header back up
+                                    self.krama.restart_progress("menu_fade", 0);
+                                    self.clear_selection();
+                                    self.exit_term_interactive();
+                                    return Ok(true);
+                                }
+                            }
+                        }
+
+                        // Check click on top header bar (Row 0 when closed, Row 1 when open)
+                        if mouse.row == 0 || mouse.row == 1 {
+                            if let Some((h_row, h_x0, h_x1)) = self.header_bar_hit {
+                                if (mouse.row == h_row || (mouse.row <= 1 && !self.header_dropdown_open)) && mouse.column >= h_x0 && mouse.column <= h_x1 {
+                                    self.header_dropdown_open = !self.header_dropdown_open;
+                                    self.krama.restart_progress("slide", 0);
+                                    self.clear_selection();
+                                    self.exit_term_interactive();
+                                    return Ok(true);
+                                }
+                            }
+                        }
+
+                        // Clicking anywhere outside dropdown closes it
+                        if self.header_dropdown_open {
+                            self.header_dropdown_open = false;
+                        }
+
                         // Check click on Model Name badge to toggle input prompt focus
                         if let Some((badge_y, badge_x0, badge_x1)) = self.model_badge_hit {
                             if mouse.row == badge_y && mouse.column >= badge_x0 && mouse.column <= badge_x1 {
                                 self.input_focused = !self.input_focused;
+                                if !self.input_focused {
+                                    self.input_scroll_y = 0;
+                                }
                                 self.clear_selection();
                                 self.exit_term_interactive();
                                 return Ok(true);
@@ -3174,7 +3406,7 @@ impl App {
                                                 "WRITE — scroll with mouse wheel / PgUp/PgDn"
                                                     .into();
                                         }
-                                    } else {
+                                    } else if mouse.modifiers.contains(KeyModifiers::CONTROL) {
                                         self.exit_term_interactive();
                                         self.selection_pending_cancel = self.has_selection;
                                         self.selection_start = Some((mouse.column, mouse.row));
@@ -3185,11 +3417,15 @@ impl App {
                                             self.selected_text_buffer.clear();
                                         }
                                         self.input_focused = false;
+                                    } else {
+                                        self.clear_selection();
+                                        self.is_selecting = false;
+                                        self.input_focused = false;
                                     }
                                 }
                             }
-                        } else {
-                            // Click outside any panel — leave TERM interactive
+                        } else if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                            // Click with CTRL outside any panel — initiate selection
                             self.exit_term_interactive();
                             self.selection_pending_cancel = self.has_selection;
                             self.selection_start = Some((mouse.column, mouse.row));
@@ -3199,6 +3435,12 @@ impl App {
                             if !self.has_selection {
                                 self.selected_text_buffer.clear();
                             }
+                            self.input_focused = false;
+                        } else {
+                            // Regular click outside panels: clear any active selection
+                            self.exit_term_interactive();
+                            self.clear_selection();
+                            self.is_selecting = false;
                             self.input_focused = false;
                         }
                     }
@@ -3394,7 +3636,15 @@ impl App {
                                         self.delete_confirm_model = None;
                                         self.esc_hold_start = None;
                                     } else if self.show_menu {
-                                        self.show_menu = false;
+                                        if self.settings_col == 1 {
+                                            // Exit second column back to tab column
+                                            self.settings_col = 0;
+                                        } else {
+                                            self.menu_closing = true;
+                                        }
+                                        self.esc_hold_start = None;
+                                    } else if self.header_dropdown_open {
+                                        self.header_dropdown_open = false;
                                         self.esc_hold_start = None;
                                     } else {
                                         // Start / continue hold-to-exit (1s)
@@ -3406,13 +3656,76 @@ impl App {
                                         }
                                     }
                                 }
-                                KeyCode::Char('l') | KeyCode::Char('L')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    self.log_pane_collapsed = !self.log_pane_collapsed;
+                                KeyCode::F(1) => {
+                                    if self.show_menu && self.menu_section == 0 {
+                                        self.menu_closing = true;
+                                    } else {
+                                        self.menu_section = 0; // Help
+                                        self.show_menu = true;
+                                        self.menu_closing = false;
+                                        self.header_dropdown_open = false;
+                                        self.krama.restart_progress("menu_fade", 0);
+                                    }
+                                }
+                                KeyCode::F(2) => {
+                                    if self.show_menu && self.menu_section == 1 {
+                                        self.menu_closing = true;
+                                    } else {
+                                        self.menu_section = 1; // Registry
+                                        self.show_menu = true;
+                                        self.menu_closing = false;
+                                        self.header_dropdown_open = false;
+                                        self.krama.restart_progress("menu_fade", 0);
+                                        self.krama.restart_progress("list_fade", 0);
+                                        let manager_clone = self.manager.clone();
+                                        let search_results_clone = self.search_results.clone();
+                                        tokio::spawn(async move {
+                                            let mut combined = Vec::new();
+                                            if let Ok(ollama_models) =
+                                                manager_clone.list_ollama_models().await
+                                            {
+                                                for m in ollama_models {
+                                                    let sz = if m.size > 0 {
+                                                        crate::manager::format_model_size(m.size)
+                                                    } else {
+                                                        "?".into()
+                                                    };
+                                                    combined.push(format!(
+                                                        "Ollama Local: {} ({sz})",
+                                                        m.name
+                                                    ));
+                                                }
+                                            }
+                                            let hf =
+                                                manager_clone.search_all_models("deepseek").await;
+                                            combined.extend(hf);
+                                            *search_results_clone.lock().unwrap() = Some(combined);
+                                        });
+                                    }
                                 }
                                 KeyCode::F(3) => {
-                                    self.log_pane_collapsed = !self.log_pane_collapsed;
+                                    if self.show_menu && self.menu_section == 2 {
+                                        self.menu_closing = true;
+                                    } else {
+                                        self.menu_section = 2; // Modal (Installed models)
+                                        self.show_menu = true;
+                                        self.menu_closing = false;
+                                        self.header_dropdown_open = false;
+                                        self.krama.restart_progress("menu_fade", 0);
+                                        self.installed_models = self.manager.list_installed_local();
+                                    }
+                                }
+                                KeyCode::F(4) => {
+                                    if self.show_menu && self.menu_section == 3 {
+                                        self.menu_closing = true;
+                                    } else {
+                                        self.menu_section = 3; // Settings
+                                        self.settings_col = 0;
+                                        self.show_menu = true;
+                                        self.menu_closing = false;
+                                        self.header_dropdown_open = false;
+                                        self.krama.restart_progress("menu_fade", 0);
+                                    }
                                 }
                                 KeyCode::Char('f') | KeyCode::Char('F')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -3422,85 +3735,50 @@ impl App {
                                 KeyCode::Char('m') | KeyCode::Char('M')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
-                                    self.show_menu = !self.show_menu;
-                                    if self.show_menu {
-                                        self.krama.restart_progress("menu_fade", 0);
-                                        self.krama.restart_progress("list_fade", 0);
-                                        let manager_clone = self.manager.clone();
-                                        let search_results_clone = self.search_results.clone();
-                                        tokio::spawn(async move {
-                                            let mut combined = Vec::new();
-                                            if let Ok(ollama_models) =
-                                                manager_clone.list_ollama_models().await
-                                            {
-                                                for m in ollama_models {
-                                                    let sz = if m.size > 0 {
-                                                        crate::manager::format_model_size(m.size)
-                                                    } else {
-                                                        "?".into()
-                                                    };
-                                                    combined.push(format!(
-                                                        "Ollama Local: {} ({sz})",
-                                                        m.name
-                                                    ));
-                                                }
-                                            }
-                                            let hf =
-                                                manager_clone.search_all_models("deepseek").await;
-                                            combined.extend(hf);
-                                            *search_results_clone.lock().unwrap() = Some(combined);
-                                        });
+                                    self.header_dropdown_open = !self.header_dropdown_open;
+                                }
+                                KeyCode::Left if self.show_menu => {
+                                    if self.menu_section == 1 {
+                                        // Registry tab: toggle HF / Ollama
+                                        self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
+                                    } else if self.menu_section == 3 {
+                                        // Settings tab: if in column 1 (values), decrement / adjust setting
+                                        if self.settings_col == 1 {
+                                            self.adjust_setting_value(-1);
+                                        } else {
+                                            self.settings_tab = if self.settings_tab == 0 { 4 } else { self.settings_tab - 1 };
+                                        }
                                     }
                                 }
-                                KeyCode::F(2) => {
-                                    self.show_menu = !self.show_menu;
-                                    if self.show_menu {
-                                        self.krama.restart_progress("menu_fade", 0);
-                                        self.krama.restart_progress("list_fade", 0);
-                                        let manager_clone = self.manager.clone();
-                                        let search_results_clone = self.search_results.clone();
-                                        tokio::spawn(async move {
-                                            let mut combined = Vec::new();
-                                            if let Ok(ollama_models) =
-                                                manager_clone.list_ollama_models().await
-                                            {
-                                                for m in ollama_models {
-                                                    let sz = if m.size > 0 {
-                                                        crate::manager::format_model_size(m.size)
-                                                    } else {
-                                                        "?".into()
-                                                    };
-                                                    combined.push(format!(
-                                                        "Ollama Local: {} ({sz})",
-                                                        m.name
-                                                    ));
-                                                }
-                                            }
-                                            let hf =
-                                                manager_clone.search_all_models("deepseek").await;
-                                            combined.extend(hf);
-                                            *search_results_clone.lock().unwrap() = Some(combined);
-                                        });
-                                    }
-                                }
-                                KeyCode::F(1) => {
-                                    self.show_shortcuts = !self.show_shortcuts;
-                                    if self.show_shortcuts {
-                                        self.krama.restart_progress("help_fade", 0);
-                                        self.status_message =
-                                            "Key shortcuts visible (F1 to hide)".to_string();
+                                KeyCode::Char('a') if self.show_menu && self.menu_section == 3 => {
+                                    if self.settings_col == 1 {
+                                        self.adjust_setting_value(-1);
                                     } else {
-                                        self.status_message = "Key shortcuts hidden".to_string();
+                                        self.settings_tab = if self.settings_tab == 0 { 4 } else { self.settings_tab - 1 };
+                                    }
+                                }
+                                KeyCode::Right if self.show_menu => {
+                                    if self.menu_section == 1 {
+                                        // Registry tab: toggle HF / Ollama
+                                        self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
+                                    } else if self.menu_section == 3 {
+                                        // Settings tab: if in column 1 (values), increment / adjust setting
+                                        if self.settings_col == 1 {
+                                            self.adjust_setting_value(1);
+                                        } else {
+                                            self.settings_tab = (self.settings_tab + 1) % 5;
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('d') if self.show_menu && self.menu_section == 3 => {
+                                    if self.settings_col == 1 {
+                                        self.adjust_setting_value(1);
+                                    } else {
+                                        self.settings_tab = (self.settings_tab + 1) % 5;
                                     }
                                 }
                                 KeyCode::Left => {
-                                    if self.show_menu {
-                                        self.menu_section = if self.menu_section == 0 {
-                                            4
-                                        } else {
-                                            self.menu_section - 1
-                                        };
-                                    } else if self.input_focused {
+                                    if self.input_focused {
                                         if key.modifiers.contains(KeyModifiers::ALT) {
                                             self.input_cursor_position = self.cursor_word_left();
                                         } else {
@@ -3512,9 +3790,7 @@ impl App {
                                     }
                                 }
                                 KeyCode::Right => {
-                                    if self.show_menu {
-                                        self.menu_section = (self.menu_section + 1) % 5;
-                                    } else if self.input_focused {
+                                    if self.input_focused {
                                         if key.modifiers.contains(KeyModifiers::ALT) {
                                             self.input_cursor_position = self.cursor_word_right();
                                         } else {
@@ -3536,78 +3812,92 @@ impl App {
                                         self.input_cursor_position = self.input.chars().count();
                                     }
                                 }
-                                KeyCode::Up => {
-                                    if self.show_menu {
-                                        if self.menu_section == 0 {
-                                            let total =
-                                                self.registry_models.len() + self.hf_models.len();
-                                            let i = match self.registry_state.selected() {
-                                                Some(i) => {
-                                                    if i == 0 {
-                                                        total.saturating_sub(1)
-                                                    } else {
-                                                        i - 1
-                                                    }
-                                                }
-                                                None => 0,
-                                            };
-                                            self.registry_state.select(Some(i));
-                                        } else if self.menu_section == 1 {
-                                            let i = match self.installed_state.selected() {
-                                                Some(i) => {
-                                                    if i == 0 {
-                                                        self.installed_models
-                                                            .len()
-                                                            .saturating_sub(1)
-                                                    } else {
-                                                        i - 1
-                                                    }
-                                                }
-                                                None => 0,
-                                            };
-                                            self.installed_state.select(Some(i));
-                                        } else if self.menu_section == 2 {
-                                            const CONFIG_LEN: usize = 3; // llama.rs | llama.cpp | Ollama
-                                            let i = match self.config_state.selected() {
-                                                Some(i) => {
-                                                    if i == 0 {
-                                                        CONFIG_LEN - 1
-                                                    } else {
-                                                        i - 1
-                                                    }
-                                                }
-                                                None => 0,
-                                            };
-                                            self.config_state.select(Some(i));
-                                        } else if self.menu_section == 3 {
-                                            const RT_LEN: usize = 8; // power×3 + sub_backend + repeat + think + ctx + temp
-                                            let i = match self.runtime_state.selected() {
-                                                Some(i) => {
-                                                    if i == 0 {
-                                                        RT_LEN - 1
-                                                    } else {
-                                                        i - 1
-                                                    }
-                                                }
-                                                None => 0,
-                                            };
-                                            self.runtime_state.select(Some(i));
+                                KeyCode::Up if self.show_menu => {
+                                    if self.menu_section == 1 {
+                                        let q_lower = self.registry_search_query.trim().to_lowercase();
+                                        let total = if self.registry_tab == 0 {
+                                            self.hf_models.iter().filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower)).count()
                                         } else {
-                                            // Permissions tab
-                                            const PERMS_LEN: usize = 4;
-                                            let i = match self.perms_state.selected() {
-                                                Some(i) => {
-                                                    if i == 0 {
-                                                        PERMS_LEN - 1
-                                                    } else {
-                                                        i - 1
-                                                    }
-                                                }
-                                                None => 0,
-                                            };
-                                            self.perms_state.select(Some(i));
+                                            self.registry_models.iter().filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower)).count()
+                                        };
+                                        let i = match self.registry_state.selected() {
+                                            Some(i) => if i == 0 { total.saturating_sub(1) } else { i - 1 },
+                                            None => 0,
+                                        };
+                                        self.registry_state.select(Some(i));
+                                    } else if self.menu_section == 2 {
+                                        let i = match self.installed_state.selected() {
+                                            Some(i) => if i == 0 { self.installed_models.len().saturating_sub(1) } else { i - 1 },
+                                            None => 0,
+                                        };
+                                        self.installed_state.select(Some(i));
+                                    } else if self.menu_section == 3 {
+                                        if self.settings_col == 0 {
+                                            self.settings_tab = if self.settings_tab == 0 { 4 } else { self.settings_tab - 1 };
+                                        } else {
+                                            self.adjust_setting_value(-1);
                                         }
-                                    } else if self.input_focused {
+                                    }
+                                }
+                                KeyCode::Char('w') if self.show_menu && self.menu_section != 1 => {
+                                    if self.menu_section == 2 {
+                                        let i = match self.installed_state.selected() {
+                                            Some(i) => if i == 0 { self.installed_models.len().saturating_sub(1) } else { i - 1 },
+                                            None => 0,
+                                        };
+                                        self.installed_state.select(Some(i));
+                                    } else if self.menu_section == 3 {
+                                        if self.settings_col == 0 {
+                                            self.settings_tab = if self.settings_tab == 0 { 4 } else { self.settings_tab - 1 };
+                                        } else {
+                                            self.adjust_setting_value(-1);
+                                        }
+                                    }
+                                }
+                                KeyCode::Down if self.show_menu => {
+                                    if self.menu_section == 1 {
+                                        let q_lower = self.registry_search_query.trim().to_lowercase();
+                                        let total = if self.registry_tab == 0 {
+                                            self.hf_models.iter().filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower)).count()
+                                        } else {
+                                            self.registry_models.iter().filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower)).count()
+                                        };
+                                        let i = match self.registry_state.selected() {
+                                            Some(i) => if i >= total.saturating_sub(1) { 0 } else { i + 1 },
+                                            None => 0,
+                                        };
+                                        self.registry_state.select(Some(i));
+                                    } else if self.menu_section == 2 {
+                                        let i = match self.installed_state.selected() {
+                                            Some(i) => if i >= self.installed_models.len().saturating_sub(1) { 0 } else { i + 1 },
+                                            None => 0,
+                                        };
+                                        self.installed_state.select(Some(i));
+                                    } else if self.menu_section == 3 {
+                                        if self.settings_col == 0 {
+                                            self.settings_tab = (self.settings_tab + 1) % 5;
+                                        } else {
+                                            self.adjust_setting_value(1);
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('s') if self.show_menu && self.menu_section != 1 => {
+                                    if self.menu_section == 2 {
+                                        let i = match self.installed_state.selected() {
+                                            Some(i) => if i >= self.installed_models.len().saturating_sub(1) { 0 } else { i + 1 },
+                                            None => 0,
+                                        };
+                                        self.installed_state.select(Some(i));
+                                    } else if self.menu_section == 3 {
+                                        if self.settings_col == 0 {
+                                            self.settings_tab = (self.settings_tab + 1) % 5;
+                                        } else {
+                                            self.adjust_setting_value(1);
+                                        }
+                                    }
+                                }
+                                KeyCode::Up => {
+                                    if self.input_focused {
                                         self.input_cursor_up(80);
                                     } else {
                                         self.scroll_offset = self.scroll_offset.saturating_sub(1);
@@ -3615,81 +3905,11 @@ impl App {
                                     }
                                 }
                                 KeyCode::Down => {
-                                    if self.show_menu {
-                                        if self.menu_section == 0 {
-                                            let total =
-                                                self.registry_models.len() + self.hf_models.len();
-                                            let i = match self.registry_state.selected() {
-                                                Some(i) => {
-                                                    if i >= total.saturating_sub(1) {
-                                                        0
-                                                    } else {
-                                                        i + 1
-                                                    }
-                                                }
-                                                None => 0,
-                                            };
-                                            self.registry_state.select(Some(i));
-                                        } else if self.menu_section == 1 {
-                                            let i = match self.installed_state.selected() {
-                                                Some(i) => {
-                                                    if i >= self
-                                                        .installed_models
-                                                        .len()
-                                                        .saturating_sub(1)
-                                                    {
-                                                        0
-                                                    } else {
-                                                        i + 1
-                                                    }
-                                                }
-                                                None => 0,
-                                            };
-                                            self.installed_state.select(Some(i));
-                                        } else if self.menu_section == 2 {
-                                            const CONFIG_LEN: usize = 3; // llama.rs | llama.cpp | Ollama
-                                            let i = match self.config_state.selected() {
-                                                Some(i) => {
-                                                    if i >= CONFIG_LEN - 1 {
-                                                        0
-                                                    } else {
-                                                        i + 1
-                                                    }
-                                                }
-                                                None => 0,
-                                            };
-                                            self.config_state.select(Some(i));
-                                        } else if self.menu_section == 3 {
-                                            const RT_LEN: usize = 8;
-                                            let i = match self.runtime_state.selected() {
-                                                Some(i) => {
-                                                    if i >= RT_LEN - 1 {
-                                                        0
-                                                    } else {
-                                                        i + 1
-                                                    }
-                                                }
-                                                None => 0,
-                                            };
-                                            self.runtime_state.select(Some(i));
-                                        } else {
-                                            const PERMS_LEN: usize = 4;
-                                            let i = match self.perms_state.selected() {
-                                                Some(i) => {
-                                                    if i >= PERMS_LEN - 1 {
-                                                        0
-                                                    } else {
-                                                        i + 1
-                                                    }
-                                                }
-                                                None => 0,
-                                            };
-                                            self.perms_state.select(Some(i));
-                                        }
-                                    } else if self.input_focused {
+                                    if self.input_focused {
                                         self.input_cursor_down(80);
                                     } else {
                                         self.scroll_offset = self.scroll_offset.saturating_add(1);
+                                        self.auto_scroll_enabled = false;
                                     }
                                 }
                                 KeyCode::PageUp if !self.input_focused => {
@@ -3891,7 +4111,7 @@ impl App {
                                     if !key.modifiers.contains(KeyModifiers::CONTROL)
                                         && !key.modifiers.contains(KeyModifiers::ALT)
                                     {
-                                        if self.show_menu && self.menu_section == 0 {
+                                        if self.show_menu && self.menu_section == 1 {
                                             self.registry_search_query.push(c);
                                             let query = self.registry_search_query.clone();
                                             let manager = self.manager.clone();
@@ -3916,7 +4136,7 @@ impl App {
                                         || key.modifiers.contains(KeyModifiers::CONTROL)
                                     {
                                         // handled above for word-delete
-                                    } else if self.show_menu && self.menu_section == 0 {
+                                    } else if self.show_menu && self.menu_section == 1 {
                                         self.registry_search_query.pop();
                                         let query = self.registry_search_query.clone();
                                         let manager = self.manager.clone();
@@ -3970,15 +4190,18 @@ impl App {
                                         self.input_insert_char('\n');
                                     } else if self.show_menu {
                                         if self.menu_section == 0 {
-                                            let all_items: Vec<String> = self
-                                                .registry_models
-                                                .iter()
-                                                .cloned()
-                                                .chain(self.hf_models.iter().cloned())
-                                                .collect();
+                                            // Help tab: Enter closes menu
+                                            self.menu_closing = true;
+                                        } else if self.menu_section == 1 {
+                                            // Registry tab: download selected model
+                                            let items = if self.registry_tab == 0 {
+                                                &self.hf_models
+                                            } else {
+                                                &self.registry_models
+                                            };
                                             if let Some(i) = self.registry_state.selected() {
-                                                if i < all_items.len() {
-                                                    let item_str = all_items[i].clone();
+                                                if i < items.len() {
+                                                    let item_str = items[i].clone();
                                                     if item_str.starts_with("Ollama:")
                                                         || item_str.starts_with("Ollama Local:")
                                                     {
@@ -4007,6 +4230,7 @@ impl App {
                                                             l.push(format!("[OLLAMA] Initiated pull stream for model: {}", ollama_name));
                                                         }
 
+                                                        *self.download_progress.lock().unwrap() = Some(0.0);
                                                         let progress_clone =
                                                             self.download_progress.clone();
                                                         let complete_clone =
@@ -4031,7 +4255,6 @@ impl App {
                                                             }
                                                         });
                                                     } else {
-                                                        // Strip "HuggingFace:" and size tags like "[~1.9 GB Q4 est.]"
                                                         let repo_id = {
                                                             let s = item_str
                                                                 .replace("HuggingFace:", "")
@@ -4058,6 +4281,7 @@ impl App {
                                                             l.push(format!("[USER] Initiated download for HuggingFace model: {}", repo_id));
                                                         }
 
+                                                        *self.download_progress.lock().unwrap() = Some(0.0);
                                                         let progress_clone =
                                                             self.download_progress.clone();
                                                         let complete_clone =
@@ -4066,7 +4290,6 @@ impl App {
                                                         let manager_clone = self.manager.clone();
 
                                                         tokio::spawn(async move {
-                                                            // Resolve GGUF only (may remap repo to *-GGUF mirror)
                                                             let resolved = manager_clone
                                                                 .resolve_gguf_file(&repo_id)
                                                                 .await;
@@ -4076,26 +4299,6 @@ impl App {
                                                                     weight_filename,
                                                                     shard_files,
                                                                 )) => {
-                                                                    if let Ok(mut l) =
-                                                                        logs_clone.lock()
-                                                                    {
-                                                                        if dl_repo
-                                                                            != repo_id
-                                                                                .split('[')
-                                                                                .next()
-                                                                                .unwrap_or(&repo_id)
-                                                                                .trim()
-                                                                        {
-                                                                            l.push(format!(
-                                                                        "[RESOLVE] No GGUF in '{}'; using mirror repo '{}'",
-                                                                        repo_id, dl_repo
-                                                                    ));
-                                                                        }
-                                                                        l.push(format!(
-                                                                    "[RESOLVE] Selected GGUF: {}/{}",
-                                                                    dl_repo, weight_filename
-                                                                ));
-                                                                    }
                                                                     let progress_for_dl =
                                                                         progress_clone.clone();
                                                                     let res = manager_clone
@@ -4158,10 +4361,11 @@ impl App {
                                                             }
                                                         });
                                                     }
-                                                    self.show_menu = false;
+                                                    self.menu_closing = true;
                                                 }
                                             }
-                                        } else if self.menu_section == 1 {
+                                        } else if self.menu_section == 2 {
+                                            // Modal (Installed models) tab: activate model
                                             if let Some(i) = self.installed_state.selected() {
                                                 if i < self.installed_models.len() {
                                                     let selected_model =
@@ -4189,7 +4393,6 @@ impl App {
                                                             .contains(".gguf")
                                                         || selected_model.contains("GGUF")
                                                     {
-                                                        // Path is recorded in display as [...path] or in models.toml
                                                         let path =
                                                             selected_model
                                                                 .rfind('[')
@@ -4217,47 +4420,18 @@ impl App {
                                                                 });
 
                                                         if let Some(path) = path {
-                                                            match self.backend {
-                                                                AgentBackend::LlamaCppLib(_) => {
-                                                                    self.backend =
-                                                                        AgentBackend::LlamaCppLib(
-LlamaCppLibBackend::gguf(
-                                                                                path.clone(),
-                                                                            ),
-                                                                        );
-                                                                    self.status_message = format!(
-                                                                        "Active Engine: llama.cpp ({})",
-                                                                        path.display()
-                                                                    );
-                                                                }
-                                                                _ => {
-                                                                    self.backend = AgentBackend::LlamaCppLib(
+                                                            self.backend = AgentBackend::LlamaCppLib(
                                                                 LlamaCppLibBackend::gguf(path.clone()),
                                                             );
-                                                                    self.manager.set_active_gguf_path(path.display().to_string());
-                                                                    self.status_message = format!(
-                                                                        "Active Engine: llama.cpp lib ({})",
-                                                                        path.display()
-                                                                    );
-                                                                }
-                                                            }
-                                                        } else {
-                                                            self.backend = AgentBackend::LlamaCppLib(
-LlamaCppLibBackend::http(
-                                                                    "http://localhost:8080"
-                                                                        .to_string(),
-                                                                    selected_model.clone(),
-                                                                ),
-                                                            );
+                                                            self.manager.set_active_gguf_path(path.display().to_string());
                                                             self.status_message = format!(
-                                                                "Active Engine: llama.cpp server for '{}' (file not found on disk)",
-                                                                selected_model
+                                                                "Active Engine: llama.cpp lib ({})",
+                                                                path.display()
                                                             );
                                                         }
                                                     } else if let Some(path) =
                                                         self.manager.latest_gguf_path()
                                                     {
-                                                        // Default activate as llama.rs pure-Rust
                                                         self.backend = AgentBackend::LlamaCppLib(
                                                             LlamaCppLibBackend::gguf(path.clone()),
                                                         );
@@ -4266,185 +4440,19 @@ LlamaCppLibBackend::http(
                                                             "Active Engine: llama.cpp lib ({})",
                                                             path.display()
                                                         );
-                                                    } else {
-                                                        self.status_message = format!(
-                                                            "No local GGUF for '{}'",
-                                                            selected_model
-                                                        );
                                                     }
                                                     self.messages.push(format!("System: Switched active engine model to '{}'", selected_model));
                                                     self.initialized = false;
                                                     self.init_triggered = false;
-                                                    self.show_menu = false;
+                                                    self.menu_closing = true;
                                                 }
-                                            }
-                                        } else if self.menu_section == 2 {
-                                            if let Some(i) = self.config_state.selected() {
-                                                let current_path = self
-                                                    .backend
-                                                    .current_model_path()
-                                                    .or_else(|| self.manager.latest_gguf_path());
-                                                match i {
-                                                    0 => {
-                                                        // llama.rs pure Rust
-                                                        if let Some(path) = current_path {
-                                                            self.backend =
-                                                                AgentBackend::LlamaCppLib(
-                                                                    LlamaCppLibBackend::gguf(
-                                                                        path.clone(),
-                                                                    ),
-                                                                );
-                                                            self.status_message = format!(
-                                                                "Active Engine: llama.cpp lib ({})",
-                                                                path.display()
-                                                            );
-                                                        } else {
-                                                            self.backend =
-                                                                AgentBackend::LlamaCppLib(
-                                                                    LlamaCppLibBackend::http(
-                                                                        "http://localhost:8080"
-                                                                            .to_string(),
-                                                                        "llama.rs".to_string(),
-                                                                    ),
-                                                                );
-                                                            self.status_message = "Active Engine: llama.cpp lib HTTP :8080 (download a GGUF first)".to_string();
-                                                        }
-                                                    }
-                                                    1 => {
-                                                        // llama.cpp
-                                                        if let Some(path) = current_path {
-                                                            self.backend = AgentBackend::LlamaCppLib(
-LlamaCppLibBackend::gguf(path.clone()),
-                                                            );
-                                                            self.status_message = format!(
-                                                                "Active Engine: llama.cpp ({})",
-                                                                path.display()
-                                                            );
-                                                        } else {
-                                                            self.backend = AgentBackend::LlamaCppLib(
-LlamaCppLibBackend::http(
-                                                                    "http://localhost:8080"
-                                                                        .to_string(),
-                                                                    "llama.cpp".to_string(),
-                                                                ),
-                                                            );
-                                                            self.status_message = "Active Engine: llama.cpp server :8080 (no local GGUF)".to_string();
-                                                        }
-                                                    }
-                                                    _ => {
-                                                        self.backend = AgentBackend::Ollama(
-                                                            OllamaBackend::new(
-                                                                "llama3.2:latest".to_string(),
-                                                            ),
-                                                        );
-                                                        self.status_message =
-                                                    "Active Engine: Ollama (http://localhost:11434)"
-                                                        .to_string();
-                                                    }
-                                                }
-                                                self.messages.push(format!(
-                                                    "System: Backend switched to {}",
-                                                    self.backend.name()
-                                                ));
-                                                self.initialized = false;
-                                                self.init_triggered = false;
-                                                self.show_menu = false;
                                             }
                                         } else if self.menu_section == 3 {
-                                            if let Some(i) = self.runtime_state.selected() {
-                                                use crate::settings::{
-                                                    PowerMode, cycle_context_token_limit,
-                                                    cycle_repeat_threshold, format_context_tokens,
-                                                    get_settings, set_power_mode,
-                                                    toggle_repeat_thinking,
-                                                };
-                                                match i {
-                                                    0 => {
-                                                        set_power_mode(PowerMode::PowerSaver);
-                                                        // llama.cpp managed server restarts on next use
-                                                        crate::llama::server::shutdown_managed_server();
-                                                        self.status_message =
-                                                    "Power mode: Power Saver (llama.cpp restarts; llama.rs uses fewer tokens)"
-                                                        .to_string();
-                                                    }
-                                                    1 => {
-                                                        set_power_mode(PowerMode::Normal);
-                                                        crate::llama::server::shutdown_managed_server();
-                                                        self.status_message =
-                                                            "Power mode: Normal (default)"
-                                                                .to_string();
-                                                    }
-                                                    2 => {
-                                                        set_power_mode(PowerMode::Extreme);
-                                                        crate::llama::server::shutdown_managed_server();
-                                                        self.status_message =
-                                                    "Power mode: Extreme (llama.cpp max ngl; llama.rs more tokens)"
-                                                        .to_string();
-                                                    }
-
-
-
-
-
-
-
-
-
-                                                    4 => {
-                                                        use crate::settings::{
-                                                            cycle_stall_timeout,
-                                                            format_stall_timeout,
-                                                        };
-                                                        let t = cycle_stall_timeout();
-                                                        self.status_message = format!(
-                                                            "Stall Watchdog Timeout: {}",
-                                                            format_stall_timeout(t)
-                                                        );
-                                                    }
-                                                    5 => {
-                                                        cycle_repeat_threshold();
-                                                        let s = get_settings();
-                                                        self.status_message = format!(
-                                                            "Repeat threshold: {} consecutive hits",
-                                                            s.repeat_threshold
-                                                        );
-                                                    }
-                                                    6 => {
-                                                        toggle_repeat_thinking();
-                                                        let s = get_settings();
-                                                        self.status_message = format!(
-                                                            "Repeat detect on thinking: {}",
-                                                            if s.repeat_detect_thinking {
-                                                                "ON"
-                                                            } else {
-                                                                "OFF"
-                                                            }
-                                                        );
-                                                    }
-                                                    7 => {
-                                                        let n = cycle_context_token_limit();
-                                                        crate::llama::server::shutdown_managed_server();
-                                                        self.status_message = format!(
-                                                            "Context limit: {} tokens (llama-server -c restarts on next gen)",
-                                                            format_context_tokens(n)
-                                                        );
-                                                    }
-                                                    _ => {}
-                                                }
-                                                // Status bar + activity log only (not chat / not model ctx)
-                                                let s = get_settings();
-                                                if let Ok(mut l) = self.activity_logs.lock() {
-                                                    l.push(format!(
-                                                "[RUNTIME] power={} ctx={} temp={:.2} repeat={} think={}",
-                                                s.power_mode.label(),
-                                                format_context_tokens(
-                                                    crate::settings::context_token_limit()
-                                                ),
-                                                crate::settings::temperature(),
-                                                s.repeat_threshold,
-                                                s.repeat_detect_thinking
-                                            ));
-                                                }
+                                            // Settings tab (2-column)
+                                            if self.settings_col == 0 {
+                                                self.settings_col = 1; // shift focus to Column 2
+                                            } else {
+                                                self.adjust_setting_value(1); // cycle / modify
                                             }
                                         } else if self.menu_section == 4 {
                                             if let Some(i) = self.perms_state.selected() {
@@ -4714,7 +4722,7 @@ LlamaCppLibBackend::http(
                 _ => {}
             }
         } else {
-            // No event — only redraw if animating (generating / downloading / code anim)
+            // No event — redraw if any animation or background stream is active
             return Ok(is_animating);
         }
         Ok(true)
@@ -4723,7 +4731,7 @@ LlamaCppLibBackend::http(
     pub fn draw(&mut self, frame: &mut Frame) {
         let theme_color = self.theme_color;
         let dark_gray = Color::Rgb(100, 100, 100);
-        let light_blue = Color::Rgb(150, 180, 255);
+        let _light_blue = Color::Rgb(150, 180, 255);
         let white = Color::White;
 
         let area = frame.area();
@@ -4802,7 +4810,7 @@ LlamaCppLibBackend::http(
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Length(3),
+                    Constraint::Length(1), // 1-line top header bar
                     Constraint::Min(1),
                     Constraint::Length(input_box_h),
                 ]
@@ -4810,210 +4818,200 @@ LlamaCppLibBackend::http(
             )
             .split(area);
 
-        const BRAND_W: usize = 12;
-        // Exact width of every stats line including floor under the box
-        const STATS_W: usize = 16;
-        const LEFT_W: usize = 24;
+        let top_area = chunks[0];
+        let full_top_w = top_area.width as usize;
 
         let ctx_limit = crate::settings::context_token_limit().max(1);
         let ctx_used = self.estimate_full_session_tokens();
         self.context_tokens_est = ctx_used;
         let ctx_pct = ((ctx_used as f64 / ctx_limit as f64) * 100.0).min(999.0);
-        let ctx_label = crate::settings::format_context_tokens(ctx_limit);
-        let ctx_color = if ctx_pct >= 80.0 {
+        let _ctx_color = if ctx_pct >= 80.0 {
             Color::Rgb(255, 130, 140)
         } else if ctx_pct >= 50.0 {
             Color::Rgb(255, 220, 140)
         } else {
             Color::Rgb(143, 218, 255)
         };
-        let filled = ((ctx_pct / 100.0) * 8.0).round() as usize;
-        let mut bar = String::new();
-        for i in 0..8 {
-            bar.push(if i < filled { '█' } else { '░' });
-        }
-        let ctx_line = fit_width(&format!("CTX {bar} {ctx_pct:.0}% {ctx_label}"), LEFT_W);
 
-        let top_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(
-                [
-                    Constraint::Length(LEFT_W as u16),
-                    Constraint::Min(1),
-                    Constraint::Length(STATS_W as u16),
-                ]
-                .as_ref(),
-            )
-            .split(chunks[0]);
+        // Right side: CTX meter (e.g. " 🭧🭓CTX 1% 250K ")
+        let ctx_label = crate::settings::format_context_tokens(ctx_limit);
+        let right_ctx_str = format!("CTX {:.0}% {}", ctx_pct, ctx_label);
+        let right_trans = "🭧🭓";
+        let right_len = 2 + right_ctx_str.chars().count() + 2; // 🭧🭓 + " " + text + " "
 
-        let exit_hold_pct = self
-            .esc_hold_start
-            .map(|start| (start.elapsed().as_secs_f64() / 1.0).clamp(0.0, 1.0));
-        let exiting_text = if let Some(pct) = exit_hold_pct {
-            format!(" EXIT {:.0}%", pct * 100.0)
-        } else {
-            "".to_string()
-        };
-        let exit_glow = if let Some(pct) = exit_hold_pct {
-            let pulse = ((self.anim_tick as f64 * 0.35).sin() * 0.5 + 0.5) as f32;
-            let r = (180.0 + 75.0 * pct as f32 + 20.0 * pulse) as u8;
-            Color::Rgb(
-                r.min(255),
-                (40.0 * (1.0 - pct as f32)) as u8,
-                (40.0 * (1.0 - pct as f32)) as u8,
-            )
-        } else {
-            Color::Rgb(245, 248, 255)
-        };
+        // Left side: " HERCULES " + "🭞🭜"
+        let brand_text = " HERCULES ";
+        let left_trans = "🭞🭜";
+        let left_brand_w = brand_text.chars().count() + 2;
 
-        let brand_top = "╭[Hercules]╮"; // 12
-        // Left L0–L1 only; L2 is the shared floor (painted full-width below)
-        let logo_text = vec![
-            Line::from(Span::styled(
-                ctx_line,
-                Style::default().fg(ctx_color).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(vec![
-                Span::styled(
-                    brand_top.to_string(),
-                    Style::default().fg(exit_glow).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    fit_width(&exiting_text, LEFT_W.saturating_sub(BRAND_W)),
-                    Style::default()
-                        .fg(Color::Rgb(255, 120, 130))
-                        .bg(if exit_hold_pct.is_some() {
-                            Color::Rgb(140, 20, 30)
-                        } else {
-                            NORDIC_BG
-                        })
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-        ];
-        frame.render_widget(Paragraph::new(logo_text).style(Style::default().bg(NORDIC_BG)), top_chunks[0]);
+        let mid_bar_w = full_top_w.saturating_sub(left_brand_w + right_len);
 
-        let active_model = self.backend.name();
-        let exact_model = if let Some(start) = active_model.find('(') {
-            if let Some(end) = active_model.rfind(')') {
-                if end > start {
-                    active_model[start + 1..end].trim().to_string()
+        let get_bar_color = |col_idx: usize, bar_width: usize| -> Color {
+            if let Some(ref st) = stops {
+                let norm = col_idx as f32 / bar_width.max(1) as f32;
+                let cycle = ((norm * 0.3) - (phase * 0.04)).rem_euclid(1.0);
+                let wave = if cycle < 0.5 {
+                    cycle * 2.0
                 } else {
-                    active_model
+                    (1.0 - cycle) * 2.0
+                };
+                multi_stop_gradient(st, wave)
+            } else {
+                Color::Rgb(236, 239, 244)
+            }
+        };
+
+        let get_contrast_text_color = |bg: Color| -> Color {
+            if let Color::Rgb(r, g, b) = bg {
+                let lum = 0.299 * (r as f32) + 0.587 * (g as f32) + 0.114 * (b as f32);
+                if lum < 135.0 {
+                    Color::Rgb(245, 248, 255)
+                } else {
+                    NORDIC_BG
                 }
             } else {
-                active_model
+                NORDIC_BG
+            }
+        };
+
+        let mut top_spans: Vec<Span> = Vec::new();
+        let mut cur_top_col = 0;
+        let progress_val = *self.download_progress.lock().unwrap();
+        let esc_hold_p = self.esc_hold_start.map(|s| (s.elapsed().as_secs_f32() / 1.0).clamp(0.0, 1.0));
+
+        // 1. Left brand badge (colors matching the bar at col 0)
+        let brand_bg = get_bar_color(0, full_top_w);
+        let brand_fg = get_contrast_text_color(brand_bg);
+        top_spans.push(Span::styled(
+            brand_text,
+            Style::default().fg(brand_fg).bg(brand_bg).add_modifier(Modifier::BOLD),
+        ));
+        top_spans.push(Span::styled(left_trans, Style::default().fg(brand_bg).bg(NORDIC_BG)));
+        cur_top_col += left_brand_w;
+
+        // 2. Middle bar: 🬂
+        if let Some(hold_ratio) = esc_hold_p {
+            // While holding ESC to exit: fill left-to-right red gradient
+            let filled_count = ((hold_ratio * mid_bar_w as f32).round() as usize).min(mid_bar_w);
+            for i in 0..mid_bar_w {
+                if i < filled_count {
+                    let norm = i as f32 / mid_bar_w.max(1) as f32;
+                    let r = (240.0 * (1.0 - norm) + 200.0 * norm) as u8;
+                    let g = (60.0 * (1.0 - norm) + 40.0 * norm) as u8;
+                    let b = (60.0 * (1.0 - norm) + 80.0 * norm) as u8;
+                    top_spans.push(Span::styled("🬂", Style::default().fg(Color::Rgb(r, g, b)).bg(NORDIC_BG)));
+                } else {
+                    top_spans.push(Span::styled("🬂", Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG)));
+                }
+                cur_top_col += 1;
+            }
+        } else if let Some(dl_ratio) = progress_val {
+            // While downloading model: base color gray (76, 86, 106) and fill cyan-to-blue left to right
+            let filled_count = ((dl_ratio.clamp(0.0, 1.0) * mid_bar_w as f64).round() as usize).min(mid_bar_w);
+            for i in 0..mid_bar_w {
+                if i < filled_count {
+                    let norm = i as f32 / mid_bar_w.max(1) as f32;
+                    let r = (0.0 * (1.0 - norm) + 60.0 * norm) as u8;
+                    let g = (220.0 * (1.0 - norm) + 140.0 * norm) as u8;
+                    let b = (255.0 * (1.0 - norm) + 255.0 * norm) as u8;
+                    top_spans.push(Span::styled("🬂", Style::default().fg(Color::Rgb(r, g, b)).bg(NORDIC_BG)));
+                } else {
+                    top_spans.push(Span::styled("🬂", Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG)));
+                }
+                cur_top_col += 1;
             }
         } else {
-            active_model
+            // Normal mode: identical smooth gradient to prompt bar
+            for _ in 0..mid_bar_w {
+                let col_c = get_bar_color(cur_top_col, full_top_w);
+                top_spans.push(Span::styled("🬂", Style::default().fg(col_c).bg(NORDIC_BG)));
+                cur_top_col += 1;
+            }
+        }
+
+        // 3. Right CTX meter
+        let ctx_bg = get_bar_color(cur_top_col, full_top_w);
+        let ctx_fg = get_contrast_text_color(ctx_bg);
+        top_spans.push(Span::styled(right_trans, Style::default().fg(ctx_bg).bg(NORDIC_BG)));
+        top_spans.push(Span::styled(
+            format!(" {} ", right_ctx_str),
+            Style::default().fg(ctx_fg).bg(ctx_bg).add_modifier(Modifier::BOLD),
+        ));
+
+        // When dropdown is open / sliding:
+        // Row 0 shows: " Help  Registry  Modal  Settings "
+        // Row 1 shows the header bar
+        self.menu_tab_hits.clear();
+        let header_y = if self.header_anim_progress > 0.5 {
+            // Draw Row 0 menu bar
+            let mut menu_spans: Vec<Span> = Vec::new();
+            let mut col_ptr = 0u16;
+
+            let tabs = [
+                (0, " Help "),
+                (1, " Registry "),
+                (2, " Modal "),
+                (3, " Settings "),
+            ];
+
+            menu_spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
+            col_ptr += 1;
+
+            for (sec_idx, label) in tabs {
+                let label_len = label.chars().count() as u16;
+                let is_active = self.show_menu && self.menu_section == sec_idx;
+                let (tab_fg, tab_bg) = if is_active {
+                    (NORDIC_BG, Color::White)
+                } else {
+                    (Color::Rgb(220, 230, 242), Color::Rgb(46, 52, 64))
+                };
+                let x0 = col_ptr;
+                let x1 = col_ptr + label_len - 1;
+                self.menu_tab_hits.push((sec_idx, x0, x1));
+
+                menu_spans.push(Span::styled(
+                    label,
+                    Style::default().fg(tab_fg).bg(tab_bg).add_modifier(Modifier::BOLD),
+                ));
+                col_ptr += label_len;
+
+                menu_spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
+                col_ptr += 1;
+            }
+
+            frame.render_widget(
+                Paragraph::new(Line::from(menu_spans)).style(Style::default().bg(NORDIC_BG)),
+                Rect {
+                    x: top_area.x,
+                    y: 0,
+                    width: top_area.width,
+                    height: 1,
+                },
+            );
+            1
+        } else {
+            0
         };
-        let mid_w = top_chunks[1].width as usize;
-        let model_line = fit_width(&format!("Model: {exact_model}"), mid_w);
-        let hint_text = vec![
-            Line::from(Span::styled(
-                model_line,
-                Style::default().fg(Color::Rgb(225, 235, 248)).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
-            )),
-        ];
+
+        // Render header bar at header_y
+        self.header_bar_hit = Some((header_y, top_area.x, top_area.x + top_area.width.saturating_sub(1)));
         frame.render_widget(
-            Paragraph::new(hint_text).alignment(Alignment::Right),
-            top_chunks[1],
-        );
-
-        // Two-arm resource box — complete 3-line box in the right column
-        let cpu_usage = self.sys.global_cpu_usage().clamp(0.0, 100.0);
-        let mem_usage = (self.sys.used_memory() as f32 / self.sys.total_memory().max(1) as f32
-            * 100.0)
-            .clamp(0.0, 100.0);
-        let mem_gb = self.sys.used_memory() as f64 / 1_073_741_824.0;
-        let cpu_temp_c = cpu_package_temp_c(&self.sys);
-        let (c_line, m_line, s_bot) = fixed_resource_box(cpu_usage, cpu_temp_c, mem_usage, mem_gb);
-        debug_assert_eq!(c_line.chars().count(), STATS_W);
-        debug_assert_eq!(m_line.chars().count(), STATS_W);
-        debug_assert_eq!(s_bot.chars().count(), STATS_W);
-
-        // Complete box: top, middle, bottom (bottom also painted in full floor for join)
-        let stats_lines = vec![
-            Line::from(Span::styled(
-                c_line.clone(),
-                Style::default().fg(NORDIC_ACCENT).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                m_line.clone(),
-                Style::default().fg(NORDIC_ACCENT).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                s_bot.clone(),
-                Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG),
-            )),
-        ];
-        frame.render_widget(Paragraph::new(stats_lines).style(Style::default().bg(NORDIC_BG)), top_chunks[2]);
-
-        // Full-width floor on L2: joins brand → mid ─ → stats bottom (same glyphs as s_bot)
-        let full_w = chunks[0].width as usize;
-        let floor = continuous_top_floor(full_w, LEFT_W, STATS_W);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                floor,
-                Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG),
-            ))).style(Style::default().bg(NORDIC_BG)),
+            Paragraph::new(Line::from(top_spans)).style(Style::default().bg(NORDIC_BG)),
             Rect {
-                x: chunks[0].x,
-                y: chunks[0].y.saturating_add(2),
-                width: chunks[0].width,
+                x: top_area.x,
+                y: header_y,
+                width: top_area.width,
                 height: 1,
             },
         );
 
-        // --- Dynamic Focus Glowing Border Pulse with KramaFrame ---
-        // Exit-hold overrides input border with red glow
-        let focus_progress = self.krama.get_progress_f32("focus", 0);
-        let _border_color = if exit_hold_pct.is_some() {
-            exit_glow
-        } else if self.input_focused {
-            let pulse = (self.anim_tick as f64 * 0.18 + focus_progress as f64).sin() * 0.5 + 0.5;
-            let g = (140.0 + 115.0 * pulse) as u8;
-            let b = (80.0 + 60.0 * pulse) as u8;
-            Color::Rgb(0, g, b)
-        } else {
-            dark_gray
+        // --- Main Chat Body Layout (Full width, no side log panel) ---
+        let chat_area = Rect {
+            x: chunks[1].x,
+            y: if header_y == 1 { chunks[1].y.saturating_add(1) } else { chunks[1].y },
+            width: chunks[1].width,
+            height: if header_y == 1 { chunks[1].height.saturating_sub(1) } else { chunks[1].height },
         };
-
-        // --- Split Terminal Layout (Main Chat + Smooth Sliding Activity Console) ---
-        let log_pct = self.current_log_pane_pct.round() as u16;
-        let main_split = if log_pct == 0 {
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(100)].as_ref())
-                .split(chunks[1])
-        } else {
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(
-                    [
-                        Constraint::Percentage(100 - log_pct), // Left Pane: Chat
-                        Constraint::Percentage(log_pct),       // Right Pane: Activity Console
-                    ]
-                    .as_ref(),
-                )
-                .split(chunks[1])
-        };
-
-        // --- Dynamic Main Body Layout (Chat + Main Body Aligned Gradient Progress Bar) ---
-        let progress_val = *self.download_progress.lock().unwrap();
-        let left_chunks = if progress_val.is_some() {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(3)].as_ref())
-                .split(main_split[0])
-        } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1)].as_ref())
-                .split(main_split[0])
-        };
-
-        let chat_area = left_chunks[0];
         let available_width = (chat_area.width.saturating_sub(2) as usize).max(1);
 
         // Keep chip anchors on valid Agent turns so buttons scroll with that turn
@@ -5036,6 +5034,7 @@ LlamaCppLibBackend::http(
         let mut chat_lines: Vec<Line> = Vec::new();
         // (chip_id, logical chat_lines index where chip spacer starts)
         let mut chip_line_starts: Vec<(u64, usize)> = Vec::new();
+        let mut section_headers: Vec<(usize, String, Color)> = Vec::new();
         let mut all_toggle_buttons: Vec<(usize, usize, u16, u16, u16, u16)> = Vec::new();
         let mut all_copy_buttons: Vec<(usize, usize, u16, u16, String)> = Vec::new();
         let mut all_scroll_buttons: Vec<(usize, usize, u16, u16, u16, u16, u16, u16, usize)> = Vec::new();
@@ -5060,6 +5059,7 @@ LlamaCppLibBackend::http(
                 let user_bg = Color::Rgb(163, 190, 140); // Sage Green
                 let user_text = m.strip_prefix("You:").unwrap_or(&m[4..]).trim();
                 let title_spans = vec![Span::styled(" You ", Style::default().fg(NORDIC_BG).bg(user_bg).add_modifier(Modifier::BOLD))];
+                section_headers.push((chat_lines.len(), "You".to_string(), user_bg));
                 push_full_shaded!(&mut chat_lines, title_spans, 5, available_width, content_bg);
                 for u_line in user_text.lines() {
                     let inline_spans = crate::markdown::parse_inline(u_line, false, false);
@@ -5159,6 +5159,7 @@ LlamaCppLibBackend::http(
                         };
                         let think_len = think_tag.chars().count();
                         let title_spans = vec![Span::styled(think_tag, Style::default().fg(Color::Rgb(245, 248, 255)).bg(think_bg).add_modifier(Modifier::BOLD))];
+                        section_headers.push((chat_lines.len(), think_label.to_string(), think_bg));
                         push_full_shaded!(&mut chat_lines, title_spans, think_len, available_width, content_bg);
 
                         if !self.thinking_collapsed {
@@ -5191,17 +5192,24 @@ LlamaCppLibBackend::http(
                                             break;
                                         }
                                         let age = visible_think.saturating_sub(global_think_ch);
-                                        let progress = if is_generating_val && is_last_message {
-                                            (age as f64 / 10.0).clamp(0.1, 1.0)
+                                        let is_streaming = is_generating_val && is_last_message;
+                                        let target_r = 220.0;
+                                        let target_g = 160.0;
+                                        let target_b = 255.0;
+
+                                        let style_color = if is_streaming && age < 8 {
+                                            let (sr, sg, sb) = (0.0, 255.0, 120.0); // Vibrant neon green
+                                            let t = (age as f64 / 6.0).clamp(0.0, 1.0);
+                                            let r = (sr + (target_r - sr) * t).round() as u8;
+                                            let g = (sg + (target_g - sg) * t).round() as u8;
+                                            let b = (sb + (target_b - sb) * t).round() as u8;
+                                            Color::Rgb(r, g, b)
                                         } else {
-                                            1.0
+                                            Color::Rgb(target_r as u8, target_g as u8, target_b as u8)
                                         };
-                                        let r = (160.0 + 60.0 * progress) as u8;
-                                        let g = (120.0 + 40.0 * progress) as u8;
-                                        let b = (220.0 + 35.0 * progress) as u8;
                                         line_spans.push(Span::styled(
                                             ch.to_string(),
-                                            Style::default().fg(Color::Rgb(r, g, b)).bg(content_bg),
+                                            Style::default().fg(style_color).bg(content_bg),
                                         ));
                                         global_think_ch += 1;
                                     }
@@ -5251,15 +5259,23 @@ LlamaCppLibBackend::http(
                     let think_len = think_part.as_ref().map(|t| t.chars().count()).unwrap_or(0);
                     let available_output = reveal_limit.saturating_sub(think_len);
 
-                    if !text_to_render.trim().is_empty() || is_generating_val {
+                    let active_write_chip = self.tool_chips.iter().any(|c| c.kind == tool_panel::ToolPanelKind::Write && !c.tag_closed);
+                    let should_show_agent = !text_to_render.trim().is_empty() || (is_generating_val && !active_write_chip && think_part.is_none());
+
+                    if should_show_agent {
                         let agent_bg = Color::Rgb(136, 192, 208);
                         let agent_label = if is_generating_val && is_last_message {
-                            " Agent (streaming) "
+                            if active_write_chip {
+                                " Agent (writing) "
+                            } else {
+                                " Agent (streaming) "
+                            }
                         } else {
                             " Agent "
                         };
                         let agent_len = agent_label.chars().count();
                         let title_spans = vec![Span::styled(agent_label, Style::default().fg(NORDIC_BG).bg(agent_bg).add_modifier(Modifier::BOLD))];
+                        section_headers.push((chat_lines.len(), agent_label.trim().to_string(), agent_bg));
                         push_full_shaded!(&mut chat_lines, title_spans, agent_len, available_width, content_bg);
 
                         let mut global_out_ch = 0;
@@ -5365,6 +5381,7 @@ LlamaCppLibBackend::http(
                         action_tag,
                         Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
                     )];
+                    section_headers.push((chat_lines.len(), format!("Action: {}", chip.label_text()), action_bg));
                     push_full_shaded!(&mut chat_lines, title_spans, 8, available_width, content_bg);
 
                     let chip_summary = chip.label_text();
@@ -5379,18 +5396,55 @@ LlamaCppLibBackend::http(
                     let cur_w = 2 + chip_summary.chars().count();
                     push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
 
-                    // If expanded (or active/running), embed content right under Action!
-                    if chip.expanded || !chip.tag_closed {
-                        if !chip.body.trim().is_empty() {
-                            for b_line in chip.body.lines().take(25) {
-                                let cur_spans = vec![
-                                    Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
-                                    Span::styled("   ", Style::default().bg(content_bg)),
-                                    Span::styled(b_line.to_string(), Style::default().fg(NORDIC_TEXT).bg(content_bg)),
-                                ];
-                                let cur_w = 4 + b_line.chars().count();
-                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
-                            }
+                    // Compute animated content line count
+                    let max_body_lines = chip.body.lines().count().min(25);
+                    let target_open = chip.expanded || !chip.tag_closed;
+                    let elapsed_ms = chip.anim_start.map(|s| s.elapsed().as_millis()).unwrap_or(300);
+                    let anim_progress = (elapsed_ms as f32 / 200.0).clamp(0.0, 1.0);
+                    let visible_lines = if target_open {
+                        if chip.tag_closed {
+                            // Expanding or already expanded
+                            ((max_body_lines as f32) * anim_progress).round() as usize
+                        } else {
+                            // Actively writing / streaming: show full current body
+                            max_body_lines
+                        }
+                    } else {
+                        // Collapsing once completed
+                        let remaining = 1.0 - anim_progress;
+                        ((max_body_lines as f32) * remaining).round() as usize
+                    };
+
+                    if visible_lines > 0 && !chip.body.trim().is_empty() {
+                        // Top horizontal separator rule
+                        let rule_spans = vec![
+                            Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
+                            Span::styled(" ", Style::default().bg(content_bg)),
+                            Span::styled("─".repeat(available_width.saturating_sub(4).max(10)), Style::default().fg(Color::Rgb(60, 68, 82)).bg(content_bg)),
+                        ];
+                        push_full_shaded!(&mut chat_lines, rule_spans, available_width, available_width, content_bg);
+
+                        for (line_idx, b_line) in chip.body.lines().take(visible_lines).enumerate() {
+                            let is_del = b_line.starts_with("- ") || b_line.starts_with('-');
+                            let is_add = b_line.starts_with("+ ") || b_line.starts_with('+');
+                            
+                            let (line_fg, sign_color) = if is_del {
+                                (Color::Rgb(255, 130, 140), Color::Rgb(255, 90, 100))
+                            } else if is_add {
+                                (Color::Rgb(163, 190, 140), Color::Rgb(80, 220, 140))
+                            } else {
+                                (NORDIC_TEXT, Color::Rgb(100, 110, 130))
+                            };
+
+                            let line_num_str = format!(" {:2} │ ", line_idx + 1);
+                            let cur_spans = vec![
+                                Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
+                                Span::styled(" ", Style::default().bg(content_bg)),
+                                Span::styled(line_num_str, Style::default().fg(sign_color).bg(content_bg)),
+                                Span::styled(b_line.to_string(), Style::default().fg(line_fg).bg(content_bg)),
+                            ];
+                            let cur_w = 2 + 7 + b_line.chars().count();
+                            push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
                         }
                     }
                     chat_lines.push(Line::from(""));
@@ -5399,6 +5453,7 @@ LlamaCppLibBackend::http(
                 let sys_bg = Color::Rgb(94, 129, 172); // Nordic Slate Blue
                 let sys_body = m.strip_prefix("System:").unwrap_or(&m[7..]).trim();
                 let title_spans = vec![Span::styled(" System ", Style::default().fg(Color::Rgb(245, 248, 255)).bg(sys_bg).add_modifier(Modifier::BOLD))];
+                section_headers.push((chat_lines.len(), "System".to_string(), sys_bg));
                 push_full_shaded!(&mut chat_lines, title_spans, 8, available_width, content_bg);
                 for line in sys_body.lines() {
                     let mut cur_spans = vec![
@@ -5553,20 +5608,44 @@ LlamaCppLibBackend::http(
             .wrap(ratatui::widgets::Wrap { trim: false })
             .block(
                 Block::default()
-                    .borders(if log_pct == 0 {
-                        Borders::NONE
-                    } else {
-                        Borders::RIGHT
-                    })
-                    .border_style(Style::default().fg(dark_gray))
-                    .title(" Main Chat "),
+                    .borders(Borders::NONE)
             );
         frame.render_widget(chat_box, chat_area);
 
+        // Sticky process title on top of chat area (like code review sticky header)
+        if self.scroll_offset > 0 {
+            // Find active section at top of viewport (visual line == self.scroll_offset)
+            let mut active_header: Option<(&str, Color)> = None;
+            for (line_idx, label, color) in &section_headers {
+                let vis = visual_at.get(*line_idx).copied().unwrap_or(0);
+                if vis <= self.scroll_offset {
+                    active_header = Some((label.as_str(), *color));
+                } else {
+                    break;
+                }
+            }
+
+            if let Some((label, bg_col)) = active_header {
+                let sticky_label = format!(" {label} ");
+                let sticky_w = (sticky_label.chars().count() as u16).min(chat_area.width.saturating_sub(4));
+                let sticky_area = Rect {
+                    x: chat_area.x, // Sticky to left side matching actual section label direction
+                    y: chat_area.y,
+                    width: sticky_w,
+                    height: 1,
+                };
+                let sticky_span = Span::styled(
+                    sticky_label,
+                    Style::default().fg(NORDIC_BG).bg(bg_col).add_modifier(Modifier::BOLD),
+                );
+                frame.render_widget(Paragraph::new(Line::from(sticky_span)), sticky_area);
+            }
+        }
+
         // Draw chips at their agent-turn anchors (visual line + scroll)
         {
-            let x = chat_area.x.saturating_add(3);
-            let max_w = chat_area.width.saturating_sub(6);
+            let _x = chat_area.x.saturating_add(3);
+            let _max_w = chat_area.width.saturating_sub(6);
             let chat_top = chat_area.y.saturating_add(1);
             let chat_bot = chat_area
                 .y
@@ -5599,138 +5678,7 @@ LlamaCppLibBackend::http(
         }
 
         self.last_chat_area = Some(chat_area);
-
-        // KramaFrame fly: abs(progress) so reverse animates 1→0 (not clamp-to-0 snap)
-        if let Some(ref mut panel) = self.tool_panel {
-            let t = self.krama.get_progress_f32("panel_fly", 0).abs();
-            // Sync chip origin every frame
-            if let Some(chip) = self
-                .tool_chips
-                .iter()
-                .find(|c| c.id == panel.chip_id)
-                .cloned()
-            {
-                if let Some(r) = chip.rect {
-                    panel.chip_rect = Some(r);
-                }
-                if panel.kind == ToolPanelKind::Write {
-                    panel.set_body_streaming(chip.body.clone(), chip.tag_closed);
-                } else if panel.kind == ToolPanelKind::Cmd && !chip.body.is_empty() {
-                    panel.set_body_streaming(chip.body.clone(), true);
-                }
-            } else if let Some(chip) = self.tool_chips.iter().find(|c| {
-                c.kind == panel.kind
-                    && tool_panel::same_tool_target(panel.kind, &c.target, &panel.target)
-            }) {
-                if let Some(r) = chip.rect {
-                    panel.chip_rect = Some(r);
-                }
-            }
-            if panel.chip_rect.is_none() {
-                panel.chip_rect = Some(Rect {
-                    x: chat_area.x + 3,
-                    y: chat_area.y + 4,
-                    width: 30,
-                    height: 3,
-                });
-            }
-            let dock_w = (chat_area.width * 45 / 100).clamp(30, chat_area.width.saturating_sub(10));
-            // Minimized dock is title bar only
-            let dock_h = if panel.minimized {
-                3
-            } else {
-                chat_area.height.saturating_sub(2)
-            };
-            panel.dock_rect = Some(Rect {
-                x: chat_area.x + chat_area.width.saturating_sub(dock_w),
-                y: chat_area.y + 1,
-                width: dock_w,
-                height: dock_h,
-            });
-            if let Some(rect) = tool_panel::draw_tool_panel(frame, panel, t, theme_color) {
-                self.tool_panel_rect = Some(rect);
-            }
-        } else {
-            self.tool_panel_rect = None;
-        }
-
-        // Main Body Aligned Gradient Progress Bar
-        if let Some(ratio) = progress_val {
-            let total_width = left_chunks[1].width.saturating_sub(22) as usize;
-            let mut bar_spans = Vec::new();
-            bar_spans.push(Span::styled(
-                " [DOWNLOADING] ",
-                Style::default()
-                    .fg(theme_color)
-                    .add_modifier(Modifier::BOLD),
-            ));
-
-            let subblocks = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
-            let total_subblocks = total_width * 8;
-            let filled_subblocks = ((ratio.clamp(0.0, 1.0) * total_subblocks as f64).round()
-                as usize)
-                .min(total_subblocks);
-            let full_blocks = filled_subblocks / 8;
-            let partial_idx = filled_subblocks % 8;
-
-            for i in 0..full_blocks {
-                let norm = i as f64 / total_width.max(1) as f64;
-                let r = (255.0 * norm) as u8;
-                let g = 255;
-                let b = (255.0 * (1.0 - norm)) as u8;
-                bar_spans.push(Span::styled("█", Style::default().fg(Color::Rgb(r, g, b))));
-            }
-
-            if full_blocks < total_width && partial_idx > 0 {
-                let norm = full_blocks as f64 / total_width.max(1) as f64;
-                let r = (255.0 * norm) as u8;
-                let g = 255;
-                let b = (255.0 * (1.0 - norm)) as u8;
-                let partial_str = subblocks[partial_idx].to_string();
-                bar_spans.push(Span::styled(
-                    partial_str,
-                    Style::default().fg(Color::Rgb(r, g, b)),
-                ));
-            }
-
-            let rendered_blocks = full_blocks + if partial_idx > 0 { 1 } else { 0 };
-            for _ in rendered_blocks..total_width {
-                bar_spans.push(Span::styled("░", Style::default().fg(dark_gray)));
-            }
-            bar_spans.push(Span::styled(
-                format!(" {:.1}% ", ratio * 100.0),
-                Style::default().fg(white).add_modifier(Modifier::BOLD),
-            ));
-
-            let pbar = Paragraph::new(Line::from(bar_spans)).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme_color))
-                    .title(" Dynamic Model Weights Progress Bar "),
-            );
-            frame.render_widget(pbar, left_chunks[1]);
-        }
-
-        if log_pct > 0 {
-            let logs_guard = self.activity_logs.lock().unwrap();
-            let logs_text = logs_guard.join("\n");
-            let log_lines_count = logs_guard.len() as u16;
-            let console_scroll = log_lines_count.saturating_sub(15);
-
-            let console_box = Paragraph::new(logs_text)
-                .style(Style::default().bg(NORDIC_BG))
-                .scroll((console_scroll, 0))
-                .wrap(ratatui::widgets::Wrap { trim: true })
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(light_blue))
-                        .title(" Live Activity Log "),
-                );
-            frame.render_widget(console_box, main_split[1]);
-        }
+        self.tool_panel_rect = None;
 
         // --- Input Area (Full width bar, 1-char padded user text lines) ---
         let input_area = chunks[2];
@@ -5757,11 +5705,17 @@ LlamaCppLibBackend::http(
         // Extra spaces on both sides: "  {MODEL NAME}  "
         let badge_text = format!("  {}  ", model_clean);
         let badge_len = badge_text.chars().count();
-        let left_trans = "🭆🭂"; // 2 transition characters
-        let left_trans_len = 2;
+        let right_trans = "🭆🭂"; // 2 transition characters
+        let right_trans_len = 2;
 
-        let total_badge_w = left_trans_len + badge_len;
-        let left_bar_w = bar_w.saturating_sub(total_badge_w).max(1);
+        let main_badge_text = " Main ";
+        let main_badge_len = main_badge_text.chars().count();
+        let main_trans = "🭍🭑";
+        let main_trans_len = 2;
+        let left_main_total = main_badge_len + main_trans_len;
+
+        let total_right_badge_w = right_trans_len + badge_len;
+        let mid_bar_w = bar_w.saturating_sub(left_main_total + total_right_badge_w).max(1);
 
         let white_c = Color::Rgb(236, 239, 244); // #ECEFF4 Snow White
 
@@ -5797,19 +5751,29 @@ LlamaCppLibBackend::http(
         let mut bar_spans: Vec<Span> = Vec::new();
         let mut cur_col_idx = 0;
 
-        // 1. Left bar characters: 🬭 (smooth gradient character by character)
-        for _ in 0..left_bar_w {
+        // 1. Left " Main " badge
+        let main_bg = get_bar_color(0, bar_w);
+        let main_fg = get_contrast_text_color(main_bg);
+        bar_spans.push(Span::styled(
+            main_badge_text,
+            Style::default().fg(main_fg).bg(main_bg).add_modifier(Modifier::BOLD),
+        ));
+        bar_spans.push(Span::styled(main_trans, Style::default().fg(main_bg).bg(NORDIC_BG)));
+        cur_col_idx += left_main_total;
+
+        // 2. Middle bar characters: 🬭 (smooth gradient character by character)
+        for _ in 0..mid_bar_w {
             let col_c = get_bar_color(cur_col_idx, bar_w);
             bar_spans.push(Span::styled("🬭", Style::default().fg(col_c).bg(NORDIC_BG)));
             cur_col_idx += 1;
         }
 
-        // 2. Left transition: 🭆🭂 and 3. Model Name badge (single uniform bg color)
+        // 3. Right transition: 🭆🭂 and Model Name badge (single uniform bg color)
         let c_badge_bg = get_bar_color(cur_col_idx, bar_w);
         let c_badge_fg = get_contrast_text_color(c_badge_bg);
 
-        bar_spans.push(Span::styled(left_trans, Style::default().fg(c_badge_bg).bg(NORDIC_BG)));
-        cur_col_idx += left_trans_len;
+        bar_spans.push(Span::styled(right_trans, Style::default().fg(c_badge_bg).bg(NORDIC_BG)));
+        cur_col_idx += right_trans_len;
 
         let badge_start_col = input_area.x + cur_col_idx as u16;
         bar_spans.push(Span::styled(
@@ -5829,12 +5793,16 @@ LlamaCppLibBackend::http(
             let available_content_rows = input_box_h.saturating_sub(1);
             let (_cursor_col, cursor_row) = self.input_cursor_col_row(inner_w);
 
-            // Auto-scroll input vertically
+            let total_prompt_lines = wrapped_prompt_lines.len().max(1);
+            let max_possible_scroll = total_prompt_lines.saturating_sub(available_content_rows as usize) as u16;
+
+            // Auto-scroll input vertically so cursor is always visible
             if cursor_row >= self.input_scroll_y + available_content_rows {
-                self.input_scroll_y = cursor_row.saturating_sub(available_content_rows.saturating_sub(1));
+                self.input_scroll_y = (cursor_row + 1).saturating_sub(available_content_rows);
             } else if cursor_row < self.input_scroll_y {
                 self.input_scroll_y = cursor_row;
             }
+            self.input_scroll_y = self.input_scroll_y.min(max_possible_scroll);
 
             if self.term_is_interactive() {
                 input_ui_lines.push(Line::from(vec![
@@ -5869,7 +5837,7 @@ LlamaCppLibBackend::http(
                 let max_scroll = total_lines.saturating_sub(available_content_rows as usize);
                 let thumb_height = (((available_content_rows as f32 / total_lines as f32) * available_content_rows as f32).round() as usize).max(1);
                 let thumb_start = if max_scroll > 0 {
-                    (((self.input_scroll_y as f32 / max_scroll as f32) * (available_content_rows as usize - thumb_height) as f32).round() as usize)
+                    ((self.input_scroll_y as f32 / max_scroll as f32) * (available_content_rows as usize - thumb_height) as f32).round() as usize 
                 } else {
                     0
                 };
@@ -5921,436 +5889,493 @@ LlamaCppLibBackend::http(
             }
         }
 
-        // --- Unified Menu Modal (Popup with KramaFrame Fade) ---
+        // --- Custom Framed Container Modal Widget ---
         if self.show_menu {
-            let menu_fade_val = self.krama.get_progress_f32("menu_fade", 0);
-            let menu_border_color = Color::Rgb(
-                0,
-                (255.0 * menu_fade_val) as u8,
-                (128.0 * menu_fade_val) as u8,
-            );
+            let anim_p = self.menu_anim_progress.clamp(0.0, 1.0);
+            if anim_p > 0.01 {
+                let full_w = area.width;
+                let full_h = area.height;
 
-            let popup_layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(
-                    [
-                        Constraint::Percentage(15),
-                        Constraint::Percentage(70),
-                        Constraint::Percentage(15),
-                    ]
-                    .as_ref(),
-                )
-                .split(frame.area());
+                // Modal dimensions with smooth width and height slide/fade animation
+                let target_w = (full_w.saturating_sub(12)).min(110).max(60);
+                let target_h = (full_h.saturating_sub(8)).min(28).max(18);
+                let modal_w = ((target_w as f32 * (0.3 + 0.7 * anim_p)).round() as u16).max(36);
+                let modal_h = ((target_h as f32 * (0.3 + 0.7 * anim_p)).round() as u16).max(12);
 
-            let center_layout = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(
-                    [
-                        Constraint::Percentage(15),
-                        Constraint::Percentage(70),
-                        Constraint::Percentage(15),
-                    ]
-                    .as_ref(),
-                )
-                .split(popup_layout[1]);
-
-            let area = center_layout[1];
-            frame.render_widget(Clear, area);
-            frame.render_widget(Block::default().style(Style::default().bg(NORDIC_DARK_BG)), area);
-
-            let menu_block = Block::default()
-                .style(Style::default().bg(NORDIC_DARK_BG))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(menu_border_color))
-                .title(" Menu Modal [ Tab / Left / Right: Switch Section | Esc: Close ] ");
-
-            let inner_menu = menu_block.inner(area);
-            frame.render_widget(menu_block, area);
-
-            let menu_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(1)].as_ref())
-                .split(inner_menu);
-
-            // Tab bar headers inside menu
-            let reg_style = if self.menu_section == 0 {
-                Style::default()
-                    .fg(NORDIC_BG)
-                    .bg(NORDIC_ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG)
-            };
-            let inst_style = if self.menu_section == 1 {
-                Style::default()
-                    .fg(NORDIC_BG)
-                    .bg(NORDIC_ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG)
-            };
-            let cfg_style = if self.menu_section == 2 {
-                Style::default()
-                    .fg(NORDIC_BG)
-                    .bg(NORDIC_ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG)
-            };
-            let rt_style = if self.menu_section == 3 {
-                Style::default()
-                    .fg(NORDIC_BG)
-                    .bg(NORDIC_ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG)
-            };
-            let perm_style = if self.menu_section == 4 {
-                Style::default()
-                    .fg(NORDIC_BG)
-                    .bg(NORDIC_ACCENT)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG)
-            };
-
-            let tab_header = Paragraph::new(Line::from(vec![
-                Span::styled(" ", Style::default().bg(NORDIC_DARK_BG)),
-                Span::styled(" [1] Registry ", reg_style),
-                Span::styled(" [2] Installed ", inst_style),
-                Span::styled(" [3] Engine ", cfg_style),
-                Span::styled(" [4] Runtime ", rt_style),
-                Span::styled(" [5] Perms ", perm_style),
-            ])).style(Style::default().bg(NORDIC_DARK_BG));
-            frame.render_widget(tab_header, menu_chunks[0]);
-
-            if self.menu_section == 0 {
-                // Model Registry with Live Search Bar
-                let reg_chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(3), Constraint::Min(1)].as_ref())
-                    .split(menu_chunks[1]);
-
-                let search_text = if self.registry_search_query.is_empty() {
-                    Span::styled(
-                        "Type to query HuggingFace / Ollama API live...",
-                        Style::default().fg(NORDIC_MUTED).bg(NORDIC_DARK_BG),
-                    )
-                } else {
-                    Span::styled(
-                        format!(" {}", self.registry_search_query),
-                        Style::default().fg(NORDIC_ACCENT).bg(NORDIC_DARK_BG),
-                    )
+                let modal_x = area.x + (full_w.saturating_sub(modal_w)) / 2;
+                let modal_y = area.y + (full_h.saturating_sub(modal_h)) / 2;
+                let container_rect = Rect {
+                    x: modal_x,
+                    y: modal_y,
+                    width: modal_w,
+                    height: modal_h,
                 };
-                let search_box = Paragraph::new(Line::from(search_text))
-                    .style(Style::default().bg(NORDIC_DARK_BG))
-                    .block(
-                        Block::default()
-                            .style(Style::default().bg(NORDIC_DARK_BG))
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(NORDIC_ACCENT))
-                            .title(" Live HuggingFace / Ollama Search Bar "),
-                    );
-                frame.render_widget(search_box, reg_chunks[0]);
 
-                let list_fade_val = self.krama.get_progress_f32("list_fade", 0);
-                let list_item_color = Color::Rgb(
-                    (136.0 * list_fade_val) as u8,
-                    (192.0 * list_fade_val) as u8,
-                    (208.0 * list_fade_val) as u8,
-                );
+                // Clear container background with exact screen background
+                frame.render_widget(Clear, container_rect);
+                frame.render_widget(Block::default().style(Style::default().bg(NORDIC_BG)), container_rect);
 
-                let mut items: Vec<ListItem> = self
-                    .registry_models
-                    .iter()
-                    .map(|m| ListItem::new(Span::styled(m, Style::default().fg(list_item_color).bg(NORDIC_DARK_BG))))
-                    .collect();
+                let menu_title_str = match self.menu_section {
+                    0 => " Help ",
+                    1 => " Registry ",
+                    2 => " Modal ",
+                    _ => " Settings ",
+                };
 
-                let hf_items = self.hf_models.iter().map(|m| {
-                    let is_ollama = m.starts_with("Ollama:");
-                    let color = if is_ollama {
-                        list_item_color
-                    } else {
-                        Color::Rgb(
-                            150,
-                            (200.0 * list_fade_val) as u8,
-                            (255.0 * list_fade_val) as u8,
-                        )
-                    };
-                    ListItem::new(Span::styled(m, Style::default().fg(color).bg(NORDIC_DARK_BG)))
+                // Color transition with opacity fade
+                let border_alpha = (255.0 * anim_p).round() as u8;
+                let border_color = Color::Rgb(border_alpha, border_alpha, border_alpha);
+                let close_btn_str = " x ";
+                let close_btn_len = close_btn_str.chars().count() as u16;
+
+                // Top Left: 🭈🭆🭂{ menu }🭞🭜
+                // Top Right: 🭧🭓 x 🭍🭑🬽
+                let tl_badge_w = 3 + menu_title_str.chars().count() as u16 + 2; // "🭈🭆🭂" + title + "🭞🭜"
+                let tr_badge_w = 2 + close_btn_len + 3; // "🭧🭓" + " x " + "🭍🭑🬽"
+                let top_bar_fill_w = modal_w.saturating_sub(tl_badge_w + tr_badge_w) as usize;
+
+                // Record close button hit
+                let close_btn_x0 = modal_x + modal_w.saturating_sub(tr_badge_w) + 2;
+                let close_btn_x1 = close_btn_x0 + close_btn_len.saturating_sub(1);
+                self.container_close_hit = Some((modal_y, close_btn_x0, close_btn_x1));
+
+                // --- Row 0 (Top line) ---
+                let mut row0_spans: Vec<Span> = Vec::new();
+                // 🭈🭆🭂
+                row0_spans.push(Span::styled("🭈🭆🭂", Style::default().fg(border_color).bg(NORDIC_BG)));
+                // { menu } with white background and base text
+                row0_spans.push(Span::styled(
+                    menu_title_str,
+                    Style::default().fg(NORDIC_BG).bg(border_color).add_modifier(Modifier::BOLD),
+                ));
+                // 🭞🭜
+                row0_spans.push(Span::styled("🭞🭜", Style::default().fg(border_color).bg(NORDIC_BG)));
+                // Top border fill 🬂
+                for _ in 0..top_bar_fill_w {
+                    row0_spans.push(Span::styled("🬂", Style::default().fg(border_color).bg(NORDIC_BG)));
+                }
+                // 🭧🭓
+                row0_spans.push(Span::styled("🭧🭓", Style::default().fg(border_color).bg(NORDIC_BG)));
+                // " x " close button
+                row0_spans.push(Span::styled(
+                    close_btn_str,
+                    Style::default().fg(NORDIC_BG).bg(border_color).add_modifier(Modifier::BOLD),
+                ));
+                // 🭍🭑🬽
+                row0_spans.push(Span::styled("🭍🭑🬽", Style::default().fg(border_color).bg(NORDIC_BG)));
+                frame.render_widget(Paragraph::new(Line::from(row0_spans)).style(Style::default().bg(NORDIC_BG)), Rect {
+                    x: modal_x,
+                    y: modal_y,
+                    width: modal_w,
+                    height: 1,
                 });
-                items.extend(hf_items);
 
-                let list = List::new(items)
-                    .style(Style::default().bg(NORDIC_DARK_BG))
-                    .block(Block::default().style(Style::default().bg(NORDIC_DARK_BG)).borders(Borders::TOP).title(
-                        " Open Weights Registry [Up/Down: Navigate | Enter: Download & Install] ",
-                    ))
-                    .highlight_style(Style::default().bg(NORDIC_ACCENT).fg(NORDIC_BG).add_modifier(Modifier::BOLD))
-                    .highlight_symbol(">> ");
-
-                frame.render_stateful_widget(list, reg_chunks[1], &mut self.registry_state);
-            } else if self.menu_section == 1 {
-                // Installed Models Tab (Real Local Models with KramaFrame Fade)
-                let list_fade_val = self.krama.get_progress_f32("list_fade", 0);
-                let list_item_color = Color::Rgb(
-                    (136.0 * list_fade_val) as u8,
-                    (192.0 * list_fade_val) as u8,
-                    (208.0 * list_fade_val) as u8,
-                );
-
-                let items: Vec<ListItem> = self
-                    .installed_models
-                    .iter()
-                    .map(|m| {
-                        ListItem::new(Span::styled(
-                            format!("Local Installed: {}", m),
-                            Style::default().fg(list_item_color).bg(NORDIC_DARK_BG),
-                        ))
-                    })
-                    .collect();
-
-                let list = List::new(items)
-                    .style(Style::default().bg(NORDIC_DARK_BG))
-                    .block(Block::default().style(Style::default().bg(NORDIC_DARK_BG)).borders(Borders::TOP).title(
-                        " Installed Models [Up/Down: Navigate | Enter: Activate & Use Model] ",
-                    ))
-                    .highlight_style(Style::default().bg(NORDIC_ACCENT).fg(NORDIC_BG).add_modifier(Modifier::BOLD))
-                    .highlight_symbol(">> ");
-
-                frame.render_stateful_widget(list, menu_chunks[1], &mut self.installed_state);
-            } else if self.menu_section == 2 {
-                // Settings Configuration (no Burn/WGPU demo)
-                let active_backend_str = self.backend.name();
-                let options = vec![
-                    ListItem::new(Span::styled(
-                        "llama.cpp (in-process libllama.so — fast, no subprocess)",
-                        Style::default().fg(NORDIC_ACCENT).bg(NORDIC_DARK_BG),
-                    )),
-                    ListItem::new(Span::styled(
-                        "llama.cpp (warm llama-server / CLI + GPU -ngl)",
-                        Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_DARK_BG),
-                    )),
-                    ListItem::new(Span::styled(
-                        "Ollama Engine (Local daemon: http://localhost:11434)",
-                        Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG),
-                    )),
-                ];
-                let list = List::new(options)
-                    .style(Style::default().bg(NORDIC_DARK_BG))
-                    .block(Block::default().style(Style::default().bg(NORDIC_DARK_BG)).borders(Borders::TOP).title(format!(
-                        " Active Engine: {} [Enter to Select] ",
-                        active_backend_str
-                    )))
-                    .highlight_style(Style::default().bg(NORDIC_ACCENT).fg(NORDIC_BG).add_modifier(Modifier::BOLD))
-                    .highlight_symbol(">> ");
-
-                frame.render_stateful_widget(list, menu_chunks[1], &mut self.config_state);
-            } else if self.menu_section == 3 {
-                // Runtime: power mode + context + repeat detector
-                let s = crate::settings::get_settings();
-                let ctx_n = crate::settings::context_token_limit();
-                let ctx_label = crate::settings::format_context_tokens(ctx_n);
-                let mk = |active: bool, label: &str| {
-                    if active {
-                        format!("● {}", label)
-                    } else {
-                        format!("○ {}", label)
+                // --- Row 1 (Top sub-corners) ---
+                // Left: 🭝🭜🭘  Right: 🭣🭧🭒
+                if modal_h >= 4 {
+                    let mut row1_spans: Vec<Span> = Vec::new();
+                    row1_spans.push(Span::styled("🭝🭜🭘", Style::default().fg(border_color).bg(NORDIC_BG)));
+                    let middle_spaces = modal_w.saturating_sub(6) as usize;
+                    if middle_spaces > 0 {
+                        row1_spans.push(Span::raw(" ".repeat(middle_spaces)));
                     }
+                    row1_spans.push(Span::styled("🭣🭧🭒", Style::default().fg(border_color).bg(NORDIC_BG)));
+                    frame.render_widget(Paragraph::new(Line::from(row1_spans)).style(Style::default().bg(NORDIC_BG)), Rect {
+                        x: modal_x,
+                        y: modal_y + 1,
+                        width: modal_w,
+                        height: 1,
+                    });
+                }
+
+                // --- Middle Rows (Left ▌ and Right ▐) ---
+                for r in 2..modal_h.saturating_sub(2) {
+                    let left_span = Span::styled("▌", Style::default().fg(border_color).bg(NORDIC_BG));
+                    frame.render_widget(Paragraph::new(Line::from(left_span)), Rect {
+                        x: modal_x,
+                        y: modal_y + r,
+                        width: 1,
+                        height: 1,
+                    });
+                    let right_span = Span::styled("▐", Style::default().fg(border_color).bg(NORDIC_BG));
+                    frame.render_widget(Paragraph::new(Line::from(right_span)), Rect {
+                        x: modal_x + modal_w.saturating_sub(1),
+                        y: modal_y + r,
+                        width: 1,
+                        height: 1,
+                    });
+                }
+
+                // --- Row H-2 (Bottom sub-corners) ---
+                // Left: 🭌🭑🬽  Right: 🭈🭆🭁
+                if modal_h >= 4 {
+                    let mut row_sub_b_spans: Vec<Span> = Vec::new();
+                    row_sub_b_spans.push(Span::styled("🭌🭑🬽", Style::default().fg(border_color).bg(NORDIC_BG)));
+                    let middle_spaces = modal_w.saturating_sub(6) as usize;
+                    if middle_spaces > 0 {
+                        row_sub_b_spans.push(Span::raw(" ".repeat(middle_spaces)));
+                    }
+                    row_sub_b_spans.push(Span::styled("🭈🭆🭁", Style::default().fg(border_color).bg(NORDIC_BG)));
+                    frame.render_widget(Paragraph::new(Line::from(row_sub_b_spans)).style(Style::default().bg(NORDIC_BG)), Rect {
+                        x: modal_x,
+                        y: modal_y + modal_h.saturating_sub(2),
+                        width: modal_w,
+                        height: 1,
+                    });
+                }
+
+                // --- Row H-1 (Bottom line) ---
+                // Left: 🭣🭧🭓🭍🭑  Bottom line: 🬭  Right: 🭆🭂🭞🭜🭘
+                let bl_w = 5u16; // "🭣🭧🭓🭍🭑"
+                let br_w = 5u16; // "🭆🭂🭞🭜🭘"
+                let bot_fill_w = modal_w.saturating_sub(bl_w + br_w) as usize;
+                let mut row_bot_spans: Vec<Span> = Vec::new();
+                row_bot_spans.push(Span::styled("🭣🭧🭓🭍🭑", Style::default().fg(border_color).bg(NORDIC_BG)));
+                for _ in 0..bot_fill_w {
+                    row_bot_spans.push(Span::styled("🬭", Style::default().fg(border_color).bg(NORDIC_BG)));
+                }
+                row_bot_spans.push(Span::styled("🭆🭂🭞🭜🭘", Style::default().fg(border_color).bg(NORDIC_BG)));
+                frame.render_widget(Paragraph::new(Line::from(row_bot_spans)).style(Style::default().bg(NORDIC_BG)), Rect {
+                    x: modal_x,
+                    y: modal_y + modal_h.saturating_sub(1),
+                    width: modal_w,
+                    height: 1,
+                });
+
+                // --- Inner Container Content Area ---
+                let content_inner = Rect {
+                    x: modal_x + 3,
+                    y: modal_y + 2,
+                    width: modal_w.saturating_sub(6),
+                    height: modal_h.saturating_sub(4),
                 };
-                let options = vec![
-                    ListItem::new(Span::styled(
-                        mk(
-                            s.power_mode == crate::settings::PowerMode::PowerSaver,
-                            "Power Saver — ease off when CPU hot",
-                        ),
-                        Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_DARK_BG),
-                    )),
-                    ListItem::new(Span::styled(
-                        mk(
-                            s.power_mode == crate::settings::PowerMode::Normal,
-                            "Normal (default) — auto cores + GPU offload",
-                        ),
-                        Style::default().fg(NORDIC_ACCENT).bg(NORDIC_DARK_BG),
-                    )),
-                    ListItem::new(Span::styled(
-                        mk(
-                            s.power_mode == crate::settings::PowerMode::Extreme,
-                            "Extreme — max threads + max GPU layers",
-                        ),
-                        Style::default().fg(Color::Rgb(255, 120, 130)).bg(NORDIC_DARK_BG),
-                    )),
-                    ListItem::new(Span::styled(
-                        format!(
-                            "llama.cpp Sub-Backend: {}  (Enter / +/− cycles Auto→SIMD→GPU→Scalar)",
-                            "LlamaCppLib"
-                        ),
-                        Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_DARK_BG),
-                    )),
-                    ListItem::new(Span::styled(
-                        format!(
-                            "Stall Watchdog Timeout: {}  (Enter / +/− cycles 5m→10m→20m→Unlimited)",
-                            crate::settings::format_stall_timeout(s.stall_timeout_secs)
-                        ),
-                        Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_DARK_BG),
-                    )),
-                    ListItem::new(Span::styled(
-                        format!(
-                            "Repeat threshold: {}  (+/− step · Enter cycle)",
-                            s.repeat_threshold
-                        ),
-                        Style::default().fg(NORDIC_ACCENT).bg(NORDIC_DARK_BG),
-                    )),
-                    ListItem::new(Span::styled(
-                        format!(
-                            "Repeat detector on thinking: {}  (Enter toggles)",
-                            if s.repeat_detect_thinking {
-                                "ON"
+
+                match self.menu_section {
+                    0 => {
+                        // === Help Section ===
+                        let help_lines = vec![
+                            Line::from(Span::styled(" Hercules Keyboard Navigation & Quick Reference ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD))),
+                            Line::from(Span::styled("", Style::default().bg(NORDIC_BG))),
+                            Line::from(vec![
+                                Span::styled(" F1 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled("          Help & Keybindings guide", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
+                            Line::from(vec![
+                                Span::styled(" F2 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled("          Model Registry (Download from HuggingFace & Ollama)", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
+                            Line::from(vec![
+                                Span::styled(" F3 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled("          Modal (Choose & activate installed local models)", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
+                            Line::from(vec![
+                                Span::styled(" F4 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled("          Settings (Power mode, stall watchdog, permissions)", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
+                            Line::from(Span::styled("", Style::default().bg(NORDIC_BG))),
+                            Line::from(vec![
+                                Span::styled(" Esc ", Style::default().fg(Color::Rgb(255, 180, 180)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                Span::styled("         Close menu / (Hold 1s) Quit application", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
+                            Line::from(vec![
+                                Span::styled(" Ctrl+Esc ", Style::default().fg(Color::Rgb(255, 120, 120)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                Span::styled("    Exit immediately", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
+                            Line::from(vec![
+                                Span::styled(" Ctrl+F ", Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                Span::styled("      Focus / Unfocus user prompt bar", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
+                            Line::from(vec![
+                                Span::styled(" Ctrl+C ", Style::default().fg(Color::Rgb(255, 200, 100)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                Span::styled("      Interrupt streaming response or tool execution", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
+                            Line::from(vec![
+                                Span::styled(" PgUp / PgDn ", Style::default().fg(Color::Rgb(180, 160, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                Span::styled(" Scroll conversation history", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
+                        ];
+                        frame.render_widget(Paragraph::new(help_lines).style(Style::default().bg(NORDIC_BG)), content_inner);
+                    }
+                    1 => {
+                        // === Registry Section (Tab Bar + Search Bar + Filtered Model List) ===
+                        let chunks = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Length(2), Constraint::Length(2), Constraint::Min(1)].as_ref())
+                            .split(content_inner);
+
+                        let hf_style = if self.registry_tab == 0 {
+                            Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG)
+                        };
+                        let ol_style = if self.registry_tab == 1 {
+                            Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG)
+                        };
+
+                        let tab_bar = Paragraph::new(Line::from(vec![
+                            Span::styled(" [ HuggingFace Models ] ", hf_style),
+                            Span::styled("  ", Style::default().bg(NORDIC_BG)),
+                            Span::styled(" [ Ollama Models ] ", ol_style),
+                            Span::styled("   (Left/Right to switch tab | Enter to download)", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG)),
+                        ])).style(Style::default().bg(NORDIC_BG));
+                        frame.render_widget(tab_bar, chunks[0]);
+
+                        // Search Bar
+                        let search_text = if self.registry_search_query.is_empty() {
+                            Span::styled(" Search models (type to filter query)...", Style::default().fg(Color::Rgb(100, 120, 140)).bg(NORDIC_BG))
+                        } else {
+                            Span::styled(format!(" Search: {}", self.registry_search_query), Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD))
+                        };
+                        frame.render_widget(Paragraph::new(Line::from(vec![search_text])).style(Style::default().bg(NORDIC_BG)), chunks[1]);
+
+                        let q_lower = self.registry_search_query.trim().to_lowercase();
+                        let total_w = chunks[2].width as usize;
+                        let items: Vec<ListItem> = if self.registry_tab == 0 {
+                            self.hf_models.iter()
+                                .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower))
+                                .map(|m| {
+                                    // Split org/repo [size] into columns: Org │ Model │ Size
+                                    let (repo_part, size_part) = if let Some(bracket_idx) = m.find('[') {
+                                        (m[..bracket_idx].trim(), m[bracket_idx..].trim())
+                                    } else {
+                                        (m.trim(), "")
+                                    };
+                                    let (org, model_name) = if let Some(slash_idx) = repo_part.find('/') {
+                                        (&repo_part[..slash_idx], &repo_part[slash_idx + 1..])
+                                    } else {
+                                        ("-", repo_part)
+                                    };
+
+                                    let org_col = format!("{:<14}", if org.len() > 14 { &org[..14] } else { org });
+                                    let size_clean = size_part.trim_matches(|c| c == '[' || c == ']').replace("Q4 est.", "est").replace("GGUF", "").trim().to_string();
+                                    let size_col = format!("{:>12}", if size_clean.len() > 12 { &size_clean[..12] } else { &size_clean });
+                                    
+                                    let used_w = 14 + 3 + 12 + 3; // org + " │ " + size + " │ "
+                                    let model_max_w = total_w.saturating_sub(used_w).max(10);
+                                    let model_col = format!("{:<width$}", if model_name.len() > model_max_w { &model_name[..model_max_w] } else { model_name }, width = model_max_w);
+
+                                    ListItem::new(Line::from(vec![
+                                        Span::styled(org_col, Style::default().fg(Color::Rgb(136, 192, 208))),
+                                        Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))),
+                                        Span::styled(model_col, Style::default().fg(Color::Rgb(220, 230, 242)).add_modifier(Modifier::BOLD)),
+                                        Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))),
+                                        Span::styled(size_col, Style::default().fg(Color::Rgb(163, 190, 140))),
+                                    ]))
+                                }).collect()
+                        } else {
+                            self.registry_models.iter()
+                                .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower))
+                                .map(|m| {
+                                    let (name_part, size_part) = if let Some(idx) = m.find('(') {
+                                        (m[..idx].trim(), m[idx..].trim_matches(|c| c == '(' || c == ')').trim())
+                                    } else if let Some(idx) = m.find('[') {
+                                        (m[..idx].trim(), m[idx..].trim_matches(|c| c == '[' || c == ']').trim())
+                                    } else {
+                                        (m.trim(), "")
+                                    };
+
+                                    let (org, model_name) = if let Some(slash_idx) = name_part.find('/') {
+                                        (&name_part[..slash_idx], &name_part[slash_idx + 1..])
+                                    } else {
+                                        ("ollama", name_part)
+                                    };
+
+                                    let org_col = format!("{:<14}", if org.len() > 14 { &org[..14] } else { org });
+                                    let size_col = format!("{:>12}", if size_part.len() > 12 { &size_part[..12] } else { size_part });
+                                    let used_w = 14 + 3 + 12 + 3;
+                                    let model_max_w = total_w.saturating_sub(used_w).max(10);
+                                    let model_col = format!("{:<width$}", if model_name.len() > model_max_w { &model_name[..model_max_w] } else { model_name }, width = model_max_w);
+
+                                    ListItem::new(Line::from(vec![
+                                        Span::styled(org_col, Style::default().fg(Color::Rgb(136, 192, 208))),
+                                        Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))),
+                                        Span::styled(model_col, Style::default().fg(Color::Rgb(220, 230, 242)).add_modifier(Modifier::BOLD)),
+                                        Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))),
+                                        Span::styled(size_col, Style::default().fg(Color::Rgb(163, 190, 140))),
+                                    ]))
+                                }).collect()
+                        };
+
+                        let list = List::new(items)
+                            .style(Style::default().bg(NORDIC_BG))
+                            .highlight_style(Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD));
+                        frame.render_stateful_widget(list, chunks[2], &mut self.registry_state);
+                    }
+                    2 => {
+                        // === Modal (Installed Models) Section ===
+                        let chunks = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Length(2), Constraint::Min(1)].as_ref())
+                            .split(content_inner);
+
+                        let info = Paragraph::new(Line::from(vec![
+                            Span::styled(" Installed Models ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                            Span::styled(" (Up/Down or W/S to navigate | Enter to activate model)", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG)),
+                        ])).style(Style::default().bg(NORDIC_BG));
+                        frame.render_widget(info, chunks[0]);
+
+                        let items: Vec<ListItem> = self.installed_models.iter().map(|m| {
+                            let is_active = self.backend.name().contains(m) || m.contains(&self.backend.name());
+                            let (badge_txt, badge_fg, badge_bg) = if is_active {
+                                (" ACTIVE ", NORDIC_BG, Color::Rgb(163, 190, 140))
                             } else {
-                                "OFF"
+                                (" READY  ", NORDIC_BG, Color::Rgb(76, 86, 106))
+                            };
+
+                            let clean_name = m.replace("Local GGUF:", "").replace("Ollama Local:", "").trim().to_string();
+                            let (repo, model_label) = if let Some(idx) = clean_name.find('/') {
+                                (&clean_name[..idx], clean_name[idx+1..].trim())
+                            } else {
+                                ("local", clean_name.as_str())
+                            };
+
+                            let repo_col = format!("{:<14}", if repo.len() > 14 { &repo[..14] } else { repo });
+                            let total_w = chunks[1].width as usize;
+                            let used_w = 9 + 1 + 14 + 3; // badge + space + repo + " │ "
+                            let name_max_w = total_w.saturating_sub(used_w).max(10);
+                            let name_col = format!("{:<width$}", if model_label.len() > name_max_w { &model_label[..name_max_w] } else { model_label }, width = name_max_w);
+
+                            ListItem::new(Line::from(vec![
+                                Span::styled(badge_txt, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD)),
+                                Span::styled(" ", Style::default().bg(NORDIC_BG)),
+                                Span::styled(repo_col, Style::default().fg(Color::Rgb(136, 192, 208))),
+                                Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))),
+                                Span::styled(name_col, Style::default().fg(Color::Rgb(220, 230, 242)).add_modifier(Modifier::BOLD)),
+                            ]))
+                        }).collect();
+
+                        let list = List::new(items)
+                            .style(Style::default().bg(NORDIC_BG))
+                            .highlight_style(Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD));
+                        frame.render_stateful_widget(list, chunks[1], &mut self.installed_state);
+                    }
+                    _ => {
+                        // === Settings Section (Two-Column Layout) ===
+                        let s = crate::settings::get_settings();
+                        let p = get_tool_permissions();
+                        let ctx_n = crate::settings::context_token_limit();
+                        let ctx_label = crate::settings::format_context_tokens(ctx_n);
+
+                        let cols = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([Constraint::Length(22), Constraint::Length(2), Constraint::Min(1)].as_ref())
+                            .split(content_inner);
+
+                        // Column 1: Tabs (w/Up to go up, s/Down to go down)
+                        let tab_names = [
+                            "Power Mode",
+                            "Stall Time",
+                            "Repeat Detector",
+                            "Context Window",
+                            "Permissions",
+                        ];
+
+                        let mut tab_items: Vec<ListItem> = Vec::new();
+                        for (idx, name) in tab_names.iter().enumerate() {
+                            let is_selected = self.settings_tab == idx;
+                            let is_focused_col = self.settings_col == 0;
+                            let (fg, bg) = if is_selected && is_focused_col {
+                                (NORDIC_BG, Color::White)
+                            } else if is_selected {
+                                (Color::White, Color::Rgb(59, 66, 82))
+                            } else {
+                                (Color::Rgb(160, 175, 195), NORDIC_BG)
+                            };
+
+                            let symbol = if is_selected { "● " } else { "  " };
+                            tab_items.push(ListItem::new(Line::from(vec![
+                                Span::styled(symbol, Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)),
+                                Span::styled(*name, Style::default().fg(fg).bg(bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })),
+                            ])));
+                        }
+
+                        let col1_list = List::new(tab_items).style(Style::default().bg(NORDIC_BG));
+                        frame.render_widget(col1_list, cols[0]);
+
+                        // Column separator
+                        let sep_lines: Vec<Line> = (0..cols[1].height).map(|_| Line::from(Span::styled("│", Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG)))).collect();
+                        frame.render_widget(Paragraph::new(sep_lines), cols[1]);
+
+                        // Column 2: Value options
+                        let col2_focus = self.settings_col == 1;
+                        let focus_badge = if col2_focus {
+                            Span::styled(" [FOCUSED: A/D or Left/Right to change] ", Style::default().fg(NORDIC_BG).bg(Color::Rgb(143, 218, 255)).add_modifier(Modifier::BOLD))
+                        } else {
+                            Span::styled(" [Press Enter to Edit Value] ", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))
+                        };
+
+                        let mut val_lines: Vec<Line> = vec![
+                            Line::from(focus_badge),
+                            Line::from(Span::styled("", Style::default().bg(NORDIC_BG))),
+                        ];
+
+                        match self.settings_tab {
+                            0 => {
+                                // Power mode options
+                                let modes = [
+                                    (crate::settings::PowerMode::PowerSaver, "Power Saver (ease off when CPU is warm)"),
+                                    (crate::settings::PowerMode::Normal, "Normal (default - auto threads & GPU offload)"),
+                                    (crate::settings::PowerMode::Extreme, "Extreme (max GPU layers & full CPU threads)"),
+                                ];
+                                for (m, desc) in modes {
+                                    let active = s.power_mode == m;
+                                    let sym = if active { "● " } else { "○ " };
+                                    let color = if active { Color::Rgb(163, 190, 140) } else { Color::Rgb(160, 175, 195) };
+                                    val_lines.push(Line::from(vec![
+                                        Span::styled(sym, Style::default().fg(color).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                        Span::styled(desc, Style::default().fg(if active { Color::White } else { color }).bg(NORDIC_BG).add_modifier(if active { Modifier::BOLD } else { Modifier::empty() })),
+                                    ]));
+                                }
                             }
-                        ),
-                        Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_DARK_BG),
-                    )),
-                    ListItem::new(Span::styled(
-                        format!(
-                            "Context window: {} ({ctx_n})  (+/− step · Enter cycle 4K…1M)",
-                            ctx_label
-                        ),
-                        Style::default().fg(Color::Rgb(180, 160, 255)).bg(NORDIC_DARK_BG),
-                    )),
-                ];
-                let list =
-                    List::new(options)
-                        .style(Style::default().bg(NORDIC_DARK_BG))
-                        .block(Block::default().style(Style::default().bg(NORDIC_DARK_BG)).borders(Borders::TOP).title(
-                            " Runtime [Power | Ctx | Temp | Repeat] Enter=apply · +/−=nudge ",
-                        ))
-                        .highlight_style(Style::default().bg(NORDIC_ACCENT).fg(NORDIC_BG).add_modifier(Modifier::BOLD))
-                        .highlight_symbol(">> ");
-                frame.render_stateful_widget(list, menu_chunks[1], &mut self.runtime_state);
-            } else {
-                // Permissions tab
-                let p = get_tool_permissions();
-                let mode_ask = if p.mode == PermissionMode::Ask {
-                    "● Ask user to allow (default)"
-                } else {
-                    "○ Ask user to allow"
-                };
-                let mode_always = if p.mode == PermissionMode::AlwaysAllow {
-                    "● Always allow (tools may write/run)"
-                } else {
-                    "○ Always allow"
-                };
-                let scope_cur = if p.folder_scope == FolderScope::CurrentDir {
-                    "● Interact on current dir only (safefolder)"
-                } else {
-                    "○ Interact on current dir only (safefolder)"
-                };
-                let scope_all = if p.folder_scope == FolderScope::AllDirs {
-                    "● Interact on all directories"
-                } else {
-                    "○ Interact on all directories"
-                };
-                let options = vec![
-                    ListItem::new(Span::styled(mode_ask, Style::default().fg(NORDIC_ACCENT).bg(NORDIC_DARK_BG))),
-                    ListItem::new(Span::styled(mode_always, Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_DARK_BG))),
-                    ListItem::new(Span::styled(
-                        scope_cur,
-                        Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_DARK_BG),
-                    )),
-                    ListItem::new(Span::styled(scope_all, Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG))),
-                ];
-                let list = List::new(options)
-                    .style(Style::default().bg(NORDIC_DARK_BG))
-                    .block(Block::default().style(Style::default().bg(NORDIC_DARK_BG)).borders(Borders::TOP).title(
-                        " Tool Permissions [Enter: Apply]  Ask=block write/cmd until /allow ",
-                    ))
-                    .highlight_style(Style::default().bg(NORDIC_ACCENT).fg(NORDIC_BG).add_modifier(Modifier::BOLD))
-                    .highlight_symbol(">> ");
-                frame.render_stateful_widget(list, menu_chunks[1], &mut self.perms_state);
+                            1 => {
+                                // Stall watchdog options
+                                val_lines.push(Line::from(vec![
+                                    Span::styled("Watchdog Timeout: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(crate::settings::format_stall_timeout(s.stall_timeout_secs), Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                ]));
+                                val_lines.push(Line::from(Span::styled("Cycles: 5 min → 10 min → 20 min → Unlimited", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
+                            }
+                            2 => {
+                                // Repeat detector
+                                val_lines.push(Line::from(vec![
+                                    Span::styled("Repeat Threshold: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(format!("{} consecutive outputs", s.repeat_threshold), Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                ]));
+                                val_lines.push(Line::from(vec![
+                                    Span::styled("Detect on Thinking: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(if s.repeat_detect_thinking { "ENABLED" } else { "DISABLED" }, Style::default().fg(if s.repeat_detect_thinking { Color::Rgb(163, 190, 140) } else { Color::Rgb(255, 120, 120) }).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                ]));
+                            }
+                            3 => {
+                                // Context window
+                                val_lines.push(Line::from(vec![
+                                    Span::styled("Context Window Limit: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(format!("{} ({} tokens)", ctx_label, ctx_n), Style::default().fg(Color::Rgb(180, 160, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                ]));
+                                val_lines.push(Line::from(Span::styled("Cycles: 4K → 8K → 16K → 32K → 64K → 128K → 250K → 1M", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
+                            }
+                            _ => {
+                                // Permissions
+                                val_lines.push(Line::from(vec![
+                                    Span::styled("Action Permission Mode: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(p.mode_label(), Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                ]));
+                                val_lines.push(Line::from(vec![
+                                    Span::styled("Directory Access Scope: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(p.scope_label(), Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                ]));
+                            }
+                        }
+
+                        frame.render_widget(Paragraph::new(val_lines).style(Style::default().bg(NORDIC_BG)), cols[2]);
+                    }
+                }
             }
         }
 
-        // F1 keyboard shortcuts overlay (off by default; one-shot fade-in)
-        if self.show_shortcuts {
-            let fade = self.krama.get_progress_f32("help_fade", 0).clamp(0.0, 1.0);
-            let alpha = (200.0 * fade) as u8;
-            let fg = Color::Rgb(
-                (220.0 * fade) as u8,
-                (255.0 * fade) as u8,
-                (230.0 * fade) as u8,
-            );
-            let border = Color::Rgb(0, alpha.saturating_add(40), (180.0 * fade) as u8);
 
-            let popup_layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(
-                    [
-                        Constraint::Percentage(12),
-                        Constraint::Percentage(76),
-                        Constraint::Percentage(12),
-                    ]
-                    .as_ref(),
-                )
-                .split(frame.area());
-            let center = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(
-                    [
-                        Constraint::Percentage(15),
-                        Constraint::Percentage(70),
-                        Constraint::Percentage(15),
-                    ]
-                    .as_ref(),
-                )
-                .split(popup_layout[1]);
-            let area = center[1];
-            frame.render_widget(Clear, area);
-            frame.render_widget(Block::default().style(Style::default().bg(NORDIC_DARK_BG)), area);
-
-            let help = concat!(
-                " F1              Toggle this shortcuts panel (default: off)\n",
-                " F2 / Ctrl+M     Menu (Registry / Installed / Engine / Permissions)\n",
-                " F3 / Ctrl+L     Collapse activity log\n",
-                " Ctrl+F          Focus / unfocus input\n",
-                " Left / Right    Move cursor by character\n",
-                " Alt+Left/Right  Move cursor by word\n",
-                " Alt+Backspace   Delete previous word (also Ctrl+Backspace)\n",
-                " Ctrl+Z          Undo input\n",
-                " Ctrl+Y / Ctrl+Shift+Z   Redo input\n",
-                " Home / End      Start / end of prompt\n",
-                " Ctrl+C          Interrupt generation or clear input\n",
-                " Ctrl+Enter      Force-send / interrupt generation\n",
-                " Ctrl+T          Collapse/expand thinking block\n",
-                " Esc (hold 1s)   Quit\n",
-                "\n",
-                " /allow          Grant write/cmd for this session (Ask permission mode)\n",
-                " /compact        Compress history → memory, forget old turns (anti-hallucination)\n",
-                " /gc             Alias for /compact\n",
-                " /tasks          List background task manager jobs\n",
-                " Ctrl+C          Interrupt generation + kill long-running tasks\n",
-                " Menu→Permissions  Ask vs Always allow · safefolder current vs all dirs\n",
-                "\n",
-                " Long cmds (>10s) park in task manager; output returns when done.\n",
-                " Generation idle 20s → auto-interrupt (stall / ctx overload).\n",
-                "\n",
-                " Downloads resume after network drops (Range). Re-run install to continue.\n",
-            );
-            let help_para = Paragraph::new(help)
-                .style(Style::default().fg(Color::Rgb(225, 235, 248)).bg(NORDIC_DARK_BG))
-                .block(
-                    Block::default()
-                        .style(Style::default().bg(NORDIC_DARK_BG))
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(Color::Rgb(136, 192, 208)))
-                        .title(" Keyboard Shortcuts [F1 to close] "),
-                );
-            frame.render_widget(help_para, area);
-        }
 
         // --- Model Deletion Confirmation Modal ---
         if let Some(ref target) = self.delete_confirm_model {
@@ -6522,110 +6547,4 @@ fn trunc_chars(s: &str, max: usize) -> String {
             s.chars().take(max.saturating_sub(1)).collect::<String>()
         )
     }
-}
-
-/// Pad/truncate to exact display width (char count).
-fn fit_width(s: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let n = s.chars().count();
-    if n == width {
-        s.to_string()
-    } else if n > width {
-        s.chars().take(width).collect()
-    } else {
-        format!("{s}{}", " ".repeat(width - n))
-    }
-}
-
-/// Best-effort CPU package temperature (°C) via sysinfo thermal sensors.
-fn cpu_package_temp_c(_sys: &sysinfo::System) -> f32 {
-    use sysinfo::Components;
-    let comps = Components::new_with_refreshed_list();
-    let mut best: Option<f32> = None;
-    for c in comps.iter() {
-        let label = c.label().to_ascii_lowercase();
-        let Some(t) = c.temperature() else {
-            continue;
-        };
-        if !t.is_finite() || t <= 0.0 || t > 150.0 {
-            continue;
-        }
-        let prefer = label.contains("package")
-            || label.contains("tctl")
-            || label.contains("cpu")
-            || label.contains("coretemp")
-            || label.contains("k10temp")
-            || label.contains("acpitz");
-        if prefer {
-            best = Some(match best {
-                Some(b) => b.max(t),
-                None => t,
-            });
-        } else if best.is_none() {
-            best = Some(t);
-        }
-    }
-    best.unwrap_or(0.0)
-}
-
-/// Classic two-arm resource box — **exactly 16 cells per line**, including floor.
-///
-/// ```text
-/// ╭[C: 64%  70C ]╮
-/// ├[M: 53%  4.1G]┤
-/// ┴──────────────╯
-/// ```
-fn fixed_resource_box(
-    cpu_pct: f32,
-    cpu_c: f32,
-    mem_pct: f32,
-    mem_gb: f64,
-) -> (String, String, String) {
-    const W: usize = 16;
-    // Space before ] makes C always 16 (raw format is 15 without it).
-    let c = format!(
-        "╭[C:{:>3.0}% {:>3.0}C ]╮",
-        cpu_pct.clamp(0.0, 100.0),
-        cpu_c.clamp(0.0, 150.0)
-    );
-    let m = format!(
-        "├[M:{:>3.0}% {:>4.1}G]┤",
-        mem_pct.clamp(0.0, 100.0),
-        mem_gb.clamp(0.0, 999.9)
-    );
-    let bot = format!("┴{}╯", "─".repeat(W - 2));
-    assert_eq!(c.chars().count(), W, "C width: {c:?}");
-    assert_eq!(m.chars().count(), W, "M width: {m:?}");
-    assert_eq!(bot.chars().count(), W, "bot width: {bot:?}");
-    assert!(c.ends_with('╮'));
-    assert!(m.ends_with('┤'));
-    assert!(bot.ends_with('╯'));
-    (c, m, bot)
-}
-
-/// Full-width L2 floor: brand arm + mid ─ + stats bottom (same STATS_W).
-///
-/// `╰──────────┴────…────┴─────────────╯`
-fn continuous_top_floor(full_w: usize, left_w: usize, stats_w: usize) -> String {
-    if full_w < 4 {
-        return "─".repeat(full_w);
-    }
-    let brand = 12usize; // ╰──────────┴
-    let left_w = left_w.max(brand);
-    let stats_w = stats_w.min(full_w.saturating_sub(brand + 1)).max(3);
-    let mid_w = full_w.saturating_sub(left_w).saturating_sub(stats_w);
-
-    let mut s = String::with_capacity(full_w);
-    s.push_str("╰──────────┴"); // 12 — opens right under Hercules
-    if left_w > brand {
-        s.push_str(&"─".repeat(left_w - brand));
-    }
-    s.push_str(&"─".repeat(mid_w));
-    // Stats bottom: must match fixed_resource_box bot exactly
-    s.push('┴');
-    s.push_str(&"─".repeat(stats_w.saturating_sub(2)));
-    s.push('╯');
-    fit_width(&s, full_w)
 }

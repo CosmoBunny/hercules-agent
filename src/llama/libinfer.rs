@@ -188,14 +188,6 @@ impl LlamaCppLib {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    /// Build a ChatML-format prompt.
-    fn build_prompt(system: &str, user: &str) -> String {
-        format!(
-            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            system, user
-        )
-    }
-
     /// Full generation with optional streaming.
     pub fn generate_stream(
         &self,
