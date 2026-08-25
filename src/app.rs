@@ -47,6 +47,83 @@ pub struct CodeBlockScrollHit {
     pub max_scroll: usize,
 }
 
+pub const NORDIC_BG: Color = Color::Rgb(46, 52, 64);        // #2E3440 Polar Night
+pub const NORDIC_DARK_BG: Color = Color::Rgb(36, 41, 51);   // #242933
+pub const NORDIC_CARD_BG: Color = Color::Rgb(59, 66, 82);   // #3B4252
+pub const NORDIC_TEXT: Color = Color::Rgb(236, 239, 244);   // #ECEFF4 Snow Storm
+pub const NORDIC_MUTED: Color = Color::Rgb(129, 161, 193);  // #81A1C1 Frost Blue
+pub const NORDIC_ACCENT: Color = Color::Rgb(136, 192, 208); // #88C0D0 Frost Cyan
+
+pub fn interpolate_rgb(c1: (u8, u8, u8), c2: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    let r = (c1.0 as f32 + (c2.0 as f32 - c1.0 as f32) * t).round() as u8;
+    let g = (c1.1 as f32 + (c2.1 as f32 - c1.1 as f32) * t).round() as u8;
+    let b = (c1.2 as f32 + (c2.2 as f32 - c1.2 as f32) * t).round() as u8;
+    (r, g, b)
+}
+
+pub fn multi_stop_gradient(stops: &[(f32, (u8, u8, u8))], pos: f32) -> Color {
+    let pos = pos.clamp(0.0, 1.0);
+    if stops.is_empty() {
+        return Color::White;
+    }
+    if stops.len() == 1 || pos <= stops[0].0 {
+        let (r, g, b) = stops[0].1;
+        return Color::Rgb(r, g, b);
+    }
+    for i in 0..stops.len() - 1 {
+        let (p1, c1) = stops[i];
+        let (p2, c2) = stops[i + 1];
+        if pos >= p1 && pos <= p2 {
+            let seg_t = if (p2 - p1).abs() < 0.0001 { 0.0 } else { (pos - p1) / (p2 - p1) };
+            let (r, g, b) = interpolate_rgb(c1, c2, seg_t);
+            return Color::Rgb(r, g, b);
+        }
+    }
+    let (r, g, b) = stops.last().unwrap().1;
+    Color::Rgb(r, g, b)
+}
+
+pub fn get_status_gradient_stops(
+    is_generating: bool,
+    is_thinking: bool,
+    exit_hold_pct: Option<f64>,
+) -> Vec<(f32, (u8, u8, u8))> {
+    if let Some(pct) = exit_hold_pct {
+        let p = pct as f32;
+        let r_mid = (180.0 + 75.0 * p).min(255.0) as u8;
+        return vec![
+            (0.0, (140, 20, 30)),
+            (0.5, (r_mid, 30, 40)),
+            (1.0, (255, 50, 50)),
+        ];
+    }
+    if is_generating {
+        if is_thinking {
+            // Thinking: linear-gradient(rgba(0, 8, 117, 1) 1%, rgba(200, 75, 250, 1) 51%, rgba(65, 0, 217, 1) 100%)
+            vec![
+                (0.01, (0, 8, 117)),
+                (0.51, (200, 75, 250)),
+                (1.00, (65, 0, 217)),
+            ]
+        } else {
+            // Streaming: linear-gradient(rgba(6, 0, 181, 1) 0%, rgba(64, 255, 220, 1) 50%, rgba(0, 33, 196, 1) 100%)
+            vec![
+                (0.0, (6, 0, 181)),
+                (0.5, (64, 255, 220)),
+                (1.0, (0, 33, 196)),
+            ]
+        }
+    } else {
+        // Idle / Normal: Nordic Frost
+        vec![
+            (0.0, (94, 129, 172)),
+            (0.5, (136, 192, 208)),
+            (1.0, (143, 188, 187)),
+        ]
+    }
+}
+
 pub struct App {
     pub should_quit: bool,
     pub status_message: String,
@@ -56,6 +133,9 @@ pub struct App {
     pub messages: Vec<String>,
     pub session_id: Option<String>,
     pub backend: AgentBackend,
+    pub input_anim_height: f32,
+    pub model_badge_hit: Option<(u16, u16, u16)>,
+    pub input_scroll_y: u16,
 
     // Registry state
     pub manager: ModelManager,
@@ -203,6 +283,9 @@ impl App {
             input: String::new(),
             messages: vec!["System: Welcome to Hercules. Ask me anything!".to_string()],
             session_id: Some(default_sid),
+            input_anim_height: 3.0,
+            model_badge_hit: None,
+            input_scroll_y: 0,
             backend: {
                 // Prefer local GGUF with llama.rs (pure Rust); else llama.cpp if path exists
                 let mgr = ModelManager::new();
@@ -2830,6 +2913,23 @@ impl App {
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
+                        // Check click on Model Name badge to toggle input prompt focus
+                        if let Some((badge_y, badge_x0, badge_x1)) = self.model_badge_hit {
+                            if mouse.row == badge_y && mouse.column >= badge_x0 && mouse.column <= badge_x1 {
+                                self.input_focused = !self.input_focused;
+                                self.clear_selection();
+                                self.exit_term_interactive();
+                                return Ok(());
+                            }
+                            let input_h = (self.input_anim_height.round() as u16).max(1);
+                            if mouse.row >= badge_y && mouse.row < badge_y + input_h {
+                                self.input_focused = true;
+                                self.clear_selection();
+                                self.exit_term_interactive();
+                                return Ok(());
+                            }
+                        }
+
                         // Check interactive code block Copy button first
                         let mut copy_action: Option<(usize, String)> = None;
                         for hit in &self.code_block_copy_hits {
@@ -4503,38 +4603,68 @@ LlamaCppLibBackend::http(
 
         let area = frame.area();
 
-        // Grow input box with multiline content (3..=10 rows total including borders)
+        // 1. Fill entire screen background with Nordic Gray
+        frame.render_widget(Block::default().style(Style::default().bg(NORDIC_BG)), area);
+
+        let is_gen = *self.is_generating.lock().unwrap();
+        let is_thinking = if is_gen {
+            let s = self.streaming_response.lock().unwrap();
+            s.contains("<think>") && !s.contains("</think>")
+        } else {
+            false
+        };
+        let exit_hold_pct = self
+            .esc_hold_start
+            .map(|start| (start.elapsed().as_secs_f64() / 1.0).clamp(0.0, 1.0));
+        let stops = get_status_gradient_stops(is_gen, is_thinking, exit_hold_pct);
+        let speed = if is_gen { 0.03 } else { 0.015 };
+        let phase = (self.anim_tick as f32 * speed) % 1.0;
+
+        // Dynamic input height with smooth collapse/expand animation
         let inner_w = area.width.saturating_sub(6).max(1) as usize;
-        let mut input_lines = 0;
-        for (i, row) in self.input.split('\n').enumerate() {
-            let mut col = if i == 0 { 1 } else { 0 };
-            for _ in row.chars() {
-                if col >= inner_w {
-                    input_lines += 1;
-                    col = 0;
+        let mut wrapped_prompt_lines: Vec<String> = Vec::new();
+        for row in self.input.split('\n') {
+            if row.is_empty() {
+                wrapped_prompt_lines.push(String::new());
+            } else {
+                let mut cur = String::new();
+                let mut col = 0;
+                for ch in row.chars() {
+                    if col >= inner_w {
+                        wrapped_prompt_lines.push(cur.clone());
+                        cur.clear();
+                        col = 0;
+                    }
+                    cur.push(ch);
+                    col += 1;
                 }
-                col += 1;
+                if !cur.is_empty() || wrapped_prompt_lines.is_empty() {
+                    wrapped_prompt_lines.push(cur);
+                }
             }
-            input_lines += 1;
         }
         if self.input.ends_with('\n') {
-            input_lines += 1;
+            wrapped_prompt_lines.push(String::new());
         }
-        if input_lines == 0 {
-            input_lines = 1;
+        if wrapped_prompt_lines.is_empty() {
+            wrapped_prompt_lines.push(String::new());
         }
-        
-        let input_inner_h = (input_lines as u16).clamp(1, 8);
-        let input_box_h = (input_inner_h + 2).clamp(3, 10); // borders
 
-        // Top bar 3 rows — classic two-arm resource box (CPU%+°C, Mem%+GB).
-        //
-        //  L0: CTX …              Model: …                 ╭[C: 64% 70C]╮
-        //  L1: ╭[Hercules]╮       Press CTRL+M…            ├[M: 53% 4.1G]┤
-        //  L2: ╰──────────┴───────…────────────────────────┴─────────────╯
-        //
-        // Right column paints ALL 3 lines of the stats box (complete, closed).
-        // Floor is one continuous string so arms always meet.
+        let content_count = wrapped_prompt_lines.len().max(1);
+        let target_input_h = if self.input_focused {
+            (1 + content_count).clamp(3, 7) as f32
+        } else {
+            1.0f32
+        };
+
+        let h_diff = target_input_h - self.input_anim_height;
+        if h_diff.abs() < 0.05 {
+            self.input_anim_height = target_input_h;
+        } else {
+            self.input_anim_height += h_diff * 0.35;
+        }
+        let input_box_h = (self.input_anim_height.round() as u16).clamp(1, 7);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
@@ -4634,17 +4764,10 @@ LlamaCppLibBackend::http(
         let active_model = self.backend.name();
         let mid_w = top_chunks[1].width as usize;
         let model_line = fit_width(&format!("Model: {active_model}"), mid_w);
-        let menu_line = fit_width("Press CTRL+M or F2 for Menu Modal", mid_w);
         let hint_text = vec![
             Line::from(Span::styled(
                 model_line,
-                Style::default().fg(light_blue).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                menu_line,
-                Style::default()
-                    .fg(theme_color)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(NORDIC_MUTED).add_modifier(Modifier::BOLD),
             )),
         ];
         frame.render_widget(
@@ -4700,7 +4823,7 @@ LlamaCppLibBackend::http(
         // --- Dynamic Focus Glowing Border Pulse with KramaFrame ---
         // Exit-hold overrides input border with red glow
         let focus_progress = self.krama.get_progress_f32("focus", 0);
-        let border_color = if exit_hold_pct.is_some() {
+        let _border_color = if exit_hold_pct.is_some() {
             exit_glow
         } else if self.input_focused {
             let pulse = (self.anim_tick as f64 * 0.18 + focus_progress as f64).sin() * 0.5 + 0.5;
@@ -5141,6 +5264,7 @@ LlamaCppLibBackend::http(
         }
 
         let chat_box = Paragraph::new(chat_lines)
+            .style(Style::default().bg(NORDIC_BG))
             .scroll((self.scroll_offset, 0))
             .wrap(ratatui::widgets::Wrap { trim: false })
             .block(
@@ -5151,11 +5275,7 @@ LlamaCppLibBackend::http(
                         Borders::RIGHT
                     })
                     .border_style(Style::default().fg(dark_gray))
-                    .title(if self.selection_active() {
-                        " Main Chat  [select: Ctrl+C copy | click cancel] "
-                    } else {
-                        " Main Chat "
-                    }),
+                    .title(" Main Chat "),
             );
         frame.render_widget(chat_box, chat_area);
 
@@ -5310,6 +5430,7 @@ LlamaCppLibBackend::http(
             let console_scroll = log_lines_count.saturating_sub(15);
 
             let console_box = Paragraph::new(logs_text)
+                .style(Style::default().bg(NORDIC_BG))
                 .scroll((console_scroll, 0))
                 .wrap(ratatui::widgets::Wrap { trim: true })
                 .block(
@@ -5317,7 +5438,7 @@ LlamaCppLibBackend::http(
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(light_blue))
-                        .title(" Live Activity Log [CTRL+L/F3: Collapse] "),
+                        .title(" Live Activity Log "),
                 );
             frame.render_widget(console_box, main_split[1]);
         }
@@ -5335,109 +5456,122 @@ LlamaCppLibBackend::http(
             )
             .split(chunks[2]);
 
-        let title_text = if let Some(pct) = exit_hold_pct {
-            format!(
-                " [ EXITING {:.0}% — keep holding Esc | release to cancel | Ctrl+Esc = quit now ] ",
-                pct * 100.0
-            )
-        } else if self.term_is_interactive() {
-            " [ TERM interactive · type command · Enter=run · Esc/click outside=leave ] "
-                .to_string()
-        } else if !self.pending_actions.is_empty() {
-            format!(
-                " [ {} pending - Y/Enter ACCEPT | N REJECT | A always-allow ] ",
-                self.pending_actions.len()
-            )
-        } else if self.input_focused {
-            " [ Prompt · Enter=send · Shift+Enter / Ctrl+J = newline · CTRL+F unfocus ] "
-                .to_string()
+        let bar_w = input_layout[1].width as usize;
+        let raw_model = self.backend.name();
+        let model_clean = if raw_model.chars().count() > 28 {
+            format!("{}…", raw_model.chars().take(26).collect::<String>())
         } else {
-            " [ Focus: Main Body | CTRL+F focus input | Y accept pending tools ] ".to_string()
+            raw_model
         };
+        let badge_text = format!(" {} ", model_clean);
+        let badge_len = badge_text.chars().count();
+        let left_trans = "🭆🭂";
+        let right_trans = "🭍🭑";
+        let left_trans_len = 2;
+        let right_trans_len = 2;
 
-        // Multiline prompt body (or TERM interactive line)
-        let input_lines_ui: Vec<Line> = if self.term_is_interactive() {
-            vec![Line::from(vec![
-                Span::styled(" $ ", Style::default().fg(Color::Rgb(100, 255, 100))),
-                Span::styled(
-                    if self.term_input.is_empty() {
-                        "type shell command…".to_string()
-                    } else {
-                        self.term_input.clone()
-                    },
-                    Style::default().fg(if self.term_input.is_empty() {
-                        dark_gray
-                    } else {
-                        Color::Rgb(180, 255, 180)
-                    }),
-                ),
-                Span::styled("█", Style::default().fg(Color::Rgb(100, 255, 100))),
-            ])]
-        } else if self.input.is_empty() {
-            vec![Line::from(Span::styled(
-                " Type prompt or /help... (Shift+Enter for new line)",
-                Style::default().fg(dark_gray),
-            ))]
-        } else {
-            // Manually chunk the string to match `input_cursor_col_row` exactly.
-            let inner_w = input_layout[1].width.saturating_sub(2).max(1) as usize;
-            let mut lines: Vec<Line> = Vec::new();
-            
-            for (i, row) in self.input.split('\n').enumerate() {
-                let mut current_line = String::new();
-                let mut col = if i == 0 { 1 } else { 0 };
-                if i == 0 {
-                    current_line.push(' ');
-                }
-                for ch in row.chars() {
-                    if col >= inner_w {
-                        lines.push(Line::from(Span::styled(
-                            current_line.clone(),
-                            Style::default().fg(theme_color),
-                        )));
-                        current_line.clear();
-                        col = 0;
-                    }
-                    current_line.push(ch);
-                    col += 1;
-                }
-                lines.push(Line::from(Span::styled(
-                    current_line,
-                    Style::default().fg(theme_color),
+        let total_badge_w = left_trans_len + badge_len + right_trans_len;
+        let left_bar_w = bar_w.saturating_sub(total_badge_w + 3).max(1);
+        let right_bar_w = bar_w.saturating_sub(left_bar_w + total_badge_w);
+
+        let mut bar_spans: Vec<Span> = Vec::new();
+        let mut cur_col_idx = 0;
+
+        // 1. Left bar characters: 🬭
+        for _ in 0..left_bar_w {
+            let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
+            let col_c = multi_stop_gradient(&stops, pos);
+            bar_spans.push(Span::styled("🬭", Style::default().fg(col_c).bg(NORDIC_BG)));
+            cur_col_idx += 1;
+        }
+
+        // 2. Left transition: 🭆🭂
+        let pos_left_trans = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
+        let c_left_trans = multi_stop_gradient(&stops, pos_left_trans);
+        bar_spans.push(Span::styled(left_trans, Style::default().fg(c_left_trans).bg(NORDIC_BG)));
+        cur_col_idx += left_trans_len;
+
+        // 3. Model Name badge (bg matches bar gradient, text is Nordic Gray)
+        let badge_start_col = input_layout[1].x + cur_col_idx as u16;
+        let pos_badge = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
+        let c_badge_bg = multi_stop_gradient(&stops, pos_badge);
+        bar_spans.push(Span::styled(
+            badge_text,
+            Style::default().fg(NORDIC_BG).bg(c_badge_bg).add_modifier(Modifier::BOLD),
+        ));
+        cur_col_idx += badge_len;
+        let badge_end_col = input_layout[1].x + cur_col_idx as u16;
+
+        // Record hit zone for clicking on Model Name to toggle focus
+        self.model_badge_hit = Some((input_layout[1].y, badge_start_col, badge_end_col));
+
+        // 4. Right transition: 🭍🭑
+        let pos_right_trans = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
+        let c_right_trans = multi_stop_gradient(&stops, pos_right_trans);
+        bar_spans.push(Span::styled(right_trans, Style::default().fg(c_right_trans).bg(NORDIC_BG)));
+        cur_col_idx += right_trans_len;
+
+        // 5. Right bar characters: 🬭
+        for _ in 0..right_bar_w {
+            let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
+            let col_c = multi_stop_gradient(&stops, pos);
+            bar_spans.push(Span::styled("🬭", Style::default().fg(col_c).bg(NORDIC_BG)));
+            cur_col_idx += 1;
+        }
+
+        let mut input_ui_lines: Vec<Line> = vec![Line::from(bar_spans)];
+
+        // Render content lines only if expanded (input_box_h > 1 && input_focused)
+        if input_box_h > 1 && self.input_focused {
+            let available_content_rows = input_box_h.saturating_sub(1);
+            let (_cursor_col, cursor_row) = self.input_cursor_col_row(inner_w);
+
+            // Auto-scroll input vertically
+            if cursor_row >= self.input_scroll_y + available_content_rows {
+                self.input_scroll_y = cursor_row.saturating_sub(available_content_rows.saturating_sub(1));
+            } else if cursor_row < self.input_scroll_y {
+                self.input_scroll_y = cursor_row;
+            }
+
+            if self.term_is_interactive() {
+                input_ui_lines.push(Line::from(vec![
+                    Span::styled(" $ ", Style::default().fg(Color::Rgb(100, 255, 100)).bg(NORDIC_BG)),
+                    Span::styled(
+                        if self.term_input.is_empty() {
+                            "type shell command…".to_string()
+                        } else {
+                            self.term_input.clone()
+                        },
+                        Style::default().fg(if self.term_input.is_empty() {
+                            NORDIC_MUTED
+                        } else {
+                            Color::Rgb(180, 255, 180)
+                        }).bg(NORDIC_BG),
+                    ),
+                    Span::styled("█", Style::default().fg(Color::Rgb(100, 255, 100)).bg(NORDIC_BG)),
+                ]));
+            } else if self.input.is_empty() {
+                input_ui_lines.push(Line::from(Span::styled(
+                    " Type a prompt...",
+                    Style::default().fg(NORDIC_MUTED).bg(NORDIC_BG),
                 )));
+            } else {
+                let start_idx = (self.input_scroll_y as usize).min(wrapped_prompt_lines.len());
+                let end_idx = (start_idx + available_content_rows as usize).min(wrapped_prompt_lines.len());
+                for line_str in &wrapped_prompt_lines[start_idx..end_idx] {
+                    input_ui_lines.push(Line::from(Span::styled(
+                        format!(" {}", line_str),
+                        Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                    )));
+                }
             }
-            if self.input.ends_with('\n') {
-                lines.push(Line::from(Span::styled(
-                    " ",
-                    Style::default().fg(theme_color),
-                )));
-            }
-            if lines.is_empty() {
-                lines.push(Line::from(""));
-            }
-            lines
-        };
+        }
 
-        let input_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(border_color))
-            .title(Span::styled(
-                title_text,
-                if exit_hold_pct.is_some() {
-                    Style::default()
-                        .fg(Color::Rgb(255, 120, 120))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(border_color)
-                },
-            ));
-
-        let input_box = Paragraph::new(input_lines_ui)
-            .block(input_block);
+        let input_box = Paragraph::new(input_ui_lines)
+            .style(Style::default().bg(NORDIC_BG));
         frame.render_widget(input_box, input_layout[1]);
 
-        // --- Footer Status Bar (status_message truncated so it never collides with input) ---
+        // --- Footer Status Bar ---
         let engine_short = {
             let n = self.backend.name();
             if n.chars().count() > 36 {
@@ -5447,13 +5581,15 @@ LlamaCppLibBackend::http(
             }
         };
         let status_short = {
-            let s = self.status_message.chars().take(48).collect::<String>();
-            if self.status_message.chars().count() > 48 {
+            let s = self.status_message.chars().take(60).collect::<String>();
+            if self.status_message.chars().count() > 60 {
                 format!("{s}…")
             } else {
                 s
             }
         };
+        let footer_pos = phase.fract();
+        let footer_accent = multi_stop_gradient(&stops, footer_pos);
         let footer_text = Line::from(vec![
             Span::styled(
                 format!(" {engine_short} "),
@@ -5461,43 +5597,28 @@ LlamaCppLibBackend::http(
                     .bg(if exit_hold_pct.is_some() {
                         Color::Rgb(180, 40, 40)
                     } else {
-                        theme_color
+                        footer_accent
                     })
-                    .fg(Color::Black)
+                    .fg(NORDIC_BG)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
-            Span::styled(status_short, Style::default().fg(Color::Rgb(200, 200, 200))),
-            Span::raw(" │ "),
-            Span::styled("Shift+Enter=↵", Style::default().fg(dark_gray)),
-            Span::raw(" │ "),
-            Span::styled(
-                if self.selection_active() {
-                    "Ctrl+C=copy selection"
-                } else {
-                    "Ctrl+C=interrupt"
-                },
-                Style::default().fg(if self.selection_active() {
-                    Color::Rgb(120, 200, 255)
-                } else {
-                    dark_gray
-                }),
-            ),
+            Span::styled(status_short, Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
         ]);
-        frame.render_widget(Paragraph::new(footer_text), chunks[3]);
+        frame.render_widget(Paragraph::new(footer_text).style(Style::default().bg(NORDIC_BG)), chunks[3]);
 
         let is_downloading = self.download_progress.lock().unwrap().is_some();
-        if self.input_focused && !self.show_menu && !is_downloading {
-            let inner_w = input_layout[1].width.saturating_sub(2).max(1) as usize;
+        if self.input_focused && !self.show_menu && !is_downloading && input_box_h > 1 {
             let (col, row) = self.input_cursor_col_row(inner_w);
-            let max_row = input_layout[1].height.saturating_sub(3);
-            let row = row.min(max_row);
-            let cursor_x = input_layout[1].x.saturating_add(1).saturating_add(col);
-            let cursor_y = input_layout[1].y.saturating_add(1).saturating_add(row);
-            // Keep cursor inside the box
-            let max_x = input_layout[1].x + input_layout[1].width.saturating_sub(2);
-            let max_y = input_layout[1].y + input_layout[1].height.saturating_sub(2);
-            frame.set_cursor_position((cursor_x.min(max_x), cursor_y.min(max_y)));
+            let available_content_rows = input_box_h.saturating_sub(1);
+            let visible_rel_row = row.saturating_sub(self.input_scroll_y);
+            if visible_rel_row < available_content_rows {
+                let cursor_x = input_layout[1].x.saturating_add(1).saturating_add(col as u16);
+                let cursor_y = input_layout[1].y.saturating_add(1).saturating_add(visible_rel_row as u16);
+                let max_x = input_layout[1].x + input_layout[1].width.saturating_sub(1);
+                let max_y = input_layout[1].y + input_box_h.saturating_sub(1);
+                frame.set_cursor_position((cursor_x.min(max_x), cursor_y.min(max_y)));
+            }
         }
 
         // --- Unified Menu Modal (Popup with KramaFrame Fade) ---

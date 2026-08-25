@@ -347,8 +347,8 @@ pub fn render_markdown_to_lines<'a>(
     let mut current_header_line_idx: usize = 0;
     let mut current_copy_start: u16 = 0;
     let mut current_copy_end: u16 = 0;
-    let code_bg = Color::Rgb(16, 22, 34);
-    let gutter_fg = Color::Rgb(85, 110, 140);
+    let code_bg = Color::Rgb(36, 41, 51);
+    let gutter_fg = Color::Rgb(94, 129, 172);
     let target_block_width: usize = target_width.saturating_sub(4).max(40);
     let max_code_chars_per_line: usize = target_block_width.saturating_sub(12).max(20);
 
