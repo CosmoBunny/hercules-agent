@@ -220,6 +220,7 @@ Tools (raw tags only, no markdown fences — emit tags, do not describe them):
 full file body
 </write>
 <cmd>shell command</cmd>
+<agent action="spawn" role="role" model="model">task</agent>
 <memory push>note</memory>
 <memory read>
 

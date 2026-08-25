@@ -480,10 +480,14 @@ fn detect_agent(text: &str) -> Vec<StreamToolView> {
             let action = crate::agent::AgentEngine::extract_attribute(header, "action").unwrap_or_else(|| "spawn".to_string());
             let role = crate::agent::AgentEngine::extract_attribute(header, "role").unwrap_or_default();
             let to = crate::agent::AgentEngine::extract_attribute(header, "to").unwrap_or_default();
+            let model = crate::agent::AgentEngine::extract_attribute(header, "model").unwrap_or_default();
             
             let mut target_label = action.clone();
             if !role.is_empty() {
                 target_label.push_str(&format!(" role={role}"));
+            }
+            if !model.is_empty() {
+                target_label.push_str(&format!(" model={model}"));
             }
             if !to.is_empty() {
                 target_label.push_str(&format!(" to={to}"));

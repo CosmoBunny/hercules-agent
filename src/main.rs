@@ -1,5 +1,6 @@
 //! Hercules Agent TUI binary.
 
+use clap::Parser;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -10,12 +11,47 @@ use crossterm::{
 };
 use hercules_agent::app::App;
 use hercules_agent::llama;
+use hercules_agent::session;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     error::Error,
     io,
     sync::atomic::{AtomicBool, Ordering},
 };
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "hercules",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "Hercules Agent — local AI coding TUI",
+    disable_version_flag = true
+)]
+pub struct Cli {
+    /// Print version information
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    pub version: (),
+
+    /// Show current directory's session ID and exit
+    #[arg(short = 's', long = "session")]
+    pub session: bool,
+
+    /// Continue existing session for current directory, or specify a session ID
+    #[arg(
+        short = 'c',
+        long = "continue",
+        num_args = 0..=1,
+        value_name = "SESSION_ID"
+    )]
+    pub continue_session: Option<Option<String>>,
+
+    /// Clear all unlocked sessions for current directory and exit
+    #[arg(long = "clear-session")]
+    pub clear_session: bool,
+
+    /// Clear all unlocked sessions across all directories and exit
+    #[arg(long = "clear-all-session")]
+    pub clear_all_session: bool,
+}
 
 /// Set on SIGTERM only — request clean app quit (kill servers).
 /// SIGINT / Ctrl+C is **not** handled here so the TUI can interrupt generation only.
@@ -40,6 +76,45 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let cli = Cli::parse();
+
+    let cwd = std::env::current_dir()?;
+
+    // If --session / -s: print session ID for current directory and exit immediately.
+    if cli.session {
+        let sid = session::session_id_for_dir(&cwd);
+        println!("{}", sid);
+        return Ok(());
+    }
+
+    // If --clear-session: clear all unlocked sessions for current directory and exit.
+    if cli.clear_session {
+        let (cleared, skipped) = session::clear_session_for_dir(&cwd);
+        if skipped > 0 {
+            println!(
+                "Cleared {} session(s) for current directory ({} active/locked session(s) skipped).",
+                cleared, skipped
+            );
+        } else {
+            println!("Cleared {} session(s) for current directory.", cleared);
+        }
+        return Ok(());
+    }
+
+    // If --clear-all-session: clear all unlocked sessions across all directories and exit.
+    if cli.clear_all_session {
+        let (cleared, skipped) = session::clear_all_sessions();
+        if skipped > 0 {
+            println!(
+                "Cleared {} session(s) across all directories ({} active/locked session(s) skipped).",
+                cleared, skipped
+            );
+        } else {
+            println!("Cleared {} session(s) across all directories.", cleared);
+        }
+        return Ok(());
+    }
+
     unsafe {
         std::env::set_var("RUST_LOG", "error");
         std::env::set_var("WGPU_LOG", "error");
@@ -67,12 +142,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let is_continue = cli.continue_session.is_some();
+    let target_sid = match cli.continue_session {
+        Some(Some(ref explicit_id)) if !explicit_id.trim().is_empty() => explicit_id.clone(),
+        Some(_) => {
+            if let Some(latest) = session::latest_session_for_dir(&cwd) {
+                latest.session_id
+            } else {
+                session::new_session_id_for_dir(&cwd)
+            }
+        }
+        None => session::new_session_id_for_dir(&cwd),
+    };
+
+    let _lock_guard = match session::acquire_session_lock(&target_sid) {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            eprintln!("Warning: {}", err);
+            None
+        }
+    };
+
+    let mut app = if is_continue {
+        let s = session::load_or_create_session(&target_sid, &cwd);
+        App::with_session(s)
+    } else {
+        let mut app = App::new();
+        app.session_id = Some(target_sid);
+        app
+    };
+
     let res = run_app(&mut terminal, &mut app).await;
 
     if let Ok(mut g) = app.is_generating.lock() {
         *g = false;
     }
+
+    app.save_current_session();
 
     // Restore terminal first so the user's shell is usable immediately.
     restore_terminal(&mut terminal);

@@ -73,6 +73,35 @@ impl AgentBackend {
             Self::Ollama(b) => format!("Ollama ({})", b.model),
         }
     }
+
+    pub fn with_model(&self, model_name: &str, manager: &crate::manager::ModelManager) -> Self {
+        let trimmed = model_name.trim();
+        if trimmed.is_empty() {
+            return self.clone();
+        }
+        match self {
+            Self::Ollama(_) => {
+                let clean_name = trimmed.trim_start_matches("Ollama:").trim();
+                Self::Ollama(OllamaBackend::new(clean_name.to_string()))
+            }
+            Self::LlamaCppLib(_) => {
+                let entries = manager.list_installed_entries();
+                if let Some(entry) = entries.iter().find(|e| {
+                    e.name.eq_ignore_ascii_case(trimmed)
+                        || e.filename.eq_ignore_ascii_case(trimmed)
+                        || e.path.ends_with(trimmed)
+                }) {
+                    Self::LlamaCppLib(LlamaCppLibBackend::gguf_with_name(std::path::PathBuf::from(&entry.path), trimmed))
+                } else if std::path::Path::new(trimmed).exists() {
+                    Self::LlamaCppLib(LlamaCppLibBackend::gguf_with_name(std::path::PathBuf::from(trimmed), trimmed))
+                } else {
+                    Self::LlamaCppLib(LlamaCppLibBackend::http("http://localhost:8080".into(), trimmed.into()))
+                }
+            }
+            #[cfg(feature = "gpu")]
+            Self::BurnWgpu(_) => self.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

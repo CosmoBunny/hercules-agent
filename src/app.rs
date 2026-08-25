@@ -21,6 +21,32 @@ use std::time::Duration;
 use std::time::Instant;
 use sysinfo::System;
 
+#[derive(Debug, Clone, Copy)]
+pub struct CodeBlockToggleHit {
+    pub block_idx: usize,
+    pub screen_y: i32,
+    pub normal_x: (u16, u16),
+    pub preview_x: (u16, u16),
+}
+
+#[derive(Debug, Clone)]
+pub struct CodeBlockCopyHit {
+    pub block_idx: usize,
+    pub screen_y: i32,
+    pub copy_x: (u16, u16),
+    pub code_body: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CodeBlockScrollHit {
+    pub block_idx: usize,
+    pub screen_y: i32,
+    pub left_btn_x: (u16, u16),
+    pub track_x: (u16, u16),
+    pub right_btn_x: (u16, u16),
+    pub max_scroll: usize,
+}
+
 pub struct App {
     pub should_quit: bool,
     pub status_message: String,
@@ -28,6 +54,7 @@ pub struct App {
     // Chat state
     pub input: String,
     pub messages: Vec<String>,
+    pub session_id: Option<String>,
     pub backend: AgentBackend,
 
     // Registry state
@@ -73,6 +100,20 @@ pub struct App {
     pub last_chat_area: Option<ratatui::layout::Rect>,
     /// Plain text of each logical chat line (same index as draw lines) for copy.
     pub last_chat_plain_lines: Vec<String>,
+    /// Visual start offset of each logical line (for accurate mouse selection mapping)
+    pub last_chat_visual_at: Vec<u16>,
+    /// Active preview mode toggles per code block index
+    pub code_block_previews: std::collections::HashSet<usize>,
+    /// Interactive Normal/Preview toggle hit zones
+    pub code_block_hits: Vec<CodeBlockToggleHit>,
+    /// Interactive Copy button hit zones
+    pub code_block_copy_hits: Vec<CodeBlockCopyHit>,
+    /// Height transition animations per code block (to_preview, start_time)
+    pub code_block_anims: std::collections::HashMap<usize, (bool, std::time::Instant)>,
+    /// Horizontal scroll offsets per code block preview (code_block_idx -> scroll_x)
+    pub code_block_scrolls: std::collections::HashMap<usize, usize>,
+    /// Interactive preview horizontal scroll bar hit zones
+    pub code_block_scroll_hits: Vec<CodeBlockScrollHit>,
     /// Estimated context tokens used / limit (for status)
     pub context_tokens_est: usize,
     pub context_compact_count: u32,
@@ -140,6 +181,8 @@ pub struct App {
     pub tool_result_context: Vec<String>,
     /// Long-running shell jobs (http.server, cargo, …)
     pub task_manager: TaskManager,
+    /// Pending sub-agent messages queued while host/agent was busy streaming
+    pub pending_agent_messages: Vec<crate::task_manager::TaskEvent>,
     /// Stall detection: last time streaming_response grew while generating
     pub gen_last_progress: Option<Instant>,
     pub gen_last_len: usize,
@@ -152,11 +195,14 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let default_sid = crate::session::new_session_id_for_dir(&cwd);
         let app = Self {
             should_quit: false,
             status_message: "Ready.".to_string(),
             input: String::new(),
             messages: vec!["System: Welcome to Hercules. Ask me anything!".to_string()],
+            session_id: Some(default_sid),
             backend: {
                 // Prefer local GGUF with llama.rs (pure Rust); else llama.cpp if path exists
                 let mgr = ModelManager::new();
@@ -206,6 +252,13 @@ impl App {
             selected_text_buffer: String::new(),
             last_chat_area: None,
             last_chat_plain_lines: Vec::new(),
+            last_chat_visual_at: Vec::new(),
+            code_block_previews: std::collections::HashSet::new(),
+            code_block_hits: Vec::new(),
+            code_block_copy_hits: Vec::new(),
+            code_block_anims: std::collections::HashMap::new(),
+            code_block_scrolls: std::collections::HashMap::new(),
+            code_block_scroll_hits: Vec::new(),
             context_tokens_est: 0,
             context_compact_count: 0,
             hf_models: Vec::new(),
@@ -286,6 +339,7 @@ impl App {
             pending_actions: Vec::new(),
             tool_result_context: Vec::new(),
             task_manager: TaskManager::new(),
+            pending_agent_messages: Vec::new(),
             gen_last_progress: None,
             gen_last_len: 0,
             term_input: String::new(),
@@ -313,6 +367,96 @@ impl App {
 
         app
     }
+
+    pub fn with_session(session: crate::session::Session) -> Self {
+        let mut app = Self::new();
+        let sid = session.session_id.clone();
+        if !session.messages.is_empty() {
+            app.messages = session.messages;
+            // Clean up transient messages (resumed lines, stall warnings)
+            app.messages.retain(|m| {
+                !m.starts_with("System: Resumed session ")
+                    && !m.starts_with("System: [STALL]")
+                    && !m.starts_with("System: [CTRL+C]")
+            });
+            for m in &mut app.messages {
+                if m.starts_with("Agent: ") {
+                    if let Some(pos) = m.find("\n[Generation stalled") {
+                        m.truncate(pos);
+                    }
+                    if let Some(pos) = m.find("\n[STALL") {
+                        m.truncate(pos);
+                    }
+                    if let Some(pos) = m.find("\n[Generation Interrupted") {
+                        m.truncate(pos);
+                    }
+                }
+            }
+            // Auto-activate the model used in this session if recorded
+            for m in &app.messages {
+                if m.starts_with("System: Switched active engine model to ") {
+                    if let Some(open) = m.find('[') {
+                        if let Some(close) = m.rfind(']') {
+                            let path_str = &m[open + 1..close];
+                            let path = std::path::PathBuf::from(path_str);
+                            if path.exists() {
+                                app.backend = AgentBackend::LlamaCppLib(
+                                    LlamaCppLibBackend::gguf(path.clone()),
+                                );
+                                app.manager.set_active_gguf_path(path.display().to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            app.messages.push(format!("System: Resumed session {}", sid));
+        }
+        app.status_message = format!("Resumed session {}", sid);
+        app.session_id = Some(sid);
+        app
+    }
+
+    pub fn save_current_session(&self) {
+        if let Some(ref sid) = self.session_id {
+            let working_dir = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .to_string_lossy()
+                .to_string();
+            let mut session = crate::session::Session::new(sid.clone(), working_dir);
+            // Don't save transient "System: Resumed session" messages in persistent session history
+            session.messages = self
+                .messages
+                .iter()
+                .filter(|m| !m.starts_with("System: Resumed session "))
+                .cloned()
+                .collect();
+            let _ = crate::session::save_session(&session);
+        }
+    }
+
+    /// Returns list of available models for subagents, capped to the current backend's repository.
+    pub fn available_swarm_models(&self) -> Vec<String> {
+        match &self.backend {
+            AgentBackend::Ollama(_) => {
+                self.installed_models
+                    .iter()
+                    .filter(|m| m.starts_with("Ollama:"))
+                    .map(|m| m.trim_start_matches("Ollama:").trim().to_string())
+                    .collect()
+            }
+            AgentBackend::LlamaCppLib(_) => {
+                self.installed_models
+                    .iter()
+                    .filter(|m| !m.starts_with("Ollama:"))
+                    .cloned()
+                    .collect()
+            }
+            #[cfg(feature = "gpu")]
+            AgentBackend::BurnWgpu(_) => vec![],
+        }
+    }
+
     fn record_write_result(&mut self, action: &crate::agent::ProposedAction, result: &str) {
         let pretty = tool_panel::format_tool_output_for_chat(result);
 
@@ -452,17 +596,21 @@ impl App {
                 if a.kind == crate::agent::ProposedKind::Agent {
                     let role = crate::agent::AgentEngine::extract_attribute(&a.target, "role").unwrap_or_default();
                     let to = crate::agent::AgentEngine::extract_attribute(&a.target, "to").unwrap_or_default();
+                    let model = crate::agent::AgentEngine::extract_attribute(&a.target, "model").unwrap_or_default();
+                    let sub_backend = self.backend.with_model(&model, &self.manager);
                     let instruction = a.body.clone();
                     let agent_id = self.task_manager.spawn_agent(
-                        self.backend.clone(),
-                        role,
+                        sub_backend,
+                        role.clone(),
                         to,
+                        model.clone(),
                         instruction,
                         0 // spawned_by host/orchestrator
                     );
+                    let model_label = if model.is_empty() { String::new() } else { format!(" [model={model}]") };
                     if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == a.chip_id.unwrap()) {
                         chip.pending = false;
-                        chip.body = format!("[Agent Task #{agent_id} spawning]\n(waiting for reply…)");
+                        chip.body = format!("[Agent Task #{agent_id} ({role}{model_label}) spawning]\n(waiting for reply…)");
                     }
                     continue;
                 }
@@ -698,14 +846,21 @@ impl App {
         let max_y = start.1.max(end.1) as i32;
         let chat_y = self
             .last_chat_area
-            .map(|a| a.y.saturating_add(1))
-            .unwrap_or(1) as i32;
-        // Prefer plain lines from last draw (matches shaded rows)
+            .map(|a| a.y.saturating_add(1) as i32)
+            .unwrap_or(1);
+        // Prefer plain lines from last draw (matches shaded rows accurately with wrapping)
         let mut extracted: Vec<String> = Vec::new();
         if !self.last_chat_plain_lines.is_empty() {
             for (i, line) in self.last_chat_plain_lines.iter().enumerate() {
-                let screen_y = chat_y + i as i32 - self.scroll_offset as i32;
-                if screen_y >= min_y && screen_y <= max_y {
+                let vis_start = self.last_chat_visual_at.get(i).copied().unwrap_or(i as u16) as i32;
+                let vis_count = if i + 1 < self.last_chat_visual_at.len() {
+                    (self.last_chat_visual_at[i + 1] - self.last_chat_visual_at[i]) as i32
+                } else {
+                    1
+                };
+                let screen_y_start = chat_y + vis_start - self.scroll_offset as i32;
+                let screen_y_end = screen_y_start + vis_count - 1;
+                if max_y >= screen_y_start && min_y <= screen_y_end {
                     extracted.push(line.clone());
                 }
             }
@@ -1033,20 +1188,24 @@ impl App {
                 if a.kind == crate::agent::ProposedKind::Agent {
                     let role = crate::agent::AgentEngine::extract_attribute(&a.target, "role").unwrap_or_default();
                     let to = crate::agent::AgentEngine::extract_attribute(&a.target, "to").unwrap_or_default();
+                    let model = crate::agent::AgentEngine::extract_attribute(&a.target, "model").unwrap_or_default();
+                    let sub_backend = self.backend.with_model(&model, &self.manager);
                     let instruction = a.body.clone();
                     let agent_id = self.task_manager.spawn_agent(
-                        self.backend.clone(),
-                        role,
+                        sub_backend,
+                        role.clone(),
                         to,
+                        model.clone(),
                         instruction,
                         0 // spawned_by host/orchestrator
                     );
                     agent_ids.push(agent_id);
+                    let model_label = if model.is_empty() { String::new() } else { format!(" [model={model}]") };
                     if let Some(chip_id) = a.chip_id {
                         if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
                             chip.pending = false;
                             chip.tag_closed = true;
-                            chip.body = format!("[Agent Task #{agent_id} spawning]\n(waiting for reply…)");
+                            chip.body = format!("[Agent Task #{agent_id} ({role}{model_label}) spawning]\n(waiting for reply…)");
                         }
                     }
                     continue;
@@ -1121,86 +1280,38 @@ impl App {
     }
 
     /// Drain task manager events (parked / done) into chat + optional re-prompt.
+    /// If the agent is currently busy streaming, messages are queued in `pending_agent_messages`
+    /// and delivered cleanly once streaming finishes.
     fn poll_task_events(&mut self) {
-        let events = self.task_manager.take_events();
-        for ev in events {
-            match ev {
-                TaskEvent::Parked { id, cmd, spawned_by } => {
-                    self.messages.push(format!(
-                        "System: [Task #{id} (Agent {spawned_by})] still running after {QUICK_SECS}s — pushed to task manager. \
-                         Command: `{cmd}`. Agent may continue; output arrives when finished. \
-                         Ctrl+C kills running tasks."
-                    ));
-                    self.tool_result_context.push(format!(
-                        "[Task #{id} PARKED — still running]\ncmd: {cmd}\n\
-                         Do not re-run this command. Wait for [Task #{id} DONE (Agent {spawned_by})] or start other work."
-                    ));
+        let is_busy = *self.is_generating.lock().unwrap();
+
+        // 1. Ingest new events from task manager
+        let new_events = self.task_manager.take_events();
+        for ev in new_events {
+            if is_busy {
+                if let TaskEvent::Done { id, cmd, output: _, killed: _, spawned_by } = &ev {
                     if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
-                        c.kind == ToolPanelKind::Cmd
-                            && tool_panel::same_tool_target(ToolPanelKind::Cmd, &c.target, &cmd)
+                        (c.kind == ToolPanelKind::Cmd || c.kind == ToolPanelKind::Agent)
+                            && tool_panel::same_tool_target(c.kind, &c.target, cmd)
                     }) {
-                        chip.body = format!(
-                            "[Task #{id} — long running >{QUICK_SECS}s]\n$ {cmd}\n(waiting… Ctrl+C to kill)"
-                        );
-                    }
-                    // Nudge model that work is async
-                    if !*self.is_generating.lock().unwrap() {
-                        self.auto_tool_turns += 1;
-                        if self.auto_tool_turns <= 8 {
-                            self.trigger_generation_from_context();
-                        }
-                    }
-                    self.status_message = format!("Task #{id} parked (long-running)");
-                    if let Ok(mut l) = self.activity_logs.lock() {
-                        l.push(format!("[TASK #{id}] parked after {QUICK_SECS}s: {cmd}"));
+                        chip.body = format!("[Task #{id} DONE (Agent {spawned_by}) — queued in inbox]\n(waiting for current response to finish)");
                     }
                 }
-                TaskEvent::Done {
-                    id,
-                    cmd,
-                    output,
-                    killed,
-                    spawned_by,
-                } => {
-                    let label = if killed { "KILLED" } else { "DONE" };
-                    let pretty = tool_panel::format_tool_output_for_chat(&output);
-                    if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
-                        c.kind == ToolPanelKind::Cmd
-                            && tool_panel::same_tool_target(ToolPanelKind::Cmd, &c.target, &cmd)
-                    }) {
-                        chip.body = format!("[Task #{id} {label} (Agent {spawned_by})]\n$ {cmd}\n{pretty}");
-                        chip.tag_closed = true;
-                        chip.pending = false;
-                        let cid = chip.id;
-                        self.force_open_panel_from_chip(cid);
-                    }
-                    self.tool_result_context.push(format!(
-                        "[Task #{id} {label} (Agent {spawned_by})]\ncmd: {cmd}\n\n{pretty}\n\n\
-                         Use this output. Do not re-run the same command unless needed."
-                    ));
-                    if self.tool_result_context.len() > 8 {
-                        let n = self.tool_result_context.len() - 8;
-                        self.tool_result_context.drain(0..n);
-                    }
-                    self.messages.push(format!(
-                        "System: [Task #{id} {label} (Agent {spawned_by})] `{cmd}` ({} lines) — result sent to agent",
-                        pretty.lines().count()
-                    ));
-                    if let Ok(mut l) = self.activity_logs.lock() {
-                        l.push(format!("[TASK #{id}] {label} ({} bytes)", pretty.len()));
-                    }
-                    self.status_message = format!("Task #{id} {label} (Agent {spawned_by})");
-                    if !killed && !*self.is_generating.lock().unwrap() {
-                        self.auto_tool_turns += 1;
-                        if self.auto_tool_turns <= 8 {
-                            self.trigger_generation_from_context();
-                        }
-                    }
-                }
+                self.pending_agent_messages.push(ev);
+            } else {
+                self.deliver_task_event(ev);
             }
         }
 
-        // Live-update TERM panel body from running tasks
+        // 2. If agent is free and queued messages exist, deliver them now
+        if !is_busy && !self.pending_agent_messages.is_empty() {
+            let queued = std::mem::take(&mut self.pending_agent_messages);
+            for ev in queued {
+                self.deliver_task_event(ev);
+            }
+        }
+
+        // 3. Live-update TERM panel body from running tasks
         for t in self.task_manager.list() {
             if t.status != crate::task_manager::TaskStatus::Running {
                 continue;
@@ -1217,6 +1328,84 @@ impl App {
                         t.cmd,
                         t.output
                     );
+                }
+            }
+        }
+    }
+
+    fn deliver_task_event(&mut self, ev: TaskEvent) {
+        match ev {
+            TaskEvent::Parked { id, cmd, spawned_by } => {
+                self.messages.push(format!(
+                    "System: [Task #{id} (Agent {spawned_by})] still running after {QUICK_SECS}s — pushed to task manager. \
+                     Command: `{cmd}`. Agent may continue; output arrives when finished. \
+                     Ctrl+C kills running tasks."
+                ));
+                self.tool_result_context.push(format!(
+                    "[Task #{id} PARKED — still running]\ncmd: {cmd}\n\
+                     Do not re-run this command. Wait for [Task #{id} DONE (Agent {spawned_by})] or start other work."
+                ));
+                if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
+                    (c.kind == ToolPanelKind::Cmd || c.kind == ToolPanelKind::Agent)
+                        && tool_panel::same_tool_target(c.kind, &c.target, &cmd)
+                }) {
+                    chip.body = format!(
+                        "[Task #{id} — long running >{QUICK_SECS}s]\n$ {cmd}\n(waiting… Ctrl+C to kill)"
+                    );
+                }
+                if !*self.is_generating.lock().unwrap() {
+                    self.auto_tool_turns += 1;
+                    if self.auto_tool_turns <= 8 {
+                        self.trigger_generation_from_context();
+                    }
+                }
+                self.status_message = format!("Task #{id} parked (long-running)");
+                if let Ok(mut l) = self.activity_logs.lock() {
+                    l.push(format!("[TASK #{id}] parked after {QUICK_SECS}s: {cmd}"));
+                }
+            }
+            TaskEvent::Done {
+                id,
+                cmd,
+                output,
+                killed,
+                spawned_by,
+            } => {
+                let label = if killed { "KILLED" } else { "DONE" };
+                let pretty = tool_panel::format_tool_output_for_chat(&output);
+                if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
+                    (c.kind == ToolPanelKind::Cmd || c.kind == ToolPanelKind::Agent)
+                        && tool_panel::same_tool_target(c.kind, &c.target, &cmd)
+                }) {
+                    chip.body = format!(
+                        "[Task #{id} {label} (Agent {spawned_by})]\n$ {cmd}\n{pretty}"
+                    );
+                    chip.tag_closed = true;
+                    chip.pending = false;
+                    let cid = chip.id;
+                    self.force_open_panel_from_chip(cid);
+                }
+                self.tool_result_context.push(format!(
+                    "[Task #{id} {label} (Agent {spawned_by})]\ncmd: {cmd}\n\n{pretty}\n\n\
+                     Use this output. Do not re-run the same command unless needed."
+                ));
+                if self.tool_result_context.len() > 8 {
+                    let n = self.tool_result_context.len() - 8;
+                    self.tool_result_context.drain(0..n);
+                }
+                self.messages.push(format!(
+                    "System: [Task #{id} {label} (Agent {spawned_by})] `{cmd}` ({} lines) — result delivered to agent",
+                    pretty.lines().count()
+                ));
+                if let Ok(mut l) = self.activity_logs.lock() {
+                    l.push(format!("[TASK #{id}] {label} ({} bytes)", pretty.len()));
+                }
+                self.status_message = format!("Task #{id} {label} (Agent {spawned_by})");
+                if !killed && !*self.is_generating.lock().unwrap() {
+                    self.auto_tool_turns += 1;
+                    if self.auto_tool_turns <= 8 {
+                        self.trigger_generation_from_context();
+                    }
                 }
             }
         }
@@ -1367,7 +1556,7 @@ impl App {
         }
 
         let limit_secs = if has_tokens {
-            20u64 // idle mid-stream
+            crate::settings::get_settings().stall_timeout_secs.clamp(60, 300)
         } else {
             crate::settings::get_settings().stall_timeout_secs
         };
@@ -2641,8 +2830,86 @@ impl App {
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
-                        // Chip / chrome first (always clear selection)
-                        if let Some(id) =
+                        // Check interactive code block Copy button first
+                        let mut copy_action: Option<(usize, String)> = None;
+                        for hit in &self.code_block_copy_hits {
+                            if mouse.row as i32 == hit.screen_y && mouse.column >= hit.copy_x.0 && mouse.column <= hit.copy_x.1 {
+                                copy_action = Some((hit.block_idx, hit.code_body.clone()));
+                                break;
+                            }
+                        }
+                        if let Some((b_idx, code_body)) = copy_action {
+                            let ok = crate::clipboard::copy_text_silent(&code_body);
+                            let n = code_body.lines().count().max(1);
+                            self.status_message = if ok {
+                                format!("Copied code block #{} ({} lines) → clipboard", b_idx + 1, n)
+                            } else {
+                                format!("Saved code block #{} to {}", b_idx + 1, crate::clipboard::clipboard_file_path())
+                            };
+                            if let Ok(mut l) = self.activity_logs.lock() {
+                                l.push(format!("[CLIPBOARD] Code block #{} ({} lines)", b_idx + 1, n));
+                            }
+                            self.clear_selection();
+                            self.exit_term_interactive();
+                            self.input_focused = false;
+                            return Ok(());
+                        }
+
+                        // Check interactive preview horizontal scrollbar
+                        let mut scroll_action: Option<(usize, usize)> = None;
+                        for hit in &self.code_block_scroll_hits {
+                            if mouse.row as i32 == hit.screen_y {
+                                let cur = self.code_block_scrolls.get(&hit.block_idx).copied().unwrap_or(0);
+                                if mouse.column >= hit.left_btn_x.0 && mouse.column <= hit.left_btn_x.1 {
+                                    scroll_action = Some((hit.block_idx, cur.saturating_sub(8)));
+                                    break;
+                                } else if mouse.column >= hit.right_btn_x.0 && mouse.column <= hit.right_btn_x.1 {
+                                    scroll_action = Some((hit.block_idx, (cur + 8).min(hit.max_scroll)));
+                                    break;
+                                } else if mouse.column >= hit.track_x.0 && mouse.column <= hit.track_x.1 {
+                                    let track_w = (hit.track_x.1.saturating_sub(hit.track_x.0)).max(1) as f32;
+                                    let click_offset = (mouse.column.saturating_sub(hit.track_x.0)) as f32;
+                                    let pct = (click_offset / track_w).clamp(0.0, 1.0);
+                                    let target_sc = (pct * hit.max_scroll as f32).round() as usize;
+                                    scroll_action = Some((hit.block_idx, target_sc));
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some((b_idx, new_scroll)) = scroll_action {
+                            self.code_block_scrolls.insert(b_idx, new_scroll);
+                            self.clear_selection();
+                            self.exit_term_interactive();
+                            self.input_focused = false;
+                            return Ok(());
+                        }
+
+                        // Check interactive code block Normal / Preview button toggles
+                        let mut toggle_action: Option<(usize, bool)> = None;
+                        for hit in &self.code_block_hits {
+                            if mouse.row as i32 == hit.screen_y {
+                                if mouse.column >= hit.normal_x.0 && mouse.column <= hit.normal_x.1 {
+                                    toggle_action = Some((hit.block_idx, false));
+                                    break;
+                                } else if mouse.column >= hit.preview_x.0 && mouse.column <= hit.preview_x.1 {
+                                    toggle_action = Some((hit.block_idx, true));
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some((b_idx, is_preview)) = toggle_action {
+                            if is_preview {
+                                self.code_block_previews.insert(b_idx);
+                                self.status_message = format!("Code block #{} set to Preview mode", b_idx + 1);
+                            } else {
+                                self.code_block_previews.remove(&b_idx);
+                                self.status_message = format!("Code block #{} set to Normal mode", b_idx + 1);
+                            }
+                            self.code_block_anims.insert(b_idx, (is_preview, std::time::Instant::now()));
+                            self.clear_selection();
+                            self.exit_term_interactive();
+                            self.input_focused = false;
+                        } else if let Some(id) =
                             tool_panel::hit_test_chip(&self.tool_chips, mouse.column, mouse.row)
                         {
                             self.clear_selection();
@@ -4066,8 +4333,20 @@ LlamaCppLibBackend::http(
                                                     } else {
                                                         "accomplish this task"
                                                     };
+                                                    let models = self.available_swarm_models();
+                                                    let models_str = if models.is_empty() {
+                                                        "Default active model".to_string()
+                                                    } else {
+                                                        models.join(", ")
+                                                    };
+                                                    let backend_type = match &self.backend {
+                                                        AgentBackend::Ollama(_) => "Ollama repository",
+                                                        AgentBackend::LlamaCppLib(_) => "llama.cpp / local GGUF repository",
+                                                        #[cfg(feature = "gpu")]
+                                                        AgentBackend::BurnWgpu(_) => "WGPU repository",
+                                                    };
                                                     self.messages.push(
-                                                        format!("System: You are the Swarm Orchestrator (H0). Use the `<agent action=\"spawn\" role=\"...\">task description</agent>` tag to spawn specialized sub-agents to {}. Do not write code yourself. Delegate all complex work to sub-agents. When a sub-agent replies with `<agent action=\"reply\">`, evaluate their work.", instruction)
+                                                        format!("System: You are the Swarm Orchestrator (H0). You can spawn specialized sub-agents with custom models using `<agent action=\"spawn\" role=\"ROLE\" model=\"MODEL\">task description</agent>`.\n\nAvailable models for your current {backend_type}: [{models_str}]\n\nTask: {}\nDo not write code yourself. Delegate all complex work to sub-agents. When a sub-agent replies with `<agent action=\"reply\">`, evaluate and coordinate.", instruction)
                                                     );
                                                 }
                                                 "/compact" | "/compact!" | "/gc" => {
@@ -4467,6 +4746,7 @@ LlamaCppLibBackend::http(
         };
 
         let chat_area = left_chunks[0];
+        let available_width = (chat_area.width.saturating_sub(2) as usize).max(1);
 
         // Keep chip anchors on valid Agent turns so buttons scroll with that turn
         {
@@ -4488,20 +4768,42 @@ LlamaCppLibBackend::http(
         let mut chat_lines: Vec<Line> = Vec::new();
         // (chip_id, logical chat_lines index where chip spacer starts)
         let mut chip_line_starts: Vec<(u64, usize)> = Vec::new();
+        let mut all_toggle_buttons: Vec<(usize, usize, u16, u16, u16, u16)> = Vec::new();
+        let mut all_copy_buttons: Vec<(usize, usize, u16, u16, String)> = Vec::new();
+        let mut all_scroll_buttons: Vec<(usize, usize, u16, u16, u16, u16, u16, u16, usize)> = Vec::new();
 
         for (m_idx, m) in self.messages.iter().enumerate() {
             let is_last_message = m_idx == self.messages.len() - 1;
 
             if m.starts_with("You:") {
-                chat_lines.push(Line::from(vec![
-                    Span::styled(
-                        "You: ",
-                        Style::default()
-                            .fg(theme_color)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(&m[5..], Style::default().fg(white)),
-                ]));
+                let user_text = m.strip_prefix("You:").unwrap_or(&m[4..]).trim_start();
+                let inline_spans = crate::markdown::parse_inline(user_text, false, false);
+                let mut spans = vec![Span::styled(
+                    "You: ",
+                    Style::default()
+                        .fg(theme_color)
+                        .add_modifier(Modifier::BOLD),
+                )];
+                for ispan in inline_spans {
+                    let mut style = Style::default().fg(white);
+                    if ispan.bold {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    if ispan.italic {
+                        style = style.add_modifier(Modifier::ITALIC);
+                    }
+                    if ispan.strikethrough {
+                        style = style.add_modifier(Modifier::CROSSED_OUT);
+                    }
+                    if ispan.code {
+                        style = style.fg(Color::Rgb(255, 190, 100)).add_modifier(Modifier::BOLD);
+                    }
+                    if ispan.link_url.is_some() {
+                        style = style.fg(Color::Rgb(0, 200, 255)).add_modifier(Modifier::UNDERLINED);
+                    }
+                    spans.push(Span::styled(ispan.text, style));
+                }
+                chat_lines.push(Line::from(spans));
                 chat_lines.push(Line::from(""));
             } else if m.starts_with("Agent:") || m.starts_with("Error:") {
                 let content = if m.starts_with("Agent:") {
@@ -4632,125 +4934,38 @@ LlamaCppLibBackend::http(
                             Style::default().fg(light_blue).add_modifier(Modifier::BOLD),
                         )));
 
-                        let mut in_code_block = false;
-                        let total_lines = text_to_render.lines().count();
                         let mut global_out_ch = 0;
-                        for (l_idx, raw_line) in text_to_render.lines().enumerate() {
-                            let is_last_line = l_idx + 1 == total_lines;
-                            let trimmed = raw_line.trim();
-
-                            if trimmed.starts_with("```") {
-                                in_code_block = !in_code_block;
-                                let tag = if in_code_block {
-                                    " --- Code Block ---"
-                                } else {
-                                    " --- End Code ---"
-                                };
-                                chat_lines.push(Line::from(Span::styled(
-                                    tag,
-                                    Style::default()
-                                        .fg(theme_color)
-                                        .add_modifier(Modifier::BOLD),
-                                )));
-                                global_out_ch += raw_line.chars().count() + 1;
-                                continue;
-                            }
-
-                            let mut line_spans = Vec::new();
-
-                            if trimmed.starts_with('|') && trimmed.contains('|') {
-                                // Markdown Table Formatting using Box Borders
-                                line_spans.push(Span::styled("  ", Style::default()));
-                                for cell in trimmed.split('|').filter(|s| !s.trim().is_empty()) {
-                                    if cell.chars().all(|c| c == '-' || c == ':' || c == ' ') {
-                                        line_spans.push(Span::styled(
-                                            "─────┼─────",
-                                            Style::default().fg(dark_gray),
-                                        ));
-                                    } else {
-                                        line_spans.push(Span::styled(
-                                            format!(" {} │", cell.trim()),
-                                            Style::default()
-                                                .fg(Color::Rgb(0, 230, 255))
-                                                .add_modifier(Modifier::BOLD),
-                                        ));
-                                    }
-                                }
-                                global_out_ch += raw_line.chars().count() + 1;
-                            } else if trimmed.starts_with('#') && trimmed.chars().take_while(|c| *c == '#').count() > 0 && trimmed[trimmed.chars().take_while(|c| *c == '#').count()..].starts_with(' ') {
-                                let level = trimmed.chars().take_while(|c| *c == '#').count();
-                                let h_color = match level {
-                                    1 => Color::Rgb(0, 255, 0),
-                                    2 => Color::Rgb(0, 150, 255),
-                                    3 => Color::Rgb(255, 255, 0),
-                                    _ => Color::Rgb(255, 50, 50),
-                                };
-                                line_spans.push(Span::styled(
-                                    format!("  {}", trimmed),
-                                    Style::default()
-                                        .fg(h_color)
-                                        .add_modifier(Modifier::BOLD),
-                                ));
-                                global_out_ch += raw_line.chars().count() + 1;
-                            } else {
-                                let is_bullet = trimmed.starts_with("- ") || trimmed.starts_with("* ");
-                                if is_bullet {
-                                    line_spans.push(Span::styled("  ● ", Style::default().fg(theme_color)));
-                                    global_out_ch += raw_line.chars().count() - trimmed.chars().count() + 2;
-                                } else {
-                                    line_spans.push(Span::styled("  ", Style::default()));
-                                }
-                                
-                                let text_to_parse = if is_bullet { &trimmed[2..] } else { raw_line };
-                                
-                                let mut chars = text_to_parse.chars().peekable();
-                                let mut is_bold = false;
-                                
-                                while let Some(ch) = chars.next() {
-                                    if global_out_ch >= available_output {
-                                        break;
-                                    }
-                                    if ch == '*' && chars.peek() == Some(&'*') {
-                                        chars.next();
-                                        is_bold = !is_bold;
-                                        global_out_ch += 2;
-                                        continue;
-                                    }
-                                    
-                                    let age = available_output.saturating_sub(global_out_ch);
-                                    let progress = if is_generating_val && is_last_message {
-                                        (age as f64 / 10.0).clamp(0.1, 1.0)
-                                    } else {
-                                        1.0
-                                    };
-                                    let r = (40.0 + (240.0 - 40.0) * progress) as u8;
-                                    let g = (55.0 + (245.0 - 55.0) * progress) as u8;
-                                    let b = (65.0 + (255.0 - 65.0) * progress) as u8;
-                                    
-                                    let mut style = Style::default().fg(Color::Rgb(r, g, b));
-                                    if is_bold || in_code_block {
-                                        style = style.add_modifier(Modifier::BOLD);
-                                    }
-                                    
-                                    line_spans.push(Span::styled(ch.to_string(), style));
-                                    global_out_ch += 1;
-                                }
-                                global_out_ch += 1;
-                            }
-
-                            if is_last_message && is_generating_val && is_last_line {
-                                let pulse = (anim_tick as f64 * 0.3).sin() * 0.5 + 0.5;
-                                let b_val = (150.0 + 105.0 * pulse) as u8;
-                                line_spans.push(Span::styled(
-                                    " █",
-                                    Style::default()
-                                        .fg(Color::Rgb(0, 255, b_val))
-                                        .add_modifier(Modifier::BOLD),
-                                ));
-                            }
-
-                            chat_lines.push(Line::from(line_spans));
+                        let start_line_idx = chat_lines.len();
+                        let mut local_toggles = Vec::new();
+                        let mut local_copies = Vec::new();
+                        let mut local_scrolls = Vec::new();
+                        let md_lines = crate::markdown::render_markdown_to_lines(
+                            &text_to_render,
+                            available_output,
+                            &mut global_out_ch,
+                            is_generating_val,
+                            is_last_message,
+                            anim_tick,
+                            theme_color,
+                            dark_gray,
+                            &self.code_block_previews,
+                            Some(&mut local_toggles),
+                            Some(&mut local_copies),
+                            Some(&mut local_scrolls),
+                            available_width,
+                            Some(&self.code_block_anims),
+                            Some(&self.code_block_scrolls),
+                        );
+                        for (local_idx, b_idx, n_s, n_e, p_s, p_e) in local_toggles {
+                            all_toggle_buttons.push((start_line_idx + local_idx, b_idx, n_s, n_e, p_s, p_e));
                         }
+                        for (local_idx, b_idx, c_s, c_e, body) in local_copies {
+                            all_copy_buttons.push((start_line_idx + local_idx, b_idx, c_s, c_e, body));
+                        }
+                        for (local_idx, b_idx, l_s, l_e, t_s, t_e, r_s, r_e, max_sc) in local_scrolls {
+                            all_scroll_buttons.push((start_line_idx + local_idx, b_idx, l_s, l_e, t_s, t_e, r_s, r_e, max_sc));
+                        }
+                        chat_lines.extend(md_lines);
                         chat_lines.push(Line::from(""));
                     }
                 }
@@ -4812,13 +5027,58 @@ LlamaCppLibBackend::http(
 
         let available_width = (chat_area.width.saturating_sub(2) as usize).max(1);
         let mut total_visual_lines: u16 = 0;
+        let mut visual_at: Vec<u16> = Vec::with_capacity(chat_lines.len() + 1);
         for line in &chat_lines {
+            visual_at.push(total_visual_lines);
             let w = line.width();
             if w == 0 {
                 total_visual_lines += 1;
             } else {
                 let lines = (w + available_width - 1) / available_width;
                 total_visual_lines += lines as u16;
+            }
+        }
+        self.last_chat_visual_at = visual_at.clone();
+
+        // Calculate screen coordinates for interactive code block Normal/Preview and Copy buttons
+        self.code_block_hits.clear();
+        self.code_block_copy_hits.clear();
+        let chat_top = chat_area.y as i32 + 1;
+        let chat_left = chat_area.x;
+        for (l_idx, b_idx, n_s, n_e, p_s, p_e) in all_toggle_buttons {
+            if let Some(&vis) = visual_at.get(l_idx) {
+                let screen_y = chat_top + vis as i32 - self.scroll_offset as i32;
+                self.code_block_hits.push(CodeBlockToggleHit {
+                    block_idx: b_idx,
+                    screen_y,
+                    normal_x: (chat_left.saturating_add(n_s), chat_left.saturating_add(n_e)),
+                    preview_x: (chat_left.saturating_add(p_s), chat_left.saturating_add(p_e)),
+                });
+            }
+        }
+        for (l_idx, b_idx, c_s, c_e, body) in all_copy_buttons {
+            if let Some(&vis) = visual_at.get(l_idx) {
+                let screen_y = chat_top + vis as i32 - self.scroll_offset as i32;
+                self.code_block_copy_hits.push(CodeBlockCopyHit {
+                    block_idx: b_idx,
+                    screen_y,
+                    copy_x: (chat_left.saturating_add(c_s), chat_left.saturating_add(c_e)),
+                    code_body: body,
+                });
+            }
+        }
+        self.code_block_scroll_hits.clear();
+        for (l_idx, b_idx, l_s, l_e, t_s, t_e, r_s, r_e, max_sc) in all_scroll_buttons {
+            if let Some(&vis) = visual_at.get(l_idx) {
+                let screen_y = chat_top + vis as i32 - self.scroll_offset as i32;
+                self.code_block_scroll_hits.push(CodeBlockScrollHit {
+                    block_idx: b_idx,
+                    screen_y,
+                    left_btn_x: (chat_left.saturating_add(l_s), chat_left.saturating_add(l_e)),
+                    track_x: (chat_left.saturating_add(t_s), chat_left.saturating_add(t_e)),
+                    right_btn_x: (chat_left.saturating_add(r_s), chat_left.saturating_add(r_e)),
+                    max_scroll: max_sc,
+                });
             }
         }
 
@@ -4843,16 +5103,23 @@ LlamaCppLibBackend::http(
             })
             .collect();
 
-        // Shade selected rows while dragging OR after release (has_selection)
+        // Shade selected rows while dragging OR after release (has_selection) using visual row alignment
         if self.selection_active() {
             if let (Some(start), Some(end)) = (self.selection_start, self.selection_end) {
                 let min_y = start.1.min(end.1) as i32;
                 let max_y = start.1.max(end.1) as i32;
-                let chat_top = chat_area.y as i32 + 1;
                 let sel_bg = Color::Rgb(28, 72, 128);
                 for (i, line) in chat_lines.iter_mut().enumerate() {
-                    let screen_y = chat_top + i as i32 - self.scroll_offset as i32;
-                    if screen_y >= min_y && screen_y <= max_y {
+                    let vis_start = visual_at.get(i).copied().unwrap_or(i as u16) as i32;
+                    let vis_count = if i + 1 < visual_at.len() {
+                        (visual_at[i + 1] - visual_at[i]) as i32
+                    } else {
+                        1
+                    };
+                    let screen_y_start = chat_top + vis_start - self.scroll_offset as i32;
+                    let screen_y_end = screen_y_start + vis_count - 1;
+
+                    if max_y >= screen_y_start && min_y <= screen_y_end {
                         let spans: Vec<Span> = line
                             .spans
                             .iter()
@@ -4870,21 +5137,6 @@ LlamaCppLibBackend::http(
                         };
                     }
                 }
-            }
-        }
-
-        // Logical → visual line starts (for chip placement under agent turns)
-        let mut visual_at: Vec<u16> = Vec::with_capacity(chat_lines.len() + 1);
-        {
-            let mut acc = 0u16;
-            for line in &chat_lines {
-                visual_at.push(acc);
-                let w = line.width();
-                acc = acc.saturating_add(if w == 0 {
-                    1
-                } else {
-                    ((w + available_width - 1) / available_width) as u16
-                });
             }
         }
 

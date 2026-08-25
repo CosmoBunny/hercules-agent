@@ -219,10 +219,16 @@ impl TaskManager {
         id
     }
 
-    pub fn spawn_agent(&self, backend: crate::backend::AgentBackend, role: String, to: String, instruction: String, spawned_by: u32) -> u32 {
+    pub fn spawn_agent(&self, backend: crate::backend::AgentBackend, role: String, to: String, model: String, instruction: String, spawned_by: u32) -> u32 {
         let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         let kill = Arc::new(AtomicBool::new(false));
-        let cmd = format!("agent role=\"{role}\" to=\"{to}\"");
+        let mut cmd = format!("agent role=\"{role}\"");
+        if !model.is_empty() {
+            cmd.push_str(&format!(" model=\"{model}\""));
+        }
+        if !to.is_empty() {
+            cmd.push_str(&format!(" to=\"{to}\""));
+        }
         {
             if let Ok(mut g) = self.inner.lock() {
                 g.tasks.push(ManagedTask {
@@ -242,7 +248,8 @@ impl TaskManager {
         std::thread::Builder::new()
             .name(format!("hercules-agent-{id}"))
             .spawn(move || {
-                let prompt = format!("You are an AI sub-agent. Role: {role}\nInstruction: {instruction}");
+                let model_tag = if model.is_empty() { String::new() } else { format!(" [Model: {model}]") };
+                let prompt = format!("You are an AI sub-agent{model_tag}. Role: {role}\nInstruction: {instruction}");
                 let rt = tokio::runtime::Runtime::new().unwrap();
                 let output = match rt.block_on(backend.generate(&prompt)) {
                     Ok(res) => format!("<agent action=\"reply\" to=\"{spawned_by}\">\n{}\n</agent>", res),
