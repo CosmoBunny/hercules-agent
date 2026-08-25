@@ -88,39 +88,35 @@ pub fn get_status_gradient_stops(
     is_generating: bool,
     is_thinking: bool,
     exit_hold_pct: Option<f64>,
-) -> Vec<(f32, (u8, u8, u8))> {
+) -> Option<Vec<(f32, (u8, u8, u8))>> {
     if let Some(pct) = exit_hold_pct {
         let p = pct as f32;
         let r_mid = (180.0 + 75.0 * p).min(255.0) as u8;
-        return vec![
+        return Some(vec![
             (0.0, (140, 20, 30)),
             (0.5, (r_mid, 30, 40)),
             (1.0, (255, 50, 50)),
-        ];
+        ]);
     }
     if is_generating {
         if is_thinking {
             // Thinking: linear-gradient(rgba(0, 8, 117, 1) 1%, rgba(200, 75, 250, 1) 51%, rgba(65, 0, 217, 1) 100%)
-            vec![
+            Some(vec![
                 (0.01, (0, 8, 117)),
                 (0.51, (200, 75, 250)),
                 (1.00, (65, 0, 217)),
-            ]
+            ])
         } else {
             // Streaming: linear-gradient(rgba(6, 0, 181, 1) 0%, rgba(64, 255, 220, 1) 50%, rgba(0, 33, 196, 1) 100%)
-            vec![
+            Some(vec![
                 (0.0, (6, 0, 181)),
                 (0.5, (64, 255, 220)),
                 (1.0, (0, 33, 196)),
-            ]
+            ])
         }
     } else {
-        // Idle / Normal: Nordic Frost
-        vec![
-            (0.0, (94, 129, 172)),
-            (0.5, (136, 192, 208)),
-            (1.0, (143, 188, 187)),
-        ]
+        // Idle: White static color (no continuous animation)
+        None
     }
 }
 
@@ -1069,8 +1065,6 @@ impl App {
         let prefix: String = self.input.chars().take(pos).collect();
         let mut row: u16 = 0;
         let mut col: u16 = 0;
-        // Leading space in display
-        col = 1;
         for ch in prefix.chars() {
             if ch == '\n' {
                 row = row.saturating_add(1);
@@ -4621,7 +4615,7 @@ LlamaCppLibBackend::http(
         let phase = (self.anim_tick as f32 * speed) % 1.0;
 
         // Dynamic input height with smooth collapse/expand animation
-        let inner_w = area.width.saturating_sub(6).max(1) as usize;
+        let inner_w = area.width.max(1) as usize;
         let mut wrapped_prompt_lines: Vec<String> = Vec::new();
         for row in self.input.split('\n') {
             if row.is_empty() {
@@ -4672,7 +4666,6 @@ LlamaCppLibBackend::http(
                     Constraint::Length(3),
                     Constraint::Min(1),
                     Constraint::Length(input_box_h),
-                    Constraint::Length(1),
                 ]
                 .as_ref(),
             )
@@ -4689,11 +4682,11 @@ LlamaCppLibBackend::http(
         let ctx_pct = ((ctx_used as f64 / ctx_limit as f64) * 100.0).min(999.0);
         let ctx_label = crate::settings::format_context_tokens(ctx_limit);
         let ctx_color = if ctx_pct >= 80.0 {
-            Color::Rgb(255, 100, 100)
+            Color::Rgb(191, 97, 106)
         } else if ctx_pct >= 50.0 {
-            Color::Rgb(255, 200, 80)
+            Color::Rgb(235, 203, 139)
         } else {
-            theme_color
+            NORDIC_ACCENT
         };
         let filled = ((ctx_pct / 100.0) * 8.0).round() as usize;
         let mut bar = String::new();
@@ -4731,7 +4724,7 @@ LlamaCppLibBackend::http(
                 (40.0 * (1.0 - pct as f32)) as u8,
             )
         } else {
-            theme_color
+            NORDIC_TEXT
         };
 
         let brand_top = "╭[Hercules]╮"; // 12
@@ -4739,27 +4732,27 @@ LlamaCppLibBackend::http(
         let logo_text = vec![
             Line::from(Span::styled(
                 ctx_line,
-                Style::default().fg(ctx_color).add_modifier(Modifier::BOLD),
+                Style::default().fg(ctx_color).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
             )),
             Line::from(vec![
                 Span::styled(
                     brand_top.to_string(),
-                    Style::default().fg(exit_glow).add_modifier(Modifier::BOLD),
+                    Style::default().fg(exit_glow).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     fit_width(&exiting_text, LEFT_W.saturating_sub(BRAND_W)),
                     Style::default()
-                        .fg(Color::Rgb(255, 80, 80))
+                        .fg(Color::Rgb(191, 97, 106))
                         .bg(if exit_hold_pct.is_some() {
-                            Color::Rgb(40, 0, 0)
+                            Color::Rgb(140, 20, 30)
                         } else {
-                            Color::Reset
+                            NORDIC_BG
                         })
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
         ];
-        frame.render_widget(Paragraph::new(logo_text), top_chunks[0]);
+        frame.render_widget(Paragraph::new(logo_text).style(Style::default().bg(NORDIC_BG)), top_chunks[0]);
 
         let active_model = self.backend.name();
         let mid_w = top_chunks[1].width as usize;
@@ -4791,18 +4784,18 @@ LlamaCppLibBackend::http(
         let stats_lines = vec![
             Line::from(Span::styled(
                 c_line.clone(),
-                Style::default().fg(light_blue).add_modifier(Modifier::BOLD),
+                Style::default().fg(NORDIC_ACCENT).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 m_line.clone(),
-                Style::default().fg(light_blue).add_modifier(Modifier::BOLD),
+                Style::default().fg(NORDIC_ACCENT).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 s_bot.clone(),
-                Style::default().fg(Color::Rgb(140, 140, 150)),
+                Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG),
             )),
         ];
-        frame.render_widget(Paragraph::new(stats_lines), top_chunks[2]);
+        frame.render_widget(Paragraph::new(stats_lines).style(Style::default().bg(NORDIC_BG)), top_chunks[2]);
 
         // Full-width floor on L2: joins brand → mid ─ → stats bottom (same glyphs as s_bot)
         let full_w = chunks[0].width as usize;
@@ -4810,8 +4803,8 @@ LlamaCppLibBackend::http(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 floor,
-                Style::default().fg(Color::Rgb(140, 140, 150)),
-            ))),
+                Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG),
+            ))).style(Style::default().bg(NORDIC_BG)),
             Rect {
                 x: chunks[0].x,
                 y: chunks[0].y.saturating_add(2),
@@ -4904,7 +4897,7 @@ LlamaCppLibBackend::http(
                 let mut spans = vec![Span::styled(
                     "You: ",
                     Style::default()
-                        .fg(theme_color)
+                        .fg(NORDIC_ACCENT)
                         .add_modifier(Modifier::BOLD),
                 )];
                 for ispan in inline_spans {
@@ -5054,7 +5047,7 @@ LlamaCppLibBackend::http(
                         };
                         chat_lines.push(Line::from(Span::styled(
                             agent_label,
-                            Style::default().fg(light_blue).add_modifier(Modifier::BOLD),
+                            Style::default().fg(NORDIC_ACCENT).add_modifier(Modifier::BOLD),
                         )));
 
                         let mut global_out_ch = 0;
@@ -5113,9 +5106,9 @@ LlamaCppLibBackend::http(
                 // Multi-line system / tool output (cargo etc.)
                 for (i, line) in m.lines().enumerate() {
                     let style = if i == 0 {
-                        Style::default().fg(dark_gray)
+                        Style::default().fg(NORDIC_MUTED)
                     } else {
-                        Style::default().fg(Color::Rgb(160, 160, 160))
+                        Style::default().fg(NORDIC_TEXT)
                     };
                     chat_lines.push(Line::from(Span::styled(line.to_string(), style)));
                 }
@@ -5123,7 +5116,7 @@ LlamaCppLibBackend::http(
             } else {
                 chat_lines.push(Line::from(Span::styled(
                     m.clone(),
-                    Style::default().fg(dark_gray),
+                    Style::default().fg(NORDIC_MUTED),
                 )));
             }
         }
@@ -5443,78 +5436,87 @@ LlamaCppLibBackend::http(
             frame.render_widget(console_box, main_split[1]);
         }
 
-        // --- Input Area ---
-        let input_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(
-                [
-                    Constraint::Length(2), // Padding
-                    Constraint::Min(1),    // Input
-                    Constraint::Length(2), // Padding
-                ]
-                .as_ref(),
-            )
-            .split(chunks[2]);
-
-        let bar_w = input_layout[1].width as usize;
+        // --- Input Area (Full width, no left/right 2-char padding) ---
+        let input_area = chunks[2];
+        let bar_w = input_area.width as usize;
         let raw_model = self.backend.name();
-        let model_clean = if raw_model.chars().count() > 28 {
-            format!("{}…", raw_model.chars().take(26).collect::<String>())
+        let model_clean = if raw_model.chars().count() > 36 {
+            format!("{}…", raw_model.chars().take(34).collect::<String>())
         } else {
             raw_model
         };
-        let badge_text = format!(" {} ", model_clean);
+        let badge_text = model_clean;
         let badge_len = badge_text.chars().count();
-        let left_trans = "🭆🭂";
-        let right_trans = "🭍🭑";
-        let left_trans_len = 2;
-        let right_trans_len = 2;
+        let left_trans = "🭆";
+        let right_trans = "🭑";
+        let right_bar_w = 1;
 
-        let total_badge_w = left_trans_len + badge_len + right_trans_len;
-        let left_bar_w = bar_w.saturating_sub(total_badge_w + 3).max(1);
-        let right_bar_w = bar_w.saturating_sub(left_bar_w + total_badge_w);
+        let total_badge_w = 1 + badge_len + 1 + right_bar_w;
+        let left_bar_w = bar_w.saturating_sub(total_badge_w).max(1);
+
+        let white_c = Color::Rgb(236, 239, 244); // #ECEFF4 Snow White
 
         let mut bar_spans: Vec<Span> = Vec::new();
         let mut cur_col_idx = 0;
 
         // 1. Left bar characters: 🬭
         for _ in 0..left_bar_w {
-            let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
-            let col_c = multi_stop_gradient(&stops, pos);
+            let col_c = if let Some(ref st) = stops {
+                let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
+                multi_stop_gradient(st, pos)
+            } else {
+                white_c
+            };
             bar_spans.push(Span::styled("🬭", Style::default().fg(col_c).bg(NORDIC_BG)));
             cur_col_idx += 1;
         }
 
-        // 2. Left transition: 🭆🭂
-        let pos_left_trans = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
-        let c_left_trans = multi_stop_gradient(&stops, pos_left_trans);
+        // 2. Left transition: 🭆
+        let c_left_trans = if let Some(ref st) = stops {
+            let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
+            multi_stop_gradient(st, pos)
+        } else {
+            white_c
+        };
         bar_spans.push(Span::styled(left_trans, Style::default().fg(c_left_trans).bg(NORDIC_BG)));
-        cur_col_idx += left_trans_len;
+        cur_col_idx += 1;
 
-        // 3. Model Name badge (bg matches bar gradient, text is Nordic Gray)
-        let badge_start_col = input_layout[1].x + cur_col_idx as u16;
-        let pos_badge = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
-        let c_badge_bg = multi_stop_gradient(&stops, pos_badge);
+        // 3. Model Name badge (bg matches bar gradient or white, text is Nordic Gray)
+        let badge_start_col = input_area.x + cur_col_idx as u16;
+        let c_badge_bg = if let Some(ref st) = stops {
+            let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
+            multi_stop_gradient(st, pos)
+        } else {
+            white_c
+        };
         bar_spans.push(Span::styled(
             badge_text,
             Style::default().fg(NORDIC_BG).bg(c_badge_bg).add_modifier(Modifier::BOLD),
         ));
         cur_col_idx += badge_len;
-        let badge_end_col = input_layout[1].x + cur_col_idx as u16;
+        let badge_end_col = input_area.x + cur_col_idx as u16;
 
         // Record hit zone for clicking on Model Name to toggle focus
-        self.model_badge_hit = Some((input_layout[1].y, badge_start_col, badge_end_col));
+        self.model_badge_hit = Some((input_area.y, badge_start_col, badge_end_col));
 
-        // 4. Right transition: 🭍🭑
-        let pos_right_trans = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
-        let c_right_trans = multi_stop_gradient(&stops, pos_right_trans);
+        // 4. Right transition: 🭑
+        let c_right_trans = if let Some(ref st) = stops {
+            let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
+            multi_stop_gradient(st, pos)
+        } else {
+            white_c
+        };
         bar_spans.push(Span::styled(right_trans, Style::default().fg(c_right_trans).bg(NORDIC_BG)));
-        cur_col_idx += right_trans_len;
+        cur_col_idx += 1;
 
         // 5. Right bar characters: 🬭
         for _ in 0..right_bar_w {
-            let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
-            let col_c = multi_stop_gradient(&stops, pos);
+            let col_c = if let Some(ref st) = stops {
+                let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
+                multi_stop_gradient(st, pos)
+            } else {
+                white_c
+            };
             bar_spans.push(Span::styled("🬭", Style::default().fg(col_c).bg(NORDIC_BG)));
             cur_col_idx += 1;
         }
@@ -5535,7 +5537,7 @@ LlamaCppLibBackend::http(
 
             if self.term_is_interactive() {
                 input_ui_lines.push(Line::from(vec![
-                    Span::styled(" $ ", Style::default().fg(Color::Rgb(100, 255, 100)).bg(NORDIC_BG)),
+                    Span::styled("$ ", Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG)),
                     Span::styled(
                         if self.term_input.is_empty() {
                             "type shell command…".to_string()
@@ -5545,14 +5547,14 @@ LlamaCppLibBackend::http(
                         Style::default().fg(if self.term_input.is_empty() {
                             NORDIC_MUTED
                         } else {
-                            Color::Rgb(180, 255, 180)
+                            Color::Rgb(163, 190, 140)
                         }).bg(NORDIC_BG),
                     ),
-                    Span::styled("█", Style::default().fg(Color::Rgb(100, 255, 100)).bg(NORDIC_BG)),
+                    Span::styled("█", Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG)),
                 ]));
             } else if self.input.is_empty() {
                 input_ui_lines.push(Line::from(Span::styled(
-                    " Type a prompt...",
+                    "Type a prompt...",
                     Style::default().fg(NORDIC_MUTED).bg(NORDIC_BG),
                 )));
             } else {
@@ -5560,7 +5562,7 @@ LlamaCppLibBackend::http(
                 let end_idx = (start_idx + available_content_rows as usize).min(wrapped_prompt_lines.len());
                 for line_str in &wrapped_prompt_lines[start_idx..end_idx] {
                     input_ui_lines.push(Line::from(Span::styled(
-                        format!(" {}", line_str),
+                        line_str.clone(),
                         Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
                     )));
                 }
@@ -5569,43 +5571,7 @@ LlamaCppLibBackend::http(
 
         let input_box = Paragraph::new(input_ui_lines)
             .style(Style::default().bg(NORDIC_BG));
-        frame.render_widget(input_box, input_layout[1]);
-
-        // --- Footer Status Bar ---
-        let engine_short = {
-            let n = self.backend.name();
-            if n.chars().count() > 36 {
-                format!("{}…", n.chars().take(34).collect::<String>())
-            } else {
-                n
-            }
-        };
-        let status_short = {
-            let s = self.status_message.chars().take(60).collect::<String>();
-            if self.status_message.chars().count() > 60 {
-                format!("{s}…")
-            } else {
-                s
-            }
-        };
-        let footer_pos = phase.fract();
-        let footer_accent = multi_stop_gradient(&stops, footer_pos);
-        let footer_text = Line::from(vec![
-            Span::styled(
-                format!(" {engine_short} "),
-                Style::default()
-                    .bg(if exit_hold_pct.is_some() {
-                        Color::Rgb(180, 40, 40)
-                    } else {
-                        footer_accent
-                    })
-                    .fg(NORDIC_BG)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(status_short, Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
-        ]);
-        frame.render_widget(Paragraph::new(footer_text).style(Style::default().bg(NORDIC_BG)), chunks[3]);
+        frame.render_widget(input_box, input_area);
 
         let is_downloading = self.download_progress.lock().unwrap().is_some();
         if self.input_focused && !self.show_menu && !is_downloading && input_box_h > 1 {
@@ -5613,10 +5579,10 @@ LlamaCppLibBackend::http(
             let available_content_rows = input_box_h.saturating_sub(1);
             let visible_rel_row = row.saturating_sub(self.input_scroll_y);
             if visible_rel_row < available_content_rows {
-                let cursor_x = input_layout[1].x.saturating_add(1).saturating_add(col as u16);
-                let cursor_y = input_layout[1].y.saturating_add(1).saturating_add(visible_rel_row as u16);
-                let max_x = input_layout[1].x + input_layout[1].width.saturating_sub(1);
-                let max_y = input_layout[1].y + input_box_h.saturating_sub(1);
+                let cursor_x = input_area.x.saturating_add(col as u16);
+                let cursor_y = input_area.y.saturating_add(1).saturating_add(visible_rel_row as u16);
+                let max_x = input_area.x + input_area.width.saturating_sub(1);
+                let max_y = input_area.y + input_box_h.saturating_sub(1);
                 frame.set_cursor_position((cursor_x.min(max_x), cursor_y.min(max_y)));
             }
         }
