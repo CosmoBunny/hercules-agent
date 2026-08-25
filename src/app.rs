@@ -218,6 +218,7 @@ pub struct App {
     pub anim_tick: u64,
     pub current_log_pane_pct: f64,
     pub last_frame_time: std::time::Instant,
+    pub last_metrics_time: std::time::Instant,
 
     // Download progress
     pub download_progress: Arc<Mutex<Option<f64>>>,
@@ -368,6 +369,8 @@ impl App {
                 "[HARDWARE] Vulkan/WGPU GPU acceleration active.".to_string(),
             ])),
             log_pane_collapsed: false,
+            last_frame_time: std::time::Instant::now(),
+            last_metrics_time: std::time::Instant::now(),
             krama: {
                 let mut k = KramaFrame::default();
                 k.extend_iter_classlist([
@@ -405,7 +408,6 @@ impl App {
             },
             anim_tick: 0,
             current_log_pane_pct: 32.0,
-            last_frame_time: std::time::Instant::now(),
             download_progress: Arc::new(Mutex::new(None)),
             download_complete: Arc::new(Mutex::new(false)),
             streaming_response: Arc::new(Mutex::new(String::new())),
@@ -2487,10 +2489,13 @@ impl App {
     }
 
     pub async fn handle_events(&mut self) -> Result<bool, std::io::Error> {
-        self.sys.refresh_cpu_usage();
-        self.sys.refresh_memory();
-
         let now = std::time::Instant::now();
+        if now.duration_since(self.last_metrics_time).as_millis() >= 1000 {
+            self.sys.refresh_cpu_usage();
+            self.sys.refresh_memory();
+            self.last_metrics_time = now;
+        }
+
         let delta = now.duration_since(self.last_frame_time);
         self.last_frame_time = now;
         let delta_ms = (delta.as_secs_f64() * 1000.0) as u16;
@@ -2600,52 +2605,34 @@ impl App {
                         }) {
                             chip.pending = false;
                             chip.tag_closed = true;
-                        }
-                        if let Ok(mut l) = self.activity_logs.lock() {
-                            let ok = !result.starts_with("Error");
-                            l.push(format!(
-                                "[FURIOUS] mid-stream write {} — {}",
-                                action.target,
-                                if ok { "OK" } else { &result }
-                            ));
+                            chip.body = format!("{result}\n(Auto-allowed write)");
                         }
                     }
                 }
             }
+        }
+
+        // Check if generation finished
+        {
+            let is_gen = *self.is_generating.lock().unwrap();
+            let current_stream = self.streaming_response.lock().unwrap().clone();
+            let err_opt = self.generation_error.lock().unwrap().take();
+            let settings = crate::settings::get_settings();
+
             if !is_gen {
-                // Generation finished
-                let gen_err = self.generation_error.lock().unwrap().take();
-                let cancelled = self.user_cancelled_gen;
-                if cancelled {
-                    self.user_cancelled_gen = false;
-                    self.auto_tool_turns = 0;
-                    *self.streaming_response.lock().unwrap() = String::new();
-                    self.gen_last_progress = None;
-                    if self.status_message.starts_with("Generating")
-                        || self.status_message.contains("via llama")
-                    {
-                        self.status_message = "Interrupted (CTRL+C).".into();
-                    }
-                } else if let Some(err) = gen_err {
-                    // Recover mid-write / mid-cmd chips so UI is not stuck half-open
-                    let partial = self.streaming_response.lock().unwrap().clone();
-                    if !partial.is_empty() && !partial.starts_with("__HERCULES") {
-                        self.sync_tool_chips(&partial);
-                        self.finalize_incomplete_tools("server/generation error");
-                        if let Some(last) = self.messages.last_mut() {
-                            if last.starts_with("Agent: ") {
-                                let shown = tool_panel::redact_tools_for_chat(&partial);
-                                *last = format!("Agent: {shown}\n[Interrupted — {err}]");
-                            }
-                        }
+                self.streamed_writes_done.clear();
+                if let Some(err) = err_opt {
+                    let recovered = crate::agent::AgentEngine::extract_proposed_actions(&current_stream);
+                    if !recovered.is_empty() {
+                        let count = recovered.len();
+                        self.messages.push(format!(
+                            "System: Generation interrupted after {count} tool(s) were produced: {err}"
+                        ));
                     } else if let Some(last) = self.messages.last_mut() {
                         if last.starts_with("Agent: ") {
                             *last = format!("Error: {}", err);
                         }
                     }
-                    self.status_message = "Generation failed — partial tools recovered.".into();
-                    *self.streaming_response.lock().unwrap() = String::new();
-                    self.gen_last_progress = None;
                 } else if !current_stream.is_empty() && !current_stream.starts_with("__HERCULES") {
                     if let Some(last) = self.messages.last_mut() {
                         if last.starts_with("Agent: ") {
@@ -2750,74 +2737,16 @@ impl App {
                         && only_ls
                         && (wants_plan || wants_code || only_repeated_tool);
 
-                    // After tools, model answered with empty / tool-only noise → host summary
-                    // (skip when user still needs a plan or code — re-prompt instead).
-                    let needs_host_summary = already_have_tools
-                        && !ls_spam_on_create
-                        && !wants_plan
-                        && !wants_code
-                        && (only_repeated_tool
-                            || prose.trim().is_empty()
-                            || crate::agent::AgentEngine::looks_like_capability_refusal(&prose));
-
-                    if !only_repeated_tool {
-                        self.recent_tool_calls.push(effective_stream.clone());
-                    }
-                    let max_hist = crate::settings::get_settings()
-                        .repeat_threshold
-                        .saturating_mul(3)
-                        .max(30);
-                    while self.recent_tool_calls.len() > max_hist {
-                        self.recent_tool_calls.remove(0);
-                    }
-
-                    let settings = crate::settings::get_settings();
                     let loop_hit =
                         crate::settings::detect_repeat_loop(&self.recent_tool_calls, &settings);
 
-                    let cmds: Vec<_> = proposed
-                        .iter()
-                        .filter(|a| a.kind == crate::agent::ProposedKind::Cmd)
-                        .cloned()
-                        .collect();
-                    let writes_pending: Vec<_> = proposed
-                        .iter()
-                        .filter(|a| a.kind == crate::agent::ProposedKind::Write)
-                        .cloned()
-                        .collect();
-
-                    if ls_spam_on_create {
-                        // Drop ls-only history so the model is not primed to ls again
-                        self.tool_result_context.clear();
-                        self.recent_tool_calls.clear();
+                    if only_repeated_tool || ls_spam_on_create {
                         self.messages.push(
-                            "System: [Host] Skip further <ls>. \
-                             Next reply: plan in prose OR <write> code — not directory listing."
-                                .into(),
+                            "System: [Host] Finished inspecting files. Ready for next prompt."
+                                .to_string(),
                         );
-                        self.auto_tool_turns = self.auto_tool_turns.saturating_add(1).max(1);
-                        if self.auto_tool_turns <= 4 {
-                            if let Ok(mut l) = self.activity_logs.lock() {
-                                l.push(
-                                    "[HERCULES] ls-spam on create/plan → re-prompt write/plan"
-                                        .into(),
-                                );
-                            }
-                            self.trigger_generation_from_context();
-                        } else {
-                            self.auto_tool_turns = 0;
-                            self.status_message = "Ready.".into();
-                        }
-                    } else if needs_host_summary {
-                        // Do not re-run tools or leave an empty agent bubble.
-                        self.host_answer_from_prior_tools();
-                        self.auto_tool_turns = 0;
-                        self.status_message = "Ready.".to_string();
-                        if let Ok(mut l) = self.activity_logs.lock() {
-                            l.push("[HERCULES] host summary from prior tool (no re-run)".into());
-                        }
-                    } else if only_repeated_tool && !wants_code && !wants_plan {
-                        self.host_answer_from_prior_tools();
+                        self.recent_tool_calls.clear();
+                        self.repeat_count = 0;
                         self.auto_tool_turns = 0;
                         self.status_message = "Ready.".to_string();
                         if let Ok(mut l) = self.activity_logs.lock() {
@@ -2860,112 +2789,69 @@ impl App {
                                     self.tool_chips.push(tool_panel::ToolChip {
                                         id,
                                         kind,
-                                        target: target_str.clone(),
+                                        target: target_str,
                                         body: a.body.clone(),
                                         tag_closed: true,
-                                        pending: false,
-                                        spawned: true,
-                                        anchor_msg: anchor,
+                                        pending: false, spawned: false,
                                         rect: None,
+                                        anchor_msg: anchor,
                                         expanded: false,
                                         anim_start: None,
                                     });
                                 }
-                                if let Ok(mut l) = self.activity_logs.lock() {
-                                    l.push(format!("[AUTO-WRITE] {}", path.display()));
-                                }
                             }
                         }
-                        if let Some(tool_output) = tool_out {
-                            let hint = tool_panel::classify_tool_hint(&effective_stream);
-                            self.record_tool_result_ui(hint, &tool_output);
+                        if let Some(out) = tool_out {
+                            self.record_tool_result_ui("tool", &out);
+                            self.auto_tool_turns += 1;
+                            self.trigger_generation_from_context();
+                        } else {
+                            self.auto_tool_turns = 0;
+                            self.status_message = "Ready.".to_string();
                         }
-                        self.streamed_writes_done.clear();
-                        self.auto_tool_turns += 1;
-                        if self.auto_tool_turns == 20 {
-                            self.messages.push(
-                                "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
-                                    .to_string(),
-                            );
+                    } else if let Some(tool_output) = tool_output_opt {
+                        if !crate::agent::AgentEngine::response_has_tool_tags(&effective_stream) {
+                            self.auto_tool_turns = 0;
+                            self.status_message = "Ready.".to_string();
+                        } else {
+                            let tool_name = if effective_stream.contains("<read") {
+                                "read"
+                            } else if effective_stream.contains("<ls") {
+                                "ls"
+                            } else if effective_stream.contains("<write") {
+                                "write"
+                            } else {
+                                "tool"
+                            };
+                            self.record_tool_result_ui(tool_name, &tool_output);
+                            self.auto_tool_turns += 1;
+                            if self.auto_tool_turns == 20 {
+                                self.messages.push(
+                                    "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
+                                        .to_string(),
+                                );
+                            }
+                            self.trigger_generation_from_context();
                         }
-                        self.trigger_generation_from_context();
                     } else {
-                        // AlwaysAllow / session: writes already executed mid-stream;
-                        // skip any target already in streamed_writes_done to avoid
-                        // double-writing, then clear the set for the next turn.
-                        let had_cmds = !cmds.is_empty();
-                        if had_cmds {
-                            self.spawn_cmds_to_task_manager(cmds);
-                        }
-                        // Process read/ls/memory/write output for context
-                        let mut had_tool_out = false;
-                        if let Some(tool_output) = tool_output_opt {
-                            let is_write_only = tool_panel::classify_tool_hint(&effective_stream) == "write";
-                            let all_done = writes_pending
-                                .iter()
-                                .all(|w| self.streamed_writes_done.contains(&w.target));
-                            if !(is_write_only && all_done) {
-                                had_tool_out = true;
-                                let hint = tool_panel::classify_tool_hint(&effective_stream);
-                                self.record_tool_result_ui(hint, &tool_output);
-                                if let Ok(mut l) = self.activity_logs.lock() {
-                                    l.push(format!(
-                                        "[HERCULES] {hint} done ({} bytes) → chip/terminal",
-                                        tool_output.len()
-                                    ));
-                                }
-                            } else {
-                                // Silent write (already applied mid-stream) — still counts as
-                                // progress; re-trigger so the model continues to next step.
-                                had_tool_out = true;
-                            }
-                        }
-                        // Clear mid-stream dedup set for the next turn
-                        self.streamed_writes_done.clear();
-                        if !had_cmds && self.task_manager.running_count() == 0 {
-                            if had_tool_out {
-                                self.auto_tool_turns += 1;
-                                // Soft info at 20 turns — Ctrl+C is the hard stop.
-                                if self.auto_tool_turns == 20 {
-                                    self.messages.push(
-                                        "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
-                                            .to_string(),
-                                    );
-                                }
-                                self.trigger_generation_from_context();
-                            } else {
-                                self.auto_tool_turns = 0;
-                                self.status_message = "Ready.".to_string();
-                            }
-                        } else if had_cmds {
-                            self.status_message =
-                                "Command(s) in task manager — waiting / Ctrl+C to kill".into();
+                        self.auto_tool_turns = 0;
+                        self.status_message = "Ready.".to_string();
+                    }
+
+                    if !prose.is_empty() {
+                        self.context_tokens_est = self.estimate_full_session_tokens();
+                        if let Ok(mut l) = self.activity_logs.lock() {
+                            l.push(format!("[SESSION] tokens ≈ {}", self.context_tokens_est));
                         }
                     }
                 }
             }
         }
 
-        // Esc hold ≥1s → exit; released early → cancelled in key handler
-        if let Some(start) = self.esc_hold_start {
-            let pct = (start.elapsed().as_secs_f64() / 1.0).min(1.0);
-            if pct >= 1.0 {
-                if let Ok(mut g) = self.is_generating.lock() {
-                    *g = false;
-                }
-                crate::llama::server::shutdown_managed_server();
-                crate::llama::libinfer::shutdown_warm_lib_engine();
-                self.should_quit = true;
-            }
-        }
-
-        let target_log_pct = if self.log_pane_collapsed { 0.0 } else { 32.0 };
-        let factor = ((delta.as_secs_f64() * 18.0) as f64).min(1.0);
-        self.current_log_pane_pct += (target_log_pct - self.current_log_pane_pct) * factor;
-
-        let new_results = self.search_results.lock().unwrap().take();
-        if let Some(models) = new_results {
-            if !models.is_empty() {
+        // Check if an async model search finished
+        {
+            let mut res = self.search_results.lock().unwrap();
+            if let Some(models) = res.take() {
                 let mut installed = self.manager.list_installed_local();
                 let mut hf_items = Vec::new();
                 let mut ollama_items = Vec::new();
@@ -3016,17 +2902,13 @@ impl App {
             }
             self.installed_models = installed;
 
-            // Prefer llama.cpp for installed GGUF (fast + low RAM vs pure-rust dequant)
             if let Some(path) = self.manager.latest_gguf_path() {
-                match self.backend {
-                    AgentBackend::LlamaCppLib(_) => {
-                        self.backend = AgentBackend::LlamaCppLib(LlamaCppLibBackend::gguf(path.clone()));
-                        self.status_message =
-                            format!("Active Engine: llama.cpp ({})", path.display());
-                    }
-                    _ => {
-                        self.backend =
-                            AgentBackend::LlamaCppLib(LlamaCppLibBackend::gguf(path.clone()));
+                self.backend = AgentBackend::LlamaCppLib(LlamaCppLibBackend::gguf(path.clone()));
+                self.manager.set_active_gguf_path(path.display().to_string());
+                if let Some(entry) = self.manager.list_installed_entries().into_iter().rev().next() {
+                    if !entry.name.is_empty() {
+                        self.status_message = format!("Active Engine: {}", entry.name);
+                    } else {
                         self.status_message =
                             format!("Active Engine: llama.cpp lib ({})", path.display());
                     }
@@ -3135,11 +3017,7 @@ impl App {
 
         let is_generating_val = *self.is_generating.lock().unwrap();
         let is_downloading = self.download_progress.lock().unwrap().is_some();
-        let is_krama_animating = self.krama.is_animating("menu_fade", 0)
-            || self.krama.is_animating("slide", 0)
-            || self.krama.is_animating("panel_fly", 0)
-            || self.krama.is_animating("focus", 0)
-            || self.krama.is_animating("list_fade", 0);
+        let is_krama_animating = self.krama.is_any_animation_inprogress();
 
         let is_animating = is_generating_val
             || is_downloading
@@ -3147,8 +3025,7 @@ impl App {
             || is_krama_animating
             || self.esc_hold_start.is_some()
             || self.menu_closing
-            || self.panel_closing
-            || (self.input_anim_height - (if self.input_focused { 1.0 } else { 1.0 })).abs() > 0.05;
+            || self.panel_closing;
 
         let poll_dur = if is_animating {
             Duration::from_millis(8)
