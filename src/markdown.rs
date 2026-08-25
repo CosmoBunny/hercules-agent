@@ -461,6 +461,20 @@ pub fn render_markdown_to_lines<'a>(
                 let code_h = current_code_lines.len().max(1);
                 let prev_h = preview_lines.len().max(1);
 
+                // Trim trailing blank lines from code block
+                while current_code_lines.len() > 1 {
+                    let is_blank = current_code_lines.last().map(|l| {
+                        let text: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                        let inner = text.trim_matches(|c: char| c == '│' || c == ' ' || c.is_ascii_digit());
+                        inner.is_empty()
+                    }).unwrap_or(false);
+                    if is_blank {
+                        current_code_lines.pop();
+                    } else {
+                        break;
+                    }
+                }
+
                 let mut active_display_lines = if is_preview {
                     preview_lines
                 } else {
@@ -1000,6 +1014,19 @@ pub fn render_markdown_to_lines<'a>(
     }
 
     if in_code_block {
+        while current_code_lines.len() > 1 {
+            let is_blank = current_code_lines.last().map(|l| {
+                let text: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                let inner = text.trim_matches(|c: char| c == '│' || c == ' ' || c.is_ascii_digit());
+                inner.is_empty()
+            }).unwrap_or(false);
+            if is_blank {
+                current_code_lines.pop();
+            } else {
+                break;
+            }
+        }
+
         if current_code_lines.is_empty() {
             let mut line_spans = vec![
                 Span::styled("  │", Style::default().fg(theme_color).bg(code_bg)),

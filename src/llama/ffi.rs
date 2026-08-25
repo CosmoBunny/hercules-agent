@@ -163,6 +163,12 @@ type FnLogSet = unsafe extern "C" fn(
 );
 type FnGetMemory = unsafe extern "C" fn(*const LlamaContext) -> *mut c_void;
 type FnMemoryClear = unsafe extern "C" fn(*mut c_void, bool);
+/// llama_state_get_size(ctx) → number of bytes needed to serialise the full KV state.
+type FnStateGetSize = unsafe extern "C" fn(*const LlamaContext) -> usize;
+/// llama_state_get_data(ctx, dst, size) → bytes written.
+type FnStateGetData = unsafe extern "C" fn(*mut LlamaContext, *mut u8, usize) -> usize;
+/// llama_state_set_data(ctx, src, size) → bytes read.
+type FnStateSetData = unsafe extern "C" fn(*mut LlamaContext, *const u8, usize) -> usize;
 
 // ---------------------------------------------------------------------------
 // LlamaLib
@@ -208,6 +214,10 @@ pub struct LlamaLib {
     /// Optional: clear KV between turns (newer llama.cpp).
     pub get_memory: Option<FnGetMemory>,
     pub memory_clear: Option<FnMemoryClear>,
+    /// Optional: serialise / restore the full KV-cache state (llama.cpp ≥ b3000).
+    pub state_get_size: Option<FnStateGetSize>,
+    pub state_get_data: Option<FnStateGetData>,
+    pub state_set_data: Option<FnStateSetData>,
 }
 
 unsafe impl Send for LlamaLib {}
@@ -260,6 +270,10 @@ unsafe extern "C" {
     );
     fn llama_get_memory(ctx: *const LlamaContext) -> *mut c_void;
     fn llama_memory_clear(mem: *mut c_void, data: bool);
+    // KV state serialisation — present in llama.cpp ≥ b3000
+    fn llama_state_get_size(ctx: *const LlamaContext) -> usize;
+    fn llama_state_get_data(ctx: *mut LlamaContext, dst: *mut u8, size: usize) -> usize;
+    fn llama_state_set_data(ctx: *mut LlamaContext, src: *const u8, size: usize) -> usize;
 }
 
 #[cfg(feature = "llama-cpp-static")]
@@ -299,6 +313,9 @@ impl LlamaLib {
             log_set:                       llama_log_set,
             get_memory:                    Some(llama_get_memory),
             memory_clear:                  Some(llama_memory_clear),
+            state_get_size:                Some(llama_state_get_size),
+            state_get_data:                Some(llama_state_get_data),
+            state_set_data:                Some(llama_state_set_data),
         }
     }
 }
@@ -478,6 +495,21 @@ impl LlamaLib {
                 lib.get(b"llama_memory_clear")
                     .ok()
                     .map(|s: libloading::Symbol<FnMemoryClear>| *s)
+            },
+            state_get_size: unsafe {
+                lib.get(b"llama_state_get_size")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnStateGetSize>| *s)
+            },
+            state_get_data: unsafe {
+                lib.get(b"llama_state_get_data")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnStateGetData>| *s)
+            },
+            state_set_data: unsafe {
+                lib.get(b"llama_state_set_data")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnStateSetData>| *s)
             },
             _deps: deps,
             _lib: lib,

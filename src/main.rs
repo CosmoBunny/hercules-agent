@@ -199,6 +199,8 @@ async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
 ) -> io::Result<()> {
+    // Always draw once at startup so the user sees the UI immediately.
+    terminal.draw(|f| app.draw(f))?;
     loop {
         if REQUEST_QUIT.load(Ordering::SeqCst) {
             app.should_quit = true;
@@ -209,8 +211,10 @@ async fn run_app(
             std::thread::spawn(cleanup_engines);
             return Ok(());
         }
-        terminal.draw(|f| app.draw(f))?;
-        app.handle_events().await?;
+        let needs_redraw = app.handle_events().await?;
+        if needs_redraw {
+            terminal.draw(|f| app.draw(f))?;
+        }
         if app.should_quit {
             if let Ok(mut g) = app.is_generating.lock() {
                 *g = false;

@@ -631,6 +631,8 @@ impl App {
                     pending: false, spawned: false,
                     rect: None,
                     anchor_msg: anchor,
+                    expanded: false,
+                    anim_start: None,
                 });
                 auto_open = Some(id);
             }
@@ -1080,6 +1082,61 @@ impl App {
         (col, row)
     }
 
+    fn char_pos_from_col_row(&self, target_col: u16, target_row: u16, content_width: usize) -> usize {
+        let width = content_width.max(1);
+        let mut cur_row: u16 = 0;
+        let mut cur_col: u16 = 0;
+        let mut best_pos = 0;
+        let total_chars = self.input.chars().count();
+
+        for (pos, ch) in self.input.chars().enumerate() {
+            if cur_row == target_row && cur_col == target_col {
+                return pos;
+            }
+            if cur_row == target_row {
+                best_pos = pos;
+            }
+            if ch == '\n' {
+                if cur_row == target_row {
+                    return pos;
+                }
+                cur_row = cur_row.saturating_add(1);
+                cur_col = 0;
+            } else {
+                cur_col = cur_col.saturating_add(1);
+                if cur_col as usize >= width {
+                    if cur_row == target_row {
+                        return pos;
+                    }
+                    cur_row = cur_row.saturating_add(1);
+                    cur_col = 0;
+                }
+            }
+        }
+        if cur_row == target_row {
+            total_chars
+        } else if cur_row < target_row {
+            total_chars
+        } else {
+            best_pos
+        }
+    }
+
+    fn input_cursor_up(&mut self, content_width: usize) {
+        let (col, row) = self.input_cursor_col_row(content_width);
+        if row > 0 {
+            self.input_cursor_position = self.char_pos_from_col_row(col, row - 1, content_width);
+        } else {
+            self.input_cursor_position = 0;
+        }
+    }
+
+    fn input_cursor_down(&mut self, content_width: usize) {
+        let (col, row) = self.input_cursor_col_row(content_width);
+        let total_pos = self.char_pos_from_col_row(col, row + 1, content_width);
+        self.input_cursor_position = total_pos;
+    }
+
     /// Queue write/cmd for user accept; open preview panel.
     fn propose_actions(&mut self, mut actions: Vec<ProposedAction>) {
         if actions.is_empty() {
@@ -1159,6 +1216,8 @@ impl App {
                     pending: true, spawned: false,
                     rect: None,
                     anchor_msg: anchor,
+                    expanded: false,
+                    anim_start: None,
                 });
 
                 a.chip_id = Some(id);
@@ -1167,9 +1226,6 @@ impl App {
             }
         }
         self.dedupe_tool_chips();
-        if let Some(id) = open_id {
-            self.force_open_panel_from_chip(id);
-        }
         let n = actions.len();
         let summary = actions
             .iter()
@@ -1335,13 +1391,9 @@ impl App {
                     pending: false, spawned: false,
                     rect: None,
                     anchor_msg: self.latest_agent_msg_idx(),
+                    expanded: false,
+                    anim_start: None,
                 });
-            }
-            if let Some(chip) = self.tool_chips.iter().rev().find(|c| {
-                c.kind == ToolPanelKind::Cmd
-                    && tool_panel::same_tool_target(ToolPanelKind::Cmd, &c.target, &cmd)
-            }) {
-                self.force_open_panel_from_chip(chip.id);
             }
             self.messages.push(format!(
                 "System: [Task #{id} (Agent 0)] started: `{cmd}` (if >{QUICK_SECS}s → task manager; Ctrl+C kills)"
@@ -1432,9 +1484,13 @@ impl App {
                 }
                 if !*self.is_generating.lock().unwrap() {
                     self.auto_tool_turns += 1;
-                    if self.auto_tool_turns <= 8 {
-                        self.trigger_generation_from_context();
+                    if self.auto_tool_turns == 20 {
+                        self.messages.push(
+                            "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
+                                .to_string(),
+                        );
                     }
+                    self.trigger_generation_from_context();
                 }
                 self.status_message = format!("Task #{id} parked (long-running)");
                 if let Ok(mut l) = self.activity_logs.lock() {
@@ -1480,9 +1536,13 @@ impl App {
                 self.status_message = format!("Task #{id} {label} (Agent {spawned_by})");
                 if !killed && !*self.is_generating.lock().unwrap() {
                     self.auto_tool_turns += 1;
-                    if self.auto_tool_turns <= 8 {
-                        self.trigger_generation_from_context();
+                    if self.auto_tool_turns == 20 {
+                        self.messages.push(
+                            "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
+                                .to_string(),
+                        );
                     }
+                    self.trigger_generation_from_context();
                 }
             }
         }
@@ -2132,17 +2192,13 @@ impl App {
                 pending: false, spawned: false,
                 rect: None,
                 anchor_msg: anchor,
+                expanded: false,
+                anim_start: None,
             });
             open_id = Some(id);
         }
 
         self.dedupe_tool_chips();
-        if let Some(id) = open_id {
-            self.force_open_panel_from_chip(id);
-        }
-        let lines = pretty.lines().count();
-        self.messages
-            .push(format!("System: [OK] {kind_hint} finished ({lines} lines)"));
     }
 
     /// Latest user message only (best for one-shot llama.cpp).
@@ -2340,7 +2396,7 @@ impl App {
         self.input_cursor_position = pos + inserted_len;
     }
 
-    pub async fn handle_events(&mut self) -> Result<(), std::io::Error> {
+    pub async fn handle_events(&mut self) -> Result<bool, std::io::Error> {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
 
@@ -2401,9 +2457,13 @@ impl App {
                 self.record_tool_result_ui("command", &joined);
                 self.status_message = "Command finished — terminal open".to_string();
                 self.auto_tool_turns += 1;
-                if self.auto_tool_turns <= 8 {
-                    self.trigger_generation_from_context();
+                if self.auto_tool_turns == 20 {
+                    self.messages.push(
+                        "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
+                            .to_string(),
+                    );
                 }
+                self.trigger_generation_from_context();
             }
         }
 
@@ -2512,7 +2572,7 @@ impl App {
                     if incomplete {
                         if self.continue_incomplete_tool(&current_stream) {
                             // Do not process the incomplete action in this turn.
-                            return Ok(());
+                            return Ok(true);
                         }
 
                         self.finalize_incomplete_tools("continuation limit reached");
@@ -2688,11 +2748,57 @@ impl App {
                         self.recent_tool_calls.clear();
                         self.repeat_count = 0;
                     } else if need_accept {
-                        // Ask mode: queue the actions but do NOT interrupt the AI.
-                        // The PENDING system message is suppressed while generating;
-                        // propose_actions will show it once the stream is done.
-                        self.propose_actions(proposed);
-                        // Do not auto re-prompt until user accepts/rejects
+                        // "Ask" permission mode — auto-execute writes immediately for
+                        // continuous operation. Ctrl+C is the user's stop signal.
+                        let tool_out = crate::agent::AgentEngine::process_response(&effective_stream);
+                        for a in &proposed {
+                            if a.kind == crate::agent::ProposedKind::Write {
+                                let path = crate::agent::AgentEngine::expand_path(&a.target);
+                                if let Some(parent) = path.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                let _ = std::fs::write(&path, &a.body);
+                                let anchor = self.latest_agent_msg_idx();
+                                let kind = tool_panel::ToolPanelKind::Write;
+                                let target_str = tool_panel::normalize_target(kind, &path.display().to_string());
+                                let chip_exists = self.tool_chips.iter().any(|c| {
+                                    c.kind == kind && tool_panel::same_tool_target(c.kind, &c.target, &target_str)
+                                });
+                                if !chip_exists {
+                                    let id = self.next_chip_id;
+                                    self.next_chip_id += 1;
+                                    self.tool_chips.push(tool_panel::ToolChip {
+                                        id,
+                                        kind,
+                                        target: target_str.clone(),
+                                        body: a.body.clone(),
+                                        tag_closed: true,
+                                        pending: false,
+                                        spawned: true,
+                                        anchor_msg: anchor,
+                                        rect: None,
+                                        expanded: false,
+                                        anim_start: None,
+                                    });
+                                }
+                                if let Ok(mut l) = self.activity_logs.lock() {
+                                    l.push(format!("[AUTO-WRITE] {}", path.display()));
+                                }
+                            }
+                        }
+                        if let Some(tool_output) = tool_out {
+                            let hint = tool_panel::classify_tool_hint(&effective_stream);
+                            self.record_tool_result_ui(hint, &tool_output);
+                        }
+                        self.streamed_writes_done.clear();
+                        self.auto_tool_turns += 1;
+                        if self.auto_tool_turns == 20 {
+                            self.messages.push(
+                                "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
+                                    .to_string(),
+                            );
+                        }
+                        self.trigger_generation_from_context();
                     } else {
                         // AlwaysAllow / session: writes already executed mid-stream;
                         // skip any target already in streamed_writes_done to avoid
@@ -2701,10 +2807,9 @@ impl App {
                         if had_cmds {
                             self.spawn_cmds_to_task_manager(cmds);
                         }
-                        // Only process read/ls/memory output (writes already handled mid-stream)
+                        // Process read/ls/memory/write output for context
                         let mut had_tool_out = false;
                         if let Some(tool_output) = tool_output_opt {
-                            // Suppress write-only results that were already applied mid-stream
                             let is_write_only = tool_panel::classify_tool_hint(&effective_stream) == "write";
                             let all_done = writes_pending
                                 .iter()
@@ -2719,25 +2824,25 @@ impl App {
                                         tool_output.len()
                                     ));
                                 }
+                            } else {
+                                // Silent write (already applied mid-stream) — still counts as
+                                // progress; re-trigger so the model continues to next step.
+                                had_tool_out = true;
                             }
                         }
                         // Clear mid-stream dedup set for the next turn
                         self.streamed_writes_done.clear();
-                        // Do NOT re-trigger generation for writes — they were already
-                        // applied silently. Only re-prompt when reads/cmds produce context.
                         if !had_cmds && self.task_manager.running_count() == 0 {
                             if had_tool_out {
                                 self.auto_tool_turns += 1;
-                                if self.auto_tool_turns <= 8 {
-                                    self.trigger_generation_from_context();
-                                } else {
+                                // Soft info at 20 turns — Ctrl+C is the hard stop.
+                                if self.auto_tool_turns == 20 {
                                     self.messages.push(
-                                        "System: [Autonomous loop threshold reached (8 tool turns)]"
+                                        "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
                                             .to_string(),
                                     );
-                                    self.auto_tool_turns = 0;
-                                    self.status_message = "Ready.".to_string();
                                 }
+                                self.trigger_generation_from_context();
                             } else {
                                 self.auto_tool_turns = 0;
                                 self.status_message = "Ready.".to_string();
@@ -2860,7 +2965,19 @@ impl App {
             }
         }
 
-        if event::poll(Duration::from_millis(16))? {
+        let is_generating_val = *self.is_generating.lock().unwrap();
+        let is_downloading = self.download_progress.lock().unwrap().is_some();
+        let is_animating = is_generating_val
+            || is_downloading
+            || !self.code_block_anims.is_empty();
+
+        let poll_dur = if is_animating {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(100)
+        };
+
+        if event::poll(poll_dur)? {
             match event::read()? {
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::ScrollUp => {
@@ -2913,14 +3030,14 @@ impl App {
                                 self.input_focused = !self.input_focused;
                                 self.clear_selection();
                                 self.exit_term_interactive();
-                                return Ok(());
+                                return Ok(true);
                             }
                             let input_h = (self.input_anim_height.round() as u16).max(1);
                             if mouse.row >= badge_y && mouse.row < badge_y + input_h {
                                 self.input_focused = true;
                                 self.clear_selection();
                                 self.exit_term_interactive();
-                                return Ok(());
+                                return Ok(true);
                             }
                         }
 
@@ -2946,7 +3063,7 @@ impl App {
                             self.clear_selection();
                             self.exit_term_interactive();
                             self.input_focused = false;
-                            return Ok(());
+                            return Ok(true);
                         }
 
                         // Check interactive preview horizontal scrollbar
@@ -2975,7 +3092,7 @@ impl App {
                             self.clear_selection();
                             self.exit_term_interactive();
                             self.input_focused = false;
-                            return Ok(());
+                            return Ok(true);
                         }
 
                         // Check interactive code block Normal / Preview button toggles
@@ -3008,7 +3125,14 @@ impl App {
                         {
                             self.clear_selection();
                             self.exit_term_interactive();
-                            self.open_panel_from_chip(id);
+                            self.is_selecting = false;
+                            self.selection_start = None;
+                            self.selection_end = None;
+                            if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == id) {
+                                chip.expanded = !chip.expanded;
+                                chip.anim_start = Some(std::time::Instant::now());
+                            }
+                            return Ok(true);
                         } else if self.tool_panel.is_some() {
                             let chrome = self
                                 .tool_panel
@@ -3483,7 +3607,9 @@ impl App {
                                             };
                                             self.perms_state.select(Some(i));
                                         }
-                                    } else if !self.input_focused {
+                                    } else if self.input_focused {
+                                        self.input_cursor_up(80);
+                                    } else {
                                         self.scroll_offset = self.scroll_offset.saturating_sub(1);
                                         self.auto_scroll_enabled = false;
                                     }
@@ -3560,7 +3686,9 @@ impl App {
                                             };
                                             self.perms_state.select(Some(i));
                                         }
-                                    } else if !self.input_focused {
+                                    } else if self.input_focused {
+                                        self.input_cursor_down(80);
+                                    } else {
                                         self.scroll_offset = self.scroll_offset.saturating_add(1);
                                     }
                                 }
@@ -4376,7 +4504,7 @@ LlamaCppLibBackend::http(
                                                 }
                                             } else {
                                                 self.status_message = "Generating... Shift+Enter=newline · CTRL+Enter=interrupt & send".to_string();
-                                                return Ok(());
+                                                return Ok(true);
                                             }
                                         }
 
@@ -4585,8 +4713,11 @@ LlamaCppLibBackend::http(
                 }
                 _ => {}
             }
+        } else {
+            // No event — only redraw if animating (generating / downloading / code anim)
+            return Ok(is_animating);
         }
-        Ok(())
+        Ok(true)
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -4611,11 +4742,19 @@ LlamaCppLibBackend::http(
             .esc_hold_start
             .map(|start| (start.elapsed().as_secs_f64() / 1.0).clamp(0.0, 1.0));
         let stops = get_status_gradient_stops(is_gen, is_thinking, exit_hold_pct);
-        let speed = if is_gen { 0.03 } else { 0.015 };
-        let phase = (self.anim_tick as f32 * speed) % 1.0;
+        let stream_len = if is_gen {
+            self.streaming_response.lock().unwrap().len()
+        } else {
+            0
+        };
+        let phase = if is_gen {
+            self.anim_tick as f32 * 0.02 + stream_len as f32 * 0.008
+        } else {
+            self.anim_tick as f32 * 0.015
+        };
 
         // Dynamic input height with smooth collapse/expand animation
-        let inner_w = area.width.max(1) as usize;
+        let inner_w = area.width.saturating_sub(4).max(1) as usize;
         let mut wrapped_prompt_lines: Vec<String> = Vec::new();
         for row in self.input.split('\n') {
             if row.is_empty() {
@@ -4682,11 +4821,11 @@ LlamaCppLibBackend::http(
         let ctx_pct = ((ctx_used as f64 / ctx_limit as f64) * 100.0).min(999.0);
         let ctx_label = crate::settings::format_context_tokens(ctx_limit);
         let ctx_color = if ctx_pct >= 80.0 {
-            Color::Rgb(191, 97, 106)
+            Color::Rgb(255, 130, 140)
         } else if ctx_pct >= 50.0 {
-            Color::Rgb(235, 203, 139)
+            Color::Rgb(255, 220, 140)
         } else {
-            NORDIC_ACCENT
+            Color::Rgb(143, 218, 255)
         };
         let filled = ((ctx_pct / 100.0) * 8.0).round() as usize;
         let mut bar = String::new();
@@ -4724,7 +4863,7 @@ LlamaCppLibBackend::http(
                 (40.0 * (1.0 - pct as f32)) as u8,
             )
         } else {
-            NORDIC_TEXT
+            Color::Rgb(245, 248, 255)
         };
 
         let brand_top = "╭[Hercules]╮"; // 12
@@ -4742,7 +4881,7 @@ LlamaCppLibBackend::http(
                 Span::styled(
                     fit_width(&exiting_text, LEFT_W.saturating_sub(BRAND_W)),
                     Style::default()
-                        .fg(Color::Rgb(191, 97, 106))
+                        .fg(Color::Rgb(255, 120, 130))
                         .bg(if exit_hold_pct.is_some() {
                             Color::Rgb(140, 20, 30)
                         } else {
@@ -4755,12 +4894,25 @@ LlamaCppLibBackend::http(
         frame.render_widget(Paragraph::new(logo_text).style(Style::default().bg(NORDIC_BG)), top_chunks[0]);
 
         let active_model = self.backend.name();
+        let exact_model = if let Some(start) = active_model.find('(') {
+            if let Some(end) = active_model.rfind(')') {
+                if end > start {
+                    active_model[start + 1..end].trim().to_string()
+                } else {
+                    active_model
+                }
+            } else {
+                active_model
+            }
+        } else {
+            active_model
+        };
         let mid_w = top_chunks[1].width as usize;
-        let model_line = fit_width(&format!("Model: {active_model}"), mid_w);
+        let model_line = fit_width(&format!("Model: {exact_model}"), mid_w);
         let hint_text = vec![
             Line::from(Span::styled(
                 model_line,
-                Style::default().fg(NORDIC_MUTED).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Rgb(225, 235, 248)).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
             )),
         ];
         frame.render_widget(
@@ -4887,39 +5039,77 @@ LlamaCppLibBackend::http(
         let mut all_toggle_buttons: Vec<(usize, usize, u16, u16, u16, u16)> = Vec::new();
         let mut all_copy_buttons: Vec<(usize, usize, u16, u16, String)> = Vec::new();
         let mut all_scroll_buttons: Vec<(usize, usize, u16, u16, u16, u16, u16, u16, usize)> = Vec::new();
+        let content_bg = Color::Rgb(34, 39, 48); // Shaded dark background for process output
+
+        macro_rules! push_full_shaded {
+            ($lines:expr, $spans:expr, $cur_w:expr, $max_w:expr, $bg:expr) => {{
+                let mut spans = $spans;
+                let cur_w = $cur_w;
+                let max_w = $max_w;
+                if cur_w < max_w {
+                    spans.push(Span::styled(" ".repeat(max_w.saturating_sub(cur_w)), Style::default().bg($bg)));
+                }
+                $lines.push(Line::from(spans));
+            }};
+        }
 
         for (m_idx, m) in self.messages.iter().enumerate() {
             let is_last_message = m_idx == self.messages.len() - 1;
 
             if m.starts_with("You:") {
-                let user_text = m.strip_prefix("You:").unwrap_or(&m[4..]).trim_start();
-                let inline_spans = crate::markdown::parse_inline(user_text, false, false);
-                let mut spans = vec![Span::styled(
-                    "You: ",
-                    Style::default()
-                        .fg(NORDIC_ACCENT)
-                        .add_modifier(Modifier::BOLD),
-                )];
-                for ispan in inline_spans {
-                    let mut style = Style::default().fg(white);
-                    if ispan.bold {
-                        style = style.add_modifier(Modifier::BOLD);
+                let user_bg = Color::Rgb(163, 190, 140); // Sage Green
+                let user_text = m.strip_prefix("You:").unwrap_or(&m[4..]).trim();
+                let title_spans = vec![Span::styled(" You ", Style::default().fg(NORDIC_BG).bg(user_bg).add_modifier(Modifier::BOLD))];
+                push_full_shaded!(&mut chat_lines, title_spans, 5, available_width, content_bg);
+                for u_line in user_text.lines() {
+                    let inline_spans = crate::markdown::parse_inline(u_line, false, false);
+                    let mut raw_spans = Vec::new();
+                    for ispan in inline_spans {
+                        let mut style = Style::default().fg(white).bg(content_bg);
+                        if ispan.bold {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                        if ispan.italic {
+                            style = style.add_modifier(Modifier::ITALIC);
+                        }
+                        if ispan.strikethrough {
+                            style = style.add_modifier(Modifier::CROSSED_OUT);
+                        }
+                        if ispan.code {
+                            style = style.fg(Color::Rgb(255, 190, 100)).bg(content_bg).add_modifier(Modifier::BOLD);
+                        }
+                        if ispan.link_url.is_some() {
+                            style = style.fg(Color::Rgb(0, 200, 255)).bg(content_bg).add_modifier(Modifier::UNDERLINED);
+                        }
+                        raw_spans.push(Span::styled(ispan.text, style));
                     }
-                    if ispan.italic {
-                        style = style.add_modifier(Modifier::ITALIC);
+                    // Word wrap so every wrapped line gets '▎ ' and full width shading
+                    let mut cur_spans = vec![
+                        Span::styled("▎", Style::default().fg(user_bg).bg(content_bg)),
+                        Span::styled(" ", Style::default().bg(content_bg)),
+                    ];
+                    let mut cur_w = 2;
+                    for sp in raw_spans {
+                        let text = sp.content.to_string();
+                        let style = sp.style;
+                        for word in text.split_inclusive(' ') {
+                            let wl = word.chars().count();
+                            if cur_w + wl > available_width && cur_w > 2 {
+                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                cur_spans = vec![
+                                    Span::styled("▎", Style::default().fg(user_bg).bg(content_bg)),
+                                    Span::styled(" ", Style::default().bg(content_bg)),
+                                ];
+                                cur_w = 2;
+                            }
+                            cur_spans.push(Span::styled(word.to_string(), style));
+                            cur_w += wl;
+                        }
                     }
-                    if ispan.strikethrough {
-                        style = style.add_modifier(Modifier::CROSSED_OUT);
+                    if cur_w > 2 {
+                        push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
                     }
-                    if ispan.code {
-                        style = style.fg(Color::Rgb(255, 190, 100)).add_modifier(Modifier::BOLD);
-                    }
-                    if ispan.link_url.is_some() {
-                        style = style.fg(Color::Rgb(0, 200, 255)).add_modifier(Modifier::UNDERLINED);
-                    }
-                    spans.push(Span::styled(ispan.text, style));
                 }
-                chat_lines.push(Line::from(spans));
                 chat_lines.push(Line::from(""));
             } else if m.starts_with("Agent:") || m.starts_with("Error:") {
                 let content = if m.starts_with("Agent:") {
@@ -4928,77 +5118,75 @@ LlamaCppLibBackend::http(
                     &m[7..]
                 };
 
-                // Thinking UI only for real <think>…</think> (Ollama wraps its
-                // `thinking` stream field that way). llama.cpp / plain GGUF usually
-                // have NO think tags — never treat their whole stream as "Thinking".
                 let (think_part, output_part, think_label) =
                     if let Some(start_think) = content.find("<think>") {
                         if let Some(end_think) = content.find("</think>") {
                             let think = &content[start_think + 7..end_think];
                             let rest = &content[end_think + 8..];
                             let before = &content[..start_think];
-                            // Content before <think> still counts as agent output
                             let out = if before.trim().is_empty() {
                                 rest.to_string()
                             } else {
                                 format!("{}{}", before, rest)
                             };
-                            (Some(think.to_string()), out, "Model thinking")
+                            (Some(think.to_string()), out, "Thinking")
                         } else {
-                            // Unclosed <think> while streaming (Ollama or explicit tags)
                             let think = &content[start_think + 7..];
                             let before = content[..start_think].to_string();
                             (
                                 Some(think.to_string()),
                                 before,
-                                "Model thinking (streaming)",
+                                "Thinking",
                             )
                         }
                     } else {
-                        // No think tags → all content is Agent output (llama.cpp default)
                         (None, content.to_string(), "")
                     };
 
                 let total_chars = content.chars().count();
                 let reveal_limit = if is_last_message { total_chars } else { 10000 };
 
-                // 1. Render Thinking Process only when real <think> exists
                 if let Some(ref think_text) = think_part {
-                    if !think_text.trim().is_empty()
+                    let clean_think = think_text.trim_start_matches(|c| c == '\n' || c == '\r');
+                    if !clean_think.trim().is_empty()
                         || (is_generating_val && content.contains("<think>"))
                     {
-                        if self.thinking_collapsed {
-                            chat_lines.push(Line::from(Span::styled(
-                                format!("[{think_label} · Collapsed — CTRL+T]"),
-                                Style::default()
-                                    .fg(Color::Rgb(180, 130, 255))
-                                    .add_modifier(Modifier::BOLD | Modifier::ITALIC),
-                            )));
+                        let think_bg = Color::Rgb(180, 100, 240); // Soft Purple
+                        let think_tag = if self.thinking_collapsed {
+                            format!(" {think_label} (collapsed) ")
                         } else {
-                            chat_lines.push(Line::from(Span::styled(
-                                format!("[{think_label} — CTRL+T collapse]"),
-                                Style::default()
-                                    .fg(Color::Rgb(180, 130, 255))
-                                    .add_modifier(Modifier::BOLD | Modifier::ITALIC),
-                            )));
+                            format!(" {think_label} ")
+                        };
+                        let think_len = think_tag.chars().count();
+                        let title_spans = vec![Span::styled(think_tag, Style::default().fg(Color::Rgb(245, 248, 255)).bg(think_bg).add_modifier(Modifier::BOLD))];
+                        push_full_shaded!(&mut chat_lines, title_spans, think_len, available_width, content_bg);
 
-                            let visible_think = reveal_limit.min(think_text.chars().count());
+                        if !self.thinking_collapsed {
+                            let visible_think = reveal_limit.min(clean_think.chars().count());
 
                             let mut global_think_ch = 0;
-                            if think_text.trim().is_empty() && is_generating_val {
+                            if clean_think.trim().is_empty() && is_generating_val {
                                 let pulse = (anim_tick as f64 * 0.3).sin() * 0.5 + 0.5;
                                 let b_val = (160.0 + 95.0 * pulse) as u8;
-                                chat_lines.push(Line::from(Span::styled(
-                                    "  Reasoning… █",
-                                    Style::default()
-                                        .fg(Color::Rgb(180, 130, b_val))
-                                        .add_modifier(Modifier::ITALIC),
-                                )));
+                                let spans = vec![
+                                    Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
+                                    Span::styled(
+                                        " Reasoning… █",
+                                        Style::default()
+                                            .fg(Color::Rgb(210, 160, b_val))
+                                            .bg(content_bg)
+                                            .add_modifier(Modifier::ITALIC),
+                                    ),
+                                ];
+                                push_full_shaded!(&mut chat_lines, spans, 15, available_width, content_bg);
                             } else {
-                                for raw_line in think_text.lines() {
-                                    let mut line_spans =
-                                        vec![Span::styled("  │ ", Style::default().fg(dark_gray))];
-                                    for ch in raw_line.chars() {
+                                for raw_line in clean_think.lines() {
+                                    let line_str = raw_line.trim_start();
+                                    if line_str.is_empty() {
+                                        continue;
+                                    }
+                                    let mut line_spans = Vec::new();
+                                    for ch in line_str.chars() {
                                         if global_think_ch >= visible_think {
                                             break;
                                         }
@@ -5008,17 +5196,42 @@ LlamaCppLibBackend::http(
                                         } else {
                                             1.0
                                         };
-                                        let r = (35.0 + (190.0 - 35.0) * progress) as u8;
-                                        let g = (30.0 + (150.0 - 30.0) * progress) as u8;
-                                        let b = (50.0 + (255.0 - 50.0) * progress) as u8;
+                                        let r = (160.0 + 60.0 * progress) as u8;
+                                        let g = (120.0 + 40.0 * progress) as u8;
+                                        let b = (220.0 + 35.0 * progress) as u8;
                                         line_spans.push(Span::styled(
                                             ch.to_string(),
-                                            Style::default().fg(Color::Rgb(r, g, b)),
+                                            Style::default().fg(Color::Rgb(r, g, b)).bg(content_bg),
                                         ));
                                         global_think_ch += 1;
                                     }
                                     global_think_ch += 1;
-                                    chat_lines.push(Line::from(line_spans));
+
+                                    let mut cur_spans = vec![
+                                        Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
+                                        Span::styled(" ", Style::default().bg(content_bg)),
+                                    ];
+                                    let mut cur_w = 2;
+                                    for sp in line_spans {
+                                        let text = sp.content.to_string();
+                                        let style = sp.style;
+                                        for word in text.split_inclusive(' ') {
+                                            let wl = word.chars().count();
+                                            if cur_w + wl > available_width && cur_w > 2 {
+                                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                                cur_spans = vec![
+                                                    Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
+                                                    Span::styled(" ", Style::default().bg(content_bg)),
+                                                ];
+                                                cur_w = 2;
+                                            }
+                                            cur_spans.push(Span::styled(word.to_string(), style));
+                                            cur_w += wl;
+                                        }
+                                    }
+                                    if cur_w > 2 {
+                                        push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                    }
                                 }
                             }
                         }
@@ -5026,7 +5239,6 @@ LlamaCppLibBackend::http(
                     }
                 }
 
-                // 2. Render Agent Response Output (llama.cpp / tools live here — not under Thinking)
                 if !output_part.trim().is_empty()
                     || (think_part.is_none() && (is_generating_val || !content.trim().is_empty()))
                 {
@@ -5035,20 +5247,20 @@ LlamaCppLibBackend::http(
                     } else {
                         output_part.as_str()
                     };
-                    let text_to_render = raw_text.to_string();
+                    let text_to_render = raw_text.trim_start_matches(|c| c == '\n' || c == '\r').to_string();
                     let think_len = think_part.as_ref().map(|t| t.chars().count()).unwrap_or(0);
                     let available_output = reveal_limit.saturating_sub(think_len);
 
                     if !text_to_render.trim().is_empty() || is_generating_val {
+                        let agent_bg = Color::Rgb(136, 192, 208);
                         let agent_label = if is_generating_val && is_last_message {
-                            "Agent (streaming): "
+                            " Agent (streaming) "
                         } else {
-                            "Agent: "
+                            " Agent "
                         };
-                        chat_lines.push(Line::from(Span::styled(
-                            agent_label,
-                            Style::default().fg(NORDIC_ACCENT).add_modifier(Modifier::BOLD),
-                        )));
+                        let agent_len = agent_label.chars().count();
+                        let title_spans = vec![Span::styled(agent_label, Style::default().fg(NORDIC_BG).bg(agent_bg).add_modifier(Modifier::BOLD))];
+                        push_full_shaded!(&mut chat_lines, title_spans, agent_len, available_width, content_bg);
 
                         let mut global_out_ch = 0;
                         let start_line_idx = chat_lines.len();
@@ -5068,49 +5280,148 @@ LlamaCppLibBackend::http(
                             Some(&mut local_toggles),
                             Some(&mut local_copies),
                             Some(&mut local_scrolls),
-                            available_width,
+                            available_width.saturating_sub(4),
                             Some(&self.code_block_anims),
                             Some(&self.code_block_scrolls),
                         );
                         for (local_idx, b_idx, n_s, n_e, p_s, p_e) in local_toggles {
-                            all_toggle_buttons.push((start_line_idx + local_idx, b_idx, n_s, n_e, p_s, p_e));
+                            all_toggle_buttons.push((start_line_idx + local_idx, b_idx, n_s + 2, n_e + 2, p_s + 2, p_e + 2));
                         }
                         for (local_idx, b_idx, c_s, c_e, body) in local_copies {
-                            all_copy_buttons.push((start_line_idx + local_idx, b_idx, c_s, c_e, body));
+                            all_copy_buttons.push((start_line_idx + local_idx, b_idx, c_s + 2, c_e + 2, body));
                         }
                         for (local_idx, b_idx, l_s, l_e, t_s, t_e, r_s, r_e, max_sc) in local_scrolls {
-                            all_scroll_buttons.push((start_line_idx + local_idx, b_idx, l_s, l_e, t_s, t_e, r_s, r_e, max_sc));
+                            all_scroll_buttons.push((start_line_idx + local_idx, b_idx, l_s + 2, l_e + 2, t_s + 2, t_e + 2, r_s + 2, r_e + 2, max_sc));
                         }
-                        chat_lines.extend(md_lines);
+                        for md_l in md_lines {
+                            let spans_with_bg: Vec<Span> = md_l.spans.into_iter().map(|s| {
+                                Span::styled(s.content, s.style.bg(content_bg))
+                            }).collect();
+
+                            let is_code_or_table = spans_with_bg.iter().any(|s| {
+                                s.content.contains('│') || s.content.contains('┌') || s.content.contains('└') || s.content.contains('─')
+                            });
+
+                            if is_code_or_table {
+                                let mut cur_w = 2;
+                                for s in &spans_with_bg {
+                                    cur_w += s.content.chars().count();
+                                }
+                                let mut spans = vec![
+                                    Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
+                                    Span::styled(" ", Style::default().bg(content_bg)),
+                                ];
+                                spans.extend(spans_with_bg);
+                                push_full_shaded!(&mut chat_lines, spans, cur_w, available_width, content_bg);
+                            } else {
+                                let mut cur_spans = vec![
+                                    Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
+                                    Span::styled(" ", Style::default().bg(content_bg)),
+                                ];
+                                let mut cur_w = 2;
+                                for sp in spans_with_bg {
+                                    let text = sp.content.to_string();
+                                    let style = sp.style;
+                                    for word in text.split_inclusive(' ') {
+                                        let wl = word.chars().count();
+                                        if cur_w + wl > available_width && cur_w > 2 {
+                                            push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                            cur_spans = vec![
+                                                Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
+                                                Span::styled(" ", Style::default().bg(content_bg)),
+                                            ];
+                                            cur_w = 2;
+                                        }
+                                        cur_spans.push(Span::styled(word.to_string(), style));
+                                        cur_w += wl;
+                                    }
+                                }
+                                if cur_w > 2 {
+                                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                }
+                            }
+                        }
                         chat_lines.push(Line::from(""));
                     }
                 }
 
-                // Stick WRITE/RUN chips under THIS agent turn (not chat bottom)
-                if m.starts_with("Agent:") {
-                    let ids: Vec<u64> = self
-                        .tool_chips
-                        .iter()
-                        .filter(|c| c.anchor_msg == Some(m_idx))
-                        .map(|c| c.id)
-                        .collect();
-                    for id in ids {
-                        let start = chat_lines.len();
-                        for _ in 0..tool_panel::CHIP_ROW_HEIGHT {
-                            chat_lines.push(Line::from(""));
+                // Render Action process block embedded under agent turn
+                let action_bg = Color::Rgb(235, 203, 139); // Amber / Gold
+                let matching_chips: Vec<&ToolChip> = self
+                    .tool_chips
+                    .iter()
+                    .filter(|c| c.anchor_msg == Some(m_idx))
+                    .collect();
+
+                for chip in matching_chips {
+                    let action_tag = " Action ";
+
+                    // Record chip start BEFORE title line so the hit rect covers
+                    // both the title row AND the summary row below it.
+                    let chip_start = chat_lines.len();
+                    chip_line_starts.push((chip.id, chip_start));
+
+                    let title_spans = vec![Span::styled(
+                        action_tag,
+                        Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
+                    )];
+                    push_full_shaded!(&mut chat_lines, title_spans, 8, available_width, content_bg);
+
+                    let chip_summary = chip.label_text();
+                    let cur_spans = vec![
+                        Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
+                        Span::styled(" ", Style::default().bg(content_bg)),
+                        Span::styled(
+                            chip_summary.clone(),
+                            Style::default().fg(chip.kind.accent()).bg(content_bg).add_modifier(Modifier::BOLD),
+                        ),
+                    ];
+                    let cur_w = 2 + chip_summary.chars().count();
+                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+
+                    // If expanded (or active/running), embed content right under Action!
+                    if chip.expanded || !chip.tag_closed {
+                        if !chip.body.trim().is_empty() {
+                            for b_line in chip.body.lines().take(25) {
+                                let cur_spans = vec![
+                                    Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
+                                    Span::styled("   ", Style::default().bg(content_bg)),
+                                    Span::styled(b_line.to_string(), Style::default().fg(NORDIC_TEXT).bg(content_bg)),
+                                ];
+                                let cur_w = 4 + b_line.chars().count();
+                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                            }
                         }
-                        chip_line_starts.push((id, start));
                     }
+                    chat_lines.push(Line::from(""));
                 }
             } else if m.starts_with("System:") {
-                // Multi-line system / tool output (cargo etc.)
-                for (i, line) in m.lines().enumerate() {
-                    let style = if i == 0 {
-                        Style::default().fg(NORDIC_MUTED)
-                    } else {
-                        Style::default().fg(NORDIC_TEXT)
-                    };
-                    chat_lines.push(Line::from(Span::styled(line.to_string(), style)));
+                let sys_bg = Color::Rgb(94, 129, 172); // Nordic Slate Blue
+                let sys_body = m.strip_prefix("System:").unwrap_or(&m[7..]).trim();
+                let title_spans = vec![Span::styled(" System ", Style::default().fg(Color::Rgb(245, 248, 255)).bg(sys_bg).add_modifier(Modifier::BOLD))];
+                push_full_shaded!(&mut chat_lines, title_spans, 8, available_width, content_bg);
+                for line in sys_body.lines() {
+                    let mut cur_spans = vec![
+                        Span::styled("▎", Style::default().fg(sys_bg).bg(content_bg)),
+                        Span::styled(" ", Style::default().bg(content_bg)),
+                    ];
+                    let mut cur_w = 2;
+                    for word in line.split_inclusive(' ') {
+                        let wl = word.chars().count();
+                        if cur_w + wl > available_width && cur_w > 2 {
+                            push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                            cur_spans = vec![
+                                Span::styled("▎", Style::default().fg(sys_bg).bg(content_bg)),
+                                Span::styled(" ", Style::default().bg(content_bg)),
+                            ];
+                            cur_w = 2;
+                        }
+                        cur_spans.push(Span::styled(word.to_string(), Style::default().fg(NORDIC_TEXT).bg(content_bg)));
+                        cur_w += wl;
+                    }
+                    if cur_w > 2 {
+                        push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                    }
                 }
                 chat_lines.push(Line::from(""));
             } else {
@@ -5118,26 +5429,6 @@ LlamaCppLibBackend::http(
                     m.clone(),
                     Style::default().fg(NORDIC_MUTED),
                 )));
-            }
-        }
-
-        // Orphan chips (no anchor row yet) — park under last agent turn spacers already
-        // inserted; if none, reserve at end so they remain clickable
-        {
-            let placed: std::collections::HashSet<u64> =
-                chip_line_starts.iter().map(|(id, _)| *id).collect();
-            let orphans: Vec<u64> = self
-                .tool_chips
-                .iter()
-                .filter(|c| !placed.contains(&c.id))
-                .map(|c| c.id)
-                .collect();
-            for id in orphans {
-                let start = chat_lines.len();
-                for _ in 0..tool_panel::CHIP_ROW_HEIGHT {
-                    chat_lines.push(Line::from(""));
-                }
-                chip_line_starts.push((id, start));
             }
         }
 
@@ -5295,10 +5586,15 @@ LlamaCppLibBackend::http(
                 }
                 let y_off = vis.saturating_sub(self.scroll_offset);
                 let y = chat_top.saturating_add(y_off);
-                if y.saturating_add(tool_panel::CHIP_ROW_HEIGHT) > chat_bot {
+                if y > chat_bot {
                     continue;
                 }
-                chip.draw_at(frame, x, y, max_w);
+                chip.rect = Some(Rect {
+                    x: chat_area.x,
+                    y,
+                    width: chat_area.width,
+                    height: 2, // covers title row + summary row
+                });
             }
         }
 
@@ -5436,90 +5732,95 @@ LlamaCppLibBackend::http(
             frame.render_widget(console_box, main_split[1]);
         }
 
-        // --- Input Area (Full width, no left/right 2-char padding) ---
+        // --- Input Area (Full width bar, 1-char padded user text lines) ---
         let input_area = chunks[2];
         let bar_w = input_area.width as usize;
         let raw_model = self.backend.name();
-        let model_clean = if raw_model.chars().count() > 36 {
-            format!("{}…", raw_model.chars().take(34).collect::<String>())
+        let exact_model = if let Some(start) = raw_model.find('(') {
+            if let Some(end) = raw_model.rfind(')') {
+                if end > start {
+                    raw_model[start + 1..end].trim().to_string()
+                } else {
+                    raw_model
+                }
+            } else {
+                raw_model
+            }
         } else {
             raw_model
         };
-        let badge_text = model_clean;
+        let model_clean = if exact_model.chars().count() > 34 {
+            format!("{}…", exact_model.chars().take(32).collect::<String>())
+        } else {
+            exact_model
+        };
+        // Extra spaces on both sides: "  {MODEL NAME}  "
+        let badge_text = format!("  {}  ", model_clean);
         let badge_len = badge_text.chars().count();
-        let left_trans = "🭆";
-        let right_trans = "🭑";
-        let right_bar_w = 1;
+        let left_trans = "🭆🭂"; // 2 transition characters
+        let left_trans_len = 2;
 
-        let total_badge_w = 1 + badge_len + 1 + right_bar_w;
+        let total_badge_w = left_trans_len + badge_len;
         let left_bar_w = bar_w.saturating_sub(total_badge_w).max(1);
 
         let white_c = Color::Rgb(236, 239, 244); // #ECEFF4 Snow White
 
+        let get_bar_color = |col_idx: usize, bar_width: usize| -> Color {
+            if let Some(ref st) = stops {
+                let norm = col_idx as f32 / bar_width.max(1) as f32;
+                // 0.3 factor gradient smoothly traveling from left to right
+                let cycle = ((norm * 0.3) - (phase * 0.04)).rem_euclid(1.0);
+                let wave = if cycle < 0.5 {
+                    cycle * 2.0
+                } else {
+                    (1.0 - cycle) * 2.0
+                };
+                multi_stop_gradient(st, wave)
+            } else {
+                white_c
+            }
+        };
+
+        let get_contrast_text_color = |bg: Color| -> Color {
+            if let Color::Rgb(r, g, b) = bg {
+                let lum = 0.299 * (r as f32) + 0.587 * (g as f32) + 0.114 * (b as f32);
+                if lum < 135.0 {
+                    Color::Rgb(245, 248, 255) // Light text on dark bg
+                } else {
+                    NORDIC_BG // Dark text on light bg
+                }
+            } else {
+                NORDIC_BG
+            }
+        };
+
         let mut bar_spans: Vec<Span> = Vec::new();
         let mut cur_col_idx = 0;
 
-        // 1. Left bar characters: 🬭
+        // 1. Left bar characters: 🬭 (smooth gradient character by character)
         for _ in 0..left_bar_w {
-            let col_c = if let Some(ref st) = stops {
-                let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
-                multi_stop_gradient(st, pos)
-            } else {
-                white_c
-            };
+            let col_c = get_bar_color(cur_col_idx, bar_w);
             bar_spans.push(Span::styled("🬭", Style::default().fg(col_c).bg(NORDIC_BG)));
             cur_col_idx += 1;
         }
 
-        // 2. Left transition: 🭆
-        let c_left_trans = if let Some(ref st) = stops {
-            let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
-            multi_stop_gradient(st, pos)
-        } else {
-            white_c
-        };
-        bar_spans.push(Span::styled(left_trans, Style::default().fg(c_left_trans).bg(NORDIC_BG)));
-        cur_col_idx += 1;
+        // 2. Left transition: 🭆🭂 and 3. Model Name badge (single uniform bg color)
+        let c_badge_bg = get_bar_color(cur_col_idx, bar_w);
+        let c_badge_fg = get_contrast_text_color(c_badge_bg);
 
-        // 3. Model Name badge (bg matches bar gradient or white, text is Nordic Gray)
+        bar_spans.push(Span::styled(left_trans, Style::default().fg(c_badge_bg).bg(NORDIC_BG)));
+        cur_col_idx += left_trans_len;
+
         let badge_start_col = input_area.x + cur_col_idx as u16;
-        let c_badge_bg = if let Some(ref st) = stops {
-            let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
-            multi_stop_gradient(st, pos)
-        } else {
-            white_c
-        };
         bar_spans.push(Span::styled(
             badge_text,
-            Style::default().fg(NORDIC_BG).bg(c_badge_bg).add_modifier(Modifier::BOLD),
+            Style::default().fg(c_badge_fg).bg(c_badge_bg).add_modifier(Modifier::BOLD),
         ));
         cur_col_idx += badge_len;
         let badge_end_col = input_area.x + cur_col_idx as u16;
 
         // Record hit zone for clicking on Model Name to toggle focus
         self.model_badge_hit = Some((input_area.y, badge_start_col, badge_end_col));
-
-        // 4. Right transition: 🭑
-        let c_right_trans = if let Some(ref st) = stops {
-            let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
-            multi_stop_gradient(st, pos)
-        } else {
-            white_c
-        };
-        bar_spans.push(Span::styled(right_trans, Style::default().fg(c_right_trans).bg(NORDIC_BG)));
-        cur_col_idx += 1;
-
-        // 5. Right bar characters: 🬭
-        for _ in 0..right_bar_w {
-            let col_c = if let Some(ref st) = stops {
-                let pos = ((cur_col_idx as f32 / bar_w.max(1) as f32) + phase).fract();
-                multi_stop_gradient(st, pos)
-            } else {
-                white_c
-            };
-            bar_spans.push(Span::styled("🬭", Style::default().fg(col_c).bg(NORDIC_BG)));
-            cur_col_idx += 1;
-        }
 
         let mut input_ui_lines: Vec<Line> = vec![Line::from(bar_spans)];
 
@@ -5537,7 +5838,7 @@ LlamaCppLibBackend::http(
 
             if self.term_is_interactive() {
                 input_ui_lines.push(Line::from(vec![
-                    Span::styled("$ ", Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG)),
+                    Span::styled(" $ ", Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG)),
                     Span::styled(
                         if self.term_input.is_empty() {
                             "type shell command…".to_string()
@@ -5554,17 +5855,50 @@ LlamaCppLibBackend::http(
                 ]));
             } else if self.input.is_empty() {
                 input_ui_lines.push(Line::from(Span::styled(
-                    "Type a prompt...",
+                    " Type a prompt...",
                     Style::default().fg(NORDIC_MUTED).bg(NORDIC_BG),
                 )));
             } else {
-                let start_idx = (self.input_scroll_y as usize).min(wrapped_prompt_lines.len());
-                let end_idx = (start_idx + available_content_rows as usize).min(wrapped_prompt_lines.len());
-                for line_str in &wrapped_prompt_lines[start_idx..end_idx] {
-                    input_ui_lines.push(Line::from(Span::styled(
-                        line_str.clone(),
-                        Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
-                    )));
+                let total_lines = wrapped_prompt_lines.len();
+                let has_scrollbar = total_lines > available_content_rows as usize;
+                let text_w = if has_scrollbar {
+                    inner_w.saturating_sub(1)
+                } else {
+                    inner_w
+                };
+                let max_scroll = total_lines.saturating_sub(available_content_rows as usize);
+                let thumb_height = (((available_content_rows as f32 / total_lines as f32) * available_content_rows as f32).round() as usize).max(1);
+                let thumb_start = if max_scroll > 0 {
+                    (((self.input_scroll_y as f32 / max_scroll as f32) * (available_content_rows as usize - thumb_height) as f32).round() as usize)
+                } else {
+                    0
+                };
+
+                let start_idx = (self.input_scroll_y as usize).min(total_lines);
+                let end_idx = (start_idx + available_content_rows as usize).min(total_lines);
+
+                for (r, line_str) in wrapped_prompt_lines[start_idx..end_idx].iter().enumerate() {
+                    let mut row_spans = vec![
+                        Span::raw(" "), // 1-character left padding for user text input
+                        Span::styled(
+                            line_str.clone(),
+                            Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                        ),
+                    ];
+
+                    if has_scrollbar {
+                        let line_len = line_str.chars().count();
+                        let pad_spaces = text_w.saturating_sub(line_len);
+                        if pad_spaces > 0 {
+                            row_spans.push(Span::styled(" ".repeat(pad_spaces), Style::default().bg(NORDIC_BG)));
+                        }
+                        let is_thumb = r >= thumb_start && r < thumb_start + thumb_height;
+                        let sb_char = if is_thumb { "┃" } else { "│" };
+                        let sb_color = if is_thumb { Color::Rgb(143, 218, 255) } else { Color::Rgb(76, 86, 106) };
+                        row_spans.push(Span::styled(sb_char, Style::default().fg(sb_color).bg(NORDIC_BG)));
+                    }
+
+                    input_ui_lines.push(Line::from(row_spans));
                 }
             }
         }
@@ -5579,7 +5913,7 @@ LlamaCppLibBackend::http(
             let available_content_rows = input_box_h.saturating_sub(1);
             let visible_rel_row = row.saturating_sub(self.input_scroll_y);
             if visible_rel_row < available_content_rows {
-                let cursor_x = input_area.x.saturating_add(col as u16);
+                let cursor_x = input_area.x.saturating_add(1).saturating_add(col as u16);
                 let cursor_y = input_area.y.saturating_add(1).saturating_add(visible_rel_row as u16);
                 let max_x = input_area.x + input_area.width.saturating_sub(1);
                 let max_y = input_area.y + input_box_h.saturating_sub(1);
@@ -5622,8 +5956,10 @@ LlamaCppLibBackend::http(
 
             let area = center_layout[1];
             frame.render_widget(Clear, area);
+            frame.render_widget(Block::default().style(Style::default().bg(NORDIC_DARK_BG)), area);
 
             let menu_block = Block::default()
+                .style(Style::default().bg(NORDIC_DARK_BG))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(menu_border_color))
@@ -5640,53 +5976,53 @@ LlamaCppLibBackend::http(
             // Tab bar headers inside menu
             let reg_style = if self.menu_section == 0 {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(theme_color)
+                    .fg(NORDIC_BG)
+                    .bg(NORDIC_ACCENT)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(white)
+                Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG)
             };
             let inst_style = if self.menu_section == 1 {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(theme_color)
+                    .fg(NORDIC_BG)
+                    .bg(NORDIC_ACCENT)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(white)
+                Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG)
             };
             let cfg_style = if self.menu_section == 2 {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(theme_color)
+                    .fg(NORDIC_BG)
+                    .bg(NORDIC_ACCENT)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(white)
+                Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG)
             };
             let rt_style = if self.menu_section == 3 {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(theme_color)
+                    .fg(NORDIC_BG)
+                    .bg(NORDIC_ACCENT)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(white)
+                Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG)
             };
             let perm_style = if self.menu_section == 4 {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(theme_color)
+                    .fg(NORDIC_BG)
+                    .bg(NORDIC_ACCENT)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(white)
+                Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG)
             };
 
             let tab_header = Paragraph::new(Line::from(vec![
-                Span::raw(" "),
+                Span::styled(" ", Style::default().bg(NORDIC_DARK_BG)),
                 Span::styled(" [1] Registry ", reg_style),
                 Span::styled(" [2] Installed ", inst_style),
                 Span::styled(" [3] Engine ", cfg_style),
                 Span::styled(" [4] Runtime ", rt_style),
                 Span::styled(" [5] Perms ", perm_style),
-            ]));
+            ])).style(Style::default().bg(NORDIC_DARK_BG));
             frame.render_widget(tab_header, menu_chunks[0]);
 
             if self.menu_section == 0 {
@@ -5699,33 +6035,37 @@ LlamaCppLibBackend::http(
                 let search_text = if self.registry_search_query.is_empty() {
                     Span::styled(
                         "Type to query HuggingFace / Ollama API live...",
-                        Style::default().fg(dark_gray),
+                        Style::default().fg(NORDIC_MUTED).bg(NORDIC_DARK_BG),
                     )
                 } else {
                     Span::styled(
                         format!(" {}", self.registry_search_query),
-                        Style::default().fg(theme_color),
+                        Style::default().fg(NORDIC_ACCENT).bg(NORDIC_DARK_BG),
                     )
                 };
-                let search_box = Paragraph::new(Line::from(search_text)).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .title(" Live HuggingFace / Ollama Search Bar "),
-                );
+                let search_box = Paragraph::new(Line::from(search_text))
+                    .style(Style::default().bg(NORDIC_DARK_BG))
+                    .block(
+                        Block::default()
+                            .style(Style::default().bg(NORDIC_DARK_BG))
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(NORDIC_ACCENT))
+                            .title(" Live HuggingFace / Ollama Search Bar "),
+                    );
                 frame.render_widget(search_box, reg_chunks[0]);
 
                 let list_fade_val = self.krama.get_progress_f32("list_fade", 0);
                 let list_item_color = Color::Rgb(
-                    0,
-                    (255.0 * list_fade_val) as u8,
-                    (180.0 * list_fade_val) as u8,
+                    (136.0 * list_fade_val) as u8,
+                    (192.0 * list_fade_val) as u8,
+                    (208.0 * list_fade_val) as u8,
                 );
 
                 let mut items: Vec<ListItem> = self
                     .registry_models
                     .iter()
-                    .map(|m| ListItem::new(Span::styled(m, Style::default().fg(list_item_color))))
+                    .map(|m| ListItem::new(Span::styled(m, Style::default().fg(list_item_color).bg(NORDIC_DARK_BG))))
                     .collect();
 
                 let hf_items = self.hf_models.iter().map(|m| {
@@ -5739,15 +6079,16 @@ LlamaCppLibBackend::http(
                             (255.0 * list_fade_val) as u8,
                         )
                     };
-                    ListItem::new(Span::styled(m, Style::default().fg(color)))
+                    ListItem::new(Span::styled(m, Style::default().fg(color).bg(NORDIC_DARK_BG)))
                 });
                 items.extend(hf_items);
 
                 let list = List::new(items)
-                    .block(Block::default().borders(Borders::TOP).title(
+                    .style(Style::default().bg(NORDIC_DARK_BG))
+                    .block(Block::default().style(Style::default().bg(NORDIC_DARK_BG)).borders(Borders::TOP).title(
                         " Open Weights Registry [Up/Down: Navigate | Enter: Download & Install] ",
                     ))
-                    .highlight_style(Style::default().bg(theme_color).fg(Color::Black))
+                    .highlight_style(Style::default().bg(NORDIC_ACCENT).fg(NORDIC_BG).add_modifier(Modifier::BOLD))
                     .highlight_symbol(">> ");
 
                 frame.render_stateful_widget(list, reg_chunks[1], &mut self.registry_state);
@@ -5755,9 +6096,9 @@ LlamaCppLibBackend::http(
                 // Installed Models Tab (Real Local Models with KramaFrame Fade)
                 let list_fade_val = self.krama.get_progress_f32("list_fade", 0);
                 let list_item_color = Color::Rgb(
-                    0,
-                    (255.0 * list_fade_val) as u8,
-                    (180.0 * list_fade_val) as u8,
+                    (136.0 * list_fade_val) as u8,
+                    (192.0 * list_fade_val) as u8,
+                    (208.0 * list_fade_val) as u8,
                 );
 
                 let items: Vec<ListItem> = self
@@ -5766,16 +6107,17 @@ LlamaCppLibBackend::http(
                     .map(|m| {
                         ListItem::new(Span::styled(
                             format!("Local Installed: {}", m),
-                            Style::default().fg(list_item_color),
+                            Style::default().fg(list_item_color).bg(NORDIC_DARK_BG),
                         ))
                     })
                     .collect();
 
                 let list = List::new(items)
-                    .block(Block::default().borders(Borders::TOP).title(
+                    .style(Style::default().bg(NORDIC_DARK_BG))
+                    .block(Block::default().style(Style::default().bg(NORDIC_DARK_BG)).borders(Borders::TOP).title(
                         " Installed Models [Up/Down: Navigate | Enter: Activate & Use Model] ",
                     ))
-                    .highlight_style(Style::default().bg(theme_color).fg(Color::Black))
+                    .highlight_style(Style::default().bg(NORDIC_ACCENT).fg(NORDIC_BG).add_modifier(Modifier::BOLD))
                     .highlight_symbol(">> ");
 
                 frame.render_stateful_widget(list, menu_chunks[1], &mut self.installed_state);
@@ -5785,23 +6127,24 @@ LlamaCppLibBackend::http(
                 let options = vec![
                     ListItem::new(Span::styled(
                         "llama.cpp (in-process libllama.so — fast, no subprocess)",
-                        Style::default().fg(light_blue),
+                        Style::default().fg(NORDIC_ACCENT).bg(NORDIC_DARK_BG),
                     )),
                     ListItem::new(Span::styled(
                         "llama.cpp (warm llama-server / CLI + GPU -ngl)",
-                        Style::default().fg(Color::Rgb(255, 180, 80)),
+                        Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_DARK_BG),
                     )),
                     ListItem::new(Span::styled(
                         "Ollama Engine (Local daemon: http://localhost:11434)",
-                        Style::default().fg(white),
+                        Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG),
                     )),
                 ];
                 let list = List::new(options)
-                    .block(Block::default().borders(Borders::TOP).title(format!(
+                    .style(Style::default().bg(NORDIC_DARK_BG))
+                    .block(Block::default().style(Style::default().bg(NORDIC_DARK_BG)).borders(Borders::TOP).title(format!(
                         " Active Engine: {} [Enter to Select] ",
                         active_backend_str
                     )))
-                    .highlight_style(Style::default().bg(theme_color).fg(Color::Black))
+                    .highlight_style(Style::default().bg(NORDIC_ACCENT).fg(NORDIC_BG).add_modifier(Modifier::BOLD))
                     .highlight_symbol(">> ");
 
                 frame.render_stateful_widget(list, menu_chunks[1], &mut self.config_state);
@@ -5823,42 +6166,42 @@ LlamaCppLibBackend::http(
                             s.power_mode == crate::settings::PowerMode::PowerSaver,
                             "Power Saver — ease off when CPU hot",
                         ),
-                        Style::default().fg(Color::Rgb(100, 220, 140)),
+                        Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_DARK_BG),
                     )),
                     ListItem::new(Span::styled(
                         mk(
                             s.power_mode == crate::settings::PowerMode::Normal,
                             "Normal (default) — auto cores + GPU offload",
                         ),
-                        Style::default().fg(theme_color),
+                        Style::default().fg(NORDIC_ACCENT).bg(NORDIC_DARK_BG),
                     )),
                     ListItem::new(Span::styled(
                         mk(
                             s.power_mode == crate::settings::PowerMode::Extreme,
                             "Extreme — max threads + max GPU layers",
                         ),
-                        Style::default().fg(Color::Rgb(255, 100, 100)),
+                        Style::default().fg(Color::Rgb(255, 120, 130)).bg(NORDIC_DARK_BG),
                     )),
                     ListItem::new(Span::styled(
                         format!(
                             "llama.cpp Sub-Backend: {}  (Enter / +/− cycles Auto→SIMD→GPU→Scalar)",
                             "LlamaCppLib"
                         ),
-                        Style::default().fg(Color::Rgb(100, 200, 255)),
+                        Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_DARK_BG),
                     )),
                     ListItem::new(Span::styled(
                         format!(
                             "Stall Watchdog Timeout: {}  (Enter / +/− cycles 5m→10m→20m→Unlimited)",
                             crate::settings::format_stall_timeout(s.stall_timeout_secs)
                         ),
-                        Style::default().fg(Color::Rgb(255, 180, 80)),
+                        Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_DARK_BG),
                     )),
                     ListItem::new(Span::styled(
                         format!(
                             "Repeat threshold: {}  (+/− step · Enter cycle)",
                             s.repeat_threshold
                         ),
-                        Style::default().fg(light_blue),
+                        Style::default().fg(NORDIC_ACCENT).bg(NORDIC_DARK_BG),
                     )),
                     ListItem::new(Span::styled(
                         format!(
@@ -5869,22 +6212,23 @@ LlamaCppLibBackend::http(
                                 "OFF"
                             }
                         ),
-                        Style::default().fg(Color::Rgb(255, 200, 80)),
+                        Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_DARK_BG),
                     )),
                     ListItem::new(Span::styled(
                         format!(
                             "Context window: {} ({ctx_n})  (+/− step · Enter cycle 4K…1M)",
                             ctx_label
                         ),
-                        Style::default().fg(Color::Rgb(180, 160, 255)),
+                        Style::default().fg(Color::Rgb(180, 160, 255)).bg(NORDIC_DARK_BG),
                     )),
                 ];
                 let list =
                     List::new(options)
-                        .block(Block::default().borders(Borders::TOP).title(
+                        .style(Style::default().bg(NORDIC_DARK_BG))
+                        .block(Block::default().style(Style::default().bg(NORDIC_DARK_BG)).borders(Borders::TOP).title(
                             " Runtime [Power | Ctx | Temp | Repeat] Enter=apply · +/−=nudge ",
                         ))
-                        .highlight_style(Style::default().bg(theme_color).fg(Color::Black))
+                        .highlight_style(Style::default().bg(NORDIC_ACCENT).fg(NORDIC_BG).add_modifier(Modifier::BOLD))
                         .highlight_symbol(">> ");
                 frame.render_stateful_widget(list, menu_chunks[1], &mut self.runtime_state);
             } else {
@@ -5911,19 +6255,20 @@ LlamaCppLibBackend::http(
                     "○ Interact on all directories"
                 };
                 let options = vec![
-                    ListItem::new(Span::styled(mode_ask, Style::default().fg(theme_color))),
-                    ListItem::new(Span::styled(mode_always, Style::default().fg(light_blue))),
+                    ListItem::new(Span::styled(mode_ask, Style::default().fg(NORDIC_ACCENT).bg(NORDIC_DARK_BG))),
+                    ListItem::new(Span::styled(mode_always, Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_DARK_BG))),
                     ListItem::new(Span::styled(
                         scope_cur,
-                        Style::default().fg(Color::Rgb(255, 200, 80)),
+                        Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_DARK_BG),
                     )),
-                    ListItem::new(Span::styled(scope_all, Style::default().fg(white))),
+                    ListItem::new(Span::styled(scope_all, Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG))),
                 ];
                 let list = List::new(options)
-                    .block(Block::default().borders(Borders::TOP).title(
+                    .style(Style::default().bg(NORDIC_DARK_BG))
+                    .block(Block::default().style(Style::default().bg(NORDIC_DARK_BG)).borders(Borders::TOP).title(
                         " Tool Permissions [Enter: Apply]  Ask=block write/cmd until /allow ",
                     ))
-                    .highlight_style(Style::default().bg(theme_color).fg(Color::Black))
+                    .highlight_style(Style::default().bg(NORDIC_ACCENT).fg(NORDIC_BG).add_modifier(Modifier::BOLD))
                     .highlight_symbol(">> ");
                 frame.render_stateful_widget(list, menu_chunks[1], &mut self.perms_state);
             }
@@ -5964,6 +6309,7 @@ LlamaCppLibBackend::http(
                 .split(popup_layout[1]);
             let area = center[1];
             frame.render_widget(Clear, area);
+            frame.render_widget(Block::default().style(Style::default().bg(NORDIC_DARK_BG)), area);
 
             let help = concat!(
                 " F1              Toggle this shortcuts panel (default: off)\n",
@@ -5993,13 +6339,16 @@ LlamaCppLibBackend::http(
                 "\n",
                 " Downloads resume after network drops (Range). Re-run install to continue.\n",
             );
-            let help_para = Paragraph::new(help).style(Style::default().fg(fg)).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(border))
-                    .title(" Keyboard Shortcuts [F1 to close] "),
-            );
+            let help_para = Paragraph::new(help)
+                .style(Style::default().fg(Color::Rgb(225, 235, 248)).bg(NORDIC_DARK_BG))
+                .block(
+                    Block::default()
+                        .style(Style::default().bg(NORDIC_DARK_BG))
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::Rgb(136, 192, 208)))
+                        .title(" Keyboard Shortcuts [F1 to close] "),
+                );
             frame.render_widget(help_para, area);
         }
 
@@ -6031,8 +6380,10 @@ LlamaCppLibBackend::http(
 
             let area = center_layout[1];
             frame.render_widget(Clear, area);
+            frame.render_widget(Block::default().style(Style::default().bg(NORDIC_DARK_BG)), area);
 
             let block = Block::default()
+                .style(Style::default().bg(NORDIC_DARK_BG))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Double)
                 .border_style(Style::default().fg(Color::Rgb(255, 80, 80)))
@@ -6043,12 +6394,13 @@ LlamaCppLibBackend::http(
                     "Model Deletion Confirmation",
                     Style::default()
                         .fg(Color::Rgb(255, 80, 80))
+                        .bg(NORDIC_DARK_BG)
                         .add_modifier(Modifier::BOLD),
                 )),
-                Line::from(""),
-                Line::from(format!("Target Model: {}", target)),
-                Line::from("Are you sure you want to delete this model weight from memory/disk?"),
-                Line::from(""),
+                Line::from(Span::styled("", Style::default().bg(NORDIC_DARK_BG))),
+                Line::from(Span::styled(format!("Target Model: {}", target), Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG))),
+                Line::from(Span::styled("Are you sure you want to delete this model weight from memory/disk?", Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG))),
+                Line::from(Span::styled("", Style::default().bg(NORDIC_DARK_BG))),
                 Line::from(vec![
                     Span::styled(
                         " [Y] Confirm Delete ",
@@ -6057,15 +6409,16 @@ LlamaCppLibBackend::http(
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw("   "),
+                    Span::styled("   ", Style::default().bg(NORDIC_DARK_BG)),
                     Span::styled(
                         " [N / Esc] Cancel ",
-                        Style::default().bg(dark_gray).fg(Color::White),
+                        Style::default().bg(NORDIC_BG).fg(NORDIC_TEXT),
                     ),
                 ]),
             ];
 
             let dialog = Paragraph::new(confirm_lines)
+                .style(Style::default().bg(NORDIC_DARK_BG))
                 .block(block)
                 .alignment(Alignment::Center);
             frame.render_widget(dialog, area);

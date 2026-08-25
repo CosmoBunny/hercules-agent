@@ -2,11 +2,37 @@
 //!
 //! Replaces the pure-Rust `llama.rs` inference path. Loads the model once,
 //! caches it globally, and streams tokens into the shared UI buffer.
+//!
+//! ## KV-cache warm-start
+//!
+//! After the first successful generation, the system-prompt portion of the
+//! KV state is snapshotted via `llama_state_get_data`.  On every subsequent
+//! call the snapshot is restored **instead of clearing and re-prefilling the
+//! system prompt**, so only the new user-turn tokens need to be decoded.
+//! This saves 0.5–5 seconds per turn on large system prompts.
+//!
+//! The snapshot is invalidated whenever the system prompt text changes
+//! (e.g. different working directory) so it never goes stale.
 
 use crate::llama::ffi::{LlamaContext, LlamaModel, LlamaVocab, get_lib};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+// ---------------------------------------------------------------------------
+// KV-cache system-prompt snapshot
+// ---------------------------------------------------------------------------
+
+/// Stores a serialised llama.cpp KV state taken immediately after the
+/// system-prompt tokens have been decoded (but before any user turn).
+struct SyspromptSnapshot {
+    /// The exact system-prompt text this snapshot was built for.
+    system_text: String,
+    /// Number of tokens in the system-prompt batch (= KV position after prefill).
+    n_sys_tokens: usize,
+    /// Raw serialised KV-cache bytes from `llama_state_get_data`.
+    data: Vec<u8>,
+}
 
 // ---------------------------------------------------------------------------
 // LlamaCppLib — in-process engine
@@ -20,6 +46,8 @@ pub struct LlamaCppLib {
     n_ctx: u32,
     /// Max tokens per llama_decode call (must match context params).
     n_batch: u32,
+    /// Cached KV state after system-prompt prefill — avoids re-encoding on every turn.
+    sys_snapshot: Mutex<Option<SyspromptSnapshot>>,
 }
 
 // SAFETY: we only access model/ctx/vocab through a single Mutex at a time.
@@ -97,6 +125,7 @@ impl LlamaCppLib {
             vocab,
             n_ctx,
             n_batch: 512,
+            sys_snapshot: Mutex::new(None),
         })
     }
 
@@ -181,17 +210,6 @@ impl LlamaCppLib {
 
         let lib = get_lib()?;
 
-        // Fresh KV each turn (warm engine reuses one context).
-        // clear(data=false) is enough for a new prompt; data=true has crashed some builds.
-        if let (Some(get_mem), Some(clear)) = (lib.get_memory, lib.memory_clear) {
-            unsafe {
-                let mem = get_mem(self.ctx);
-                if !mem.is_null() {
-                    clear(mem, false);
-                }
-            }
-        }
-
         let system = crate::agent::AgentEngine::system_prompt_compact_for_cwd();
         // After tools already ran, the host sends "Tool results are above" — do NOT
         // re-apply tool-force nudge (that re-emits the same <read> and clears the answer).
@@ -203,36 +221,116 @@ impl LlamaCppLib {
         } else {
             crate::agent::AgentEngine::with_tool_nudge(user_prompt)
         };
-        let prompt = Self::build_prompt(&system, &user);
 
-        // Tokenize
+        // Build the system-only prefix and the full prompt.
+        // We'll encode the system part once and snapshot it; subsequent calls restore.
+        let sys_prefix = format!(
+            "<|im_start|>system\n{}<|im_end|>\n",
+            system
+        );
+        let user_suffix = format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            user
+        );
+        let prompt = format!("{}{}", sys_prefix, user_suffix);
+
         let add_bos = unsafe { (lib.vocab_get_add_bos)(self.vocab) };
-        let mut tokens = self.tokenize(&prompt, add_bos)?;
-
         let max_ctx = self.n_ctx as usize;
+        let n_batch = self.n_batch.max(1) as usize;
+        let n_predict = crate::settings::get_settings().power_mode.max_tokens() as usize;
+        let _stderr_guard = StderrSilence::enter();
+
+        // -------------------------------------------------------------------
+        // PREFILL: try to restore system-prompt snapshot, fall back to full prefill
+        // -------------------------------------------------------------------
+        let mut snap_guard = self.sys_snapshot.lock().unwrap();
+
+        let can_restore = snap_guard
+            .as_ref()
+            .map(|s| s.system_text == system)
+            .unwrap_or(false);
+
+        if can_restore {
+            // Restore the serialised KV state — skips system-prompt re-encoding.
+            let snap = snap_guard.as_ref().unwrap();
+            if let (Some(set_data), Some(get_size)) = (lib.state_set_data, lib.state_get_size) {
+                let needed = unsafe { get_size(self.ctx) };
+                if snap.data.len() == needed {
+                    let restored = unsafe {
+                        set_data(self.ctx, snap.data.as_ptr(), snap.data.len())
+                    };
+                    if restored == snap.data.len() {
+                        // State restored — now tokenize only the user-turn suffix and prefill it.
+                        let mut user_tokens = self.tokenize(&user_suffix, false)?;
+                        // Trim if combined length would overflow context
+                        let sys_tokens = snap.n_sys_tokens;
+                        let available = max_ctx.saturating_sub(sys_tokens + 32);
+                        if user_tokens.len() > available {
+                            user_tokens.truncate(available);
+                        }
+                        // Re-encode user tokens starting from sys position
+                        let mut i = 0;
+                        while i < user_tokens.len() {
+                            if let Ok(is_gen) = is_generating.lock() {
+                                if !*is_gen { return Ok(String::new()); }
+                            }
+                            let end = (i + n_batch).min(user_tokens.len());
+                            // Build a batch with explicit positions
+                            let chunk = &mut user_tokens[i..end];
+                            let batch = unsafe { (lib.batch_get_one)(chunk.as_mut_ptr(), chunk.len() as i32) };
+                            let ret = unsafe { (lib.decode)(self.ctx, batch) };
+                            if ret != 0 {
+                                // Fall through to full prefill on error
+                                break;
+                            }
+                            i = end;
+                        }
+                        // If user prefill succeeded, jump straight to sample loop
+                        let chain_params = unsafe { (lib.sampler_chain_default_params)() };
+                        let chain = unsafe { (lib.sampler_chain_init)(chain_params) };
+                        if !chain.is_null() {
+                            unsafe {
+                                (lib.sampler_chain_add)(chain, (lib.sampler_init_top_p)(0.9, 1));
+                                (lib.sampler_chain_add)(chain, (lib.sampler_init_temp)(0.7));
+                                (lib.sampler_chain_add)(chain, (lib.sampler_init_dist)(0));
+                            }
+                            let result = self.sample_loop(chain, &lib, &stream_target, &is_generating, n_predict);
+                            unsafe { (lib.sampler_free)(chain) };
+                            return result;
+                        }
+                    }
+                }
+            }
+            // Snapshot size mismatch or set_data unavailable — invalidate and fall through
+            *snap_guard = None;
+        }
+
+        // Full prefill path (first call, or snapshot invalid/unavailable).
+        // Clear KV first.
+        if let (Some(get_mem), Some(clear)) = (lib.get_memory, lib.memory_clear) {
+            unsafe {
+                let mem = get_mem(self.ctx);
+                if !mem.is_null() {
+                    clear(mem, false);
+                }
+            }
+        }
+
+        let mut tokens = self.tokenize(&prompt, add_bos)?;
         if tokens.len() >= max_ctx.saturating_sub(32) {
-            // Trim prompt tokens from the front, keep BOS + last tokens
             let keep = max_ctx.saturating_sub(64);
             let skip = tokens.len() - keep;
             tokens.drain(1..=skip);
         }
 
-        let n_predict = crate::settings::get_settings().power_mode.max_tokens() as usize;
-        // Silence ggml/llama abort spam on the TUI alternate screen for this call.
-        let _stderr_guard = StderrSilence::enter();
-
-        // Prefill in chunks ≤ n_batch.
-        // A single decode() with tokens.len() > n_batch triggers ggml abort
-        // (looks like "Rust code" stack dump in the terminal after ls + re-prompt).
-        // NOTE: llama_batch_get_one() does NOT allocate — do NOT llama_batch_free().
-        let n_batch = self.n_batch.max(1) as usize;
+        // Encode system-prompt tokens first, then snapshot the KV state.
+        let sys_tokens = self.tokenize(&sys_prefix, add_bos)?;
+        let n_sys = sys_tokens.len();
         {
             let mut offset = 0usize;
             while offset < tokens.len() {
                 if let Ok(is_gen) = is_generating.lock() {
-                    if !*is_gen {
-                        return Ok(String::new());
-                    }
+                    if !*is_gen { return Ok(String::new()); }
                 }
                 let end = (offset + n_batch).min(tokens.len());
                 let chunk = &mut tokens[offset..end];
@@ -244,11 +342,32 @@ impl LlamaCppLib {
                         offset, end, ret
                     ));
                 }
+                // After finishing system-prefix tokens, take the KV snapshot.
+                if offset + chunk.len() >= n_sys
+                    && snap_guard.is_none()
+                {
+                    if let (Some(get_size), Some(get_data)) = (lib.state_get_size, lib.state_get_data) {
+                        let sz = unsafe { get_size(self.ctx) };
+                        if sz > 0 && sz < 512 * 1024 * 1024 {
+                            // Cap at 512 MB — guard against absurd values on old builds
+                            let mut buf = vec![0u8; sz];
+                            let written = unsafe { get_data(self.ctx, buf.as_mut_ptr(), sz) };
+                            if written == sz {
+                                *snap_guard = Some(SyspromptSnapshot {
+                                    system_text: system.clone(),
+                                    n_sys_tokens: n_sys,
+                                    data: buf,
+                                });
+                            }
+                        }
+                    }
+                }
                 offset = end;
             }
         }
+        drop(snap_guard);
 
-        // Build sampler chain
+        // Build sampler chain and run the token generation loop.
         let sampler_params = unsafe { (lib.sampler_chain_default_params)() };
         let chain = unsafe { (lib.sampler_chain_init)(sampler_params) };
         if chain.is_null() {
@@ -259,15 +378,22 @@ impl LlamaCppLib {
             (lib.sampler_chain_add)(chain, (lib.sampler_init_temp)(0.7));
             (lib.sampler_chain_add)(chain, (lib.sampler_init_dist)(0));
         }
+        let result = self.sample_loop(chain, &lib, &stream_target, &is_generating, n_predict);
+        unsafe { (lib.sampler_free)(chain) };
+        result
+    }
 
-        // Decode loop
-        let mut full_text = String::new();
-        let mut n_generated = 0usize;
-
+    /// Token sampling loop — called after prefill is done.
+    /// `chain` must already be initialised; caller is responsible for freeing it.
+    fn sample_loop(
+        &self,
+        chain: *mut crate::llama::ffi::LlamaSampler,
+        lib: &crate::llama::ffi::LlamaLib,
+        stream_target: &Arc<Mutex<String>>,
+        is_generating: &Arc<Mutex<bool>>,
+        n_predict: usize,
+    ) -> Result<String, String> {
         // String-based stop sequences — same set as the HTTP backend.
-        // The lib-mode loop only gets token_is_eog for native EOS; models like
-        // DeepSeek Coder emit <|im_end|> as a *regular text token* and then
-        // hallucinate the next user turn. We must stop on these strings too.
         const STOP_SEQS: &[&str] = &[
             "<|im_end|>",
             "<|im_start|>",
@@ -280,30 +406,25 @@ impl LlamaCppLib {
             "\nCRITICAL -",
         ];
 
+        let mut full_text = String::new();
+        let mut n_generated = 0usize;
+
         loop {
-            // Check cancellation
             if let Ok(is_gen) = is_generating.lock() {
-                if !*is_gen {
-                    break;
-                }
+                if !*is_gen { break; }
             }
 
             let token = unsafe { (lib.sampler_sample)(chain, self.ctx, -1) };
 
-            // Check EOS
             let is_eog = unsafe { (lib.token_is_eog)(self.vocab, token) };
             if is_eog || n_generated >= n_predict {
                 break;
             }
 
-            // Decode token to text
             let piece = self.token_to_piece(token);
             if !piece.is_empty() {
                 full_text.push_str(&piece);
 
-                // Check string-based stop sequences.
-                // Only need to look at the tail (max stop-seq length ≈ 20 chars).
-                // Use char_indices to avoid slicing inside a multi-byte UTF-8 character.
                 let tail_start = full_text
                     .char_indices()
                     .rev()
@@ -312,11 +433,9 @@ impl LlamaCppLib {
                     .unwrap_or(0);
                 let tail = &full_text[tail_start..];
                 if let Some(stop) = STOP_SEQS.iter().find(|&&s| tail.contains(s)) {
-                    // Strip the stop sequence and everything after it from full_text
                     if let Some(idx) = full_text.rfind(stop) {
                         full_text.truncate(idx);
                     }
-                    // Update the stream buffer too
                     if let Ok(mut t) = stream_target.lock() {
                         *t = full_text.clone();
                     }
@@ -330,22 +449,15 @@ impl LlamaCppLib {
 
             n_generated += 1;
 
-            // Feed token back for next iteration (get_one batch — do not free)
             let mut tok = token;
             let batch = unsafe { (lib.batch_get_one)(&mut tok, 1) };
             let ret = unsafe { (lib.decode)(self.ctx, batch) };
-            if ret != 0 {
-                break;
-            }
+            if ret != 0 { break; }
         }
 
-        unsafe { (lib.sampler_free)(chain) };
-
         let cancelled = is_generating.lock().map(|g| !*g).unwrap_or(false);
-
         if full_text.is_empty() {
             if cancelled {
-                // Ctrl+C before first token — not a hard failure (avoids noisy aborts).
                 Ok(String::new())
             } else {
                 Err("[llama.cpp lib] No tokens generated".to_string())

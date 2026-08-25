@@ -76,8 +76,9 @@ pub struct ToolChip {
     pub pending: bool,
     pub spawned: bool,
     pub rect: Option<Rect>,
-    /// `messages` index of the Agent turn that emitted this tool (scrolls with chat).
     pub anchor_msg: Option<usize>,
+    pub expanded: bool,
+    pub anim_start: Option<Instant>,
 }
 
 /// Terminal rows reserved under an agent turn for one chip (bordered 3-row button).
@@ -90,23 +91,22 @@ impl ToolChip {
                 let short = self.target.rsplit('/').next().unwrap_or(&self.target);
                 let lines = line_count(&self.body);
                 if self.pending {
-                    // tag closed but waiting for user to press Y — NOT written yet
-                    format!(" [PENDING] {short} | {lines} lines > ")
+                    format!("WRITE {short} ({lines} lines, pending)")
                 } else if self.tag_closed {
-                    format!(" [WROTE] {short} | {lines} lines > ")
+                    format!("WROTE {lines} lines to {short}")
                 } else {
-                    format!(" [WRITE] {short} | {lines} lines... > ")
+                    format!("WRITE {short} ({lines} lines…)")
                 }
             }
             ToolPanelKind::Cmd => {
                 let cmd = clean_cmd(&self.target);
                 let cmd = trunc(&cmd, 42);
                 if self.pending {
-                    format!(" [RUN] `{cmd}` > ")
+                    format!("RUN `{cmd}` (pending)")
                 } else if !self.body.is_empty() {
-                    format!(" [RAN] `{cmd}` > ")
+                    format!("RAN `{cmd}`")
                 } else {
-                    format!(" [RUN] `{cmd}` > ")
+                    format!("RUN `{cmd}`")
                 }
             }
             ToolPanelKind::Read => {
@@ -114,14 +114,16 @@ impl ToolChip {
                 let short = trunc(short, 36);
                 let lines = line_count(&self.body);
                 if self.tag_closed && !self.body.is_empty() {
-                    format!(" [READ] {short} | {lines} lines > ")
+                    format!("READ {short} ({lines} lines)")
                 } else if self.tag_closed {
-                    format!(" [READ] {short} > ")
+                    format!("READ {short}")
                 } else {
-                    format!(" [READ] {short}... > ")
+                    format!("READ {short}…")
                 }
             }
-            ToolPanelKind::Mcp | ToolPanelKind::Skill | ToolPanelKind::WebSearch | ToolPanelKind::Agent => format!(" [{}] ", self.target),
+            ToolPanelKind::Mcp | ToolPanelKind::Skill | ToolPanelKind::WebSearch | ToolPanelKind::Agent => {
+                format!("MCP {}", self.target)
+            }
         }
     }
 
@@ -139,8 +141,11 @@ impl ToolChip {
             height: h,
         };
         let accent = self.kind.accent();
+        let bg_color = Color::Rgb(36, 41, 51); // Nordic Dark BG #242933
         frame.render_widget(Clear, area);
+        frame.render_widget(Block::default().style(Style::default().bg(bg_color)), area);
         let block = Block::default()
+            .style(Style::default().bg(bg_color))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(accent));
@@ -149,8 +154,8 @@ impl ToolChip {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 self.label_text(),
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ))),
+                Style::default().fg(accent).bg(bg_color).add_modifier(Modifier::BOLD),
+            ))).style(Style::default().bg(bg_color)),
             inner,
         );
         self.rect = Some(area);
@@ -736,25 +741,20 @@ fn extract_attr(tag: &str, name: &str) -> Option<String> {
 
 pub fn redact_tools_for_chat(content: &str) -> String {
     let mut s = content.to_string();
-    while let Some(start) = s.find("<write src=") {
-        if let Some(rel_end) = s[start..].find("</write>") {
-            s.replace_range(start..start + rel_end + 8, "");
-        } else if s[start..].find('>').is_some() {
-            s = s[..start].to_string();
-            break;
-        } else {
-            break;
+    let tags = ["<write", "<cmd", "<read", "<ls", "<mcp", "<skill", "<websearch", "<agent", "<memory"];
+    for tag in tags {
+        let close_tag = format!("</{}>", tag.trim_start_matches('<'));
+        while let Some(start) = s.find(tag) {
+            if let Some(rel_end) = s[start..].find(&close_tag) {
+                s.replace_range(start..start + rel_end + close_tag.len(), "");
+            } else if let Some(gt) = s[start..].find('>') {
+                s.replace_range(start..start + gt + 1, "");
+            } else {
+                s = s[..start].to_string();
+                break;
+            }
         }
     }
-    while let Some(start) = s.find("<cmd>") {
-        if let Some(rel_end) = s[start..].find("</cmd>") {
-            s.replace_range(start..start + rel_end + 6, "");
-        } else {
-            s = s[..start].to_string();
-            break;
-        }
-    }
-    // Keep short read tags visible in chat (they're the whole answer often)
     s.trim().to_string()
 }
 
@@ -857,14 +857,21 @@ pub fn draw_tool_panel(
             );
         }
     }
-    frame.render_widget(Clear, rect);
+    let is_term = panel.kind == ToolPanelKind::Cmd;
+    let bg_color = if is_term {
+        Color::Rgb(20, 24, 30)
+    } else {
+        Color::Rgb(36, 41, 51) // Nordic Dark BG #242933
+    };
 
-    let accent = if panel.interactive && panel.kind == ToolPanelKind::Cmd {
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Block::default().style(Style::default().bg(bg_color)), rect);
+
+    let accent = if panel.interactive && is_term {
         Color::Rgb(80, 220, 255) // cyan when TERM interactive
     } else {
         panel.kind.accent()
     };
-    let is_term = panel.kind == ToolPanelKind::Cmd;
 
     // Left title + right chrome so [-]/[x] hit-test matches paint
     let mode = if panel.interactive && is_term {
@@ -903,27 +910,24 @@ pub fn draw_tool_panel(
     }
 
     let block = Block::default()
+        .style(Style::default().bg(bg_color))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(accent))
         .title(Span::styled(
             left_title,
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(accent).bg(bg_color).add_modifier(Modifier::BOLD),
         ))
         .title(
             Line::from(Span::styled(
                 format!(" {chrome} "),
                 Style::default()
                     .fg(Color::Rgb(220, 220, 220))
+                    .bg(bg_color)
                     .add_modifier(Modifier::BOLD),
             ))
             .right_aligned(),
-        )
-        .style(if is_term {
-            Style::default().bg(Color::Rgb(10, 12, 14))
-        } else {
-            Style::default()
-        });
+        );
 
     // Nearly closed / minimized: morph border only
     if t < 0.12 || rect.height <= 3 || panel.minimized {
@@ -959,18 +963,18 @@ pub fn draw_tool_panel(
         )));
         lines.push(Line::from(Span::styled(
             "─".repeat(inner.width as usize),
-            Style::default().fg(Color::Rgb(40, 50, 40)),
+            Style::default().fg(Color::Rgb(40, 50, 40)).bg(bg_color),
         )));
         for raw in vis.lines() {
             lines.push(Line::from(Span::styled(
                 raw.to_string(),
-                Style::default().fg(Color::Rgb(180, 255, 180)),
+                Style::default().fg(Color::Rgb(180, 255, 180)).bg(bg_color),
             )));
         }
         if !panel.tag_closed || panel.revealed_chars < panel.body.chars().count() {
             lines.push(Line::from(Span::styled(
                 "█",
-                Style::default().fg(Color::Rgb(100, 255, 100)),
+                Style::default().fg(Color::Rgb(100, 255, 100)).bg(bg_color),
             )));
         }
     } else {
@@ -980,7 +984,8 @@ pub fn draw_tool_panel(
                 trunc(&panel.target, (inner.width as usize).saturating_sub(28))
             ),
             Style::default()
-                .fg(Color::Rgb(120, 120, 120))
+                .fg(Color::Rgb(140, 150, 165))
+                .bg(bg_color)
                 .add_modifier(Modifier::ITALIC),
         )));
         let mut char_i = 0usize;
@@ -1003,20 +1008,13 @@ pub fn draw_tool_panel(
                 }
                 
                 let mut fg = panel.char_color(char_i, now);
-                // Override base color with diff color, but keep fade logic if it's very dim?
-                // Actually if line_fg is present, just use it directly, but maybe multiply by fade?
-                // Ratatui doesn't easily multiply colors, so just use line_fg if it's revealed, else use char_color (which handles the fade).
-                // If char_color is near white/gray (revealed), we override it.
-                // Since char_color returns the exact color, we can check if it's the bright end.
-                // But it's easier to just use line_fg and ignore the fade for diff lines, or just use it always.
-                // Let's just use line_fg directly.
                 if let Some(c) = line_fg {
                     fg = c;
                 }
                 
                 spans.push(Span::styled(
                     ch.to_string(),
-                    Style::default().fg(fg),
+                    Style::default().fg(fg).bg(bg_color),
                 ));
                 char_i += 1;
             }
@@ -1029,7 +1027,7 @@ pub fn draw_tool_panel(
         if panel.revealed_chars < panel.body.chars().count() {
             lines.push(Line::from(Span::styled(
                 "▍",
-                Style::default().fg(accent),
+                Style::default().fg(accent).bg(bg_color),
             )));
         }
     }
@@ -1055,8 +1053,8 @@ pub fn draw_tool_panel(
         frame.render_widget(
             Paragraph::new(Span::styled(
                 format!(" {}/{} ", panel.scroll, panel.max_scroll),
-                Style::default().fg(Color::Rgb(140, 140, 160)),
-            )),
+                Style::default().fg(Color::Rgb(140, 140, 160)).bg(bg_color),
+            )).style(Style::default().bg(bg_color)),
             Rect {
                 x: rect.x.saturating_add(rect.width.saturating_sub(12)),
                 y: rect.y.saturating_add(rect.height.saturating_sub(1)),
@@ -1069,13 +1067,8 @@ pub fn draw_tool_panel(
 
     frame.render_widget(
         Paragraph::new(lines)
-            
             .scroll((panel.scroll, 0))
-            .style(if is_term {
-                Style::default().bg(Color::Rgb(10, 12, 14))
-            } else {
-                Style::default()
-            }),
+            .style(Style::default().bg(bg_color)),
         inner,
     );
     panel.drawn_rect = Some(rect);
