@@ -614,7 +614,9 @@ impl ModelManager {
 
     pub async fn fetch_hf_models(&self, search: &str) -> Result<Vec<String>, String> {
         let trimmed = search.trim();
-        let url = if trimmed.contains('/') {
+        let query_lower = trimmed.to_lowercase();
+        
+        let urls_to_try: Vec<String> = if query_lower.contains('/') {
             let parts: Vec<&str> = trimmed.splitn(2, '/').collect();
             let p0 = parts[0].to_lowercase();
             let author = match p0.as_str() {
@@ -626,47 +628,59 @@ impl ModelManager {
                 "microsoft" | "phi" => "microsoft",
                 _other => parts[0],
             };
-            let sub_query = parts.get(1).unwrap_or(&"");
-            if sub_query.is_empty() {
-                format!(
-                    "https://huggingface.co/api/models?author={}&blobs=true&full=true&limit=25",
-                    author
-                )
+            let sub = parts.get(1).unwrap_or(&"").trim();
+            if sub.is_empty() {
+                vec![
+                    format!("https://huggingface.co/api/models?author={}&blobs=true&full=true&limit=30", author),
+                    format!("https://huggingface.co/api/models?search={}&blobs=true&full=true&limit=30", parts[0]),
+                ]
             } else {
-                format!(
-                    "https://huggingface.co/api/models?author={}&search={}&blobs=true&full=true&limit=25",
-                    author, sub_query
-                )
+                vec![
+                    format!("https://huggingface.co/api/models?author={}&search={}&blobs=true&full=true&limit=30", author, sub),
+                    format!("https://huggingface.co/api/models?search={}&blobs=true&full=true&limit=30", trimmed),
+                ]
             }
+        } else if query_lower.is_empty() {
+            vec![
+                "https://huggingface.co/api/models?search=gguf&sort=downloads&direction=-1&blobs=true&full=true&limit=30".to_string(),
+                "https://huggingface.co/api/models?tags=gguf&sort=downloads&direction=-1&blobs=true&full=true&limit=30".to_string(),
+            ]
         } else {
-            if trimmed.is_empty() {
-                "https://huggingface.co/api/models?tags=gguf&sort=downloads&direction=-1&blobs=true&full=true&limit=25".to_string()
-            } else {
-                format!(
-                    "https://huggingface.co/api/models?search={}&tags=gguf&sort=downloads&direction=-1&blobs=true&full=true&limit=25",
-                    trimmed
-                )
-            }
+            vec![
+                format!("https://huggingface.co/api/models?search={}&tags=gguf&sort=downloads&direction=-1&blobs=true&full=true&limit=30", trimmed),
+                format!("https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&blobs=true&full=true&limit=30", trimmed),
+                format!("https://huggingface.co/api/models?author={}&blobs=true&full=true&limit=30", trimmed),
+            ]
         };
 
         let hf_token = crate::settings::get_hf_token()
             .or_else(|| std::env::var("HF_TOKEN").ok().filter(|s| !s.trim().is_empty()));
 
         let client = reqwest::Client::new();
-        let mut req = client.get(&url).header("User-Agent", "Hercules-CLI/1.0");
-        if let Some(ref tok) = hf_token {
-            req = req.header("Authorization", format!("Bearer {}", tok));
-        }
-        let res = req.send().await.map_err(|e| e.to_string())?;
-
-        let text = res.text().await.map_err(|e| e.to_string())?;
-        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         let mut model_ids = Vec::new();
-        if let Some(arr) = json.as_array() {
-            for item in arr {
-                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                    model_ids.push(id.to_string());
+
+        for url in urls_to_try {
+            let mut req = client.get(&url).header("User-Agent", "Hercules-CLI/1.0");
+            if let Some(ref tok) = hf_token {
+                req = req.header("Authorization", format!("Bearer {}", tok));
+            }
+            if let Ok(res) = req.send().await {
+                if let Ok(text) = res.text().await {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(arr) = json.as_array() {
+                            for item in arr {
+                                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                                    if !model_ids.contains(&id.to_string()) {
+                                        model_ids.push(id.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
+            }
+            if !model_ids.is_empty() {
+                break;
             }
         }
 

@@ -6251,9 +6251,21 @@ impl App {
                                 }).collect()
                         };
 
-                        let list = List::new(items)
-                            .style(Style::default().bg(NORDIC_BG));
-                        frame.render_stateful_widget(list, chunks[2], &mut self.registry_state);
+                        if items.is_empty() {
+                            let empty_msg = if q_raw.is_empty() {
+                                "Loading model catalog from Hugging Face & Ollama..."
+                            } else {
+                                "No models found matching query. Press Backspace or search another author/model."
+                            };
+                            let p = Paragraph::new(Line::from(vec![
+                                Span::styled(format!("  {}", empty_msg), Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG))
+                            ])).style(Style::default().bg(NORDIC_BG));
+                            frame.render_widget(p, chunks[2]);
+                        } else {
+                            let list = List::new(items)
+                                .style(Style::default().bg(NORDIC_BG));
+                            frame.render_stateful_widget(list, chunks[2], &mut self.registry_state);
+                        }
                     }
                     2 => {
                         // === Modal (Installed Models) Section ===
