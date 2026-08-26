@@ -515,6 +515,30 @@ impl App {
                     }
                 }
             }
+            // Re-populate tool chips from historical agent messages
+            for (idx, msg) in app.messages.iter().enumerate() {
+                if let Some(agent_text) = msg.strip_prefix("Agent: ") {
+                    for view in tool_panel::detect_all_stream_tools(agent_text) {
+                        let target = tool_panel::normalize_target(view.kind, &view.target);
+                        let id = app.next_chip_id;
+                        app.next_chip_id += 1;
+                        app.tool_chips.push(tool_panel::ToolChip {
+                            id,
+                            kind: view.kind,
+                            target,
+                            body: view.body,
+                            tag_closed: view.tag_closed,
+                            pending: false,
+                            spawned: false,
+                            rect: None,
+                            anchor_msg: Some(idx),
+                            expanded: false,
+                            anim_start: None,
+                        });
+                    }
+                }
+            }
+
             app.messages.push(format!("System: Resumed session {}", sid));
         }
         app.status_message = format!("Resumed session {}", sid);

@@ -180,6 +180,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     app.save_current_session();
 
+    // Release lock file explicitly before _exit
+    drop(_lock_guard);
+    if let Some(ref sid) = app.session_id {
+        session::release_session_lock(sid);
+    }
+
     // Restore terminal first so the user's shell is usable immediately.
     restore_terminal(&mut terminal);
 
