@@ -5641,20 +5641,29 @@ impl App {
                             collapsed_row_buf.push((badge_span, agent_len, SectionKind::Agent(m_idx), agent_bg, agent_label.trim().to_string()));
                         } else {
                             flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
-
                             let title_line_idx = chat_lines.len();
                             all_section_hits_unmapped.push((title_line_idx, 0, agent_len as u16, SectionKind::Agent(m_idx)));
                             section_headers.push((title_line_idx, agent_label.trim().to_string(), agent_bg));
                             let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
                             push_full_shaded!(&mut chat_lines, vec![badge_span], agent_len, available_width, row_bg);
 
-                            let show_agent_body = !is_collapsed || is_anim;
+                            let total_agent_lines = text_to_render.lines().count().max(1);
+                            let visible_agent_lines: usize = if is_anim {
+                                self.krama.from_range("collapse", anim_id, 0..=total_agent_lines)
+                            } else if is_collapsed {
+                                0
+                            } else {
+                                total_agent_lines
+                            };
+
+                            let show_agent_body = visible_agent_lines > 0;
                             if show_agent_body {
                                 let mut global_out_ch = 0;
                                 let start_line_idx = chat_lines.len();
                                 let mut local_toggles = Vec::new();
                                 let mut local_copies = Vec::new();
                                 let mut local_scrolls = Vec::new();
+                                
                                 let md_lines = crate::markdown::render_markdown_to_lines(
                                     &text_to_render,
                                     available_output,
@@ -5681,7 +5690,7 @@ impl App {
                                 for (local_idx, b_idx, l_s, l_e, t_s, t_e, r_s, r_e, max_sc) in local_scrolls {
                                     all_scroll_buttons.push((start_line_idx + local_idx, b_idx, l_s + 2, l_e + 2, t_s + 2, t_e + 2, r_s + 2, r_e + 2, max_sc));
                                 }
-                                for md_l in md_lines {
+                                for md_l in md_lines.into_iter().take(visible_agent_lines) {
                                     let spans_with_bg: Vec<Span> = md_l.spans.into_iter().map(|s| {
                                         Span::styled(s.content, s.style.bg(content_bg))
                                     }).collect();
@@ -5728,8 +5737,8 @@ impl App {
                                             push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
                                         }
                                     }
-                                    chat_lines.push(Line::from(""));
                                 }
+                                chat_lines.push(Line::from(""));
                             }
                         }
                     }
