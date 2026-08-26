@@ -189,7 +189,6 @@ pub struct App {
     pub typewriter_len: usize,
     pub collapsed_thoughts: std::collections::HashSet<usize>,
     pub collapsed_messages: std::collections::HashSet<usize>,
-    pub collapsed_animations: std::collections::HashMap<usize, (bool, std::time::Instant)>,
     pub delete_confirm_model: Option<String>,
     pub esc_hold_start: Option<std::time::Instant>,
     /// Text selection: drag shades rows; Ctrl+C copies; click elsewhere cancels.
@@ -367,7 +366,6 @@ impl App {
             typewriter_len: 1000,
             collapsed_thoughts: std::collections::HashSet::new(),
             collapsed_messages: std::collections::HashSet::new(),
-            collapsed_animations: std::collections::HashMap::new(),
             delete_confirm_model: None,
             esc_hold_start: None,
             selection_start: None,
@@ -3191,13 +3189,11 @@ impl App {
         let is_krama_animating = self.krama.is_any_animation_inprogress();
 
         self.code_block_anims.retain(|_, (_, t)| t.elapsed().as_millis() < 220);
-        self.collapsed_animations.retain(|_, (_, t)| t.elapsed().as_millis() < 220);
 
         let is_animating = is_generating_val
             || is_downloading
             || is_krama_animating
             || !self.code_block_anims.is_empty()
-            || !self.collapsed_animations.is_empty()
             || self.esc_hold_start.is_some()
             || self.menu_closing
             || self.panel_closing;
@@ -3415,12 +3411,15 @@ impl App {
                             match hit_kind {
                                 SectionKind::You(idx) | SectionKind::Agent(idx) | SectionKind::System(idx) => {
                                     let is_collapsed = self.collapsed_messages.contains(&idx);
+                                    let anim_id = idx as u32;
                                     if is_collapsed {
                                         self.collapsed_messages.remove(&idx);
+                                        self.krama.forward_animate("collapse", anim_id);
+                                        self.krama.restart_progress("collapse", anim_id);
                                     } else {
                                         self.collapsed_messages.insert(idx);
+                                        self.krama.reverse_start("collapse", anim_id);
                                     }
-                                    self.collapsed_animations.insert(idx, (!is_collapsed, std::time::Instant::now()));
                                     self.status_message = format!(
                                         "Section #{}: {}",
                                         idx + 1,
@@ -3429,13 +3428,15 @@ impl App {
                                 }
                                 SectionKind::Thought(idx) => {
                                     let is_col = self.collapsed_thoughts.contains(&idx);
+                                    let anim_id = (idx as u32) | 0x4000_0000;
                                     if is_col {
                                         self.collapsed_thoughts.remove(&idx);
+                                        self.krama.forward_animate("collapse", anim_id);
+                                        self.krama.restart_progress("collapse", anim_id);
                                     } else {
                                         self.collapsed_thoughts.insert(idx);
+                                        self.krama.reverse_start("collapse", anim_id);
                                     }
-                                    let anim_key = idx ^ 0x4000_0000;
-                                    self.collapsed_animations.insert(anim_key, (!is_col, std::time::Instant::now()));
                                     self.status_message = format!(
                                         "Thought: {}",
                                         if !is_col { "Collapsed" } else { "Expanded" }
@@ -3445,7 +3446,13 @@ impl App {
                                     if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
                                         chip.tag_closed = true;
                                         chip.expanded = !chip.expanded;
-                                        self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (!chip.expanded, std::time::Instant::now()));
+                                        let anim_id = (chip.id as u32) | 0x8000_0000;
+                                        if chip.expanded {
+                                            self.krama.forward_animate("collapse", anim_id);
+                                            self.krama.restart_progress("collapse", anim_id);
+                                        } else {
+                                            self.krama.reverse_start("collapse", anim_id);
+                                        }
                                         self.status_message = format!(
                                             "Action: {}",
                                             if chip.expanded { "Expanded" } else { "Collapsed" }
@@ -4111,17 +4118,16 @@ impl App {
                                 KeyCode::Char('t') | KeyCode::Char('T')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
-                                    let now = std::time::Instant::now();
-
                                     // Collapse only messages and thoughts that were NOT already collapsed
                                     for i in 0..self.messages.len() {
                                         if !self.collapsed_messages.contains(&i) {
                                             self.collapsed_messages.insert(i);
-                                            self.collapsed_animations.insert(i, (true, now));
+                                            self.krama.reverse_start("collapse", i as u32);
                                         }
                                         if !self.collapsed_thoughts.contains(&i) {
                                             self.collapsed_thoughts.insert(i);
-                                            self.collapsed_animations.insert(i ^ 0x4000_0000, (true, now));
+                                            let anim_id = (i as u32) | 0x4000_0000;
+                                            self.krama.reverse_start("collapse", anim_id);
                                         }
                                     }
 
@@ -4130,7 +4136,8 @@ impl App {
                                         if chip.expanded || !chip.tag_closed {
                                             chip.expanded = false;
                                             chip.tag_closed = true;
-                                            self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (true, now));
+                                            let anim_id = (chip.id as u32) | 0x8000_0000;
+                                            self.krama.reverse_start("collapse", anim_id);
                                         }
                                     }
 
@@ -4139,17 +4146,18 @@ impl App {
                                 KeyCode::Char('o') | KeyCode::Char('O')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
-                                    let now = std::time::Instant::now();
-
                                     // Expand all messages in history
                                     for &i in &self.collapsed_messages {
-                                        self.collapsed_animations.insert(i, (false, now));
+                                        self.krama.forward_animate("collapse", i as u32);
+                                        self.krama.restart_progress("collapse", i as u32);
                                     }
                                     self.collapsed_messages.clear();
 
                                     // Expand all thoughts in history
                                     for &i in &self.collapsed_thoughts {
-                                        self.collapsed_animations.insert(i ^ 0x4000_0000, (false, now));
+                                        let anim_id = (i as u32) | 0x4000_0000;
+                                        self.krama.forward_animate("collapse", anim_id);
+                                        self.krama.restart_progress("collapse", anim_id);
                                     }
                                     self.collapsed_thoughts.clear();
 
@@ -4157,7 +4165,9 @@ impl App {
                                     for chip in &mut self.tool_chips {
                                         if !chip.expanded {
                                             chip.expanded = true;
-                                            self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (false, now));
+                                            let anim_id = (chip.id as u32) | 0x8000_0000;
+                                            self.krama.forward_animate("collapse", anim_id);
+                                            self.krama.restart_progress("collapse", anim_id);
                                         }
                                     }
 
@@ -5309,13 +5319,11 @@ impl App {
                 let user_text = m.strip_prefix("You:").unwrap_or(&m[4..]).trim();
                 let is_collapsed = self.collapsed_messages.contains(&m_idx);
                 let badge_span = Span::styled(" You ", Style::default().fg(NORDIC_BG).bg(user_bg).add_modifier(Modifier::BOLD));
-
-                let anim_opt = self.collapsed_animations.get(&m_idx).cloned();
-                let is_anim = anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
-                let col_progress = if let Some((to_col, t)) = anim_opt {
-                    let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
-                    let ease = 1.0 - (1.0 - p) * (1.0 - p);
-                    if to_col { 1.0 - ease } else { ease }
+                let anim_id = m_idx as u32;
+                let is_anim = self.krama.is_animating("collapse", anim_id);
+                let col_progress = if is_anim {
+                    let p = self.krama.get_progress_f32("collapse", anim_id).abs();
+                    if is_collapsed { 1.0 - p } else { p }
                 } else if is_collapsed {
                     0.0
                 } else {
@@ -5440,14 +5448,12 @@ impl App {
                         let think_tag = format!(" {think_label} ");
                         let think_len = think_tag.chars().count();
                         let badge_span = Span::styled(think_tag, Style::default().fg(Color::Rgb(245, 248, 255)).bg(think_bg).add_modifier(Modifier::BOLD));
-
                         let is_collapsed = self.collapsed_thoughts.contains(&m_idx);
-                        let anim_opt = self.collapsed_animations.get(&(m_idx ^ 0x4000_0000)).cloned();
-                        let is_anim = anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
-                        let think_progress = if let Some((to_col, t)) = anim_opt {
-                            let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
-                            let ease = 1.0 - (1.0 - p) * (1.0 - p);
-                            if to_col { 1.0 - ease } else { ease }
+                        let anim_id = (m_idx as u32) | 0x4000_0000;
+                        let is_anim = self.krama.is_animating("collapse", anim_id);
+                        let think_progress = if is_anim {
+                            let p = self.krama.get_progress_f32("collapse", anim_id).abs();
+                            if is_collapsed { 1.0 - p } else { p }
                         } else if is_collapsed {
                             0.0
                         } else {
@@ -5602,9 +5608,8 @@ impl App {
                         let is_collapsed = self.collapsed_messages.contains(&m_idx);
                         let agent_len = agent_label.chars().count();
                         let badge_span = Span::styled(agent_label, Style::default().fg(NORDIC_BG).bg(agent_bg).add_modifier(Modifier::BOLD));
-
-                        let anim_opt = self.collapsed_animations.get(&m_idx).cloned();
-                        let is_anim = anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
+                        let anim_id = m_idx as u32;
+                        let is_anim = self.krama.is_animating("collapse", anim_id);
 
                         if is_collapsed && !is_anim {
                             collapsed_row_buf.push((badge_span, agent_len, SectionKind::Agent(m_idx), agent_bg, agent_label.trim().to_string()));
@@ -5715,17 +5720,16 @@ impl App {
                 for chip in matching_chips {
                     let action_tag = " Action ";
                     let is_open = chip.expanded || !chip.tag_closed;
-                    let action_anim_opt = self.collapsed_animations.get(&(chip.id as usize ^ 0x8000_0000)).cloned();
-                    let is_anim = action_anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
+                    let anim_id = (chip.id as u32) | 0x8000_0000;
+                    let is_anim = self.krama.is_animating("collapse", anim_id);
                     let badge_span = Span::styled(
                         action_tag,
                         Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
                     );
 
-                    let anim_progress = if let Some((to_col, t)) = action_anim_opt {
-                        let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
-                        let ease = 1.0 - (1.0 - p) * (1.0 - p);
-                        if to_col { 1.0 - ease } else { ease }
+                    let anim_progress = if is_anim {
+                        let p = self.krama.get_progress_f32("collapse", anim_id).abs();
+                        if is_open { p } else { 1.0 - p }
                     } else if is_open {
                         1.0
                     } else {
@@ -5811,12 +5815,11 @@ impl App {
                 let is_collapsed = self.collapsed_messages.contains(&m_idx);
                 let badge_span = Span::styled(" System ", Style::default().fg(Color::Rgb(245, 248, 255)).bg(sys_bg).add_modifier(Modifier::BOLD));
 
-                let anim_opt = self.collapsed_animations.get(&m_idx).cloned();
-                let is_anim = anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
-                let col_progress = if let Some((to_col, t)) = anim_opt {
-                    let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
-                    let ease = 1.0 - (1.0 - p) * (1.0 - p);
-                    if to_col { 1.0 - ease } else { ease }
+                let anim_id = m_idx as u32;
+                let is_anim = self.krama.is_animating("collapse", anim_id);
+                let col_progress = if is_anim {
+                    let p = self.krama.get_progress_f32("collapse", anim_id).abs();
+                    if is_collapsed { 1.0 - p } else { p }
                 } else if is_collapsed {
                     0.0
                 } else {
@@ -5891,17 +5894,16 @@ impl App {
             for chip in unanchored_chips {
                 let action_tag = " Action ";
                 let is_open = chip.expanded || !chip.tag_closed;
-                let action_anim_opt = self.collapsed_animations.get(&(chip.id as usize ^ 0x8000_0000)).cloned();
-                let is_anim = action_anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
+                let anim_id = (chip.id as u32) | 0x8000_0000;
+                let is_anim = self.krama.is_animating("collapse", anim_id);
                 let badge_span = Span::styled(
                     action_tag,
                     Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
                 );
 
-                let anim_progress = if let Some((to_open, t)) = action_anim_opt {
-                    let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
-                    let ease = 1.0 - (1.0 - p) * (1.0 - p);
-                    if to_open { ease } else { 1.0 - ease }
+                let anim_progress = if is_anim {
+                    let p = self.krama.get_progress_f32("collapse", anim_id).abs();
+                    if is_open { p } else { 1.0 - p }
                 } else if is_open {
                     1.0
                 } else {
