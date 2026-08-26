@@ -313,7 +313,7 @@ fn line_count(body: &str) -> usize {
     if body.is_empty() {
         0
     } else {
-        body.lines().filter(|l| !l.trim().is_empty()).count().max(1)
+        body.trim_start_matches(|c| c == '\n' || c == '\r').lines().count()
     }
 }
 

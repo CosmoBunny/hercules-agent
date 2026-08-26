@@ -1836,13 +1836,20 @@ impl AgentEngine {
         let old_lines: Vec<&str> = old.lines().collect();
         let new_lines: Vec<&str> = new.lines().collect();
         
-        if old_lines.len() > 1000 || new_lines.len() > 1000 {
-            let mut out = String::new();
-            out.push_str("--- (Old file too large to diff)\n");
-            for line in new_lines {
-                out.push_str("+ "); out.push_str(line); out.push('\n');
+        if old_lines.is_empty() {
+            let mut out = Vec::new();
+            for (idx, line) in new_lines.iter().enumerate() {
+                out.push(format!("+ {:4} | {}", idx + 1, line));
             }
-            return out;
+            return out.join("\n");
+        }
+
+        if old_lines.len() > 1000 || new_lines.len() > 1000 {
+            let mut out = Vec::new();
+            for (idx, line) in new_lines.iter().enumerate() {
+                out.push(format!("+ {:4} | {}", idx + 1, line));
+            }
+            return out.join("\n");
         }
         
         let n = old_lines.len();
@@ -1863,14 +1870,14 @@ impl AgentEngine {
         let mut diff = Vec::new();
         while i > 0 || j > 0 {
             if i > 0 && j > 0 && old_lines[i-1] == new_lines[j-1] {
-                diff.push(format!("  {}", old_lines[i-1]));
+                diff.push(format!("  {:4} | {}", j, new_lines[j-1]));
                 i -= 1;
                 j -= 1;
             } else if j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]) {
-                diff.push(format!("+ {}", new_lines[j-1]));
+                diff.push(format!("+ {:4} | {}", j, new_lines[j-1]));
                 j -= 1;
             } else if i > 0 && (j == 0 || dp[i][j-1] < dp[i-1][j]) {
-                diff.push(format!("- {}", old_lines[i-1]));
+                diff.push(format!("- {:4} | {}", i, old_lines[i-1]));
                 i -= 1;
             }
         }
@@ -1944,11 +1951,11 @@ impl AgentEngine {
             }
 
             let mut diff = String::new();
-            for old in old_removed {
-                diff.push_str(&format!("- {}\n", old));
+            for (idx, old) in old_removed.iter().enumerate() {
+                diff.push_str(&format!("- {:4} | {}\n", start_line + idx, old));
             }
-            for new in &replacement_lines {
-                diff.push_str(&format!("+ {}\n", new));
+            for (idx, new) in replacement_lines.iter().enumerate() {
+                diff.push_str(&format!("+ {:4} | {}\n", start_line + idx, new));
             }
             if diff.is_empty() {
                 diff = "No changes.\n".to_string();

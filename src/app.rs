@@ -47,6 +47,23 @@ pub struct CodeBlockScrollHit {
     pub max_scroll: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionKind {
+    You(usize),
+    Thought(usize),
+    Agent(usize),
+    Action(u64),
+    System(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SectionLabelHit {
+    pub screen_y: i32,
+    pub x0: u16,
+    pub x1: u16,
+    pub kind: SectionKind,
+}
+
 pub const NORDIC_BG: Color = Color::Rgb(46, 52, 64);        // #2E3440 Polar Night
 pub const NORDIC_DARK_BG: Color = Color::Rgb(36, 41, 51);   // #242933
 pub const NORDIC_CARD_BG: Color = Color::Rgb(59, 66, 82);   // #3B4252
@@ -170,7 +187,9 @@ pub struct App {
     pub auto_scroll_enabled: bool,
     pub table_scroll_x: usize,
     pub typewriter_len: usize,
-    pub thinking_collapsed: bool,
+    pub collapsed_thoughts: std::collections::HashSet<usize>,
+    pub collapsed_messages: std::collections::HashSet<usize>,
+    pub collapsed_animations: std::collections::HashMap<usize, (bool, std::time::Instant)>,
     pub delete_confirm_model: Option<String>,
     pub esc_hold_start: Option<std::time::Instant>,
     /// Text selection: drag shades rows; Ctrl+C copies; click elsewhere cancels.
@@ -202,6 +221,8 @@ pub struct App {
     pub code_block_scrolls: std::collections::HashMap<usize, usize>,
     /// Interactive preview horizontal scroll bar hit zones
     pub code_block_scroll_hits: Vec<CodeBlockScrollHit>,
+    /// Interactive section label toggle hit zones
+    pub section_label_hits: Vec<SectionLabelHit>,
     /// Estimated context tokens used / limit (for status)
     pub context_tokens_est: usize,
     pub context_compact_count: u32,
@@ -344,7 +365,9 @@ impl App {
             auto_scroll_enabled: true,
             table_scroll_x: 0,
             typewriter_len: 1000,
-            thinking_collapsed: false,
+            collapsed_thoughts: std::collections::HashSet::new(),
+            collapsed_messages: std::collections::HashSet::new(),
+            collapsed_animations: std::collections::HashMap::new(),
             delete_confirm_model: None,
             esc_hold_start: None,
             selection_start: None,
@@ -363,6 +386,7 @@ impl App {
             code_block_anims: std::collections::HashMap::new(),
             code_block_scrolls: std::collections::HashMap::new(),
             code_block_scroll_hits: Vec::new(),
+            section_label_hits: Vec::new(),
             context_tokens_est: 0,
             context_compact_count: 0,
             hf_models: Vec::new(),
@@ -392,6 +416,11 @@ impl App {
                         "panel_fly",
                         KeyFrameFunction::new_cubic_bezier_f32(0.22, 1.0, 0.36, 1.0),
                     ),
+                    // Section height collapse/expand: 200ms cubic bezier
+                    (
+                        "collapse",
+                        KeyFrameFunction::new_cubic_bezier_f32(0.25, 0.1, 0.25, 1.0),
+                    ),
                 ]);
                 k.framelist.extend([
                     ("slide", KeyList::new(0, TRES16Bits::from_millis(300))),
@@ -401,13 +430,9 @@ impl App {
                     ("list_fade", KeyList::new(0, TRES16Bits::from_millis(350))),
                     ("help_fade", KeyList::new(0, TRES16Bits::from_millis(280))),
                     ("panel_fly", KeyList::new(0, TRES16Bits::from_millis(500))),
+                    ("collapse", KeyList::new(0, TRES16Bits::from_millis(220))),
                 ]);
-                k.restart_progress("slide", 0);
-                k.restart_progress("focus", 0);
-                k.restart_progress("pbar", 0);
-                k.restart_progress("menu_fade", 0);
-                k.restart_progress("list_fade", 0);
-                // panel_* started when a tool panel opens
+                // Framelist instances start on demand when user opens dropdown/menu/panel
                 k
             },
             anim_tick: 0,
@@ -600,8 +625,42 @@ impl App {
     fn record_write_result(&mut self, action: &crate::agent::ProposedAction, result: &str) {
         let pretty = tool_panel::format_tool_output_for_chat(result);
 
+        // Count +/- lines in the diff to tell the AI what changed
+        let added: usize = pretty.lines().filter(|l| l.starts_with("+ ") || *l == "+").count();
+        let removed: usize = pretty.lines().filter(|l| l.starts_with("- ") || *l == "-").count();
+        let total_lines = if result.trim() == "No changes." {
+            0usize
+        } else {
+            pretty.lines().filter(|l| !l.starts_with("- ")).count()
+        };
+
+        // Compact diff for context: only changed lines, truncated to keep KV cache small
+        let compact_diff: String = pretty
+            .lines()
+            .filter(|l| l.starts_with("+ ") || l.starts_with("- "))
+            .take(40)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let file_name = action.target
+            .split('/')
+            .last()
+            .unwrap_or(&action.target)
+            .trim_matches('"');
+
+        let context_entry = if result.trim() == "No changes." {
+            format!("[write: {}] No changes (file identical).", file_name)
+        } else if compact_diff.is_empty() {
+            format!("[write: {}] Wrote {} lines.", file_name, total_lines)
+        } else {
+            format!(
+                "[write: {}] +{} lines / -{} lines (net {} lines written).\nChanges:\n{}",
+                file_name, added, removed, total_lines, compact_diff
+            )
+        };
+
         // Result is for the LLM/context, NOT the source-code chip body.
-        self.tool_result_context.push(pretty.clone());
+        self.tool_result_context.push(context_entry);
 
         if self.tool_result_context.len() > 8 {
             let n = self.tool_result_context.len() - 8;
@@ -618,10 +677,14 @@ impl App {
             self.force_open_panel_from_chip(chip_id);
         }
 
-        let lines = pretty.lines().count();
+        let change_summary = if result.trim() == "No changes." {
+            "no changes".to_string()
+        } else {
+            format!("+{added}/-{removed}")
+        };
 
         self.messages
-            .push(format!("System: [OK] write finished ({lines} lines)"));
+            .push(format!("System: [OK] Wrote {} ({change_summary})", file_name));
     }
 
     /// Upsert bordered chips from stream (write + run). Auto-opens on new/update.
@@ -2634,8 +2697,9 @@ impl App {
                 // Update last message — redact <write>/<cmd> bodies to labels only
                 if let Some(last) = self.messages.last_mut() {
                     if last.starts_with("Agent: ") || last.starts_with("Agent: ▍") {
-                        let shown = tool_panel::redact_tools_for_chat(&current_stream);
-                        *last = format!("Agent: {}", shown);
+                        // Store raw stream (with <think> and tool tags) so session save/restore
+                        // preserves thinking blocks and action chips on reload.
+                        *last = format!("Agent: {}", current_stream);
                     }
                 }
                 // Chips only while streaming (panel opens from chip click)
@@ -2655,10 +2719,32 @@ impl App {
                         if self.streamed_writes_done.contains(&action.target) {
                             continue;
                         }
-                        let _result = crate::agent::AgentEngine::execute_proposed(&action);
+                        let write_result = crate::agent::AgentEngine::execute_proposed(&action);
                         self.streamed_writes_done.push(action.target.clone());
-                        // Update chip to [WROTE] without touching tool_result_context
-                        // or calling trigger_generation_from_context — AI keeps streaming.
+
+                        // Record +/- stats into context so AI knows what changed next turn
+                        let added: usize = write_result.lines().filter(|l| l.starts_with("+ ")).count();
+                        let removed: usize = write_result.lines().filter(|l| l.starts_with("- ")).count();
+                        let file_name = action.target.split('/').last().unwrap_or(&action.target).trim_matches('"').to_string();
+                        let compact_diff: String = write_result.lines()
+                            .filter(|l| l.starts_with("+ ") || l.starts_with("- "))
+                            .take(40)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let context_entry = if write_result.trim() == "No changes." {
+                            format!("[write: {}] No changes (file identical).", file_name)
+                        } else if compact_diff.is_empty() {
+                            format!("[write: {}] Wrote {} lines.", file_name, write_result.lines().count())
+                        } else {
+                            format!("[write: {}] +{} lines / -{} lines.\nChanges:\n{}", file_name, added, removed, compact_diff)
+                        };
+                        self.tool_result_context.push(context_entry);
+                        if self.tool_result_context.len() > 8 {
+                            let n = self.tool_result_context.len() - 8;
+                            self.tool_result_context.drain(0..n);
+                        }
+
+                        // Update chip to [WROTE] without touching trigger_generation_from_context — AI keeps streaming.
                         if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
                             c.kind == crate::tool_panel::ToolPanelKind::Write
                                 && crate::tool_panel::same_tool_target(
@@ -2703,8 +2789,8 @@ impl App {
                 } else if !current_stream.is_empty() && !current_stream.starts_with("__HERCULES") {
                     if let Some(last) = self.messages.last_mut() {
                         if last.starts_with("Agent: ") {
-                            let shown = tool_panel::redact_tools_for_chat(&current_stream);
-                            *last = format!("Agent: {}", shown);
+                            // Preserve raw stream including <think> and tool tags for session restore
+                            *last = format!("Agent: {}", current_stream);
                             self.typewriter_len = 1000;
                         }
                     }
@@ -3104,10 +3190,14 @@ impl App {
         let is_downloading = self.download_progress.lock().unwrap().is_some();
         let is_krama_animating = self.krama.is_any_animation_inprogress();
 
+        self.code_block_anims.retain(|_, (_, t)| t.elapsed().as_millis() < 220);
+        self.collapsed_animations.retain(|_, (_, t)| t.elapsed().as_millis() < 220);
+
         let is_animating = is_generating_val
             || is_downloading
-            || !self.code_block_anims.is_empty()
             || is_krama_animating
+            || !self.code_block_anims.is_empty()
+            || !self.collapsed_animations.is_empty()
             || self.esc_hold_start.is_some()
             || self.menu_closing
             || self.panel_closing;
@@ -3198,15 +3288,13 @@ impl App {
                         }
 
                         // Check click on top header bar (Row 0 when closed, Row 1 when open)
-                        if mouse.row == 0 || mouse.row == 1 {
-                            if let Some((h_row, h_x0, h_x1)) = self.header_bar_hit {
-                                if (mouse.row == h_row || (mouse.row <= 1 && !self.header_dropdown_open)) && mouse.column >= h_x0 && mouse.column <= h_x1 {
-                                    self.header_dropdown_open = !self.header_dropdown_open;
-                                    self.krama.restart_progress("slide", 0);
-                                    self.clear_selection();
-                                    self.exit_term_interactive();
-                                    return Ok(true);
-                                }
+                        if let Some((h_row, h_x0, h_x1)) = self.header_bar_hit {
+                            if mouse.row == h_row && mouse.column >= h_x0 && mouse.column <= h_x1 {
+                                self.header_dropdown_open = !self.header_dropdown_open;
+                                self.krama.restart_progress("slide", 0);
+                                self.clear_selection();
+                                self.exit_term_interactive();
+                                return Ok(true);
                             }
                         }
 
@@ -3314,6 +3402,58 @@ impl App {
                             self.clear_selection();
                             self.exit_term_interactive();
                             self.input_focused = false;
+                        } else if let Some(hit_kind) = self.section_label_hits.iter().find(|hit| {
+                            mouse.row as i32 == hit.screen_y && mouse.column >= hit.x0 && mouse.column <= hit.x1
+                        }).map(|h| h.kind) {
+                            self.clear_selection();
+                            self.exit_term_interactive();
+                            self.is_selecting = false;
+                            self.selection_start = None;
+                            self.selection_end = None;
+                            self.krama.restart_progress("collapse", 0);
+
+                            match hit_kind {
+                                SectionKind::You(idx) | SectionKind::Agent(idx) | SectionKind::System(idx) => {
+                                    let is_collapsed = self.collapsed_messages.contains(&idx);
+                                    if is_collapsed {
+                                        self.collapsed_messages.remove(&idx);
+                                    } else {
+                                        self.collapsed_messages.insert(idx);
+                                    }
+                                    self.collapsed_animations.insert(idx, (!is_collapsed, std::time::Instant::now()));
+                                    self.status_message = format!(
+                                        "Section #{}: {}",
+                                        idx + 1,
+                                        if !is_collapsed { "Collapsed" } else { "Expanded" }
+                                    );
+                                }
+                                SectionKind::Thought(idx) => {
+                                    let is_col = self.collapsed_thoughts.contains(&idx);
+                                    if is_col {
+                                        self.collapsed_thoughts.remove(&idx);
+                                    } else {
+                                        self.collapsed_thoughts.insert(idx);
+                                    }
+                                    let anim_key = idx ^ 0x4000_0000;
+                                    self.collapsed_animations.insert(anim_key, (!is_col, std::time::Instant::now()));
+                                    self.status_message = format!(
+                                        "Thought: {}",
+                                        if !is_col { "Collapsed" } else { "Expanded" }
+                                    );
+                                }
+                                SectionKind::Action(chip_id) => {
+                                    if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
+                                        chip.tag_closed = true;
+                                        chip.expanded = !chip.expanded;
+                                        self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (chip.expanded, std::time::Instant::now()));
+                                        self.status_message = format!(
+                                            "Action: {}",
+                                            if chip.expanded { "Expanded" } else { "Collapsed" }
+                                        );
+                                    }
+                                }
+                            }
+                            return Ok(true);
                         } else if let Some(id) =
                             tool_panel::hit_test_chip(&self.tool_chips, mouse.column, mouse.row)
                         {
@@ -3322,9 +3462,9 @@ impl App {
                             self.is_selecting = false;
                             self.selection_start = None;
                             self.selection_end = None;
+                            self.krama.restart_progress("collapse", 0);
                             if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == id) {
                                 chip.expanded = !chip.expanded;
-                                chip.anim_start = Some(std::time::Instant::now());
                             }
                             return Ok(true);
                         } else if self.tool_panel.is_some() {
@@ -3709,6 +3849,7 @@ impl App {
                                     if self.menu_section == 1 {
                                         // Registry tab: toggle HF / Ollama
                                         self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
+                                        self.registry_state.select(Some(0));
                                     } else if self.menu_section == 3 {
                                         if !self.hf_token_editing {
                                             if self.settings_col == 1 {
@@ -3734,6 +3875,7 @@ impl App {
                                     if self.menu_section == 1 {
                                         // Registry tab: toggle HF / Ollama
                                         self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
+                                        self.registry_state.select(Some(0));
                                     } else if self.menu_section == 3 {
                                         if !self.hf_token_editing {
                                             if self.settings_col == 1 {
@@ -3941,12 +4083,6 @@ impl App {
                                                 target.clone()
                                             };
                                             self.gen_last_progress = None;
-                                            if !partial.is_empty()
-                                                && !partial.starts_with("__HERCULES")
-                                            {
-                                                self.sync_tool_chips(&partial);
-                                                self.finalize_incomplete_tools("Ctrl+C");
-                                            }
                                         }
                                         if n_tasks > 0 {
                                             self.task_manager.kill_all();
@@ -3975,25 +4111,57 @@ impl App {
                                 KeyCode::Char('t') | KeyCode::Char('T')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
-                                    self.thinking_collapsed = !self.thinking_collapsed;
-                                    self.status_message = format!(
-                                        "Thinking block: {}",
-                                        if self.thinking_collapsed {
-                                            "Collapsed"
-                                        } else {
-                                            "Expanded"
+                                    let now = std::time::Instant::now();
+
+                                    // Collapse only messages and thoughts that were NOT already collapsed
+                                    for i in 0..self.messages.len() {
+                                        if !self.collapsed_messages.contains(&i) {
+                                            self.collapsed_messages.insert(i);
+                                            self.collapsed_animations.insert(i, (true, now));
                                         }
-                                    );
-                                    if let Ok(mut l) = self.activity_logs.lock() {
-                                        l.push(format!(
-                                            "[UI] Thinking block toggled to {}",
-                                            if self.thinking_collapsed {
-                                                "Collapsed"
-                                            } else {
-                                                "Expanded"
-                                            }
-                                        ));
+                                        if !self.collapsed_thoughts.contains(&i) {
+                                            self.collapsed_thoughts.insert(i);
+                                            self.collapsed_animations.insert(i ^ 0x4000_0000, (true, now));
+                                        }
                                     }
+
+                                    // Collapse and close action chips that were open
+                                    for chip in &mut self.tool_chips {
+                                        if chip.expanded || !chip.tag_closed {
+                                            chip.expanded = false;
+                                            chip.tag_closed = true;
+                                            self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (false, now));
+                                        }
+                                    }
+
+                                    self.status_message = "Collapsed all sections (Ctrl+T)".to_string();
+                                }
+                                KeyCode::Char('o') | KeyCode::Char('O')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    let now = std::time::Instant::now();
+
+                                    // Expand all messages in history
+                                    for &i in &self.collapsed_messages {
+                                        self.collapsed_animations.insert(i, (false, now));
+                                    }
+                                    self.collapsed_messages.clear();
+
+                                    // Expand all thoughts in history
+                                    for &i in &self.collapsed_thoughts {
+                                        self.collapsed_animations.insert(i ^ 0x4000_0000, (false, now));
+                                    }
+                                    self.collapsed_thoughts.clear();
+
+                                    // Expand action chips that were closed/collapsed
+                                    for chip in &mut self.tool_chips {
+                                        if !chip.expanded {
+                                            chip.expanded = true;
+                                            self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (true, now));
+                                        }
+                                    }
+
+                                    self.status_message = "Opened all sections (Ctrl+O)".to_string();
                                 }
                                 // Panel chrome only when input unfocused (mouse is primary open)
                                 KeyCode::Char('x') | KeyCode::Char('X')
@@ -4213,14 +4381,27 @@ impl App {
                                             self.menu_closing = true;
                                         } else if self.menu_section == 1 {
                                             // Registry tab: download selected model
-                                            let items = if self.registry_tab == 0 {
-                                                &self.hf_models
+                                            let q_lower = self.registry_search_query.trim().to_lowercase();
+                                            let filtered_models: Vec<String> = if self.registry_tab == 0 {
+                                                self.hf_models.iter()
+                                                    .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
+                                                        let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
+                                                        !sub.is_empty() && m.to_lowercase().contains(sub)
+                                                    })
+                                                    .cloned()
+                                                    .collect()
                                             } else {
-                                                &self.registry_models
+                                                self.registry_models.iter()
+                                                    .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
+                                                        let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
+                                                        !sub.is_empty() && m.to_lowercase().contains(sub)
+                                                    })
+                                                    .cloned()
+                                                    .collect()
                                             };
                                             if let Some(i) = self.registry_state.selected() {
-                                                if i < items.len() {
-                                                    let item_str = items[i].clone();
+                                                if i < filtered_models.len() {
+                                                    let item_str = filtered_models[i].clone();
                                                     if item_str.starts_with("Ollama:")
                                                         || item_str.starts_with("Ollama Local:")
                                                     {
@@ -4826,11 +5007,12 @@ impl App {
         }
         let input_box_h = (self.input_anim_height.round() as u16).clamp(1, 7);
 
+        let top_header_h = if self.header_anim_progress > 0.5 { 2 } else { 1 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
                 [
-                    Constraint::Length(1), // 1-line top header bar
+                    Constraint::Length(top_header_h), // Top header bar (1 line normal, 2 lines dropdown)
                     Constraint::Min(1),
                     Constraint::Length(input_box_h),
                 ]
@@ -5028,11 +5210,11 @@ impl App {
         // --- Main Chat Body Layout (Full width, no side log panel) ---
         let chat_area = Rect {
             x: chunks[1].x,
-            y: if header_y == 1 { chunks[1].y.saturating_add(1) } else { chunks[1].y },
+            y: chunks[1].y,
             width: chunks[1].width,
-            height: if header_y == 1 { chunks[1].height.saturating_sub(1) } else { chunks[1].height },
+            height: chunks[1].height,
         };
-        let available_width = (chat_area.width.saturating_sub(2) as usize).max(1);
+        let available_width = (chat_area.width as usize).max(1);
 
         // Keep chip anchors on valid Agent turns so buttons scroll with that turn
         {
@@ -5072,65 +5254,148 @@ impl App {
             }};
         }
 
+        // Buffer for consecutive collapsed section labels to line up horizontally
+        let mut collapsed_row_buf: Vec<(Span<'static>, usize, SectionKind, Color, String)> = Vec::new();
+
+        let flush_collapsed_row = |lines: &mut Vec<Line>,
+                                   btn_list: &mut Vec<(usize, u16, u16, SectionKind)>,
+                                   headers: &mut Vec<(usize, String, Color)>,
+                                   buf: &mut Vec<(Span<'static>, usize, SectionKind, Color, String)>,
+                                   max_w: usize| {
+            if buf.is_empty() {
+                return;
+            }
+            let mut cur_line_spans: Vec<Span<'static>> = Vec::new();
+            let mut cur_line_w: usize = 0;
+            let mut cur_line_idx = lines.len();
+
+            for (span, badge_w, kind, color, label_str) in buf.drain(..) {
+                let needed_w = if cur_line_w > 0 { badge_w + 1 } else { badge_w };
+                if cur_line_w + needed_w > max_w && cur_line_w > 0 {
+                    // Flush current line
+                    push_full_shaded!(lines, cur_line_spans, cur_line_w, max_w, NORDIC_BG);
+                    cur_line_spans = Vec::new();
+                    cur_line_w = 0;
+                    cur_line_idx = lines.len();
+                }
+
+                if cur_line_w > 0 {
+                    cur_line_spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
+                    cur_line_w += 1;
+                }
+
+                let x_start = cur_line_w as u16;
+                let x_end = (cur_line_w + badge_w) as u16;
+                btn_list.push((cur_line_idx, x_start, x_end, kind));
+                headers.push((cur_line_idx, label_str, color));
+
+                cur_line_spans.push(span);
+                cur_line_w += badge_w;
+            }
+
+            if cur_line_w > 0 {
+                push_full_shaded!(lines, cur_line_spans, cur_line_w, max_w, NORDIC_BG);
+            }
+            lines.push(Line::from(""));
+        };
+
+        let mut all_section_hits_unmapped: Vec<(usize, u16, u16, SectionKind)> = Vec::new();
+
         for (m_idx, m) in self.messages.iter().enumerate() {
             let is_last_message = m_idx == self.messages.len() - 1;
 
             if m.starts_with("You:") {
                 let user_bg = Color::Rgb(163, 190, 140); // Sage Green
                 let user_text = m.strip_prefix("You:").unwrap_or(&m[4..]).trim();
-                let title_spans = vec![Span::styled(" You ", Style::default().fg(NORDIC_BG).bg(user_bg).add_modifier(Modifier::BOLD))];
-                section_headers.push((chat_lines.len(), "You".to_string(), user_bg));
-                push_full_shaded!(&mut chat_lines, title_spans, 5, available_width, content_bg);
-                for u_line in user_text.lines() {
-                    let inline_spans = crate::markdown::parse_inline(u_line, false, false);
-                    let mut raw_spans = Vec::new();
-                    for ispan in inline_spans {
-                        let mut style = Style::default().fg(white).bg(content_bg);
-                        if ispan.bold {
-                            style = style.add_modifier(Modifier::BOLD);
-                        }
-                        if ispan.italic {
-                            style = style.add_modifier(Modifier::ITALIC);
-                        }
-                        if ispan.strikethrough {
-                            style = style.add_modifier(Modifier::CROSSED_OUT);
-                        }
-                        if ispan.code {
-                            style = style.fg(Color::Rgb(255, 190, 100)).bg(content_bg).add_modifier(Modifier::BOLD);
-                        }
-                        if ispan.link_url.is_some() {
-                            style = style.fg(Color::Rgb(0, 200, 255)).bg(content_bg).add_modifier(Modifier::UNDERLINED);
-                        }
-                        raw_spans.push(Span::styled(ispan.text, style));
-                    }
-                    // Word wrap so every wrapped line gets '▎ ' and full width shading
-                    let mut cur_spans = vec![
-                        Span::styled("▎", Style::default().fg(user_bg).bg(content_bg)),
-                        Span::styled(" ", Style::default().bg(content_bg)),
-                    ];
-                    let mut cur_w = 2;
-                    for sp in raw_spans {
-                        let text = sp.content.to_string();
-                        let style = sp.style;
-                        for word in text.split_inclusive(' ') {
-                            let wl = word.chars().count();
-                            if cur_w + wl > available_width && cur_w > 2 {
-                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
-                                cur_spans = vec![
-                                    Span::styled("▎", Style::default().fg(user_bg).bg(content_bg)),
-                                    Span::styled(" ", Style::default().bg(content_bg)),
-                                ];
-                                cur_w = 2;
+                let is_collapsed = self.collapsed_messages.contains(&m_idx);
+                let badge_span = Span::styled(" You ", Style::default().fg(NORDIC_BG).bg(user_bg).add_modifier(Modifier::BOLD));
+
+                let anim_opt = self.collapsed_animations.get(&m_idx).cloned();
+                let is_anim = anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
+                let col_progress = if let Some((to_col, t)) = anim_opt {
+                    let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
+                    let ease = 1.0 - (1.0 - p) * (1.0 - p);
+                    if to_col { 1.0 - ease } else { ease }
+                } else if is_collapsed {
+                    0.0
+                } else {
+                    1.0
+                };
+
+                if is_collapsed && !is_anim {
+                    // Fully collapsed: buffer for horizontal row line up
+                    collapsed_row_buf.push((badge_span, 5, SectionKind::You(m_idx), user_bg, "You".to_string()));
+                } else {
+                    // Flushing any previously buffered collapsed row
+                    flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+
+                    let title_line_idx = chat_lines.len();
+                    all_section_hits_unmapped.push((title_line_idx, 0, 5, SectionKind::You(m_idx)));
+                    section_headers.push((title_line_idx, "You".to_string(), user_bg));
+                    let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
+                    push_full_shaded!(&mut chat_lines, vec![badge_span], 5, available_width, row_bg);
+
+                    let total_u_lines = user_text.lines().count().max(1);
+                    let visible_u_lines = ((total_u_lines as f32) * col_progress).round() as usize;
+
+                    if visible_u_lines > 0 {
+                        let mut rendered_u = 0;
+                        for u_line in user_text.lines() {
+                            if rendered_u >= visible_u_lines {
+                                break;
                             }
-                            cur_spans.push(Span::styled(word.to_string(), style));
-                            cur_w += wl;
+                            rendered_u += 1;
+                            let inline_spans = crate::markdown::parse_inline(u_line, false, false);
+                            let mut raw_spans = Vec::new();
+                            for ispan in inline_spans {
+                                let mut style = Style::default().fg(white).bg(content_bg);
+                                if ispan.bold {
+                                    style = style.add_modifier(Modifier::BOLD);
+                                }
+                                if ispan.italic {
+                                    style = style.add_modifier(Modifier::ITALIC);
+                                }
+                                if ispan.strikethrough {
+                                    style = style.add_modifier(Modifier::CROSSED_OUT);
+                                }
+                                if ispan.code {
+                                    style = style.fg(Color::Rgb(255, 190, 100)).bg(content_bg).add_modifier(Modifier::BOLD);
+                                }
+                                if ispan.link_url.is_some() {
+                                    style = style.fg(Color::Rgb(0, 200, 255)).bg(content_bg).add_modifier(Modifier::UNDERLINED);
+                                }
+                                raw_spans.push(Span::styled(ispan.text, style));
+                            }
+                            // Word wrap so every wrapped line gets '▎ ' and full width shading
+                            let mut cur_spans = vec![
+                                Span::styled("▎", Style::default().fg(user_bg).bg(content_bg)),
+                                Span::styled(" ", Style::default().bg(content_bg)),
+                            ];
+                            let mut cur_w = 2;
+                            for sp in raw_spans {
+                                let text = sp.content.to_string();
+                                let style = sp.style;
+                                for word in text.split_inclusive(' ') {
+                                    let wl = word.chars().count();
+                                    if cur_w + wl > available_width && cur_w > 2 {
+                                        push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                        cur_spans = vec![
+                                            Span::styled("▎", Style::default().fg(user_bg).bg(content_bg)),
+                                            Span::styled(" ", Style::default().bg(content_bg)),
+                                        ];
+                                        cur_w = 2;
+                                    }
+                                    cur_spans.push(Span::styled(word.to_string(), style));
+                                    cur_w += wl;
+                                }
+                            }
+                            if cur_w > 2 {
+                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                            }
                         }
                     }
-                    if cur_w > 2 {
-                        push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
-                    }
+                    chat_lines.push(Line::from(""));
                 }
-                chat_lines.push(Line::from(""));
             } else if m.starts_with("Agent:") || m.starts_with("Error:") {
                 let content = if m.starts_with("Agent:") {
                     &m[7..]
@@ -5149,14 +5414,14 @@ impl App {
                             } else {
                                 format!("{}{}", before, rest)
                             };
-                            (Some(think.to_string()), out, "Thinking")
+                            (Some(think.to_string()), out, "Thought")
                         } else {
                             let think = &content[start_think + 7..];
                             let before = content[..start_think].to_string();
                             (
                                 Some(think.to_string()),
                                 before,
-                                "Thinking",
+                                "Thought",
                             )
                         }
                     } else {
@@ -5172,80 +5437,118 @@ impl App {
                         || (is_generating_val && content.contains("<think>"))
                     {
                         let think_bg = Color::Rgb(180, 100, 240); // Soft Purple
-                        let think_tag = if self.thinking_collapsed {
-                            format!(" {think_label} (collapsed) ")
-                        } else {
-                            format!(" {think_label} ")
-                        };
+                        let think_tag = format!(" {think_label} ");
                         let think_len = think_tag.chars().count();
-                        let title_spans = vec![Span::styled(think_tag, Style::default().fg(Color::Rgb(245, 248, 255)).bg(think_bg).add_modifier(Modifier::BOLD))];
-                        section_headers.push((chat_lines.len(), think_label.to_string(), think_bg));
-                        push_full_shaded!(&mut chat_lines, title_spans, think_len, available_width, content_bg);
+                        let badge_span = Span::styled(think_tag, Style::default().fg(Color::Rgb(245, 248, 255)).bg(think_bg).add_modifier(Modifier::BOLD));
 
-                        if !self.thinking_collapsed {
-                            let visible_think = reveal_limit.min(clean_think.chars().count());
+                        let is_collapsed = self.collapsed_thoughts.contains(&m_idx);
+                        let anim_opt = self.collapsed_animations.get(&(m_idx ^ 0x4000_0000)).cloned();
+                        let is_anim = anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
+                        let think_progress = if let Some((to_open, t)) = anim_opt {
+                            let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
+                            let ease = 1.0 - (1.0 - p) * (1.0 - p);
+                            if to_open { ease } else { 1.0 - ease }
+                        } else if is_collapsed {
+                            0.0
+                        } else {
+                            1.0
+                        };
 
-                            let mut global_think_ch = 0;
-                            if clean_think.trim().is_empty() && is_generating_val {
-                                let pulse = (anim_tick as f64 * 0.3).sin() * 0.5 + 0.5;
-                                let b_val = (160.0 + 95.0 * pulse) as u8;
-                                let spans = vec![
-                                    Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
-                                    Span::styled(
-                                        " Reasoning… █",
-                                        Style::default()
-                                            .fg(Color::Rgb(210, 160, b_val))
-                                            .bg(content_bg)
-                                            .add_modifier(Modifier::ITALIC),
-                                    ),
-                                ];
-                                push_full_shaded!(&mut chat_lines, spans, 15, available_width, content_bg);
-                            } else {
-                                for raw_line in clean_think.lines() {
-                                    let line_str = raw_line.trim_start();
-                                    if line_str.is_empty() {
-                                        continue;
-                                    }
-                                    let mut line_spans = Vec::new();
-                                    for ch in line_str.chars() {
-                                        if global_think_ch >= visible_think {
+                        if is_collapsed && !is_anim {
+                            // Fully collapsed: buffer for horizontal row line up
+                            collapsed_row_buf.push((badge_span, think_len, SectionKind::Thought(m_idx), think_bg, think_label.to_string()));
+                        } else {
+                            flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+
+                            let title_line_idx = chat_lines.len();
+                            all_section_hits_unmapped.push((title_line_idx, 0, think_len as u16, SectionKind::Thought(m_idx)));
+                            section_headers.push((title_line_idx, think_label.to_string(), think_bg));
+                            let header_row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
+                            push_full_shaded!(&mut chat_lines, vec![badge_span], think_len, available_width, header_row_bg);
+
+                            let total_think_lines = clean_think.lines().filter(|l| !l.trim().is_empty()).count().max(1);
+                            let visible_think_lines = ((total_think_lines as f32) * think_progress).round() as usize;
+
+                            if visible_think_lines > 0 {
+                                let visible_think = reveal_limit.min(clean_think.chars().count());
+
+                                let mut global_think_ch = 0;
+                                if clean_think.trim().is_empty() && is_generating_val {
+                                    let pulse = (anim_tick as f64 * 0.3).sin() * 0.5 + 0.5;
+                                    let b_val = (160.0 + 95.0 * pulse) as u8;
+                                    let reason_str = " Reasoning… █";
+                                    let cur_w = 2 + reason_str.chars().count();
+                                    let spans = vec![
+                                        Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
+                                        Span::styled(
+                                            reason_str,
+                                            Style::default()
+                                                .fg(Color::Rgb(210, 160, b_val))
+                                                .bg(content_bg)
+                                                .add_modifier(Modifier::ITALIC),
+                                        ),
+                                    ];
+                                    push_full_shaded!(&mut chat_lines, spans, cur_w, available_width, content_bg);
+                                } else {
+                                    let mut line_start = true;
+                                    let mut rendered_think_lines = 0;
+                                    for raw_line in clean_think.lines() {
+                                        if rendered_think_lines >= visible_think_lines {
                                             break;
                                         }
-                                        let age = visible_think.saturating_sub(global_think_ch);
-                                        let is_streaming = is_generating_val && is_last_message;
-                                        let target_r = 220.0;
-                                        let target_g = 160.0;
-                                        let target_b = 255.0;
+                                        if !line_start {
+                                            global_think_ch += 1;
+                                        }
+                                        line_start = false;
 
-                                        let style_color = if is_streaming && age < 8 {
-                                            let (sr, sg, sb) = (0.0, 255.0, 120.0); // Vibrant neon green
-                                            let t = (age as f64 / 6.0).clamp(0.0, 1.0);
-                                            let r = (sr + (target_r - sr) * t).round() as u8;
-                                            let g = (sg + (target_g - sg) * t).round() as u8;
-                                            let b = (sb + (target_b - sb) * t).round() as u8;
-                                            Color::Rgb(r, g, b)
-                                        } else {
-                                            Color::Rgb(target_r as u8, target_g as u8, target_b as u8)
-                                        };
-                                        line_spans.push(Span::styled(
-                                            ch.to_string(),
-                                            Style::default().fg(style_color).bg(content_bg),
-                                        ));
-                                        global_think_ch += 1;
-                                    }
-                                    global_think_ch += 1;
+                                        let line_str = raw_line.trim_start();
+                                        if line_str.is_empty() {
+                                            continue;
+                                        }
+                                        rendered_think_lines += 1;
 
-                                    let mut cur_spans = vec![
-                                        Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
-                                        Span::styled(" ", Style::default().bg(content_bg)),
-                                    ];
-                                    let mut cur_w = 2;
-                                    for sp in line_spans {
-                                        let text = sp.content.to_string();
-                                        let style = sp.style;
-                                        for word in text.split_inclusive(' ') {
-                                            let wl = word.chars().count();
-                                            if cur_w + wl > available_width && cur_w > 2 {
+                                        let mut cur_spans = vec![
+                                            Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
+                                            Span::styled(" ", Style::default().bg(content_bg)),
+                                        ];
+                                        let mut cur_w = 2;
+
+                                        for word in line_str.split_inclusive(' ') {
+                                            if global_think_ch >= visible_think {
+                                                break;
+                                            }
+                                            let mut word_spans = Vec::new();
+                                            let mut word_w = 0;
+                                            for ch in word.chars() {
+                                                if global_think_ch >= visible_think {
+                                                    break;
+                                                }
+                                                let age = visible_think.saturating_sub(global_think_ch);
+                                                let is_streaming_think = is_generating_val && is_last_message && !content.contains("</think>");
+                                                let target_r = 220.0;
+                                                let target_g = 160.0;
+                                                let target_b = 255.0;
+
+                                                let style_color = if is_streaming_think && age < 8 {
+                                                    let (sr, sg, sb) = (0.0, 255.0, 120.0);
+                                                    let t = (age as f64 / 6.0).clamp(0.0, 1.0);
+                                                    let r = (sr + (target_r - sr) * t).round() as u8;
+                                                    let g = (sg + (target_g - sg) * t).round() as u8;
+                                                    let b = (sb + (target_b - sb) * t).round() as u8;
+                                                    Color::Rgb(r, g, b)
+                                                } else {
+                                                    Color::Rgb(target_r as u8, target_g as u8, target_b as u8)
+                                                };
+
+                                                word_spans.push(Span::styled(
+                                                    ch.to_string(),
+                                                    Style::default().fg(style_color).bg(content_bg),
+                                                ));
+                                                word_w += 1;
+                                                global_think_ch += 1;
+                                            }
+
+                                            if cur_w + word_w > available_width && cur_w > 2 {
                                                 push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
                                                 cur_spans = vec![
                                                     Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
@@ -5253,27 +5556,30 @@ impl App {
                                                 ];
                                                 cur_w = 2;
                                             }
-                                            cur_spans.push(Span::styled(word.to_string(), style));
-                                            cur_w += wl;
+
+                                            cur_spans.extend(word_spans);
+                                            cur_w += word_w;
                                         }
-                                    }
-                                    if cur_w > 2 {
-                                        push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+
+                                        if cur_w > 2 {
+                                            push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                        }
                                     }
                                 }
                             }
+                            chat_lines.push(Line::from(""));
                         }
-                        chat_lines.push(Line::from(""));
                     }
                 }
 
-                if !output_part.trim().is_empty()
+                let clean_output = tool_panel::redact_tools_for_chat(&output_part);
+                if !clean_output.trim().is_empty()
                     || (think_part.is_none() && (is_generating_val || !content.trim().is_empty()))
                 {
-                    let raw_text = if output_part.is_empty() && think_part.is_none() {
+                    let raw_text = if clean_output.is_empty() && think_part.is_none() {
                         content
                     } else {
-                        output_part.as_str()
+                        clean_output.as_str()
                     };
                     let text_to_render = raw_text.trim_start_matches(|c| c == '\n' || c == '\r').to_string();
                     let think_len = think_part.as_ref().map(|t| t.chars().count()).unwrap_or(0);
@@ -5293,91 +5599,108 @@ impl App {
                         } else {
                             " Agent "
                         };
+                        let is_collapsed = self.collapsed_messages.contains(&m_idx);
                         let agent_len = agent_label.chars().count();
-                        let title_spans = vec![Span::styled(agent_label, Style::default().fg(NORDIC_BG).bg(agent_bg).add_modifier(Modifier::BOLD))];
-                        section_headers.push((chat_lines.len(), agent_label.trim().to_string(), agent_bg));
-                        push_full_shaded!(&mut chat_lines, title_spans, agent_len, available_width, content_bg);
+                        let badge_span = Span::styled(agent_label, Style::default().fg(NORDIC_BG).bg(agent_bg).add_modifier(Modifier::BOLD));
 
-                        let mut global_out_ch = 0;
-                        let start_line_idx = chat_lines.len();
-                        let mut local_toggles = Vec::new();
-                        let mut local_copies = Vec::new();
-                        let mut local_scrolls = Vec::new();
-                        let md_lines = crate::markdown::render_markdown_to_lines(
-                            &text_to_render,
-                            available_output,
-                            &mut global_out_ch,
-                            is_generating_val,
-                            is_last_message,
-                            anim_tick,
-                            theme_color,
-                            dark_gray,
-                            &self.code_block_previews,
-                            Some(&mut local_toggles),
-                            Some(&mut local_copies),
-                            Some(&mut local_scrolls),
-                            available_width.saturating_sub(4),
-                            Some(&self.code_block_anims),
-                            Some(&self.code_block_scrolls),
-                        );
-                        for (local_idx, b_idx, n_s, n_e, p_s, p_e) in local_toggles {
-                            all_toggle_buttons.push((start_line_idx + local_idx, b_idx, n_s + 2, n_e + 2, p_s + 2, p_e + 2));
-                        }
-                        for (local_idx, b_idx, c_s, c_e, body) in local_copies {
-                            all_copy_buttons.push((start_line_idx + local_idx, b_idx, c_s + 2, c_e + 2, body));
-                        }
-                        for (local_idx, b_idx, l_s, l_e, t_s, t_e, r_s, r_e, max_sc) in local_scrolls {
-                            all_scroll_buttons.push((start_line_idx + local_idx, b_idx, l_s + 2, l_e + 2, t_s + 2, t_e + 2, r_s + 2, r_e + 2, max_sc));
-                        }
-                        for md_l in md_lines {
-                            let spans_with_bg: Vec<Span> = md_l.spans.into_iter().map(|s| {
-                                Span::styled(s.content, s.style.bg(content_bg))
-                            }).collect();
+                        let anim_opt = self.collapsed_animations.get(&m_idx).cloned();
+                        let is_anim = anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
 
-                            let is_code_or_table = spans_with_bg.iter().any(|s| {
-                                s.content.contains('│') || s.content.contains('┌') || s.content.contains('└') || s.content.contains('─')
-                            });
+                        if is_collapsed && !is_anim {
+                            collapsed_row_buf.push((badge_span, agent_len, SectionKind::Agent(m_idx), agent_bg, agent_label.trim().to_string()));
+                        } else {
+                            flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
 
-                            if is_code_or_table {
-                                let mut cur_w = 2;
-                                for s in &spans_with_bg {
-                                    cur_w += s.content.chars().count();
+                            let title_line_idx = chat_lines.len();
+                            all_section_hits_unmapped.push((title_line_idx, 0, agent_len as u16, SectionKind::Agent(m_idx)));
+                            section_headers.push((title_line_idx, agent_label.trim().to_string(), agent_bg));
+                            let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
+                            push_full_shaded!(&mut chat_lines, vec![badge_span], agent_len, available_width, row_bg);
+
+                            let show_agent_body = !is_collapsed || is_anim;
+                            if show_agent_body {
+                                let mut global_out_ch = 0;
+                                let start_line_idx = chat_lines.len();
+                                let mut local_toggles = Vec::new();
+                                let mut local_copies = Vec::new();
+                                let mut local_scrolls = Vec::new();
+                                let md_lines = crate::markdown::render_markdown_to_lines(
+                                    &text_to_render,
+                                    available_output,
+                                    &mut global_out_ch,
+                                    is_generating_val,
+                                    is_last_message,
+                                    anim_tick,
+                                    theme_color,
+                                    dark_gray,
+                                    &self.code_block_previews,
+                                    Some(&mut local_toggles),
+                                    Some(&mut local_copies),
+                                    Some(&mut local_scrolls),
+                                    available_width.saturating_sub(4),
+                                    Some(&self.code_block_anims),
+                                    Some(&self.code_block_scrolls),
+                                );
+                                for (local_idx, b_idx, n_s, n_e, p_s, p_e) in local_toggles {
+                                    all_toggle_buttons.push((start_line_idx + local_idx, b_idx, n_s + 2, n_e + 2, p_s + 2, p_e + 2));
                                 }
-                                let mut spans = vec![
-                                    Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
-                                    Span::styled(" ", Style::default().bg(content_bg)),
-                                ];
-                                spans.extend(spans_with_bg);
-                                push_full_shaded!(&mut chat_lines, spans, cur_w, available_width, content_bg);
-                            } else {
-                                let mut cur_spans = vec![
-                                    Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
-                                    Span::styled(" ", Style::default().bg(content_bg)),
-                                ];
-                                let mut cur_w = 2;
-                                for sp in spans_with_bg {
-                                    let text = sp.content.to_string();
-                                    let style = sp.style;
-                                    for word in text.split_inclusive(' ') {
-                                        let wl = word.chars().count();
-                                        if cur_w + wl > available_width && cur_w > 2 {
-                                            push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
-                                            cur_spans = vec![
-                                                Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
-                                                Span::styled(" ", Style::default().bg(content_bg)),
-                                            ];
-                                            cur_w = 2;
+                                for (local_idx, b_idx, c_s, c_e, body) in local_copies {
+                                    all_copy_buttons.push((start_line_idx + local_idx, b_idx, c_s + 2, c_e + 2, body));
+                                }
+                                for (local_idx, b_idx, l_s, l_e, t_s, t_e, r_s, r_e, max_sc) in local_scrolls {
+                                    all_scroll_buttons.push((start_line_idx + local_idx, b_idx, l_s + 2, l_e + 2, t_s + 2, t_e + 2, r_s + 2, r_e + 2, max_sc));
+                                }
+                                for md_l in md_lines {
+                                    let spans_with_bg: Vec<Span> = md_l.spans.into_iter().map(|s| {
+                                        Span::styled(s.content, s.style.bg(content_bg))
+                                    }).collect();
+
+                                    let is_code_or_table = spans_with_bg.iter().any(|s| {
+                                        s.content.contains('│') || s.content.contains('┌') || s.content.contains('└') || s.content.contains('─')
+                                    });
+
+                                    if is_code_or_table {
+                                        let mut cur_w = 2;
+                                        for s in &spans_with_bg {
+                                            cur_w += s.content.chars().count();
                                         }
-                                        cur_spans.push(Span::styled(word.to_string(), style));
-                                        cur_w += wl;
+                                        let mut spans = vec![
+                                            Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
+                                            Span::styled(" ", Style::default().bg(content_bg)),
+                                        ];
+                                        spans.extend(spans_with_bg);
+                                        push_full_shaded!(&mut chat_lines, spans, cur_w, available_width, content_bg);
+                                    } else {
+                                        let mut cur_spans = vec![
+                                            Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
+                                            Span::styled(" ", Style::default().bg(content_bg)),
+                                        ];
+                                        let mut cur_w = 2;
+                                        for sp in spans_with_bg {
+                                            let text = sp.content.to_string();
+                                            let style = sp.style;
+                                            for word in text.split_inclusive(' ') {
+                                                let wl = word.chars().count();
+                                                if cur_w + wl > available_width && cur_w > 2 {
+                                                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                                    cur_spans = vec![
+                                                        Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
+                                                        Span::styled(" ", Style::default().bg(content_bg)),
+                                                    ];
+                                                    cur_w = 2;
+                                                }
+                                                cur_spans.push(Span::styled(word.to_string(), style));
+                                                cur_w += wl;
+                                            }
+                                        }
+                                        if cur_w > 2 {
+                                            push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                        }
                                     }
-                                }
-                                if cur_w > 2 {
-                                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                    chat_lines.push(Line::from(""));
                                 }
                             }
                         }
-                        chat_lines.push(Line::from(""));
                     }
                 }
 
@@ -5391,60 +5714,247 @@ impl App {
 
                 for chip in matching_chips {
                     let action_tag = " Action ";
+                    let is_open = chip.expanded || !chip.tag_closed;
+                    let action_anim_opt = self.collapsed_animations.get(&(chip.id as usize ^ 0x8000_0000)).cloned();
+                    let is_anim = action_anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
+                    let badge_span = Span::styled(
+                        action_tag,
+                        Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
+                    );
 
-                    // Record chip start BEFORE title line so the hit rect covers
-                    // both the title row AND the summary row below it.
+                    let anim_progress = if let Some((to_open, t)) = action_anim_opt {
+                        let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
+                        let ease = 1.0 - (1.0 - p) * (1.0 - p);
+                        if to_open { ease } else { 1.0 - ease }
+                    } else if is_open {
+                        1.0
+                    } else {
+                        0.0
+                    };
+
+                    if !is_open && !is_anim {
+                        // Fully collapsed: buffer for horizontal row line up
+                        collapsed_row_buf.push((badge_span, 8, SectionKind::Action(chip.id), action_bg, format!("Action: {}", chip.label_text())));
+                    } else {
+                        flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+
+                        let chip_start = chat_lines.len();
+                        chip_line_starts.push((chip.id, chip_start));
+
+                        let action_row_bg = if is_open { content_bg } else { NORDIC_BG };
+                        section_headers.push((chip_start, format!("Action: {}", chip.label_text()), action_bg));
+                        all_section_hits_unmapped.push((chip_start, 0, 8, SectionKind::Action(chip.id)));
+                        push_full_shaded!(&mut chat_lines, vec![badge_span], 8, available_width, action_row_bg);
+
+                        let chip_summary = chip.label_text();
+                        let cur_spans = vec![
+                            Span::styled("▎", Style::default().fg(action_bg).bg(action_row_bg)),
+                            Span::styled(" ", Style::default().bg(action_row_bg)),
+                            Span::styled(
+                                chip_summary.clone(),
+                                Style::default().fg(chip.kind.accent()).bg(action_row_bg).add_modifier(Modifier::BOLD),
+                            ),
+                        ];
+                        let cur_w = 2 + chip_summary.chars().count();
+                        push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, action_row_bg);
+
+                        let max_body_lines = chip.body.trim_start_matches(|c| c == '\n' || c == '\r').lines().count();
+                        let visible_lines = if !chip.tag_closed {
+                            max_body_lines
+                        } else {
+                            ((max_body_lines as f32) * anim_progress).round() as usize
+                        };
+
+                        if visible_lines > 0 && !chip.body.trim().is_empty() {
+                            let body_trimmed = chip.body.trim_start_matches(|c| c == '\n' || c == '\r');
+                            let max_body_lines_adj = body_trimmed.lines().count();
+                            let visible_lines_adj = visible_lines.min(max_body_lines_adj);
+
+                            let rule_w = available_width.saturating_sub(4).max(10);
+                            let rule_spans = vec![
+                                Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
+                                Span::styled(" ", Style::default().bg(content_bg)),
+                                Span::styled("─".repeat(rule_w), Style::default().fg(Color::Rgb(60, 68, 82)).bg(content_bg)),
+                            ];
+                            let cur_w = 2 + rule_w;
+                            push_full_shaded!(&mut chat_lines, rule_spans, cur_w, available_width, content_bg);
+
+                            for (line_idx, b_line) in body_trimmed.lines().take(visible_lines_adj).enumerate() {
+                                let is_del = b_line.starts_with("- ") || b_line.starts_with('-');
+                                let is_add = b_line.starts_with("+ ") || b_line.starts_with('+');
+                                
+                                let (line_fg, sign_color) = if is_del {
+                                    (Color::Rgb(255, 130, 140), Color::Rgb(255, 90, 100))
+                                } else if is_add {
+                                    (Color::Rgb(163, 190, 140), Color::Rgb(80, 220, 140))
+                                } else {
+                                    (NORDIC_TEXT, Color::Rgb(100, 110, 130))
+                                };
+
+                                let line_num_str = format!(" {:2} │ ", line_idx + 1);
+                                let cur_spans = vec![
+                                    Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
+                                    Span::styled(" ", Style::default().bg(content_bg)),
+                                    Span::styled(line_num_str, Style::default().fg(sign_color).bg(content_bg)),
+                                    Span::styled(b_line.to_string(), Style::default().fg(line_fg).bg(content_bg)),
+                                ];
+                                let cur_w = 2 + 7 + b_line.chars().count();
+                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                            }
+                        }
+                        chat_lines.push(Line::from(""));
+                    }
+                }
+            } else if m.starts_with("System:") {
+                let sys_bg = Color::Rgb(94, 129, 172); // Nordic Slate Blue
+                let sys_body = m.strip_prefix("System:").unwrap_or(&m[7..]).trim();
+                let is_collapsed = self.collapsed_messages.contains(&m_idx);
+                let badge_span = Span::styled(" System ", Style::default().fg(Color::Rgb(245, 248, 255)).bg(sys_bg).add_modifier(Modifier::BOLD));
+
+                let anim_opt = self.collapsed_animations.get(&m_idx).cloned();
+                let is_anim = anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
+                let col_progress = if let Some((to_col, t)) = anim_opt {
+                    let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
+                    let ease = 1.0 - (1.0 - p) * (1.0 - p);
+                    if to_col { 1.0 - ease } else { ease }
+                } else if is_collapsed {
+                    0.0
+                } else {
+                    1.0
+                };
+
+                if is_collapsed && !is_anim {
+                    // Fully collapsed: buffer for horizontal row line up
+                    collapsed_row_buf.push((badge_span, 8, SectionKind::System(m_idx), sys_bg, "System".to_string()));
+                } else {
+                    flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+
+                    let title_line_idx = chat_lines.len();
+                    all_section_hits_unmapped.push((title_line_idx, 0, 8, SectionKind::System(m_idx)));
+                    section_headers.push((title_line_idx, "System".to_string(), sys_bg));
+                    let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
+                    push_full_shaded!(&mut chat_lines, vec![badge_span], 8, available_width, row_bg);
+
+                    let total_sys_lines = sys_body.lines().count().max(1);
+                    let visible_sys_lines = ((total_sys_lines as f32) * col_progress).round() as usize;
+
+                    if visible_sys_lines > 0 {
+                        let mut rendered_sys = 0;
+                        for line in sys_body.lines() {
+                            if rendered_sys >= visible_sys_lines {
+                                break;
+                            }
+                            rendered_sys += 1;
+                            let mut cur_spans = vec![
+                                Span::styled("▎", Style::default().fg(sys_bg).bg(content_bg)),
+                                Span::styled(" ", Style::default().bg(content_bg)),
+                            ];
+                            let mut cur_w = 2;
+                            for word in line.split_inclusive(' ') {
+                                let wl = word.chars().count();
+                                if cur_w + wl > available_width && cur_w > 2 {
+                                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                    cur_spans = vec![
+                                        Span::styled("▎", Style::default().fg(sys_bg).bg(content_bg)),
+                                        Span::styled(" ", Style::default().bg(content_bg)),
+                                    ];
+                                    cur_w = 2;
+                                }
+                                cur_spans.push(Span::styled(word.to_string(), Style::default().fg(NORDIC_TEXT).bg(content_bg)));
+                                cur_w += wl;
+                            }
+                            if cur_w > 2 {
+                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                            }
+                        }
+                    }
+                    chat_lines.push(Line::from(""));
+                }
+            } else {
+                flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+                chat_lines.push(Line::from(Span::styled(
+                    m.clone(),
+                    Style::default().fg(NORDIC_MUTED),
+                )));
+            }
+        }
+
+        // Render any tool chips that might not have been matched to a message turn
+        let unanchored_chips: Vec<&ToolChip> = self
+            .tool_chips
+            .iter()
+            .filter(|c| c.anchor_msg.map(|idx| idx >= self.messages.len()).unwrap_or(true))
+            .collect();
+
+        if !unanchored_chips.is_empty() {
+            let action_bg = Color::Rgb(235, 203, 139);
+            for chip in unanchored_chips {
+                let action_tag = " Action ";
+                let is_open = chip.expanded || !chip.tag_closed;
+                let action_anim_opt = self.collapsed_animations.get(&(chip.id as usize ^ 0x8000_0000)).cloned();
+                let is_anim = action_anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
+                let badge_span = Span::styled(
+                    action_tag,
+                    Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
+                );
+
+                let anim_progress = if let Some((to_open, t)) = action_anim_opt {
+                    let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
+                    let ease = 1.0 - (1.0 - p) * (1.0 - p);
+                    if to_open { ease } else { 1.0 - ease }
+                } else if is_open {
+                    1.0
+                } else {
+                    0.0
+                };
+
+                if !is_open && !is_anim {
+                    collapsed_row_buf.push((badge_span, 8, SectionKind::Action(chip.id), action_bg, format!("Action: {}", chip.label_text())));
+                } else {
+                    flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+
                     let chip_start = chat_lines.len();
                     chip_line_starts.push((chip.id, chip_start));
 
-                    let title_spans = vec![Span::styled(
-                        action_tag,
-                        Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
-                    )];
-                    section_headers.push((chat_lines.len(), format!("Action: {}", chip.label_text()), action_bg));
-                    push_full_shaded!(&mut chat_lines, title_spans, 8, available_width, content_bg);
+                    let action_row_bg = if is_open { content_bg } else { NORDIC_BG };
+                    section_headers.push((chip_start, format!("Action: {}", chip.label_text()), action_bg));
+                    all_section_hits_unmapped.push((chip_start, 0, 8, SectionKind::Action(chip.id)));
+                    push_full_shaded!(&mut chat_lines, vec![badge_span], 8, available_width, action_row_bg);
 
                     let chip_summary = chip.label_text();
                     let cur_spans = vec![
-                        Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
-                        Span::styled(" ", Style::default().bg(content_bg)),
+                        Span::styled("▎", Style::default().fg(action_bg).bg(action_row_bg)),
+                        Span::styled(" ", Style::default().bg(action_row_bg)),
                         Span::styled(
                             chip_summary.clone(),
-                            Style::default().fg(chip.kind.accent()).bg(content_bg).add_modifier(Modifier::BOLD),
+                            Style::default().fg(chip.kind.accent()).bg(action_row_bg).add_modifier(Modifier::BOLD),
                         ),
                     ];
                     let cur_w = 2 + chip_summary.chars().count();
-                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, action_row_bg);
 
-                    // Compute animated content line count
-                    let max_body_lines = chip.body.lines().count().min(25);
-                    let target_open = chip.expanded || !chip.tag_closed;
-                    let elapsed_ms = chip.anim_start.map(|s| s.elapsed().as_millis()).unwrap_or(300);
-                    let anim_progress = (elapsed_ms as f32 / 200.0).clamp(0.0, 1.0);
-                    let visible_lines = if target_open {
-                        if chip.tag_closed {
-                            // Expanding or already expanded
-                            ((max_body_lines as f32) * anim_progress).round() as usize
-                        } else {
-                            // Actively writing / streaming: show full current body
-                            max_body_lines
-                        }
+                    let max_body_lines = chip.body.trim_start_matches(|c| c == '\n' || c == '\r').lines().count();
+                    let visible_lines = if !chip.tag_closed {
+                        max_body_lines
                     } else {
-                        // Collapsing once completed
-                        let remaining = 1.0 - anim_progress;
-                        ((max_body_lines as f32) * remaining).round() as usize
+                        ((max_body_lines as f32) * anim_progress).round() as usize
                     };
 
                     if visible_lines > 0 && !chip.body.trim().is_empty() {
-                        // Top horizontal separator rule
+                        let body_trimmed = chip.body.trim_start_matches(|c| c == '\n' || c == '\r');
+                        let max_body_lines_adj = body_trimmed.lines().count();
+                        let visible_lines_adj = visible_lines.min(max_body_lines_adj);
+
+                        let rule_w = available_width.saturating_sub(4).max(10);
                         let rule_spans = vec![
                             Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
                             Span::styled(" ", Style::default().bg(content_bg)),
-                            Span::styled("─".repeat(available_width.saturating_sub(4).max(10)), Style::default().fg(Color::Rgb(60, 68, 82)).bg(content_bg)),
+                            Span::styled("─".repeat(rule_w), Style::default().fg(Color::Rgb(60, 68, 82)).bg(content_bg)),
                         ];
-                        push_full_shaded!(&mut chat_lines, rule_spans, available_width, available_width, content_bg);
+                        let cur_w = 2 + rule_w;
+                        push_full_shaded!(&mut chat_lines, rule_spans, cur_w, available_width, content_bg);
 
-                        for (line_idx, b_line) in chip.body.lines().take(visible_lines).enumerate() {
+                        for (line_idx, b_line) in body_trimmed.lines().take(visible_lines_adj).enumerate() {
                             let is_del = b_line.starts_with("- ") || b_line.starts_with('-');
                             let is_add = b_line.starts_with("+ ") || b_line.starts_with('+');
                             
@@ -5469,45 +5979,12 @@ impl App {
                     }
                     chat_lines.push(Line::from(""));
                 }
-            } else if m.starts_with("System:") {
-                let sys_bg = Color::Rgb(94, 129, 172); // Nordic Slate Blue
-                let sys_body = m.strip_prefix("System:").unwrap_or(&m[7..]).trim();
-                let title_spans = vec![Span::styled(" System ", Style::default().fg(Color::Rgb(245, 248, 255)).bg(sys_bg).add_modifier(Modifier::BOLD))];
-                section_headers.push((chat_lines.len(), "System".to_string(), sys_bg));
-                push_full_shaded!(&mut chat_lines, title_spans, 8, available_width, content_bg);
-                for line in sys_body.lines() {
-                    let mut cur_spans = vec![
-                        Span::styled("▎", Style::default().fg(sys_bg).bg(content_bg)),
-                        Span::styled(" ", Style::default().bg(content_bg)),
-                    ];
-                    let mut cur_w = 2;
-                    for word in line.split_inclusive(' ') {
-                        let wl = word.chars().count();
-                        if cur_w + wl > available_width && cur_w > 2 {
-                            push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
-                            cur_spans = vec![
-                                Span::styled("▎", Style::default().fg(sys_bg).bg(content_bg)),
-                                Span::styled(" ", Style::default().bg(content_bg)),
-                            ];
-                            cur_w = 2;
-                        }
-                        cur_spans.push(Span::styled(word.to_string(), Style::default().fg(NORDIC_TEXT).bg(content_bg)));
-                        cur_w += wl;
-                    }
-                    if cur_w > 2 {
-                        push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
-                    }
-                }
-                chat_lines.push(Line::from(""));
-            } else {
-                chat_lines.push(Line::from(Span::styled(
-                    m.clone(),
-                    Style::default().fg(NORDIC_MUTED),
-                )));
             }
         }
 
-        let available_width = (chat_area.width.saturating_sub(2) as usize).max(1);
+        // Flush any remaining trailing collapsed labels
+        flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+
         let mut total_visual_lines: u16 = 0;
         let mut visual_at: Vec<u16> = Vec::with_capacity(chat_lines.len() + 1);
         for line in &chat_lines {
@@ -5525,7 +6002,7 @@ impl App {
         // Calculate screen coordinates for interactive code block Normal/Preview and Copy buttons
         self.code_block_hits.clear();
         self.code_block_copy_hits.clear();
-        let chat_top = chat_area.y as i32 + 1;
+        let chat_top = chat_area.y as i32;
         let chat_left = chat_area.x;
         for (l_idx, b_idx, n_s, n_e, p_s, p_e) in all_toggle_buttons {
             if let Some(&vis) = visual_at.get(l_idx) {
@@ -5560,6 +6037,18 @@ impl App {
                     track_x: (chat_left.saturating_add(t_s), chat_left.saturating_add(t_e)),
                     right_btn_x: (chat_left.saturating_add(r_s), chat_left.saturating_add(r_e)),
                     max_scroll: max_sc,
+                });
+            }
+        }
+        self.section_label_hits.clear();
+        for (l_idx, x_start, x_end, kind) in all_section_hits_unmapped {
+            if let Some(&vis) = visual_at.get(l_idx) {
+                let screen_y = chat_top + vis as i32 - self.scroll_offset as i32;
+                self.section_label_hits.push(SectionLabelHit {
+                    screen_y,
+                    x0: chat_left.saturating_add(x_start),
+                    x1: chat_left.saturating_add(x_end),
+                    kind,
                 });
             }
         }
@@ -5666,7 +6155,7 @@ impl App {
         {
             let _x = chat_area.x.saturating_add(3);
             let _max_w = chat_area.width.saturating_sub(6);
-            let chat_top = chat_area.y.saturating_add(1);
+            let chat_top = chat_area.y;
             let chat_bot = chat_area
                 .y
                 .saturating_add(chat_area.height.saturating_sub(1));
@@ -6137,6 +6626,14 @@ impl App {
                                 Span::styled("      Interrupt streaming response or tool execution", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
                             ]),
                             Line::from(vec![
+                                Span::styled(" Ctrl+T ", Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                Span::styled("      Collapse all sections before current response", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
+                            Line::from(vec![
+                                Span::styled(" Ctrl+O ", Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                Span::styled("      Open / expand all sections and labels", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
+                            Line::from(vec![
                                 Span::styled(" PgUp / PgDn ", Style::default().fg(Color::Rgb(180, 160, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
                                 Span::styled(" Scroll conversation history", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
                             ]),
@@ -6216,13 +6713,40 @@ impl App {
                             spans
                         };
 
-                        let items: Vec<ListItem> = if self.registry_tab == 0 {
-                            let selected_idx = self.registry_state.selected();
+                        let filtered_models: Vec<String> = if self.registry_tab == 0 {
                             self.hf_models.iter()
                                 .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
                                     let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
                                     !sub.is_empty() && m.to_lowercase().contains(sub)
                                 })
+                                .cloned()
+                                .collect()
+                        } else {
+                            self.registry_models.iter()
+                                .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
+                                    let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
+                                    !sub.is_empty() && m.to_lowercase().contains(sub)
+                                })
+                                .cloned()
+                                .collect()
+                        };
+
+                        // Lively adjust selection cap to match filtered items length
+                        if filtered_models.is_empty() {
+                            self.registry_state.select(None);
+                        } else {
+                            let cur_sel = self.registry_state.selected().unwrap_or(0);
+                            if cur_sel >= filtered_models.len() {
+                                self.registry_state.select(Some(filtered_models.len() - 1));
+                            } else if self.registry_state.selected().is_none() {
+                                self.registry_state.select(Some(0));
+                            }
+                        }
+
+                        let selected_idx = self.registry_state.selected();
+
+                        let items: Vec<ListItem> = if self.registry_tab == 0 {
+                            filtered_models.iter()
                                 .enumerate()
                                 .map(|(row_idx, m)| {
                                     let is_selected = selected_idx == Some(row_idx);
@@ -6266,12 +6790,7 @@ impl App {
                                     ListItem::new(Line::from(line_spans)).style(Style::default().bg(row_bg))
                                 }).collect()
                         } else {
-                            let selected_idx = self.registry_state.selected();
-                            self.registry_models.iter()
-                                .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
-                                    let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
-                                    !sub.is_empty() && m.to_lowercase().contains(sub)
-                                })
+                            filtered_models.iter()
                                 .enumerate()
                                 .map(|(row_idx, m)| {
                                     let is_selected = selected_idx == Some(row_idx);
@@ -6344,6 +6863,17 @@ impl App {
                             Span::styled(" (Up/Down or W/S to navigate | Enter to activate model)", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG)),
                         ])).style(Style::default().bg(NORDIC_BG));
                         frame.render_widget(info, chunks[0]);
+
+                        if self.installed_models.is_empty() {
+                            self.installed_state.select(None);
+                        } else {
+                            let cur_sel = self.installed_state.selected().unwrap_or(0);
+                            if cur_sel >= self.installed_models.len() {
+                                self.installed_state.select(Some(self.installed_models.len() - 1));
+                            } else if self.installed_state.selected().is_none() {
+                                self.installed_state.select(Some(0));
+                            }
+                        }
 
                         let selected_idx = self.installed_state.selected();
                         let items: Vec<ListItem> = self.installed_models.iter().enumerate().map(|(row_idx, m)| {
