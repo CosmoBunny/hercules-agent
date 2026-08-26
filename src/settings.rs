@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use sysinfo::System;
 
 /// How hard to push CPU/GPU for local LLM backends (llama-server).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PowerMode {
     /// Lower threads / GPU layers when system is already hot.
     PowerSaver,
@@ -111,7 +111,7 @@ pub const CONTEXT_COMPACT_RATIO: f32 = 0.80;
 /// Default sampling temperature (low = more deterministic / better tool following).
 pub const DEFAULT_TEMPERATURE: f32 = 0.2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WebSearchProvider {
     DuckDuckGo,
     Google,
@@ -134,35 +134,64 @@ impl WebSearchProvider {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeSettings {
+    #[serde(default = "default_power_mode")]
     pub power_mode: PowerMode,
+    #[serde(default = "default_web_search_provider")]
     pub web_search_provider: WebSearchProvider,
+    #[serde(default = "default_max_subagents")]
     pub max_subagents: usize,
+    #[serde(default = "default_max_subagent_depth")]
     pub max_subagent_depth: usize,
+    #[serde(default = "default_stall_timeout_secs")]
     pub stall_timeout_secs: u64,
     /// Consecutive identical / pattern hits before we intervene.
+    #[serde(default = "default_repeat_threshold")]
     pub repeat_threshold: usize,
     /// Also scan `<think>` bodies for looping phrases.
+    #[serde(default = "default_true")]
     pub repeat_detect_thinking: bool,
     /// Max context tokens (prompt budget). Default 256K.
+    #[serde(default = "context_limit_from_env")]
     pub context_token_limit: usize,
     /// Fraction of limit that triggers auto-compact (default 0.80).
+    #[serde(default = "default_compact_ratio")]
     pub compact_ratio: f32,
     /// Sampling temperature for llama.cpp / HTTP / (hint for llama.rs).
+    #[serde(default = "default_temperature")]
     pub temperature: f32,
     /// Send recent sub-agent response back to main agent on finish.
+    #[serde(default = "default_true")]
     pub subagent_quick_response: bool,
     /// OCR model / engine (auto, llava, qwen2-vl, tesseract).
+    #[serde(default = "default_none")]
     pub ocr_model: String,
     /// Image generative model / engine (auto, sd-webui, ollama, diffusers).
+    #[serde(default = "default_none")]
     pub image_gen_model: String,
     /// Video generative model / engine (auto, animatediff, cogvideox).
+    #[serde(default = "default_none")]
     pub video_gen_model: String,
+    /// HuggingFace API token for authenticated searches & downloads.
+    #[serde(default)]
+    pub hf_token: Option<String>,
 }
+
+fn default_power_mode() -> PowerMode { PowerMode::Normal }
+fn default_web_search_provider() -> WebSearchProvider { WebSearchProvider::DuckDuckGo }
+fn default_max_subagents() -> usize { 4 }
+fn default_max_subagent_depth() -> usize { 3 }
+fn default_stall_timeout_secs() -> u64 { 300 }
+fn default_repeat_threshold() -> usize { 10 }
+fn default_true() -> bool { true }
+fn default_compact_ratio() -> f32 { CONTEXT_COMPACT_RATIO }
+fn default_temperature() -> f32 { DEFAULT_TEMPERATURE }
+fn default_none() -> String { "none".to_string() }
 
 impl Default for RuntimeSettings {
     fn default() -> Self {
+        let env_tok = std::env::var("HF_TOKEN").ok().filter(|s| !s.trim().is_empty());
         Self {
             power_mode: PowerMode::Normal,
             web_search_provider: WebSearchProvider::DuckDuckGo,
@@ -178,6 +207,7 @@ impl Default for RuntimeSettings {
             ocr_model: "none".to_string(),
             image_gen_model: "none".to_string(),
             video_gen_model: "none".to_string(),
+            hf_token: env_tok,
         }
     }
 }
@@ -266,18 +296,71 @@ pub fn estimate_tokens(text: &str) -> usize {
     (text.chars().count() + 3) / 4
 }
 
+pub fn settings_toml_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".local").join("hercules").join("settings.toml")
+}
+
+pub fn load_settings_from_disk() -> RuntimeSettings {
+    let path = settings_toml_path();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Ok(s) = toml::from_str::<RuntimeSettings>(&text) {
+            return s;
+        }
+    }
+    RuntimeSettings::default()
+}
+
+pub fn save_settings_to_disk(settings: &RuntimeSettings) {
+    let path = settings_toml_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = toml::to_string_pretty(settings) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
 static SETTINGS: Mutex<Option<RuntimeSettings>> = Mutex::new(None);
 
 fn ensure_settings() -> RuntimeSettings {
     let mut g = SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
     if g.is_none() {
-        *g = Some(RuntimeSettings::default());
+        *g = Some(load_settings_from_disk());
     }
     g.clone().unwrap_or_default()
 }
 
 pub fn get_settings() -> RuntimeSettings {
     ensure_settings()
+}
+
+pub fn get_hf_token() -> Option<String> {
+    get_settings().hf_token
+}
+
+pub fn set_hf_token(tok: String) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        let trimmed = tok.trim().to_string();
+        if trimmed.is_empty() {
+            s.hf_token = None;
+        } else {
+            s.hf_token = Some(trimmed);
+        }
+        save_settings_to_disk(s);
+    }
+}
+
+pub fn clear_hf_token() {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.hf_token = None;
+        save_settings_to_disk(s);
+    }
 }
 
 pub fn context_token_limit() -> usize {

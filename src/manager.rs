@@ -649,13 +649,15 @@ impl ModelManager {
             }
         };
 
+        let hf_token = crate::settings::get_hf_token()
+            .or_else(|| std::env::var("HF_TOKEN").ok().filter(|s| !s.trim().is_empty()));
+
         let client = reqwest::Client::new();
-        let res = client
-            .get(&url)
-            .header("User-Agent", "Hercules-CLI/1.0")
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut req = client.get(&url).header("User-Agent", "Hercules-CLI/1.0");
+        if let Some(ref tok) = hf_token {
+            req = req.header("Authorization", format!("Bearer {}", tok));
+        }
+        let res = req.send().await.map_err(|e| e.to_string())?;
 
         let text = res.text().await.map_err(|e| e.to_string())?;
         let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
@@ -672,10 +674,15 @@ impl ModelManager {
         let mut fetch_futs = Vec::new();
         for id in model_ids {
             let client = client.clone();
+            let tok_opt = hf_token.clone();
             fetch_futs.push(async move {
                 let single_url = format!("https://huggingface.co/api/models/{}?blobs=true", id);
                 let mut size_tag = "[-]".to_string();
-                if let Ok(res) = client.get(&single_url).header("User-Agent", "Hercules-CLI/1.0").send().await {
+                let mut req = client.get(&single_url).header("User-Agent", "Hercules-CLI/1.0");
+                if let Some(ref tok) = tok_opt {
+                    req = req.header("Authorization", format!("Bearer {}", tok));
+                }
+                if let Ok(res) = req.send().await {
                     if let Ok(t) = res.text().await {
                         if let Ok(item_json) = serde_json::from_str::<serde_json::Value>(&t) {
                             let mut gguf_sizes: Vec<(String, u64)> = Vec::new();

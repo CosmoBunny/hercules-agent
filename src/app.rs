@@ -153,7 +153,9 @@ pub struct App {
     pub menu_tab_hits: Vec<(usize, u16, u16)>,   // (section_idx, start_col, end_col) on row 0
     pub container_close_hit: Option<(u16, u16, u16)>, // (row, start_col, end_col) for " x " close button
     pub settings_col: usize,       // 0 = left category tabs, 1 = right values
-    pub settings_tab: usize,       // 0: Power, 1: Stall, 2: Repeat, 3: Context, 4: Permissions
+    pub settings_tab: usize,       // 0: Power, 1: Stall, 2: Repeat, 3: Context, 4: Permissions, 5: HF Token
+    pub hf_token_input: String,
+    pub hf_token_editing: bool,
     pub registry_tab: usize,       // 0: HuggingFace, 1: Ollama
     pub config_state: ListState,
 
@@ -322,6 +324,8 @@ impl App {
             container_close_hit: None,
             settings_col: 0,
             settings_tab: 0,
+            hf_token_input: String::new(),
+            hf_token_editing: false,
             registry_tab: 0,
             config_state: {
                 let mut st = ListState::default();
@@ -2464,6 +2468,17 @@ impl App {
                 let p2 = get_tool_permissions();
                 self.status_message = format!("Permissions: {} | {}", p2.mode_label(), p2.scope_label());
             }
+            5 => {
+                // HF Token
+                if dir > 0 {
+                    self.hf_token_input = crate::settings::get_hf_token().unwrap_or_default();
+                    self.hf_token_editing = true;
+                    self.status_message = "Type or paste HuggingFace token...".to_string();
+                } else {
+                    crate::settings::clear_hf_token();
+                    self.status_message = "HuggingFace token removed.".to_string();
+                }
+            }
             _ => {}
         }
     }
@@ -3513,7 +3528,11 @@ impl App {
                                         self.delete_confirm_model = None;
                                         self.esc_hold_start = None;
                                     } else if self.show_menu {
-                                        if self.settings_col == 1 {
+                                        if self.hf_token_editing {
+                                            self.hf_token_editing = false;
+                                            self.hf_token_input.clear();
+                                            self.status_message = "Token editing cancelled.".to_string();
+                                        } else if self.settings_col == 1 {
                                             // Exit second column back to tab column
                                             self.settings_col = 0;
                                         } else {
@@ -3619,19 +3638,24 @@ impl App {
                                         // Registry tab: toggle HF / Ollama
                                         self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
                                     } else if self.menu_section == 3 {
-                                        // Settings tab: if in column 1 (values), decrement / adjust setting
-                                        if self.settings_col == 1 {
-                                            self.adjust_setting_value(-1);
-                                        } else {
-                                            self.settings_tab = if self.settings_tab == 0 { 4 } else { self.settings_tab - 1 };
+                                        if !self.hf_token_editing {
+                                            if self.settings_col == 1 {
+                                                self.adjust_setting_value(-1);
+                                            } else {
+                                                self.settings_tab = if self.settings_tab == 0 { 5 } else { self.settings_tab - 1 };
+                                            }
                                         }
                                     }
                                 }
                                 KeyCode::Char('a') if self.show_menu && self.menu_section == 3 => {
-                                    if self.settings_col == 1 {
-                                        self.adjust_setting_value(-1);
+                                    if !self.hf_token_editing {
+                                        if self.settings_col == 1 {
+                                            self.adjust_setting_value(-1);
+                                        } else {
+                                            self.settings_tab = if self.settings_tab == 0 { 5 } else { self.settings_tab - 1 };
+                                        }
                                     } else {
-                                        self.settings_tab = if self.settings_tab == 0 { 4 } else { self.settings_tab - 1 };
+                                        self.hf_token_input.push('a');
                                     }
                                 }
                                 KeyCode::Right if self.show_menu => {
@@ -3639,19 +3663,29 @@ impl App {
                                         // Registry tab: toggle HF / Ollama
                                         self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
                                     } else if self.menu_section == 3 {
-                                        // Settings tab: if in column 1 (values), increment / adjust setting
-                                        if self.settings_col == 1 {
-                                            self.adjust_setting_value(1);
-                                        } else {
-                                            self.settings_tab = (self.settings_tab + 1) % 5;
+                                        if !self.hf_token_editing {
+                                            if self.settings_col == 1 {
+                                                self.adjust_setting_value(1);
+                                            } else {
+                                                self.settings_tab = (self.settings_tab + 1) % 6;
+                                            }
                                         }
                                     }
                                 }
                                 KeyCode::Char('d') if self.show_menu && self.menu_section == 3 => {
-                                    if self.settings_col == 1 {
-                                        self.adjust_setting_value(1);
+                                    if !self.hf_token_editing {
+                                        if self.settings_col == 1 {
+                                            if self.settings_tab == 5 {
+                                                crate::settings::clear_hf_token();
+                                                self.status_message = "HuggingFace token removed.".to_string();
+                                            } else {
+                                                self.adjust_setting_value(1);
+                                            }
+                                        } else {
+                                            self.settings_tab = (self.settings_tab + 1) % 6;
+                                        }
                                     } else {
-                                        self.settings_tab = (self.settings_tab + 1) % 5;
+                                        self.hf_token_input.push('d');
                                     }
                                 }
                                 KeyCode::Left => {
@@ -3709,10 +3743,12 @@ impl App {
                                         };
                                         self.installed_state.select(Some(i));
                                     } else if self.menu_section == 3 {
-                                        if self.settings_col == 0 {
-                                            self.settings_tab = if self.settings_tab == 0 { 4 } else { self.settings_tab - 1 };
-                                        } else {
-                                            self.adjust_setting_value(-1);
+                                        if !self.hf_token_editing {
+                                            if self.settings_col == 0 {
+                                                self.settings_tab = if self.settings_tab == 0 { 5 } else { self.settings_tab - 1 };
+                                            } else {
+                                                self.adjust_setting_value(-1);
+                                            }
                                         }
                                     }
                                 }
@@ -3724,10 +3760,14 @@ impl App {
                                         };
                                         self.installed_state.select(Some(i));
                                     } else if self.menu_section == 3 {
-                                        if self.settings_col == 0 {
-                                            self.settings_tab = if self.settings_tab == 0 { 4 } else { self.settings_tab - 1 };
+                                        if !self.hf_token_editing {
+                                            if self.settings_col == 0 {
+                                                self.settings_tab = if self.settings_tab == 0 { 5 } else { self.settings_tab - 1 };
+                                            } else {
+                                                self.adjust_setting_value(-1);
+                                            }
                                         } else {
-                                            self.adjust_setting_value(-1);
+                                            self.hf_token_input.push('w');
                                         }
                                     }
                                 }
@@ -3751,10 +3791,12 @@ impl App {
                                         };
                                         self.installed_state.select(Some(i));
                                     } else if self.menu_section == 3 {
-                                        if self.settings_col == 0 {
-                                            self.settings_tab = (self.settings_tab + 1) % 5;
-                                        } else {
-                                            self.adjust_setting_value(1);
+                                        if !self.hf_token_editing {
+                                            if self.settings_col == 0 {
+                                                self.settings_tab = (self.settings_tab + 1) % 6;
+                                            } else {
+                                                self.adjust_setting_value(1);
+                                            }
                                         }
                                     }
                                 }
@@ -3766,10 +3808,14 @@ impl App {
                                         };
                                         self.installed_state.select(Some(i));
                                     } else if self.menu_section == 3 {
-                                        if self.settings_col == 0 {
-                                            self.settings_tab = (self.settings_tab + 1) % 5;
+                                        if !self.hf_token_editing {
+                                            if self.settings_col == 0 {
+                                                self.settings_tab = (self.settings_tab + 1) % 6;
+                                            } else {
+                                                self.adjust_setting_value(1);
+                                            }
                                         } else {
-                                            self.adjust_setting_value(1);
+                                            self.hf_token_input.push('s');
                                         }
                                     }
                                 }
@@ -3998,6 +4044,10 @@ impl App {
                                                     manager.search_all_models(&query).await;
                                                 *results.lock().unwrap() = Some(matches);
                                             });
+                                        } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 5 && self.hf_token_editing {
+                                            if c != '\n' && c != '\r' {
+                                                self.hf_token_input.push(c);
+                                            }
                                         } else if self.input_focused && !self.show_menu {
                                             // Paste / typed text may include newlines
                                             if c == '\n' || c == '\r' {
@@ -4022,6 +4072,8 @@ impl App {
                                             let matches = manager.search_all_models(&query).await;
                                             *results.lock().unwrap() = Some(matches);
                                         });
+                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 5 && self.hf_token_editing {
+                                        self.hf_token_input.pop();
                                     } else if self.input_focused && !self.show_menu {
                                         if self.input_cursor_position > 0 && !self.input.is_empty()
                                         {
@@ -4043,6 +4095,13 @@ impl App {
                                                 self.delete_confirm_model =
                                                     Some(self.installed_models[idx].clone());
                                             }
+                                        }
+                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 5 {
+                                        if self.hf_token_editing {
+                                            self.hf_token_input.clear();
+                                        } else {
+                                            crate::settings::clear_hf_token();
+                                            self.status_message = "HuggingFace token removed.".to_string();
                                         }
                                     } else if self.input_focused && !self.show_menu {
                                         let len = self.input.chars().count();
@@ -4326,7 +4385,27 @@ impl App {
                                             }
                                         } else if self.menu_section == 3 {
                                             // Settings tab (2-column)
-                                            if self.settings_col == 0 {
+                                            if self.settings_tab == 5 {
+                                                if self.hf_token_editing {
+                                                    // Save token
+                                                    let tok = self.hf_token_input.trim().to_string();
+                                                    if tok.is_empty() {
+                                                        crate::settings::clear_hf_token();
+                                                        self.status_message = "HuggingFace token cleared.".to_string();
+                                                    } else {
+                                                        crate::settings::set_hf_token(tok);
+                                                        self.status_message = "HuggingFace token saved successfully.".to_string();
+                                                    }
+                                                    self.hf_token_editing = false;
+                                                    self.hf_token_input.clear();
+                                                } else if self.settings_col == 0 {
+                                                    self.settings_col = 1;
+                                                } else {
+                                                    // Enter editing mode
+                                                    self.hf_token_input = crate::settings::get_hf_token().unwrap_or_default();
+                                                    self.hf_token_editing = true;
+                                                }
+                                            } else if self.settings_col == 0 {
                                                 self.settings_col = 1; // shift focus to Column 2
                                             } else {
                                                 self.adjust_setting_value(1); // cycle / modify
@@ -6147,6 +6226,7 @@ impl App {
                             "Repeat Detector",
                             "Context Window",
                             "Permissions",
+                            "HF Token",
                         ];
 
                         let mut tab_items: Vec<ListItem> = Vec::new();
@@ -6177,7 +6257,15 @@ impl App {
 
                         // Column 2: Value options
                         let col2_focus = self.settings_col == 1;
-                        let focus_badge = if col2_focus {
+                        let focus_badge = if self.settings_tab == 5 {
+                            if self.hf_token_editing {
+                                Span::styled(" [EDITING: Type token | Enter=Save | Esc=Cancel] ", Style::default().fg(NORDIC_BG).bg(Color::Rgb(163, 190, 140)).add_modifier(Modifier::BOLD))
+                            } else if col2_focus {
+                                Span::styled(" [FOCUSED: Enter=Edit/Add | D/Delete=Remove] ", Style::default().fg(NORDIC_BG).bg(Color::Rgb(143, 218, 255)).add_modifier(Modifier::BOLD))
+                            } else {
+                                Span::styled(" [Press Enter to Configure Token] ", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))
+                            }
+                        } else if col2_focus {
                             Span::styled(" [FOCUSED: A/D or Left/Right to change] ", Style::default().fg(NORDIC_BG).bg(Color::Rgb(143, 218, 255)).add_modifier(Modifier::BOLD))
                         } else {
                             Span::styled(" [Press Enter to Edit Value] ", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))
@@ -6233,7 +6321,7 @@ impl App {
                                 ]));
                                 val_lines.push(Line::from(Span::styled("Cycles: 4K → 8K → 16K → 32K → 64K → 128K → 250K → 1M", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
                             }
-                            _ => {
+                            4 => {
                                 // Permissions
                                 val_lines.push(Line::from(vec![
                                     Span::styled("Action Permission Mode: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
@@ -6243,6 +6331,56 @@ impl App {
                                     Span::styled("Directory Access Scope: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
                                     Span::styled(p.scope_label(), Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
                                 ]));
+                            }
+                            _ => {
+                                // HuggingFace Token
+                                let tok_opt = crate::settings::get_hf_token();
+                                let has_token = tok_opt.is_some();
+                                let masked_token = if let Some(ref t) = tok_opt {
+                                    if t.len() > 10 {
+                                        format!("{}...{}", &t[..4], &t[t.len() - 4..])
+                                    } else {
+                                        "********".to_string()
+                                    }
+                                } else {
+                                    "None (Unauthenticated / Anonymous)".to_string()
+                                };
+
+                                val_lines.push(Line::from(vec![
+                                    Span::styled("Current Token: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(
+                                        masked_token,
+                                        Style::default().fg(if has_token { Color::Rgb(163, 190, 140) } else { Color::Rgb(235, 203, 139) }).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                    ),
+                                ]));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Used for Hugging Face model registry searches and GGUF downloads.",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+
+                                if self.hf_token_editing {
+                                    val_lines.push(Line::from(vec![
+                                        Span::styled("New Token: ", Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                        Span::styled(&self.hf_token_input, Style::default().fg(Color::White).bg(Color::Rgb(46, 52, 64))),
+                                        Span::styled("▍", Style::default().fg(Color::Rgb(143, 218, 255)).bg(Color::Rgb(46, 52, 64))),
+                                    ]));
+                                    val_lines.push(Line::from(Span::styled(
+                                        "Paste or type token (starts with 'hf_...'), then press Enter to save.",
+                                        Style::default().fg(Color::Rgb(160, 175, 195)).bg(NORDIC_BG),
+                                    )));
+                                } else {
+                                    val_lines.push(Line::from(vec![
+                                        Span::styled("[ Enter ] ", Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                        Span::styled(if has_token { "Change / Overwrite Token" } else { "Add HF Token" }, Style::default().fg(Color::White).bg(NORDIC_BG)),
+                                    ]));
+                                    if has_token {
+                                        val_lines.push(Line::from(vec![
+                                            Span::styled("[ D / Del ] ", Style::default().fg(Color::Rgb(255, 120, 120)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                            Span::styled("Remove / Clear Saved Token", Style::default().fg(Color::White).bg(NORDIC_BG)),
+                                        ]));
+                                    }
+                                }
                             }
                         }
 
