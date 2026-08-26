@@ -121,7 +121,10 @@ impl ToolChip {
                     format!("READ {short}…")
                 }
             }
-            ToolPanelKind::Mcp | ToolPanelKind::Skill | ToolPanelKind::WebSearch | ToolPanelKind::Agent => {
+            ToolPanelKind::Agent => {
+                format!("AGENT {}", self.target)
+            }
+            ToolPanelKind::Mcp | ToolPanelKind::Skill | ToolPanelKind::WebSearch => {
                 format!("MCP {}", self.target)
             }
         }

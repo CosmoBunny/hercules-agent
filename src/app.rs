@@ -5717,7 +5717,7 @@ impl App {
         let mut bar_spans: Vec<Span> = Vec::new();
         let mut cur_col_idx = 0;
 
-        // 1. Left " Main " badge
+        // 1. Left " Main " badge + dynamic sub-agent tabs (H1, H2...)
         let main_bg = get_bar_color(0, bar_w);
         let main_fg = get_contrast_text_color(main_bg);
         bar_spans.push(Span::styled(
@@ -5726,6 +5726,32 @@ impl App {
         ));
         bar_spans.push(Span::styled(main_trans, Style::default().fg(main_bg).bg(NORDIC_BG)));
         cur_col_idx += left_main_total;
+
+        // Render sub-agent tabs if any tasks exist (e.g. " H1 ", " H2 ")
+        let tasks = self.task_manager.list();
+        let agent_tasks: Vec<_> = tasks.iter().filter(|t| t.cmd.starts_with("agent ")).collect();
+        for t in &agent_tasks {
+            let tag = format!(" H{} ", t.id);
+            let tag_len = tag.chars().count();
+            if cur_col_idx + tag_len + right_trans_len + badge_len + 4 < bar_w {
+                let is_running = t.status == crate::task_manager::TaskStatus::Running;
+                let bg_c = if is_running {
+                    Color::Rgb(180, 142, 173) // Nordic Purple for active subagent
+                } else {
+                    Color::Rgb(76, 86, 106)
+                };
+                let fg_c = get_contrast_text_color(bg_c);
+                bar_spans.push(Span::styled(
+                    tag,
+                    Style::default().fg(fg_c).bg(bg_c).add_modifier(Modifier::BOLD),
+                ));
+                bar_spans.push(Span::styled("🭍🭑", Style::default().fg(bg_c).bg(NORDIC_BG)));
+                cur_col_idx += tag_len + 2;
+            }
+        }
+
+        let total_right_badge_w = right_trans_len + badge_len;
+        let mid_bar_w = bar_w.saturating_sub(cur_col_idx + total_right_badge_w).max(1);
 
         // 2. Middle bar characters: 🬭 (smooth gradient character by character)
         for _ in 0..mid_bar_w {
