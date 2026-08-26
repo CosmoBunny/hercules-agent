@@ -3414,11 +3414,16 @@ impl App {
                                     let anim_id = idx as u32;
                                     if is_collapsed {
                                         self.collapsed_messages.remove(&idx);
-                                        self.krama.forward_animate("collapse", anim_id);
+                                        if self.krama.is_reversed("collapse", anim_id) {
+                                            self.krama.forward_animate("collapse", anim_id);
+                                        }
                                         self.krama.restart_progress("collapse", anim_id);
                                     } else {
                                         self.collapsed_messages.insert(idx);
-                                        self.krama.reverse_start("collapse", anim_id);
+                                        if !self.krama.is_reversed("collapse", anim_id) {
+                                            self.krama.reverse_animate("collapse", anim_id);
+                                        }
+                                        self.krama.restart_progress("collapse", anim_id);
                                     }
                                     self.status_message = format!(
                                         "Section #{}: {}",
@@ -3431,11 +3436,16 @@ impl App {
                                     let anim_id = (idx as u32) | 0x4000_0000;
                                     if is_col {
                                         self.collapsed_thoughts.remove(&idx);
-                                        self.krama.forward_animate("collapse", anim_id);
+                                        if self.krama.is_reversed("collapse", anim_id) {
+                                            self.krama.forward_animate("collapse", anim_id);
+                                        }
                                         self.krama.restart_progress("collapse", anim_id);
                                     } else {
                                         self.collapsed_thoughts.insert(idx);
-                                        self.krama.reverse_start("collapse", anim_id);
+                                        if !self.krama.is_reversed("collapse", anim_id) {
+                                            self.krama.reverse_animate("collapse", anim_id);
+                                        }
+                                        self.krama.restart_progress("collapse", anim_id);
                                     }
                                     self.status_message = format!(
                                         "Thought: {}",
@@ -3448,10 +3458,15 @@ impl App {
                                         chip.expanded = !chip.expanded;
                                         let anim_id = (chip.id as u32) | 0x8000_0000;
                                         if chip.expanded {
-                                            self.krama.forward_animate("collapse", anim_id);
+                                            if self.krama.is_reversed("collapse", anim_id) {
+                                                self.krama.forward_animate("collapse", anim_id);
+                                            }
                                             self.krama.restart_progress("collapse", anim_id);
                                         } else {
-                                            self.krama.reverse_start("collapse", anim_id);
+                                            if !self.krama.is_reversed("collapse", anim_id) {
+                                                self.krama.reverse_animate("collapse", anim_id);
+                                            }
+                                            self.krama.restart_progress("collapse", anim_id);
                                         }
                                         self.status_message = format!(
                                             "Action: {}",
@@ -4122,12 +4137,19 @@ impl App {
                                     for i in 0..self.messages.len() {
                                         if !self.collapsed_messages.contains(&i) {
                                             self.collapsed_messages.insert(i);
-                                            self.krama.reverse_start("collapse", i as u32);
+                                            let anim_id = i as u32;
+                                            if !self.krama.is_reversed("collapse", anim_id) {
+                                                self.krama.reverse_animate("collapse", anim_id);
+                                            }
+                                            self.krama.restart_progress("collapse", anim_id);
                                         }
                                         if !self.collapsed_thoughts.contains(&i) {
                                             self.collapsed_thoughts.insert(i);
                                             let anim_id = (i as u32) | 0x4000_0000;
-                                            self.krama.reverse_start("collapse", anim_id);
+                                            if !self.krama.is_reversed("collapse", anim_id) {
+                                                self.krama.reverse_animate("collapse", anim_id);
+                                            }
+                                            self.krama.restart_progress("collapse", anim_id);
                                         }
                                     }
 
@@ -4137,7 +4159,10 @@ impl App {
                                             chip.expanded = false;
                                             chip.tag_closed = true;
                                             let anim_id = (chip.id as u32) | 0x8000_0000;
-                                            self.krama.reverse_start("collapse", anim_id);
+                                            if !self.krama.is_reversed("collapse", anim_id) {
+                                                self.krama.reverse_animate("collapse", anim_id);
+                                            }
+                                            self.krama.restart_progress("collapse", anim_id);
                                         }
                                     }
 
@@ -4148,15 +4173,20 @@ impl App {
                                 {
                                     // Expand all messages in history
                                     for &i in &self.collapsed_messages {
-                                        self.krama.forward_animate("collapse", i as u32);
-                                        self.krama.restart_progress("collapse", i as u32);
+                                        let anim_id = i as u32;
+                                        if self.krama.is_reversed("collapse", anim_id) {
+                                            self.krama.forward_animate("collapse", anim_id);
+                                        }
+                                        self.krama.restart_progress("collapse", anim_id);
                                     }
                                     self.collapsed_messages.clear();
 
                                     // Expand all thoughts in history
                                     for &i in &self.collapsed_thoughts {
                                         let anim_id = (i as u32) | 0x4000_0000;
-                                        self.krama.forward_animate("collapse", anim_id);
+                                        if self.krama.is_reversed("collapse", anim_id) {
+                                            self.krama.forward_animate("collapse", anim_id);
+                                        }
                                         self.krama.restart_progress("collapse", anim_id);
                                     }
                                     self.collapsed_thoughts.clear();
@@ -4166,7 +4196,9 @@ impl App {
                                         if !chip.expanded {
                                             chip.expanded = true;
                                             let anim_id = (chip.id as u32) | 0x8000_0000;
-                                            self.krama.forward_animate("collapse", anim_id);
+                                            if self.krama.is_reversed("collapse", anim_id) {
+                                                self.krama.forward_animate("collapse", anim_id);
+                                            }
                                             self.krama.restart_progress("collapse", anim_id);
                                         }
                                     }
@@ -5321,13 +5353,13 @@ impl App {
                 let badge_span = Span::styled(" You ", Style::default().fg(NORDIC_BG).bg(user_bg).add_modifier(Modifier::BOLD));
                 let anim_id = m_idx as u32;
                 let is_anim = self.krama.is_animating("collapse", anim_id);
-                let col_progress = if is_anim {
-                    let p = self.krama.get_progress_f32("collapse", anim_id).abs();
-                    if is_collapsed { 1.0 - p } else { p }
+                let total_u_lines = user_text.lines().count().max(1);
+                let visible_u_lines: usize = if is_anim {
+                    self.krama.from_range("collapse", anim_id, 0..=total_u_lines)
                 } else if is_collapsed {
-                    0.0
+                    0
                 } else {
-                    1.0
+                    total_u_lines
                 };
 
                 if is_collapsed && !is_anim {
@@ -5342,9 +5374,6 @@ impl App {
                     section_headers.push((title_line_idx, "You".to_string(), user_bg));
                     let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
                     push_full_shaded!(&mut chat_lines, vec![badge_span], 5, available_width, row_bg);
-
-                    let total_u_lines = user_text.lines().count().max(1);
-                    let visible_u_lines = ((total_u_lines as f32) * col_progress).round() as usize;
 
                     if visible_u_lines > 0 {
                         let mut rendered_u = 0;
@@ -5451,13 +5480,13 @@ impl App {
                         let is_collapsed = self.collapsed_thoughts.contains(&m_idx);
                         let anim_id = (m_idx as u32) | 0x4000_0000;
                         let is_anim = self.krama.is_animating("collapse", anim_id);
-                        let think_progress = if is_anim {
-                            let p = self.krama.get_progress_f32("collapse", anim_id).abs();
-                            if is_collapsed { 1.0 - p } else { p }
+                        let total_think_lines = clean_think.lines().filter(|l| !l.trim().is_empty()).count().max(1);
+                        let visible_think_lines: usize = if is_anim {
+                            self.krama.from_range("collapse", anim_id, 0..=total_think_lines)
                         } else if is_collapsed {
-                            0.0
+                            0
                         } else {
-                            1.0
+                            total_think_lines
                         };
 
                         if is_collapsed && !is_anim {
@@ -5471,9 +5500,6 @@ impl App {
                             section_headers.push((title_line_idx, think_label.to_string(), think_bg));
                             let header_row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
                             push_full_shaded!(&mut chat_lines, vec![badge_span], think_len, available_width, header_row_bg);
-
-                            let total_think_lines = clean_think.lines().filter(|l| !l.trim().is_empty()).count().max(1);
-                            let visible_think_lines = ((total_think_lines as f32) * think_progress).round() as usize;
 
                             if visible_think_lines > 0 {
                                 let visible_think = reveal_limit.min(clean_think.chars().count());
@@ -5727,15 +5753,6 @@ impl App {
                         Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
                     );
 
-                    let anim_progress = if is_anim {
-                        let p = self.krama.get_progress_f32("collapse", anim_id).abs();
-                        if is_open { p } else { 1.0 - p }
-                    } else if is_open {
-                        1.0
-                    } else {
-                        0.0
-                    };
-
                     if !is_open && !is_anim {
                         // Fully collapsed: buffer for horizontal row line up
                         collapsed_row_buf.push((badge_span, 8, SectionKind::Action(chip.id), action_bg, format!("Action: {}", chip.label_text())));
@@ -5763,10 +5780,14 @@ impl App {
                         push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, action_row_bg);
 
                         let max_body_lines = chip.body.trim_start_matches(|c| c == '\n' || c == '\r').lines().count();
-                        let visible_lines = if !chip.tag_closed {
+                        let visible_lines: usize = if !chip.tag_closed {
+                            max_body_lines
+                        } else if is_anim {
+                            self.krama.from_range("collapse", anim_id, 0..=max_body_lines)
+                        } else if is_open {
                             max_body_lines
                         } else {
-                            ((max_body_lines as f32) * anim_progress).round() as usize
+                            0
                         };
 
                         if visible_lines > 0 && !chip.body.trim().is_empty() {
@@ -5817,13 +5838,13 @@ impl App {
 
                 let anim_id = m_idx as u32;
                 let is_anim = self.krama.is_animating("collapse", anim_id);
-                let col_progress = if is_anim {
-                    let p = self.krama.get_progress_f32("collapse", anim_id).abs();
-                    if is_collapsed { 1.0 - p } else { p }
+                let total_sys_lines = sys_body.lines().count().max(1);
+                let visible_sys_lines: usize = if is_anim {
+                    self.krama.from_range("collapse", anim_id, 0..=total_sys_lines)
                 } else if is_collapsed {
-                    0.0
+                    0
                 } else {
-                    1.0
+                    total_sys_lines
                 };
 
                 if is_collapsed && !is_anim {
@@ -5837,9 +5858,6 @@ impl App {
                     section_headers.push((title_line_idx, "System".to_string(), sys_bg));
                     let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
                     push_full_shaded!(&mut chat_lines, vec![badge_span], 8, available_width, row_bg);
-
-                    let total_sys_lines = sys_body.lines().count().max(1);
-                    let visible_sys_lines = ((total_sys_lines as f32) * col_progress).round() as usize;
 
                     if visible_sys_lines > 0 {
                         let mut rendered_sys = 0;
@@ -5901,15 +5919,6 @@ impl App {
                     Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
                 );
 
-                let anim_progress = if is_anim {
-                    let p = self.krama.get_progress_f32("collapse", anim_id).abs();
-                    if is_open { p } else { 1.0 - p }
-                } else if is_open {
-                    1.0
-                } else {
-                    0.0
-                };
-
                 if !is_open && !is_anim {
                     collapsed_row_buf.push((badge_span, 8, SectionKind::Action(chip.id), action_bg, format!("Action: {}", chip.label_text())));
                 } else {
@@ -5936,10 +5945,14 @@ impl App {
                     push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, action_row_bg);
 
                     let max_body_lines = chip.body.trim_start_matches(|c| c == '\n' || c == '\r').lines().count();
-                    let visible_lines = if !chip.tag_closed {
+                    let visible_lines: usize = if !chip.tag_closed {
+                        max_body_lines
+                    } else if is_anim {
+                        self.krama.from_range("collapse", anim_id, 0..=max_body_lines)
+                    } else if is_open {
                         max_body_lines
                     } else {
-                        ((max_body_lines as f32) * anim_progress).round() as usize
+                        0
                     };
 
                     if visible_lines > 0 && !chip.body.trim().is_empty() {
