@@ -1941,33 +1941,10 @@ impl App {
 
         let mut out = body;
         if self.auto_tool_turns > 0 {
-            let last_user = self
-                .messages
-                .iter()
-                .rev()
-                .find_map(|m| m.strip_prefix("You: ").map(|s| s.to_string()))
-                .unwrap_or_default();
-            if crate::agent::AgentEngine::wants_plan_first(&last_user) {
-                out.push_str(
-                    "\n\nInstruction: Give a clear multi-step PLAN in natural language. \
-                     Do NOT emit tool tags. Do NOT ls again.",
-                );
-            } else if crate::agent::AgentEngine::wants_implement(&last_user)
-                || last_user.to_ascii_lowercase().contains("start coding")
-            {
-                out.push_str(
-                    "\n\nInstruction: Directory listing (if any) is above. \
-                     Now IMPLEMENT: emit <write src=\"...\"> with full file content. \
-                     Do NOT emit <ls> again. One primary app file is fine to start.",
-                );
-            } else {
-                out.push_str(
-                    "\n\nInstruction: Tool results are above (Result: blocks). \
-                     Reply in natural language only — tell the user what you found. \
-                     Do NOT emit any tool tags (<read>, <ls>, <write>, <cmd>). \
-                     Do NOT say you lack file access. Open chips already show full content.",
-                );
-            }
+            out.push_str(
+                "\n\nInstruction: Tool results are above. Proceed with the user's request directly. \
+                 Summarize findings or use the next tool if more actions are required.",
+            );
         }
         out
     }
