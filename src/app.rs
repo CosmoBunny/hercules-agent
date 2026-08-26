@@ -524,18 +524,29 @@ impl App {
 
     pub fn save_current_session(&self) {
         if let Some(ref sid) = self.session_id {
-            let working_dir = std::env::current_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                .to_string_lossy()
-                .to_string();
-            let mut session = crate::session::Session::new(sid.clone(), working_dir);
-            // Don't save transient "System: Resumed session" messages in persistent session history
-            session.messages = self
+            // Filter out transient messages
+            let persistent_messages: Vec<String> = self
                 .messages
                 .iter()
                 .filter(|m| !m.starts_with("System: Resumed session "))
                 .cloned()
                 .collect();
+
+            // Do not store empty sessions that only contain the initial greeting / system messages
+            let has_user_or_agent = persistent_messages
+                .iter()
+                .any(|m| m.starts_with("You: ") || m.starts_with("Agent: "));
+
+            if !has_user_or_agent {
+                return;
+            }
+
+            let working_dir = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .to_string_lossy()
+                .to_string();
+            let mut session = crate::session::Session::new(sid.clone(), working_dir);
+            session.messages = persistent_messages;
             let _ = crate::session::save_session(&session);
         }
     }
@@ -2998,7 +3009,7 @@ impl App {
                 }
                 let t = self.krama.get_progress_f32("menu_fade", 0).abs();
                 self.menu_anim_progress = t;
-                if !self.krama.is_animating("menu_fade", 0) || t == 0.0 {
+                if !self.krama.is_animating("menu_fade", 0) || t <= 0.01 {
                     self.show_menu = false;
                     self.menu_closing = false;
                     self.menu_anim_progress = 0.0;
@@ -3008,7 +3019,8 @@ impl App {
                 if self.krama.is_reversed("menu_fade", 0) {
                     self.krama.reverse_animate("menu_fade", 0);
                 }
-                self.menu_anim_progress = self.krama.get_progress_f32("menu_fade", 0).abs();
+                let t = self.krama.get_progress_f32("menu_fade", 0).abs();
+                self.menu_anim_progress = if self.krama.is_animating("menu_fade", 0) { t } else { 1.0 };
             }
         } else {
             self.menu_anim_progress = 0.0;
@@ -3018,7 +3030,8 @@ impl App {
             if self.krama.is_reversed("slide", 0) {
                 self.krama.reverse_animate("slide", 0);
             }
-            self.header_anim_progress = self.krama.get_progress_f32("slide", 0).abs();
+            let t = self.krama.get_progress_f32("slide", 0).abs();
+            self.header_anim_progress = if self.krama.is_animating("slide", 0) { t } else { 1.0 };
         } else {
             if !self.krama.is_reversed("slide", 0) && self.header_anim_progress > 0.0 {
                 self.krama.reverse_animate("slide", 0);
@@ -6139,12 +6152,17 @@ impl App {
                         };
 
                         let items: Vec<ListItem> = if self.registry_tab == 0 {
+                            let selected_idx = self.registry_state.selected();
                             self.hf_models.iter()
                                 .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
                                     let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
                                     !sub.is_empty() && m.to_lowercase().contains(sub)
                                 })
-                                .map(|m| {
+                                .enumerate()
+                                .map(|(row_idx, m)| {
+                                    let is_selected = selected_idx == Some(row_idx);
+                                    let row_bg = if is_selected { Color::Rgb(59, 66, 82) } else { NORDIC_BG };
+
                                     // Split org/repo [size] into columns: Org │ Model │ Size
                                     let (repo_part, size_part) = if let Some(bracket_idx) = m.find('[') {
                                         (m[..bracket_idx].trim(), m[bracket_idx..].trim())
@@ -6165,30 +6183,35 @@ impl App {
                                     let model_max_w = total_w.saturating_sub(used_w).max(10);
                                     let model_col = format!("{:<width$}", if model_name.len() > model_max_w { &model_name[..model_max_w] } else { model_name }, width = model_max_w);
 
-                                    let org_base_style = Style::default().fg(Color::Rgb(136, 192, 208));
-                                    let org_match_style = Style::default().fg(Color::Rgb(255, 255, 255)).bg(Color::Rgb(94, 129, 172)).add_modifier(Modifier::BOLD);
+                                    let org_base_style = Style::default().fg(if is_selected { Color::Rgb(143, 218, 255) } else { Color::Rgb(136, 192, 208) }).bg(row_bg);
+                                    let org_match_style = Style::default().fg(Color::White).bg(Color::Rgb(94, 129, 172)).add_modifier(Modifier::BOLD);
                                     let org_spans = build_highlighted_spans(&org_col, q_raw, org_base_style, org_match_style);
 
-                                    let model_base_style = Style::default().fg(Color::Rgb(220, 230, 242)).add_modifier(Modifier::BOLD);
-                                    let model_match_style = Style::default().fg(Color::Rgb(255, 255, 255)).bg(Color::Rgb(136, 192, 208)).fg(NORDIC_BG).add_modifier(Modifier::BOLD);
+                                    let model_base_style = Style::default().fg(if is_selected { Color::White } else { Color::Rgb(220, 230, 242) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() });
+                                    let model_match_style = Style::default().fg(Color::Rgb(235, 203, 139)).bg(Color::Rgb(67, 76, 94)).add_modifier(Modifier::BOLD);
                                     let model_spans = build_highlighted_spans(&model_col, q_raw, model_base_style, model_match_style);
 
                                     let mut line_spans = Vec::new();
                                     line_spans.extend(org_spans);
-                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))));
+                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)));
                                     line_spans.extend(model_spans);
-                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))));
-                                    line_spans.push(Span::styled(size_col, Style::default().fg(Color::Rgb(163, 190, 140))));
+                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)));
+                                    line_spans.push(Span::styled(size_col, Style::default().fg(if is_selected { Color::Rgb(180, 240, 160) } else { Color::Rgb(163, 190, 140) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })));
 
-                                    ListItem::new(Line::from(line_spans))
+                                    ListItem::new(Line::from(line_spans)).style(Style::default().bg(row_bg))
                                 }).collect()
                         } else {
+                            let selected_idx = self.registry_state.selected();
                             self.registry_models.iter()
                                 .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
                                     let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
                                     !sub.is_empty() && m.to_lowercase().contains(sub)
                                 })
-                                .map(|m| {
+                                .enumerate()
+                                .map(|(row_idx, m)| {
+                                    let is_selected = selected_idx == Some(row_idx);
+                                    let row_bg = if is_selected { Color::Rgb(59, 66, 82) } else { NORDIC_BG };
+
                                     let (name_part, size_part) = if let Some(idx) = m.find('(') {
                                         (m[..idx].trim(), m[idx..].trim_matches(|c| c == '(' || c == ')').trim())
                                     } else if let Some(idx) = m.find('[') {
@@ -6209,28 +6232,27 @@ impl App {
                                     let model_max_w = total_w.saturating_sub(used_w).max(10);
                                     let model_col = format!("{:<width$}", if model_name.len() > model_max_w { &model_name[..model_max_w] } else { model_name }, width = model_max_w);
 
-                                    let org_base_style = Style::default().fg(Color::Rgb(136, 192, 208));
-                                    let org_match_style = Style::default().fg(Color::Rgb(255, 255, 255)).bg(Color::Rgb(94, 129, 172)).add_modifier(Modifier::BOLD);
+                                    let org_base_style = Style::default().fg(if is_selected { Color::Rgb(143, 218, 255) } else { Color::Rgb(136, 192, 208) }).bg(row_bg);
+                                    let org_match_style = Style::default().fg(Color::White).bg(Color::Rgb(94, 129, 172)).add_modifier(Modifier::BOLD);
                                     let org_spans = build_highlighted_spans(&org_col, q_raw, org_base_style, org_match_style);
 
-                                    let model_base_style = Style::default().fg(Color::Rgb(220, 230, 242)).add_modifier(Modifier::BOLD);
-                                    let model_match_style = Style::default().fg(Color::Rgb(255, 255, 255)).bg(Color::Rgb(136, 192, 208)).fg(NORDIC_BG).add_modifier(Modifier::BOLD);
+                                    let model_base_style = Style::default().fg(if is_selected { Color::White } else { Color::Rgb(220, 230, 242) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() });
+                                    let model_match_style = Style::default().fg(Color::Rgb(235, 203, 139)).bg(Color::Rgb(67, 76, 94)).add_modifier(Modifier::BOLD);
                                     let model_spans = build_highlighted_spans(&model_col, q_raw, model_base_style, model_match_style);
 
                                     let mut line_spans = Vec::new();
                                     line_spans.extend(org_spans);
-                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))));
+                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)));
                                     line_spans.extend(model_spans);
-                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))));
-                                    line_spans.push(Span::styled(size_col, Style::default().fg(Color::Rgb(163, 190, 140))));
+                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)));
+                                    line_spans.push(Span::styled(size_col, Style::default().fg(if is_selected { Color::Rgb(180, 240, 160) } else { Color::Rgb(163, 190, 140) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })));
 
-                                    ListItem::new(Line::from(line_spans))
+                                    ListItem::new(Line::from(line_spans)).style(Style::default().bg(row_bg))
                                 }).collect()
                         };
 
                         let list = List::new(items)
-                            .style(Style::default().bg(NORDIC_BG))
-                            .highlight_style(Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD));
+                            .style(Style::default().bg(NORDIC_BG));
                         frame.render_stateful_widget(list, chunks[2], &mut self.registry_state);
                     }
                     2 => {
@@ -6246,7 +6268,11 @@ impl App {
                         ])).style(Style::default().bg(NORDIC_BG));
                         frame.render_widget(info, chunks[0]);
 
-                        let items: Vec<ListItem> = self.installed_models.iter().map(|m| {
+                        let selected_idx = self.installed_state.selected();
+                        let items: Vec<ListItem> = self.installed_models.iter().enumerate().map(|(row_idx, m)| {
+                            let is_selected = selected_idx == Some(row_idx);
+                            let row_bg = if is_selected { Color::Rgb(59, 66, 82) } else { NORDIC_BG };
+
                             let is_active = self.backend.name().contains(m) || m.contains(&self.backend.name());
                             let (badge_txt, badge_fg, badge_bg) = if is_active {
                                 (" ACTIVE ", NORDIC_BG, Color::Rgb(163, 190, 140))
@@ -6269,16 +6295,15 @@ impl App {
 
                             ListItem::new(Line::from(vec![
                                 Span::styled(badge_txt, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD)),
-                                Span::styled(" ", Style::default().bg(NORDIC_BG)),
-                                Span::styled(repo_col, Style::default().fg(Color::Rgb(136, 192, 208))),
-                                Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))),
-                                Span::styled(name_col, Style::default().fg(Color::Rgb(220, 230, 242)).add_modifier(Modifier::BOLD)),
-                            ]))
+                                Span::styled(" ", Style::default().bg(row_bg)),
+                                Span::styled(repo_col, Style::default().fg(if is_selected { Color::Rgb(143, 218, 255) } else { Color::Rgb(136, 192, 208) }).bg(row_bg)),
+                                Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)),
+                                Span::styled(name_col, Style::default().fg(if is_selected { Color::White } else { Color::Rgb(220, 230, 242) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })),
+                            ])).style(Style::default().bg(row_bg))
                         }).collect();
 
                         let list = List::new(items)
-                            .style(Style::default().bg(NORDIC_BG))
-                            .highlight_style(Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD));
+                            .style(Style::default().bg(NORDIC_BG));
                         frame.render_stateful_widget(list, chunks[1], &mut self.installed_state);
                     }
                     _ => {
