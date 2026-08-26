@@ -428,7 +428,7 @@ impl App {
                     ("list_fade", KeyList::new(0, TRES16Bits::from_millis(350))),
                     ("help_fade", KeyList::new(0, TRES16Bits::from_millis(280))),
                     ("panel_fly", KeyList::new(0, TRES16Bits::from_millis(500))),
-                    ("collapse", KeyList::new(0, TRES16Bits::from_millis(220))),
+                    ("collapse", KeyList::new(0, TRES16Bits::from_millis(250))),
                 ]);
                 // Framelist instances start on demand when user opens dropdown/menu/panel
                 k
