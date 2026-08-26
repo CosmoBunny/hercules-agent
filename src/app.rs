@@ -4557,9 +4557,16 @@ impl App {
                                                         #[cfg(feature = "gpu")]
                                                         AgentBackend::BurnWgpu(_) => "WGPU repository",
                                                     };
+                                                    self.status_message = "Swarm Orchestrator active — delegating to sub-agents...".to_string();
                                                     self.messages.push(
-                                                        format!("System: You are the Swarm Orchestrator (H0). You can spawn specialized sub-agents with custom models using `<agent action=\"spawn\" role=\"ROLE\" model=\"MODEL\">task description</agent>`.\n\nAvailable models for your current {backend_type}: [{models_str}]\n\nTask: {}\nDo not write code yourself. Delegate all complex work to sub-agents. When a sub-agent replies with `<agent action=\"reply\">`, evaluate and coordinate.", instruction)
+                                                        format!("System: [Swarm Orchestrator initialized] Available models: [{models_str}]")
                                                     );
+                                                    // Trigger agent generation with the swarm orchestration prompt in memory context
+                                                    self.tool_result_context.push(format!(
+                                                        "[System Orchestration]\nYou are the Swarm Orchestrator (H0). You can spawn specialized sub-agents with custom models using `<agent action=\"spawn\" role=\"ROLE\" model=\"MODEL\">task description</agent>`.\nAvailable models for your current {backend_type}: [{models_str}]\nTask: {}\nDo not write full code directly. Delegate tasks to specialized sub-agents.",
+                                                        instruction
+                                                    ));
+                                                    self.trigger_generation_from_context();
                                                 }
                                                 "/compact" | "/compact!" | "/gc" => {
                                                     let before =
