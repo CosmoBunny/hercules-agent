@@ -2850,8 +2850,14 @@ impl App {
                         }
                         if let Some(out) = tool_out {
                             self.record_tool_result_ui("tool", &out);
-                            self.auto_tool_turns += 1;
-                            self.trigger_generation_from_context();
+                            let has_writes = proposed.iter().any(|a| a.kind == crate::agent::ProposedKind::Write);
+                            if !has_writes {
+                                self.auto_tool_turns += 1;
+                                self.trigger_generation_from_context();
+                            } else {
+                                self.auto_tool_turns = 0;
+                                self.status_message = "Ready.".to_string();
+                            }
                         } else {
                             self.auto_tool_turns = 0;
                             self.status_message = "Ready.".to_string();
@@ -2861,24 +2867,30 @@ impl App {
                             self.auto_tool_turns = 0;
                             self.status_message = "Ready.".to_string();
                         } else {
+                            let is_write = effective_stream.contains("<write");
                             let tool_name = if effective_stream.contains("<read") {
                                 "read"
                             } else if effective_stream.contains("<ls") {
                                 "ls"
-                            } else if effective_stream.contains("<write") {
+                            } else if is_write {
                                 "write"
                             } else {
                                 "tool"
                             };
                             self.record_tool_result_ui(tool_name, &tool_output);
-                            self.auto_tool_turns += 1;
-                            if self.auto_tool_turns == 20 {
-                                self.messages.push(
-                                    "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
-                                        .to_string(),
-                                );
+                            if !is_write {
+                                self.auto_tool_turns += 1;
+                                if self.auto_tool_turns == 20 {
+                                    self.messages.push(
+                                        "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
+                                            .to_string(),
+                                    );
+                                }
+                                self.trigger_generation_from_context();
+                            } else {
+                                self.auto_tool_turns = 0;
+                                self.status_message = "Ready.".to_string();
                             }
-                            self.trigger_generation_from_context();
                         }
                     } else {
                         self.auto_tool_turns = 0;
