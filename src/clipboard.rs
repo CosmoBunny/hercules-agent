@@ -58,6 +58,41 @@ fn try_pipe_tool(bin: &str, args: &[&str], text: &str) -> bool {
     }
 }
 
+pub fn read_clipboard_silent() -> Option<String> {
+    // Try system clip tools first (wl-paste, xclip, xsel)
+    if let Some(txt) = try_read_cmd("wl-paste", &["--no-newline"]) {
+        if !txt.is_empty() {
+            return Some(txt);
+        }
+    }
+    if let Some(txt) = try_read_cmd("xclip", &["-selection", "clipboard", "-out"]) {
+        if !txt.is_empty() {
+            return Some(txt);
+        }
+    }
+    if let Some(txt) = try_read_cmd("xsel", &["--clipboard", "--output"]) {
+        if !txt.is_empty() {
+            return Some(txt);
+        }
+    }
+    // Fallback to local clipboard file
+    std::fs::read_to_string(CLIP_FILE).ok().filter(|s| !s.is_empty())
+}
+
+fn try_read_cmd(bin: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let output = cmd.output().ok()?;
+    if output.status.success() {
+        String::from_utf8(output.stdout).ok()
+    } else {
+        None
+    }
+}
+
 pub fn clipboard_file_path() -> &'static str {
     CLIP_FILE
 }

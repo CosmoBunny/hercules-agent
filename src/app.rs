@@ -3368,7 +3368,9 @@ impl App {
                 },
 
                 Event::Paste(text) => {
-                    if self.input_focused && !self.show_menu {
+                    if self.show_menu && self.menu_section == 3 && self.settings_tab == 5 && self.hf_token_editing {
+                        self.hf_token_input.push_str(text.trim());
+                    } else if self.input_focused && !self.show_menu {
                         self.input_insert_text(&text);
                     }
                 }
@@ -3961,6 +3963,17 @@ impl App {
                                     // Ctrl+Backspace or Alt+Backspace: delete previous word
                                     if self.input_focused && !self.show_menu {
                                         self.delete_word_backward();
+                                    }
+                                }
+                                KeyCode::Char('v') | KeyCode::Char('V')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    if let Some(text) = crate::clipboard::read_clipboard_silent() {
+                                        if self.show_menu && self.menu_section == 3 && self.settings_tab == 5 && self.hf_token_editing {
+                                            self.hf_token_input.push_str(text.trim());
+                                        } else if self.input_focused && !self.show_menu {
+                                            self.input_insert_text(&text);
+                                        }
                                     }
                                 }
                                 KeyCode::Char('z') | KeyCode::Char('Z')
