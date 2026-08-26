@@ -679,31 +679,30 @@ impl App {
         let mut instant_cmds = Vec::new();
         let mut instant_mcps = Vec::new();
         let perms = crate::agent::get_tool_permissions();
-        let can_instant = perms.session_allow || perms.mode == crate::agent::PermissionMode::AlwaysAllow;
-        if can_instant {
-            for chip in self.tool_chips.iter_mut() {
-                if chip.kind == tool_panel::ToolPanelKind::Cmd && chip.tag_closed && !chip.spawned {
-                    chip.spawned = true;
-                    instant_cmds.push(crate::agent::ProposedAction {
-                        kind: crate::agent::ProposedKind::Cmd,
-                        target: chip.target.clone(),
-                        body: String::new(),
-                        line_attr: None,
-                        from_think: false,
-                        chip_id: Some(chip.id),
-                    });
-                } else if matches!(chip.kind, tool_panel::ToolPanelKind::Mcp | tool_panel::ToolPanelKind::Skill | tool_panel::ToolPanelKind::WebSearch | tool_panel::ToolPanelKind::Agent) && chip.tag_closed && !chip.spawned {
-                    chip.spawned = true;
-                    let pkind = if chip.kind == tool_panel::ToolPanelKind::Mcp { crate::agent::ProposedKind::Mcp } else if chip.kind == tool_panel::ToolPanelKind::Skill { crate::agent::ProposedKind::Skill } else if chip.kind == tool_panel::ToolPanelKind::Agent { crate::agent::ProposedKind::Agent } else { crate::agent::ProposedKind::WebSearch };
-                    instant_mcps.push(crate::agent::ProposedAction {
-                        kind: pkind,
-                        target: chip.target.clone(),
-                        body: chip.body.clone(),
-                        line_attr: None,
-                        from_think: false,
-                        chip_id: Some(chip.id),
-                    });
-                }
+        let can_instant_cmd = perms.session_allow || perms.mode == crate::agent::PermissionMode::AlwaysAllow;
+
+        for chip in self.tool_chips.iter_mut() {
+            if chip.kind == tool_panel::ToolPanelKind::Cmd && chip.tag_closed && !chip.spawned && can_instant_cmd {
+                chip.spawned = true;
+                instant_cmds.push(crate::agent::ProposedAction {
+                    kind: crate::agent::ProposedKind::Cmd,
+                    target: chip.target.clone(),
+                    body: String::new(),
+                    line_attr: None,
+                    from_think: false,
+                    chip_id: Some(chip.id),
+                });
+            } else if matches!(chip.kind, tool_panel::ToolPanelKind::Mcp | tool_panel::ToolPanelKind::Skill | tool_panel::ToolPanelKind::WebSearch | tool_panel::ToolPanelKind::Agent) && chip.tag_closed && !chip.spawned {
+                chip.spawned = true;
+                let pkind = if chip.kind == tool_panel::ToolPanelKind::Mcp { crate::agent::ProposedKind::Mcp } else if chip.kind == tool_panel::ToolPanelKind::Skill { crate::agent::ProposedKind::Skill } else if chip.kind == tool_panel::ToolPanelKind::Agent { crate::agent::ProposedKind::Agent } else { crate::agent::ProposedKind::WebSearch };
+                instant_mcps.push(crate::agent::ProposedAction {
+                    kind: pkind,
+                    target: chip.target.clone(),
+                    body: chip.body.clone(),
+                    line_attr: None,
+                    from_think: false,
+                    chip_id: Some(chip.id),
+                });
             }
         }
         if !instant_cmds.is_empty() {
@@ -1097,82 +1096,6 @@ impl App {
     /// Logical lines of the prompt (split on `\n`).
 
 
-    /// Map char cursor index → (col, row) inside the input box content width.
-    fn input_cursor_col_row(&self, content_width: usize) -> (u16, u16) {
-        let width = content_width.max(1);
-        let pos = self.input_cursor_position.min(self.input.chars().count());
-        let prefix: String = self.input.chars().take(pos).collect();
-        let mut row: u16 = 0;
-        let mut col: u16 = 0;
-        for ch in prefix.chars() {
-            if ch == '\n' {
-                row = row.saturating_add(1);
-                col = 0;
-            } else {
-                col = col.saturating_add(1);
-                if col as usize >= width {
-                    row = row.saturating_add(1);
-                    col = 0;
-                }
-            }
-        }
-        (col, row)
-    }
-
-    fn char_pos_from_col_row(&self, target_col: u16, target_row: u16, content_width: usize) -> usize {
-        let width = content_width.max(1);
-        let mut cur_row: u16 = 0;
-        let mut cur_col: u16 = 0;
-        let mut best_pos = 0;
-        let total_chars = self.input.chars().count();
-
-        for (pos, ch) in self.input.chars().enumerate() {
-            if cur_row == target_row && cur_col == target_col {
-                return pos;
-            }
-            if cur_row == target_row {
-                best_pos = pos;
-            }
-            if ch == '\n' {
-                if cur_row == target_row {
-                    return pos;
-                }
-                cur_row = cur_row.saturating_add(1);
-                cur_col = 0;
-            } else {
-                cur_col = cur_col.saturating_add(1);
-                if cur_col as usize >= width {
-                    if cur_row == target_row {
-                        return pos;
-                    }
-                    cur_row = cur_row.saturating_add(1);
-                    cur_col = 0;
-                }
-            }
-        }
-        if cur_row == target_row {
-            total_chars
-        } else if cur_row < target_row {
-            total_chars
-        } else {
-            best_pos
-        }
-    }
-
-    fn input_cursor_up(&mut self, content_width: usize) {
-        let (col, row) = self.input_cursor_col_row(content_width);
-        if row > 0 {
-            self.input_cursor_position = self.char_pos_from_col_row(col, row - 1, content_width);
-        } else {
-            self.input_cursor_position = 0;
-        }
-    }
-
-    fn input_cursor_down(&mut self, content_width: usize) {
-        let (col, row) = self.input_cursor_col_row(content_width);
-        let total_pos = self.char_pos_from_col_row(col, row + 1, content_width);
-        self.input_cursor_position = total_pos;
-    }
 
     /// Queue write/cmd for user accept; open preview panel.
     fn propose_actions(&mut self, mut actions: Vec<ProposedAction>) {
@@ -2491,6 +2414,120 @@ impl App {
         self.input_cursor_position = pos + inserted_len;
     }
 
+    /// Word-wrap the input prompt for display and compute the cursor's (col, row) position.
+    pub fn wrap_input_words(&self, width: usize) -> (Vec<String>, usize, usize) {
+        let max_w = width.max(1);
+        let mut lines: Vec<String> = Vec::new();
+        let mut cursor_col = 0;
+        let mut cursor_row = 0;
+        let mut char_count = 0;
+        let cur_target = self.input_cursor_position;
+
+        for (p_idx, para) in self.input.split('\n').enumerate() {
+            if p_idx > 0 {
+                char_count += 1; // for the '\n'
+                if char_count - 1 == cur_target {
+                    // cursor was at end of previous line right before newline
+                }
+            }
+
+            if para.is_empty() {
+                if char_count == cur_target {
+                    cursor_row = lines.len();
+                    cursor_col = 0;
+                }
+                lines.push(String::new());
+                continue;
+            }
+
+            let mut current_line = String::new();
+            let mut current_line_len = 0;
+
+            for word in para.split_inclusive(char::is_whitespace) {
+                let w_len = word.chars().count();
+                if current_line_len + w_len <= max_w || current_line.is_empty() {
+                    for ch in word.chars() {
+                        if char_count == cur_target {
+                            cursor_row = lines.len();
+                            cursor_col = current_line_len;
+                        }
+                        current_line.push(ch);
+                        current_line_len += 1;
+                        char_count += 1;
+                    }
+                } else {
+                    lines.push(current_line);
+                    current_line = String::new();
+                    current_line_len = 0;
+                    for ch in word.chars() {
+                        if char_count == cur_target {
+                            cursor_row = lines.len();
+                            cursor_col = current_line_len;
+                        }
+                        current_line.push(ch);
+                        current_line_len += 1;
+                        char_count += 1;
+                    }
+                }
+            }
+            if char_count == cur_target {
+                cursor_row = lines.len();
+                cursor_col = current_line_len;
+            }
+            lines.push(current_line);
+        }
+
+        if cur_target >= char_count {
+            cursor_row = lines.len().saturating_sub(1);
+            cursor_col = lines.last().map(|l| l.chars().count()).unwrap_or(0);
+        }
+
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+
+        (lines, cursor_col, cursor_row)
+    }
+
+    pub fn input_cursor_col_row(&self, width: usize) -> (usize, usize) {
+        let (_, col, row) = self.wrap_input_words(width);
+        (col, row)
+    }
+
+    pub fn input_cursor_up(&mut self, width: usize) {
+        let (lines, col, row) = self.wrap_input_words(width);
+        if row > 0 {
+            let target_row = row - 1;
+            let target_col = col.min(lines[target_row].chars().count());
+            let mut pos = 0;
+            for (r, l) in lines.iter().enumerate() {
+                if r == target_row {
+                    pos += target_col;
+                    break;
+                }
+                pos += l.chars().count();
+            }
+            self.input_cursor_position = pos.min(self.input.chars().count());
+        }
+    }
+
+    pub fn input_cursor_down(&mut self, width: usize) {
+        let (lines, col, row) = self.wrap_input_words(width);
+        if row + 1 < lines.len() {
+            let target_row = row + 1;
+            let target_col = col.min(lines[target_row].chars().count());
+            let mut pos = 0;
+            for (r, l) in lines.iter().enumerate() {
+                if r == target_row {
+                    pos += target_col;
+                    break;
+                }
+                pos += l.chars().count();
+            }
+            self.input_cursor_position = pos.min(self.input.chars().count());
+        }
+    }
+
     pub async fn handle_events(&mut self) -> Result<bool, std::io::Error> {
         let now = std::time::Instant::now();
         if now.duration_since(self.last_metrics_time).as_millis() >= 1000 {
@@ -2519,8 +2556,8 @@ impl App {
                 if let Some(r) = chip.rect {
                     panel.chip_rect = Some(r);
                 }
-                // Live-update body while write still streaming
-                if panel.kind == ToolPanelKind::Write && !chip.tag_closed {
+                // Live-update body while write still streaming or when tag closes
+                if panel.kind == ToolPanelKind::Write && (panel.body.len() < chip.body.len() || panel.tag_closed != chip.tag_closed) {
                     panel.set_body_streaming(chip.body.clone(), chip.tag_closed);
                 }
                 if panel.kind == ToolPanelKind::Cmd && !chip.body.is_empty() {
@@ -2594,7 +2631,7 @@ impl App {
                         if self.streamed_writes_done.contains(&action.target) {
                             continue;
                         }
-                        let result = crate::agent::AgentEngine::execute_proposed(&action);
+                        let _result = crate::agent::AgentEngine::execute_proposed(&action);
                         self.streamed_writes_done.push(action.target.clone());
                         // Update chip to [WROTE] without touching tool_result_context
                         // or calling trigger_generation_from_context — AI keeps streaming.
@@ -2608,7 +2645,10 @@ impl App {
                         }) {
                             chip.pending = false;
                             chip.tag_closed = true;
-                            chip.body = format!("{result}\n(Auto-allowed write)");
+                            // Keep actual write file contents in chip.body so panel & line counts display properly
+                            if chip.body.is_empty() && !action.body.is_empty() {
+                                chip.body = action.body.clone();
+                            }
                         }
                     }
                 }
@@ -2649,7 +2689,11 @@ impl App {
 
                     let incomplete = Self::has_incomplete_tool_tag(&current_stream);
 
-                    if incomplete {
+                    if self.user_cancelled_gen {
+                        self.user_cancelled_gen = false;
+                        self.incomplete_tool_continuations = 0;
+                        self.finalize_incomplete_tools("Ctrl+C");
+                    } else if incomplete {
                         if self.continue_incomplete_tool(&current_stream) {
                             // Do not process the incomplete action in this turn.
                             return Ok(true);
@@ -4727,35 +4771,9 @@ impl App {
             self.anim_tick as f32 * 0.015
         };
 
-        // Dynamic input height with smooth collapse/expand animation
+        // Dynamic input height with smooth collapse/expand animation (word wrapped)
         let inner_w = area.width.saturating_sub(4).max(1) as usize;
-        let mut wrapped_prompt_lines: Vec<String> = Vec::new();
-        for row in self.input.split('\n') {
-            if row.is_empty() {
-                wrapped_prompt_lines.push(String::new());
-            } else {
-                let mut cur = String::new();
-                let mut col = 0;
-                for ch in row.chars() {
-                    if col >= inner_w {
-                        wrapped_prompt_lines.push(cur.clone());
-                        cur.clear();
-                        col = 0;
-                    }
-                    cur.push(ch);
-                    col += 1;
-                }
-                if !cur.is_empty() || wrapped_prompt_lines.is_empty() {
-                    wrapped_prompt_lines.push(cur);
-                }
-            }
-        }
-        if self.input.ends_with('\n') {
-            wrapped_prompt_lines.push(String::new());
-        }
-        if wrapped_prompt_lines.is_empty() {
-            wrapped_prompt_lines.push(String::new());
-        }
+        let (wrapped_prompt_lines, _, _) = self.wrap_input_words(inner_w);
 
         let content_count = wrapped_prompt_lines.len().max(1);
         let target_input_h = if self.input_focused {
@@ -5681,7 +5699,7 @@ impl App {
         let left_main_total = main_badge_len + main_trans_len;
 
         let total_right_badge_w = right_trans_len + badge_len;
-        let mid_bar_w = bar_w.saturating_sub(left_main_total + total_right_badge_w).max(1);
+        let _mid_bar_w = bar_w.saturating_sub(left_main_total + total_right_badge_w).max(1);
 
         let white_c = Color::Rgb(236, 239, 244); // #ECEFF4 Snow White
 
@@ -5789,10 +5807,11 @@ impl App {
             let max_possible_scroll = total_prompt_lines.saturating_sub(available_content_rows as usize) as u16;
 
             // Auto-scroll input vertically so cursor is always visible
-            if cursor_row >= self.input_scroll_y + available_content_rows {
-                self.input_scroll_y = (cursor_row + 1).saturating_sub(available_content_rows);
-            } else if cursor_row < self.input_scroll_y {
-                self.input_scroll_y = cursor_row;
+            let cur_row_u16 = cursor_row as u16;
+            if cur_row_u16 >= self.input_scroll_y + available_content_rows {
+                self.input_scroll_y = (cur_row_u16 + 1).saturating_sub(available_content_rows);
+            } else if cur_row_u16 < self.input_scroll_y {
+                self.input_scroll_y = cur_row_u16;
             }
             self.input_scroll_y = self.input_scroll_y.min(max_possible_scroll);
 
@@ -5871,10 +5890,10 @@ impl App {
         if self.input_focused && !self.show_menu && !is_downloading && input_box_h > 1 {
             let (col, row) = self.input_cursor_col_row(inner_w);
             let available_content_rows = input_box_h.saturating_sub(1);
-            let visible_rel_row = row.saturating_sub(self.input_scroll_y);
+            let visible_rel_row = (row as u16).saturating_sub(self.input_scroll_y);
             if visible_rel_row < available_content_rows {
                 let cursor_x = input_area.x.saturating_add(1).saturating_add(col as u16);
-                let cursor_y = input_area.y.saturating_add(1).saturating_add(visible_rel_row as u16);
+                let cursor_y = input_area.y.saturating_add(1).saturating_add(visible_rel_row);
                 let max_x = input_area.x + input_area.width.saturating_sub(1);
                 let max_y = input_area.y + input_box_h.saturating_sub(1);
                 frame.set_cursor_position((cursor_x.min(max_x), cursor_y.min(max_y)));

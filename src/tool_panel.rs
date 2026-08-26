@@ -991,9 +991,20 @@ pub fn draw_tool_panel(
                 .add_modifier(Modifier::ITALIC),
         )));
         let mut char_i = 0usize;
+        let mut line_num = 1usize;
         for raw in vis.split_inclusive('\n') {
             let mut spans = Vec::new();
             
+            // Render line number gutter for code files
+            if matches!(panel.kind, ToolPanelKind::Write | ToolPanelKind::Read) {
+                let num_str = format!("{:>3} │ ", line_num);
+                spans.push(Span::styled(
+                    num_str,
+                    Style::default().fg(Color::Rgb(80, 95, 115)).bg(bg_color),
+                ));
+                line_num += 1;
+            }
+
             let mut line_fg = None;
             if panel.kind == ToolPanelKind::Write {
                 if raw.starts_with('+') {
