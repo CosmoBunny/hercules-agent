@@ -3445,7 +3445,7 @@ impl App {
                                     if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
                                         chip.tag_closed = true;
                                         chip.expanded = !chip.expanded;
-                                        self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (chip.expanded, std::time::Instant::now()));
+                                        self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (!chip.expanded, std::time::Instant::now()));
                                         self.status_message = format!(
                                             "Action: {}",
                                             if chip.expanded { "Expanded" } else { "Collapsed" }
@@ -4130,7 +4130,7 @@ impl App {
                                         if chip.expanded || !chip.tag_closed {
                                             chip.expanded = false;
                                             chip.tag_closed = true;
-                                            self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (false, now));
+                                            self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (true, now));
                                         }
                                     }
 
@@ -4157,7 +4157,7 @@ impl App {
                                     for chip in &mut self.tool_chips {
                                         if !chip.expanded {
                                             chip.expanded = true;
-                                            self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (true, now));
+                                            self.collapsed_animations.insert(chip.id as usize ^ 0x8000_0000, (false, now));
                                         }
                                     }
 
@@ -5444,10 +5444,10 @@ impl App {
                         let is_collapsed = self.collapsed_thoughts.contains(&m_idx);
                         let anim_opt = self.collapsed_animations.get(&(m_idx ^ 0x4000_0000)).cloned();
                         let is_anim = anim_opt.as_ref().map(|(_, t)| t.elapsed().as_millis() < 220).unwrap_or(false);
-                        let think_progress = if let Some((to_open, t)) = anim_opt {
+                        let think_progress = if let Some((to_col, t)) = anim_opt {
                             let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
                             let ease = 1.0 - (1.0 - p) * (1.0 - p);
-                            if to_open { ease } else { 1.0 - ease }
+                            if to_col { 1.0 - ease } else { ease }
                         } else if is_collapsed {
                             0.0
                         } else {
@@ -5722,10 +5722,10 @@ impl App {
                         Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
                     );
 
-                    let anim_progress = if let Some((to_open, t)) = action_anim_opt {
+                    let anim_progress = if let Some((to_col, t)) = action_anim_opt {
                         let p = (t.elapsed().as_secs_f32() / 0.22).min(1.0);
                         let ease = 1.0 - (1.0 - p) * (1.0 - p);
-                        if to_open { ease } else { 1.0 - ease }
+                        if to_col { 1.0 - ease } else { ease }
                     } else if is_open {
                         1.0
                     } else {
