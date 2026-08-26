@@ -6099,11 +6099,51 @@ impl App {
                         };
                         frame.render_widget(Paragraph::new(Line::from(vec![search_text])).style(Style::default().bg(NORDIC_BG)), chunks[1]);
 
-                        let q_lower = self.registry_search_query.trim().to_lowercase();
+                        let q_raw = self.registry_search_query.trim();
+                        let q_lower = q_raw.to_lowercase();
                         let total_w = chunks[2].width as usize;
+
+                        // Helper closure to build highlighted spans with bold matching chars
+                        let build_highlighted_spans = |text: &str, query: &str, base_style: Style, match_style: Style| -> Vec<Span> {
+                            if query.is_empty() {
+                                return vec![Span::styled(text.to_string(), base_style)];
+                            }
+                            let text_lower = text.to_lowercase();
+                            let mut spans = Vec::new();
+                            let mut last_idx = 0;
+                            
+                            // Check if query is in text as substring or match sub-tokens
+                            let search_term = if let Some(slash_idx) = query.rfind('/') {
+                                &query[slash_idx + 1..]
+                            } else {
+                                query
+                            };
+                            let needle = search_term.to_lowercase();
+
+                            if !needle.is_empty() && text_lower.contains(&needle) {
+                                for (match_start, _) in text_lower.match_indices(&needle) {
+                                    if match_start > last_idx {
+                                        spans.push(Span::styled(text[last_idx..match_start].to_string(), base_style));
+                                    }
+                                    let match_end = match_start + needle.len();
+                                    spans.push(Span::styled(text[match_start..match_end].to_string(), match_style));
+                                    last_idx = match_end;
+                                }
+                                if last_idx < text.len() {
+                                    spans.push(Span::styled(text[last_idx..].to_string(), base_style));
+                                }
+                            } else {
+                                spans.push(Span::styled(text.to_string(), base_style));
+                            }
+                            spans
+                        };
+
                         let items: Vec<ListItem> = if self.registry_tab == 0 {
                             self.hf_models.iter()
-                                .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower))
+                                .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
+                                    let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
+                                    !sub.is_empty() && m.to_lowercase().contains(sub)
+                                })
                                 .map(|m| {
                                     // Split org/repo [size] into columns: Org │ Model │ Size
                                     let (repo_part, size_part) = if let Some(bracket_idx) = m.find('[') {
@@ -6125,17 +6165,29 @@ impl App {
                                     let model_max_w = total_w.saturating_sub(used_w).max(10);
                                     let model_col = format!("{:<width$}", if model_name.len() > model_max_w { &model_name[..model_max_w] } else { model_name }, width = model_max_w);
 
-                                    ListItem::new(Line::from(vec![
-                                        Span::styled(org_col, Style::default().fg(Color::Rgb(136, 192, 208))),
-                                        Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))),
-                                        Span::styled(model_col, Style::default().fg(Color::Rgb(220, 230, 242)).add_modifier(Modifier::BOLD)),
-                                        Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))),
-                                        Span::styled(size_col, Style::default().fg(Color::Rgb(163, 190, 140))),
-                                    ]))
+                                    let org_base_style = Style::default().fg(Color::Rgb(136, 192, 208));
+                                    let org_match_style = Style::default().fg(Color::Rgb(255, 255, 255)).bg(Color::Rgb(94, 129, 172)).add_modifier(Modifier::BOLD);
+                                    let org_spans = build_highlighted_spans(&org_col, q_raw, org_base_style, org_match_style);
+
+                                    let model_base_style = Style::default().fg(Color::Rgb(220, 230, 242)).add_modifier(Modifier::BOLD);
+                                    let model_match_style = Style::default().fg(Color::Rgb(255, 255, 255)).bg(Color::Rgb(136, 192, 208)).fg(NORDIC_BG).add_modifier(Modifier::BOLD);
+                                    let model_spans = build_highlighted_spans(&model_col, q_raw, model_base_style, model_match_style);
+
+                                    let mut line_spans = Vec::new();
+                                    line_spans.extend(org_spans);
+                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))));
+                                    line_spans.extend(model_spans);
+                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))));
+                                    line_spans.push(Span::styled(size_col, Style::default().fg(Color::Rgb(163, 190, 140))));
+
+                                    ListItem::new(Line::from(line_spans))
                                 }).collect()
                         } else {
                             self.registry_models.iter()
-                                .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower))
+                                .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
+                                    let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
+                                    !sub.is_empty() && m.to_lowercase().contains(sub)
+                                })
                                 .map(|m| {
                                     let (name_part, size_part) = if let Some(idx) = m.find('(') {
                                         (m[..idx].trim(), m[idx..].trim_matches(|c| c == '(' || c == ')').trim())
@@ -6157,13 +6209,22 @@ impl App {
                                     let model_max_w = total_w.saturating_sub(used_w).max(10);
                                     let model_col = format!("{:<width$}", if model_name.len() > model_max_w { &model_name[..model_max_w] } else { model_name }, width = model_max_w);
 
-                                    ListItem::new(Line::from(vec![
-                                        Span::styled(org_col, Style::default().fg(Color::Rgb(136, 192, 208))),
-                                        Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))),
-                                        Span::styled(model_col, Style::default().fg(Color::Rgb(220, 230, 242)).add_modifier(Modifier::BOLD)),
-                                        Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))),
-                                        Span::styled(size_col, Style::default().fg(Color::Rgb(163, 190, 140))),
-                                    ]))
+                                    let org_base_style = Style::default().fg(Color::Rgb(136, 192, 208));
+                                    let org_match_style = Style::default().fg(Color::Rgb(255, 255, 255)).bg(Color::Rgb(94, 129, 172)).add_modifier(Modifier::BOLD);
+                                    let org_spans = build_highlighted_spans(&org_col, q_raw, org_base_style, org_match_style);
+
+                                    let model_base_style = Style::default().fg(Color::Rgb(220, 230, 242)).add_modifier(Modifier::BOLD);
+                                    let model_match_style = Style::default().fg(Color::Rgb(255, 255, 255)).bg(Color::Rgb(136, 192, 208)).fg(NORDIC_BG).add_modifier(Modifier::BOLD);
+                                    let model_spans = build_highlighted_spans(&model_col, q_raw, model_base_style, model_match_style);
+
+                                    let mut line_spans = Vec::new();
+                                    line_spans.extend(org_spans);
+                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))));
+                                    line_spans.extend(model_spans);
+                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106))));
+                                    line_spans.push(Span::styled(size_col, Style::default().fg(Color::Rgb(163, 190, 140))));
+
+                                    ListItem::new(Line::from(line_spans))
                                 }).collect()
                         };
 
