@@ -11,10 +11,10 @@ use kramaframe::prelude::{KeyFrameFunction, KeyList};
 use kramaframe::{BTclasslist, BTframelist, KramaFrame, keylist::TRES16Bits};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -189,6 +189,7 @@ pub struct App {
     pub typewriter_len: usize,
     pub collapsed_thoughts: std::collections::HashSet<usize>,
     pub collapsed_messages: std::collections::HashSet<usize>,
+    pub collapsed_animations: std::collections::HashMap<usize, (bool, std::time::Instant)>,
     pub delete_confirm_model: Option<String>,
     pub esc_hold_start: Option<std::time::Instant>,
     /// Text selection: drag shades rows; Ctrl+C copies; click elsewhere cancels.
@@ -241,6 +242,8 @@ pub struct App {
     pub current_log_pane_pct: f64,
     pub last_frame_time: std::time::Instant,
     pub last_metrics_time: std::time::Instant,
+    pub pending_staggered_anims: std::collections::VecDeque<(u32, bool)>, // (anim_id, is_reverse)
+    pub last_stagger_release: std::time::Instant,
 
     // Download progress
     pub download_progress: Arc<Mutex<Option<f64>>>,
@@ -366,6 +369,7 @@ impl App {
             typewriter_len: 1000,
             collapsed_thoughts: std::collections::HashSet::new(),
             collapsed_messages: std::collections::HashSet::new(),
+            collapsed_animations: std::collections::HashMap::new(),
             delete_confirm_model: None,
             esc_hold_start: None,
             selection_start: None,
@@ -397,6 +401,8 @@ impl App {
             log_pane_collapsed: false,
             last_frame_time: std::time::Instant::now(),
             last_metrics_time: std::time::Instant::now(),
+            pending_staggered_anims: std::collections::VecDeque::new(),
+            last_stagger_release: std::time::Instant::now(),
             krama: {
                 let mut k = KramaFrame::default();
                 k.extend_iter_classlist([
@@ -2613,6 +2619,39 @@ impl App {
         }
     }
 
+    pub fn tick_animations(&mut self) {
+        let now = std::time::Instant::now();
+        let delta = now.duration_since(self.last_frame_time);
+        self.last_frame_time = now;
+        let delta_ms = (delta.as_secs_f64() * 1000.0) as u16;
+
+        self.anim_tick = self.anim_tick.wrapping_add(1);
+        self.typewriter_len = self.typewriter_len.saturating_add(3);
+
+        // Staggered bulk collapse / expand release (releases batch every ~16ms)
+        if !self.pending_staggered_anims.is_empty()
+            && now.duration_since(self.last_stagger_release).as_millis() >= 16
+        {
+            self.last_stagger_release = now;
+            let batch_size = 2.min(self.pending_staggered_anims.len());
+            for _ in 0..batch_size {
+                if let Some((anim_id, is_reverse)) = self.pending_staggered_anims.pop_front() {
+                    if !self.krama.is_id("collapse", anim_id) {
+                        self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+                    }
+                    if is_reverse {
+                        self.krama.reverse_start("collapse", anim_id);
+                    } else {
+                        self.krama.restart_progress("collapse", anim_id);
+                    }
+                }
+            }
+        }
+
+        self.krama
+            .update_progress(TRES16Bits::from_millis(delta_ms.max(1)));
+    }
+
     pub async fn handle_events(&mut self) -> Result<bool, std::io::Error> {
         let now = std::time::Instant::now();
         if now.duration_since(self.last_metrics_time).as_millis() >= 1000 {
@@ -2621,14 +2660,7 @@ impl App {
             self.last_metrics_time = now;
         }
 
-        let delta = now.duration_since(self.last_frame_time);
-        self.last_frame_time = now;
-        let delta_ms = (delta.as_secs_f64() * 1000.0) as u16;
-
-        self.anim_tick = self.anim_tick.wrapping_add(1);
-        self.typewriter_len = self.typewriter_len.saturating_add(3);
-        self.krama
-            .update_progress(TRES16Bits::from_millis(delta_ms.max(1))); // 60 FPS display synced clock
+        self.tick_animations();
 
         if let Some(ref mut panel) = self.tool_panel {
             if let Some(chip) = self.tool_chips.iter().find(|c| {
@@ -3188,12 +3220,10 @@ impl App {
         let is_downloading = self.download_progress.lock().unwrap().is_some();
         let is_krama_animating = self.krama.is_any_animation_inprogress();
 
-        self.code_block_anims.retain(|_, (_, t)| t.elapsed().as_millis() < 220);
-
         let is_animating = is_generating_val
             || is_downloading
             || is_krama_animating
-            || !self.code_block_anims.is_empty()
+            || !self.pending_staggered_anims.is_empty()
             || self.esc_hold_start.is_some()
             || self.menu_closing
             || self.panel_closing;
@@ -3406,22 +3436,22 @@ impl App {
                             self.is_selecting = false;
                             self.selection_start = None;
                             self.selection_end = None;
-                            self.krama.restart_progress("collapse", 0);
 
                             match hit_kind {
                                 SectionKind::You(idx) | SectionKind::Agent(idx) | SectionKind::System(idx) => {
                                     let is_collapsed = self.collapsed_messages.contains(&idx);
                                     let anim_id = idx as u32;
+
                                     if is_collapsed {
                                         self.collapsed_messages.remove(&idx);
-                                        if self.krama.is_reversed("collapse", anim_id) {
-                                            self.krama.forward_animate("collapse", anim_id);
+                                        if !self.krama.is_id("collapse", anim_id) {
+                                            self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
                                         }
-                                        self.krama.restart_progress("collapse", anim_id);
+                                        self.krama.reverse_start("collapse", anim_id);
                                     } else {
                                         self.collapsed_messages.insert(idx);
-                                        if !self.krama.is_reversed("collapse", anim_id) {
-                                            self.krama.reverse_animate("collapse", anim_id);
+                                        if !self.krama.is_id("collapse", anim_id) {
+                                            self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
                                         }
                                         self.krama.restart_progress("collapse", anim_id);
                                     }
@@ -3434,16 +3464,17 @@ impl App {
                                 SectionKind::Thought(idx) => {
                                     let is_col = self.collapsed_thoughts.contains(&idx);
                                     let anim_id = (idx as u32) | 0x4000_0000;
+
                                     if is_col {
                                         self.collapsed_thoughts.remove(&idx);
-                                        if self.krama.is_reversed("collapse", anim_id) {
-                                            self.krama.forward_animate("collapse", anim_id);
+                                        if !self.krama.is_id("collapse", anim_id) {
+                                            self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
                                         }
-                                        self.krama.restart_progress("collapse", anim_id);
+                                        self.krama.reverse_start("collapse", anim_id);
                                     } else {
                                         self.collapsed_thoughts.insert(idx);
-                                        if !self.krama.is_reversed("collapse", anim_id) {
-                                            self.krama.reverse_animate("collapse", anim_id);
+                                        if !self.krama.is_id("collapse", anim_id) {
+                                            self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
                                         }
                                         self.krama.restart_progress("collapse", anim_id);
                                     }
@@ -3457,15 +3488,13 @@ impl App {
                                         chip.tag_closed = true;
                                         chip.expanded = !chip.expanded;
                                         let anim_id = (chip.id as u32) | 0x8000_0000;
+
+                                        if !self.krama.is_id("collapse", anim_id) {
+                                            self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+                                        }
                                         if chip.expanded {
-                                            if self.krama.is_reversed("collapse", anim_id) {
-                                                self.krama.forward_animate("collapse", anim_id);
-                                            }
-                                            self.krama.restart_progress("collapse", anim_id);
+                                            self.krama.reverse_start("collapse", anim_id);
                                         } else {
-                                            if !self.krama.is_reversed("collapse", anim_id) {
-                                                self.krama.reverse_animate("collapse", anim_id);
-                                            }
                                             self.krama.restart_progress("collapse", anim_id);
                                         }
                                         self.status_message = format!(
@@ -3474,19 +3503,6 @@ impl App {
                                         );
                                     }
                                 }
-                            }
-                            return Ok(true);
-                        } else if let Some(id) =
-                            tool_panel::hit_test_chip(&self.tool_chips, mouse.column, mouse.row)
-                        {
-                            self.clear_selection();
-                            self.exit_term_interactive();
-                            self.is_selecting = false;
-                            self.selection_start = None;
-                            self.selection_end = None;
-                            self.krama.restart_progress("collapse", 0);
-                            if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == id) {
-                                chip.expanded = !chip.expanded;
                             }
                             return Ok(true);
                         } else if self.tool_panel.is_some() {
@@ -4133,23 +4149,22 @@ impl App {
                                 KeyCode::Char('t') | KeyCode::Char('T')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
+                                    self.pending_staggered_anims.clear();
+                                    self.last_stagger_release = std::time::Instant::now()
+                                        .checked_sub(Duration::from_millis(20))
+                                        .unwrap_or_else(std::time::Instant::now);
+
                                     // Collapse only messages and thoughts that were NOT already collapsed
                                     for i in 0..self.messages.len() {
+                                        let m_id = i as u32;
                                         if !self.collapsed_messages.contains(&i) {
                                             self.collapsed_messages.insert(i);
-                                            let anim_id = i as u32;
-                                            if !self.krama.is_reversed("collapse", anim_id) {
-                                                self.krama.reverse_animate("collapse", anim_id);
-                                            }
-                                            self.krama.restart_progress("collapse", anim_id);
+                                            self.pending_staggered_anims.push_back((m_id, false));
                                         }
+                                        let t_id = (i as u32) | 0x4000_0000;
                                         if !self.collapsed_thoughts.contains(&i) {
                                             self.collapsed_thoughts.insert(i);
-                                            let anim_id = (i as u32) | 0x4000_0000;
-                                            if !self.krama.is_reversed("collapse", anim_id) {
-                                                self.krama.reverse_animate("collapse", anim_id);
-                                            }
-                                            self.krama.restart_progress("collapse", anim_id);
+                                            self.pending_staggered_anims.push_back((t_id, false));
                                         }
                                     }
 
@@ -4158,11 +4173,8 @@ impl App {
                                         if chip.expanded || !chip.tag_closed {
                                             chip.expanded = false;
                                             chip.tag_closed = true;
-                                            let anim_id = (chip.id as u32) | 0x8000_0000;
-                                            if !self.krama.is_reversed("collapse", anim_id) {
-                                                self.krama.reverse_animate("collapse", anim_id);
-                                            }
-                                            self.krama.restart_progress("collapse", anim_id);
+                                            let c_id = (chip.id as u32) | 0x8000_0000;
+                                            self.pending_staggered_anims.push_back((c_id, false));
                                         }
                                     }
 
@@ -4171,23 +4183,22 @@ impl App {
                                 KeyCode::Char('o') | KeyCode::Char('O')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
+                                    self.pending_staggered_anims.clear();
+                                    self.last_stagger_release = std::time::Instant::now()
+                                        .checked_sub(Duration::from_millis(20))
+                                        .unwrap_or_else(std::time::Instant::now);
+
                                     // Expand all messages in history
                                     for &i in &self.collapsed_messages {
-                                        let anim_id = i as u32;
-                                        if self.krama.is_reversed("collapse", anim_id) {
-                                            self.krama.forward_animate("collapse", anim_id);
-                                        }
-                                        self.krama.restart_progress("collapse", anim_id);
+                                        let m_id = i as u32;
+                                        self.pending_staggered_anims.push_back((m_id, true));
                                     }
                                     self.collapsed_messages.clear();
 
                                     // Expand all thoughts in history
                                     for &i in &self.collapsed_thoughts {
-                                        let anim_id = (i as u32) | 0x4000_0000;
-                                        if self.krama.is_reversed("collapse", anim_id) {
-                                            self.krama.forward_animate("collapse", anim_id);
-                                        }
-                                        self.krama.restart_progress("collapse", anim_id);
+                                        let t_id = (i as u32) | 0x4000_0000;
+                                        self.pending_staggered_anims.push_back((t_id, true));
                                     }
                                     self.collapsed_thoughts.clear();
 
@@ -4195,11 +4206,8 @@ impl App {
                                     for chip in &mut self.tool_chips {
                                         if !chip.expanded {
                                             chip.expanded = true;
-                                            let anim_id = (chip.id as u32) | 0x8000_0000;
-                                            if self.krama.is_reversed("collapse", anim_id) {
-                                                self.krama.forward_animate("collapse", anim_id);
-                                            }
-                                            self.krama.restart_progress("collapse", anim_id);
+                                            let c_id = (chip.id as u32) | 0x8000_0000;
+                                            self.pending_staggered_anims.push_back((c_id, true));
                                         }
                                     }
 
@@ -5353,16 +5361,25 @@ impl App {
                 let badge_span = Span::styled(" You ", Style::default().fg(NORDIC_BG).bg(user_bg).add_modifier(Modifier::BOLD));
                 let anim_id = m_idx as u32;
                 let is_anim = self.krama.is_animating("collapse", anim_id);
-                let total_u_lines = user_text.lines().count().max(1);
-                let visible_u_lines: usize = if is_anim {
-                    self.krama.from_range("collapse", anim_id, 0..=total_u_lines)
-                } else if is_collapsed {
-                    0
-                } else {
-                    total_u_lines
-                };
 
-                if is_collapsed && !is_anim {
+                let raw_u = if is_anim {
+                    1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
+                } else if is_collapsed {
+                    0.0
+                } else {
+                    1.0
+                };
+                let col_progress = if raw_u < 0.02 {
+                    0.0
+                } else if raw_u > 0.98 {
+                    1.0
+                } else {
+                    raw_u
+                };
+                let total_u_lines = user_text.lines().count().max(1);
+                let visible_u_lines = ((total_u_lines as f32) * col_progress).round() as usize;
+
+                if (is_collapsed && !is_anim) || (is_collapsed && visible_u_lines == 0) {
                     // Fully collapsed: buffer for horizontal row line up
                     collapsed_row_buf.push((badge_span, 5, SectionKind::You(m_idx), user_bg, "You".to_string()));
                 } else {
@@ -5480,16 +5497,25 @@ impl App {
                         let is_collapsed = self.collapsed_thoughts.contains(&m_idx);
                         let anim_id = (m_idx as u32) | 0x4000_0000;
                         let is_anim = self.krama.is_animating("collapse", anim_id);
-                        let total_think_lines = clean_think.lines().filter(|l| !l.trim().is_empty()).count().max(1);
-                        let visible_think_lines: usize = if is_anim {
-                            self.krama.from_range("collapse", anim_id, 0..=total_think_lines)
-                        } else if is_collapsed {
-                            0
-                        } else {
-                            total_think_lines
-                        };
 
-                        if is_collapsed && !is_anim {
+                        let raw_think = if is_anim {
+                            1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
+                        } else if is_collapsed {
+                            0.0
+                        } else {
+                            1.0
+                        };
+                        let think_progress = if raw_think < 0.02 {
+                            0.0
+                        } else if raw_think > 0.98 {
+                            1.0
+                        } else {
+                            raw_think
+                        };
+                        let total_think_lines = clean_think.lines().count().max(1);
+                        let visible_think_lines = ((total_think_lines as f32) * think_progress).round() as usize;
+
+                        if (is_collapsed && !is_anim) || (is_collapsed && visible_think_lines == 0) {
                             // Fully collapsed: buffer for horizontal row line up
                             collapsed_row_buf.push((badge_span, think_len, SectionKind::Thought(m_idx), think_bg, think_label.to_string()));
                         } else {
@@ -5528,6 +5554,7 @@ impl App {
                                         if rendered_think_lines >= visible_think_lines {
                                             break;
                                         }
+                                        rendered_think_lines += 1;
                                         if !line_start {
                                             global_think_ch += 1;
                                         }
@@ -5535,9 +5562,12 @@ impl App {
 
                                         let line_str = raw_line.trim_start();
                                         if line_str.is_empty() {
+                                            push_full_shaded!(&mut chat_lines, vec![
+                                                Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
+                                                Span::styled(" ", Style::default().bg(content_bg)),
+                                            ], 2, available_width, content_bg);
                                             continue;
                                         }
-                                        rendered_think_lines += 1;
 
                                         let mut cur_spans = vec![
                                             Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
@@ -5648,13 +5678,21 @@ impl App {
                             push_full_shaded!(&mut chat_lines, vec![badge_span], agent_len, available_width, row_bg);
 
                             let total_agent_lines = text_to_render.lines().count().max(1);
-                            let visible_agent_lines: usize = if is_anim {
-                                self.krama.from_range("collapse", anim_id, 0..=total_agent_lines)
+                            let raw_agent = if is_anim {
+                                1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
                             } else if is_collapsed {
-                                0
+                                0.0
                             } else {
-                                total_agent_lines
+                                1.0
                             };
+                            let agent_col_progress = if raw_agent < 0.02 {
+                                0.0
+                            } else if raw_agent > 0.98 {
+                                1.0
+                            } else {
+                                raw_agent
+                            };
+                            let visible_agent_lines = ((total_agent_lines as f32) * agent_col_progress).round() as usize;
 
                             let show_agent_body = visible_agent_lines > 0;
                             if show_agent_body {
@@ -5762,7 +5800,22 @@ impl App {
                         Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
                     );
 
-                    if !is_open && !is_anim {
+                    let raw_action = if is_anim {
+                        1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
+                    } else if is_open {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    let anim_progress = if raw_action < 0.02 {
+                        0.0
+                    } else if raw_action > 0.98 {
+                        1.0
+                    } else {
+                        raw_action
+                    };
+
+                    if (!is_open && !is_anim) || (!is_open && anim_progress == 0.0) {
                         // Fully collapsed: buffer for horizontal row line up
                         collapsed_row_buf.push((badge_span, 8, SectionKind::Action(chip.id), action_bg, format!("Action: {}", chip.label_text())));
                     } else {
@@ -5789,14 +5842,10 @@ impl App {
                         push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, action_row_bg);
 
                         let max_body_lines = chip.body.trim_start_matches(|c| c == '\n' || c == '\r').lines().count();
-                        let visible_lines: usize = if !chip.tag_closed {
-                            max_body_lines
-                        } else if is_anim {
-                            self.krama.from_range("collapse", anim_id, 0..=max_body_lines)
-                        } else if is_open {
+                        let visible_lines = if !chip.tag_closed {
                             max_body_lines
                         } else {
-                            0
+                            ((max_body_lines as f32) * anim_progress).round() as usize
                         };
 
                         if visible_lines > 0 && !chip.body.trim().is_empty() {
@@ -5813,6 +5862,8 @@ impl App {
                             let cur_w = 2 + rule_w;
                             push_full_shaded!(&mut chat_lines, rule_spans, cur_w, available_width, content_bg);
 
+                            let num_digits = (max_body_lines_adj.max(1).ilog10() as usize + 1).max(2);
+
                             for (line_idx, b_line) in body_trimmed.lines().take(visible_lines_adj).enumerate() {
                                 let is_del = b_line.starts_with("- ") || b_line.starts_with('-');
                                 let is_add = b_line.starts_with("+ ") || b_line.starts_with('+');
@@ -5825,15 +5876,31 @@ impl App {
                                     (NORDIC_TEXT, Color::Rgb(100, 110, 130))
                                 };
 
-                                let line_num_str = format!(" {:2} │ ", line_idx + 1);
-                                let cur_spans = vec![
-                                    Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
-                                    Span::styled(" ", Style::default().bg(content_bg)),
-                                    Span::styled(line_num_str, Style::default().fg(sign_color).bg(content_bg)),
-                                    Span::styled(b_line.to_string(), Style::default().fg(line_fg).bg(content_bg)),
-                                ];
-                                let cur_w = 2 + 7 + b_line.chars().count();
-                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                let line_num_str = format!(" {:>width$} │ ", line_idx + 1, width = num_digits);
+                                let cont_num_str = format!(" {:>width$} │ ", "·", width = num_digits);
+                                let gutter_w = 2 + line_num_str.chars().count();
+                                let max_chunk_w = available_width.saturating_sub(gutter_w).max(20);
+
+                                let chars: Vec<char> = b_line.chars().collect();
+                                let chunks: Vec<Vec<char>> = if chars.is_empty() {
+                                    vec![Vec::new()]
+                                } else {
+                                    chars.chunks(max_chunk_w).map(|c| c.to_vec()).collect()
+                                };
+
+                                for (chunk_i, chunk) in chunks.into_iter().enumerate() {
+                                    let g_str = if chunk_i == 0 { &line_num_str } else { &cont_num_str };
+                                    let s_color = if chunk_i == 0 { sign_color } else { Color::Rgb(76, 86, 106) };
+                                    let chunk_str: String = chunk.into_iter().collect();
+                                    let cur_spans = vec![
+                                        Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
+                                        Span::styled(" ", Style::default().bg(content_bg)),
+                                        Span::styled(g_str.clone(), Style::default().fg(s_color).bg(content_bg)),
+                                        Span::styled(chunk_str.clone(), Style::default().fg(line_fg).bg(content_bg)),
+                                    ];
+                                    let cur_w = 2 + g_str.chars().count() + chunk_str.chars().count();
+                                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                }
                             }
                         }
                         chat_lines.push(Line::from(""));
@@ -5848,15 +5915,23 @@ impl App {
                 let anim_id = m_idx as u32;
                 let is_anim = self.krama.is_animating("collapse", anim_id);
                 let total_sys_lines = sys_body.lines().count().max(1);
-                let visible_sys_lines: usize = if is_anim {
-                    self.krama.from_range("collapse", anim_id, 0..=total_sys_lines)
+                let raw_sys = if is_anim {
+                    1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
                 } else if is_collapsed {
-                    0
+                    0.0
                 } else {
-                    total_sys_lines
+                    1.0
                 };
+                let col_progress = if raw_sys < 0.02 {
+                    0.0
+                } else if raw_sys > 0.98 {
+                    1.0
+                } else {
+                    raw_sys
+                };
+                let visible_sys_lines = ((total_sys_lines as f32) * col_progress).round() as usize;
 
-                if is_collapsed && !is_anim {
+                if (is_collapsed && !is_anim) || (is_collapsed && visible_sys_lines == 0) {
                     // Fully collapsed: buffer for horizontal row line up
                     collapsed_row_buf.push((badge_span, 8, SectionKind::System(m_idx), sys_bg, "System".to_string()));
                 } else {
@@ -5928,7 +6003,22 @@ impl App {
                     Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
                 );
 
-                if !is_open && !is_anim {
+                let raw_action2 = if is_anim {
+                    1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
+                } else if is_open {
+                    1.0
+                } else {
+                    0.0
+                };
+                let anim_progress2 = if raw_action2 < 0.02 {
+                    0.0
+                } else if raw_action2 > 0.98 {
+                    1.0
+                } else {
+                    raw_action2
+                };
+
+                if (!is_open && !is_anim) || (!is_open && anim_progress2 == 0.0) {
                     collapsed_row_buf.push((badge_span, 8, SectionKind::Action(chip.id), action_bg, format!("Action: {}", chip.label_text())));
                 } else {
                     flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
@@ -5954,14 +6044,10 @@ impl App {
                     push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, action_row_bg);
 
                     let max_body_lines = chip.body.trim_start_matches(|c| c == '\n' || c == '\r').lines().count();
-                    let visible_lines: usize = if !chip.tag_closed {
-                        max_body_lines
-                    } else if is_anim {
-                        self.krama.from_range("collapse", anim_id, 0..=max_body_lines)
-                    } else if is_open {
+                    let visible_lines = if !chip.tag_closed {
                         max_body_lines
                     } else {
-                        0
+                        ((max_body_lines as f32) * anim_progress2).round() as usize
                     };
 
                     if visible_lines > 0 && !chip.body.trim().is_empty() {
@@ -5978,6 +6064,8 @@ impl App {
                         let cur_w = 2 + rule_w;
                         push_full_shaded!(&mut chat_lines, rule_spans, cur_w, available_width, content_bg);
 
+                        let num_digits = (max_body_lines_adj.max(1).ilog10() as usize + 1).max(2);
+
                         for (line_idx, b_line) in body_trimmed.lines().take(visible_lines_adj).enumerate() {
                             let is_del = b_line.starts_with("- ") || b_line.starts_with('-');
                             let is_add = b_line.starts_with("+ ") || b_line.starts_with('+');
@@ -5990,15 +6078,31 @@ impl App {
                                 (NORDIC_TEXT, Color::Rgb(100, 110, 130))
                             };
 
-                            let line_num_str = format!(" {:2} │ ", line_idx + 1);
-                            let cur_spans = vec![
-                                Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
-                                Span::styled(" ", Style::default().bg(content_bg)),
-                                Span::styled(line_num_str, Style::default().fg(sign_color).bg(content_bg)),
-                                Span::styled(b_line.to_string(), Style::default().fg(line_fg).bg(content_bg)),
-                            ];
-                            let cur_w = 2 + 7 + b_line.chars().count();
-                            push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                            let line_num_str = format!(" {:>width$} │ ", line_idx + 1, width = num_digits);
+                            let cont_num_str = format!(" {:>width$} │ ", "·", width = num_digits);
+                            let gutter_w = 2 + line_num_str.chars().count();
+                            let max_chunk_w = available_width.saturating_sub(gutter_w).max(20);
+
+                            let chars: Vec<char> = b_line.chars().collect();
+                            let chunks: Vec<Vec<char>> = if chars.is_empty() {
+                                vec![Vec::new()]
+                            } else {
+                                chars.chunks(max_chunk_w).map(|c| c.to_vec()).collect()
+                            };
+
+                            for (chunk_i, chunk) in chunks.into_iter().enumerate() {
+                                let g_str = if chunk_i == 0 { &line_num_str } else { &cont_num_str };
+                                let s_color = if chunk_i == 0 { sign_color } else { Color::Rgb(76, 86, 106) };
+                                let chunk_str: String = chunk.into_iter().collect();
+                                let cur_spans = vec![
+                                    Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
+                                    Span::styled(" ", Style::default().bg(content_bg)),
+                                    Span::styled(g_str.clone(), Style::default().fg(s_color).bg(content_bg)),
+                                    Span::styled(chunk_str.clone(), Style::default().fg(line_fg).bg(content_bg)),
+                                ];
+                                let cur_w = 2 + g_str.chars().count() + chunk_str.chars().count();
+                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                            }
                         }
                     }
                     chat_lines.push(Line::from(""));
@@ -6902,10 +7006,19 @@ impl App {
                         let selected_idx = self.installed_state.selected();
                         let items: Vec<ListItem> = self.installed_models.iter().enumerate().map(|(row_idx, m)| {
                             let is_selected = selected_idx == Some(row_idx);
-                            let row_bg = if is_selected { Color::Rgb(59, 66, 82) } else { NORDIC_BG };
+                            let is_being_deleted = self.delete_confirm_model.as_ref() == Some(m);
+                            let row_bg = if is_being_deleted {
+                                Color::Rgb(75, 45, 45)
+                            } else if is_selected {
+                                Color::Rgb(59, 66, 82)
+                            } else {
+                                NORDIC_BG
+                            };
 
                             let is_active = self.backend.name().contains(m) || m.contains(&self.backend.name());
-                            let (badge_txt, badge_fg, badge_bg) = if is_active {
+                            let (badge_txt, badge_fg, badge_bg) = if is_being_deleted {
+                                (" DELETE? ", Color::White, Color::Rgb(220, 60, 60))
+                            } else if is_active {
                                 (" ACTIVE ", NORDIC_BG, Color::Rgb(163, 190, 140))
                             } else {
                                 (" READY  ", NORDIC_BG, Color::Rgb(76, 86, 106))
@@ -6920,17 +7033,34 @@ impl App {
 
                             let repo_col = format!("{:<14}", if repo.len() > 14 { &repo[..14] } else { repo });
                             let total_w = chunks[1].width as usize;
-                            let used_w = 9 + 1 + 14 + 3; // badge + space + repo + " │ "
-                            let name_max_w = total_w.saturating_sub(used_w).max(10);
-                            let name_col = format!("{:<width$}", if model_label.len() > name_max_w { &model_label[..name_max_w] } else { model_label }, width = name_max_w);
 
-                            ListItem::new(Line::from(vec![
-                                Span::styled(badge_txt, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD)),
-                                Span::styled(" ", Style::default().bg(row_bg)),
-                                Span::styled(repo_col, Style::default().fg(if is_selected { Color::Rgb(143, 218, 255) } else { Color::Rgb(136, 192, 208) }).bg(row_bg)),
-                                Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)),
-                                Span::styled(name_col, Style::default().fg(if is_selected { Color::White } else { Color::Rgb(220, 230, 242) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })),
-                            ])).style(Style::default().bg(row_bg))
+                            if is_being_deleted {
+                                let prompt_str = " Confirm delete? [y/n] ";
+                                let used_w = 10 + 1 + 14 + 3 + prompt_str.chars().count();
+                                let name_max_w = total_w.saturating_sub(used_w).max(10);
+                                let name_col = format!("{:<width$}", if model_label.len() > name_max_w { &model_label[..name_max_w] } else { model_label }, width = name_max_w);
+
+                                ListItem::new(Line::from(vec![
+                                    Span::styled(badge_txt, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD)),
+                                    Span::styled(" ", Style::default().bg(row_bg)),
+                                    Span::styled(repo_col, Style::default().fg(Color::Rgb(255, 140, 140)).bg(row_bg)),
+                                    Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)),
+                                    Span::styled(name_col, Style::default().fg(Color::White).bg(row_bg).add_modifier(Modifier::BOLD)),
+                                    Span::styled(prompt_str, Style::default().fg(Color::Rgb(255, 200, 100)).bg(Color::Rgb(100, 30, 30)).add_modifier(Modifier::BOLD)),
+                                ])).style(Style::default().bg(row_bg))
+                            } else {
+                                let used_w = 9 + 1 + 14 + 3; // badge + space + repo + " │ "
+                                let name_max_w = total_w.saturating_sub(used_w).max(10);
+                                let name_col = format!("{:<width$}", if model_label.len() > name_max_w { &model_label[..name_max_w] } else { model_label }, width = name_max_w);
+
+                                ListItem::new(Line::from(vec![
+                                    Span::styled(badge_txt, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD)),
+                                    Span::styled(" ", Style::default().bg(row_bg)),
+                                    Span::styled(repo_col, Style::default().fg(if is_selected { Color::Rgb(143, 218, 255) } else { Color::Rgb(136, 192, 208) }).bg(row_bg)),
+                                    Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)),
+                                    Span::styled(name_col, Style::default().fg(if is_selected { Color::White } else { Color::Rgb(220, 230, 242) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })),
+                                ])).style(Style::default().bg(row_bg))
+                            }
                         }).collect();
 
                         let list = List::new(items)
@@ -7119,80 +7249,6 @@ impl App {
                 }
             }
         }
-
-
-
-        // --- Model Deletion Confirmation Modal ---
-        if let Some(ref target) = self.delete_confirm_model {
-            let popup_layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(
-                    [
-                        Constraint::Percentage(30),
-                        Constraint::Percentage(40),
-                        Constraint::Percentage(30),
-                    ]
-                    .as_ref(),
-                )
-                .split(frame.area());
-
-            let center_layout = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(
-                    [
-                        Constraint::Percentage(20),
-                        Constraint::Percentage(60),
-                        Constraint::Percentage(20),
-                    ]
-                    .as_ref(),
-                )
-                .split(popup_layout[1]);
-
-            let area = center_layout[1];
-            frame.render_widget(Clear, area);
-            frame.render_widget(Block::default().style(Style::default().bg(NORDIC_DARK_BG)), area);
-
-            let block = Block::default()
-                .style(Style::default().bg(NORDIC_DARK_BG))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Double)
-                .border_style(Style::default().fg(Color::Rgb(255, 80, 80)))
-                .title(" Confirm Model Deletion (Agreement Required) ");
-
-            let confirm_lines = vec![
-                Line::from(Span::styled(
-                    "Model Deletion Confirmation",
-                    Style::default()
-                        .fg(Color::Rgb(255, 80, 80))
-                        .bg(NORDIC_DARK_BG)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled("", Style::default().bg(NORDIC_DARK_BG))),
-                Line::from(Span::styled(format!("Target Model: {}", target), Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG))),
-                Line::from(Span::styled("Are you sure you want to delete this model weight from memory/disk?", Style::default().fg(NORDIC_TEXT).bg(NORDIC_DARK_BG))),
-                Line::from(Span::styled("", Style::default().bg(NORDIC_DARK_BG))),
-                Line::from(vec![
-                    Span::styled(
-                        " [Y] Confirm Delete ",
-                        Style::default()
-                            .bg(Color::Rgb(255, 50, 50))
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("   ", Style::default().bg(NORDIC_DARK_BG)),
-                    Span::styled(
-                        " [N / Esc] Cancel ",
-                        Style::default().bg(NORDIC_BG).fg(NORDIC_TEXT),
-                    ),
-                ]),
-            ];
-
-            let dialog = Paragraph::new(confirm_lines)
-                .style(Style::default().bg(NORDIC_DARK_BG))
-                .block(block)
-                .alignment(Alignment::Center);
-            frame.render_widget(dialog, area);
-        }
     }
 }
 
@@ -7291,5 +7347,82 @@ fn trunc_chars(s: &str, max: usize) -> String {
             "{}…",
             s.chars().take(max.saturating_sub(1)).collect::<String>()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_collapse_and_expand_exact_flow() {
+        let mut k: KramaFrame<BTclasslist, BTframelist<TRES16Bits, i16>> = KramaFrame::default();
+        k.extend_iter_classlist([(
+            "collapse",
+            KeyFrameFunction::new_cubic_bezier_f32(0.25, 0.1, 0.25, 1.0),
+        )]);
+        let anim_id = 0u32;
+        k.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+
+        // 1. Initially expanded (is_collapsed = false)
+        // User clicks to Collapse
+        k.restart_progress("collapse", anim_id);
+        assert!(k.is_animating("collapse", anim_id));
+        assert!(k.is_any_animation_inprogress());
+
+        // Step 1: 50ms into collapse -> val should go from 1.0 down towards 0.0 using 1.0 - val
+        k.update_progress(TRES16Bits::from_millis(50));
+        let val_collapse_50 = 1.0 - k.from_range_generic("collapse", anim_id, 0.0..=1.0);
+        eprintln!("Collapse at 50ms: height factor = {}", val_collapse_50);
+        assert!(val_collapse_50 < 1.0 && val_collapse_50 > 0.0);
+
+        // Step 2: finish collapse (200ms more)
+        k.update_progress(TRES16Bits::from_millis(200));
+        let val_collapse_end = 1.0 - k.from_range_generic("collapse", anim_id, 0.0..=1.0);
+        eprintln!("Collapse at end: height factor = {}", val_collapse_end);
+        assert_eq!(val_collapse_end, 0.0);
+        assert!(!k.is_animating("collapse", anim_id));
+
+        // 2. Now section is collapsed (is_collapsed = true)
+        // User clicks to Expand -> starts reverse animation
+        k.reverse_start("collapse", anim_id);
+        assert!(k.is_animating("collapse", anim_id));
+        assert!(k.is_any_animation_inprogress());
+
+        // Step 3: 50ms into expand -> val should go from 0.0 up towards 1.0 using 1.0 - val
+        k.update_progress(TRES16Bits::from_millis(50));
+        let val_expand_50 = 1.0 - k.from_range_generic("collapse", anim_id, 0.0..=1.0);
+        eprintln!("Expand at 50ms: height factor = {}", val_expand_50);
+        assert!(val_expand_50 > 0.0 && val_expand_50 < 1.0);
+
+        // Step 4: finish expand (200ms more)
+        k.update_progress(TRES16Bits::from_millis(200));
+        let val_expand_end = 1.0 - k.from_range_generic("collapse", anim_id, 0.0..=1.0);
+        eprintln!("Expand at end: height factor = {}", val_expand_end);
+        assert_eq!(val_expand_end, 1.0);
+        assert!(!k.is_animating("collapse", anim_id));
+    }
+
+    #[tokio::test]
+    async fn test_krama_multi_frame_ticks() {
+        let mut app = App::new();
+        let anim_id = 0u32;
+        app.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+        app.krama.restart_progress("collapse", anim_id);
+
+        assert!(app.krama.is_any_animation_inprogress());
+
+        let mut frames = 0;
+        let start = std::time::Instant::now();
+        while app.krama.is_any_animation_inprogress() && frames < 50 {
+            tokio::time::sleep(Duration::from_millis(8)).await;
+            app.tick_animations();
+            frames += 1;
+        }
+
+        let elapsed = start.elapsed();
+        eprintln!("Completed in {} frames (elapsed {:?})", frames, elapsed);
+        assert!(!app.krama.is_any_animation_inprogress(), "Animation must complete");
+        assert!(frames > 5, "Should have run multiple frames");
     }
 }

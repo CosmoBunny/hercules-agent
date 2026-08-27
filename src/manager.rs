@@ -46,6 +46,36 @@ pub fn models_toml_path() -> PathBuf {
     local_hercules_dir().join("models.toml")
 }
 
+pub fn models_list_cache_path() -> PathBuf {
+    local_hercules_dir().join("models.list")
+}
+
+fn load_models_list_cache() -> Vec<String> {
+    let p = models_list_cache_path();
+    if let Ok(content) = std::fs::read_to_string(&p) {
+        content
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn save_models_list_cache(entries: &[String]) {
+    if let Ok(()) = ensure_dir(&local_hercules_dir()) {
+        let p = models_list_cache_path();
+        let mut existing = load_models_list_cache();
+        for e in entries {
+            if !existing.contains(e) {
+                existing.push(e.clone());
+            }
+        }
+        let _ = std::fs::write(&p, existing.join("\n"));
+    }
+}
+
 fn dirs_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -605,6 +635,19 @@ impl ModelManager {
                 let entry = format!("HuggingFace: {}", m);
                 if !results.contains(&entry) {
                     results.push(entry);
+                }
+            }
+        }
+
+        // Cache newly fetched models into models.list so user can still see them offline
+        if !results.is_empty() {
+            save_models_list_cache(&results);
+        } else {
+            // If offline (or no results fetched), fall back to cached models.list matching query
+            let cached = load_models_list_cache();
+            for m in cached {
+                if (query_lower.is_empty() || m.to_lowercase().contains(&query_lower)) && !results.contains(&m) {
+                    results.push(m);
                 }
             }
         }

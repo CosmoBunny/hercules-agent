@@ -218,7 +218,7 @@ async fn run_app(
             return Ok(());
         }
         let needs_redraw = app.handle_events().await?;
-        if needs_redraw {
+        if needs_redraw || app.krama.is_any_animation_inprogress() {
             terminal.draw(|f| app.draw(f))?;
         }
         if app.should_quit {

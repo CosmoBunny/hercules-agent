@@ -621,17 +621,18 @@ pub fn render_markdown_to_lines<'a>(
                 code_chars.chunks(max_code_chars_per_line).map(|c| c.to_vec()).collect()
             };
 
+            let num_digits = (code_line_num.max(1).ilog10() as usize + 1).max(2);
             for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
-                let num_prefix = if chunk_idx == 0 {
-                    format!("  │ {:2} │ ", code_line_num)
+                let gutter_str = if chunk_idx == 0 {
+                    format!(" {:>width$} │ ", code_line_num, width = num_digits)
                 } else {
-                    "  │    │ ".to_string()
+                    format!(" {:>width$} │ ", "", width = num_digits)
                 };
 
                 let mut line_spans = vec![
                     Span::styled("  │", Style::default().fg(theme_color).bg(code_bg)),
                     Span::styled(
-                        if chunk_idx == 0 { format!(" {:2} │ ", code_line_num) } else { "    │ ".to_string() },
+                        gutter_str.clone(),
                         Style::default().fg(gutter_fg).bg(code_bg),
                     ),
                 ];
@@ -667,7 +668,8 @@ pub fn render_markdown_to_lines<'a>(
                 }
 
                 // Fill background to entire width and add right border '│'
-                let total_line_chars = num_prefix.chars().count() + chunk_char_count;
+                // '  │' prefix (3 chars) + gutter_str + chunk_char_count + right border '│' (1 char)
+                let total_line_chars = 3 + gutter_str.chars().count() + chunk_char_count;
                 if total_line_chars < target_block_width - 1 {
                     let pad_spaces = (target_block_width - 1) - total_line_chars;
                     line_spans.push(Span::styled(
