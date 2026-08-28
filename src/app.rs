@@ -8070,9 +8070,10 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                         // 4. Session State Table
                         let session_color = Color::Rgb(255, 120, 120);
                         let sess_id = self.session_id.as_deref().unwrap_or("N/A");
+                        let version_str = format!("v{} ({})", env!("CARGO_PKG_VERSION"), sess_id);
                         let stats_str = format!("{} msgs | {} compacts", self.messages.len(), self.context_compact_count);
                         let session_rows = vec![
-                            ("Session ID", sess_id, Color::White),
+                            ("App Version", version_str.as_str(), Color::White),
                             ("Activity", stats_str.as_str(), Color::White),
                         ];
                         render_info_table(frame, left_rows[6], "Session State", session_color, 12, session_rows);
