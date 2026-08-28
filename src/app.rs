@@ -1434,7 +1434,27 @@ impl App {
                     continue;
                 }
 
-                let result = crate::agent::AgentEngine::execute_proposed(a);
+                let result = if a.kind == crate::agent::ProposedKind::Write {
+                    let path = crate::agent::AgentEngine::expand_path(&a.target);
+                    let res = crate::smart_system::get_smart_system().request_write(
+                        crate::smart_system::AgentId::H0,
+                        &path,
+                        a.line_attr.as_deref(),
+                        &a.body,
+                    );
+                    match res {
+                        crate::smart_system::SmartWriteResult::Committed { lines_written, new_revision, .. } => {
+                            format!("[Smart System: Revision #{new_revision} Committed] Successfully wrote {lines_written} lines to {}", path.display())
+                        }
+                        crate::smart_system::SmartWriteResult::Conflict { message, .. } => {
+                            format!("[CONFLICT REJECTED]\n{message}")
+                        }
+                        crate::smart_system::SmartWriteResult::Error(e) => e,
+                    }
+                } else {
+                    crate::agent::AgentEngine::execute_proposed(a)
+                };
+
                 if let Some(chip_id) = a.chip_id {
                     if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
                         chip.pending = false;

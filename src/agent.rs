@@ -1785,6 +1785,12 @@ Some(tag)
 
                 if let Some(path_str) = path_attr {
                     let output = Self::execute_read(&path_str, line_attr.as_deref());
+                    let expanded = Self::expand_path(&path_str);
+                    crate::smart_system::get_smart_system().register_read(
+                        crate::smart_system::AgentId::H0,
+                        &expanded,
+                        &output,
+                    );
                     results.push(output);
                     did_read = true;
                 }
@@ -1803,7 +1809,14 @@ Some(tag)
                     let line_attr = Self::extract_attribute(tag_header, "line");
                     t = &rest[close_bracket + 1..];
                     if let Some(path_str) = path_attr {
-                        results.push(Self::execute_read(&path_str, line_attr.as_deref()));
+                        let output = Self::execute_read(&path_str, line_attr.as_deref());
+                        let expanded = Self::expand_path(&path_str);
+                        crate::smart_system::get_smart_system().register_read(
+                            crate::smart_system::AgentId::H0,
+                            &expanded,
+                            &output,
+                        );
+                        results.push(output);
                     }
                 } else {
                     break;
@@ -1993,7 +2006,7 @@ Some(tag)
         diff.join("\n")
     }
 
-    fn execute_write(path_str: &str, line_attr: Option<&str>, body: &str) -> String {
+    pub fn execute_write(path_str: &str, line_attr: Option<&str>, body: &str) -> String {
         if let Err(e) = tools_allowed_for_write_cmd() {
             return format!("Error: {}", e);
         }

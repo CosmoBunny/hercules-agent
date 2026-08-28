@@ -21,6 +21,7 @@ pub mod diagram;
 pub mod graphic;
 pub mod markdown;
 pub mod session;
+pub mod smart_system;
 
 // TUI lives with the binary but is part of the crate so `app` can use `crate::`.
 pub mod app;
