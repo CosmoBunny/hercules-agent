@@ -480,21 +480,51 @@ fn detect_websearch(text: &str) -> Vec<StreamToolView> {
         if let Some(close_bracket) = r.find('>') {
             let header = &r[..close_bracket + 1];
             let mut action = crate::agent::AgentEngine::extract_attribute(header, "query").unwrap_or_else(|| "search".to_string());
-            let end = r.find("</websearch>").unwrap_or(r.len());
-            let mut body = r[close_bracket + 1..end].trim().to_string();
+            let after = &r[close_bracket + 1..];
+
+            // </websearch> is optional — find explicit end tag or next tool opening tag or line boundary
+            let mut end_pos = after.find("</websearch>");
+            let is_explicit_closed = end_pos.is_some();
+
+            if end_pos.is_none() {
+                // If query="..." attribute was provided, websearch needs no body at all
+                if action != "search" {
+                    end_pos = Some(0);
+                } else {
+                    // Check for next tool tag opening (<write, <cmd, <read, <ls, <agent, <mcp, <skill)
+                    let next_tool_pos = ["<write", "<cmd", "<read", "<ls", "<agent", "<mcp", "<skill", "<websearch"]
+                        .iter()
+                        .filter_map(|tag| after.find(tag))
+                        .min();
+                    end_pos = next_tool_pos.or_else(|| after.find('\n'));
+                }
+            }
+
+            let end = end_pos.unwrap_or(after.len());
+            let mut body = after[..end].trim().to_string();
             
             for stop in ["<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|endoftext|>", "</s>"] {
                 action = action.replace(stop, "").trim().to_string();
                 body = body.replace(stop, "").trim().to_string();
             }
 
+            if action == "search" && !body.is_empty() {
+                action = body.clone();
+            }
+
+            let advance = if is_explicit_closed {
+                end + 12
+            } else {
+                end
+            };
+
             out.push(StreamToolView {
                 kind: ToolPanelKind::WebSearch,
                 target: action,
                 body,
-                tag_closed: r.find("</websearch>").is_some(),
+                tag_closed: true, // Optional close: treat self-contained query as closed
             });
-            rest = if r.find("</websearch>").is_some() { &r[end + 12..] } else { "" };
+            rest = &after[advance.min(after.len())..];
         } else {
             break;
         }

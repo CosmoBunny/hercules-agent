@@ -1451,12 +1451,25 @@ Some(tag)
                 let header = &r[..close_bracket + 1];
                 let mut query_attr = Self::extract_attribute(header, "query");
                 let after = &r[close_bracket + 1..];
-                let (body, advance) = if let Some(end_tag) = after.find("</websearch>") {
-                    (after[..end_tag].trim().to_string(), end_tag + 12)
-                } else {
-                    let b = after.lines().next().unwrap_or("").trim().to_string();
-                    (b, after.len())
-                };
+
+                let mut end_pos = after.find("</websearch>");
+                let is_explicit_closed = end_pos.is_some();
+
+                if end_pos.is_none() {
+                    if query_attr.is_some() {
+                        end_pos = Some(0);
+                    } else {
+                        let next_tool_pos = ["<write", "<cmd", "<read", "<ls", "<agent", "<mcp", "<skill", "<websearch"]
+                            .iter()
+                            .filter_map(|tag| after.find(tag))
+                            .min();
+                        end_pos = next_tool_pos.or_else(|| after.find('\n'));
+                    }
+                }
+
+                let end = end_pos.unwrap_or(after.len());
+                let body = after[..end].trim().to_string();
+                let advance = if is_explicit_closed { end + 12 } else { end };
 
                 for stop in ["<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|endoftext|>", "</s>"] {
                     if let Some(ref mut q) = query_attr {

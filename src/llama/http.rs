@@ -224,6 +224,9 @@ impl HttpInferenceClient {
         let mut byte_stream = res.bytes_stream();
         let mut full_text = String::new();
         let mut buffer = String::new();
+        let mut token_count = 0usize;
+        let gen_start_time = std::time::Instant::now();
+        let mut first_token_time: Option<std::time::Instant> = None;
 
         while let Some(chunk_result) = byte_stream.next().await {
             if let Ok(active_gen) = is_generating.lock() {
@@ -328,6 +331,22 @@ impl HttpInferenceClient {
                             if cleaned.is_empty() {
                                 continue;
                             }
+                            token_count += 1;
+                            if first_token_time.is_none() {
+                                let now = std::time::Instant::now();
+                                first_token_time = Some(now);
+                                let ttft = (now - gen_start_time).as_secs_f64();
+                                crate::llama::libinfer::update_inference_telemetry(|t| {
+                                    t.ttft_secs = ttft;
+                                });
+                            }
+                            crate::llama::libinfer::update_inference_telemetry(|t| {
+                                t.generated_tokens = token_count;
+                                let elapsed = gen_start_time.elapsed().as_secs_f64();
+                                if elapsed > 0.0 {
+                                    t.decode_tok_per_sec = token_count as f64 / elapsed;
+                                }
+                            });
                             full_text.push_str(&cleaned);
                             if let Ok(mut target) = stream_target.lock() {
                                 target.push_str(&cleaned);
@@ -348,6 +367,19 @@ impl HttpInferenceClient {
                 }
             }
         }
+
+        let gen_dur = gen_start_time.elapsed().as_secs_f64().max(0.0001);
+        let tok_speed = token_count as f64 / gen_dur;
+        let prompt_estimate = (prompt.len() / 4).max(1);
+        crate::llama::libinfer::update_inference_telemetry(|t| {
+            t.prompt_tokens = prompt_estimate;
+            t.generated_tokens = token_count;
+            t.decode_duration_secs = gen_dur;
+            t.decode_tok_per_sec = tok_speed;
+            t.session_total_prompt_tokens += prompt_estimate;
+            t.session_total_gen_tokens += token_count;
+            t.session_total_inference_secs += gen_dur;
+        });
 
         // Flush trailing buffer line without newline
         if !buffer.trim().is_empty() {

@@ -225,6 +225,9 @@ impl OllamaBackend {
 
         let mut full_text = String::new();
         let mut thinking_active = false;
+        let mut token_count = 0usize;
+        let gen_start_time = std::time::Instant::now();
+        let mut first_token_time: Option<std::time::Instant> = None;
 
         while let Some(chunk_result) = stream.next().await {
             if let Ok(active_gen) = is_generating.lock() {
@@ -240,8 +243,17 @@ impl OllamaBackend {
             match chunk_result {
                 Ok(responses) => {
                     for resp in responses {
+                        if first_token_time.is_none() {
+                            let now = std::time::Instant::now();
+                            first_token_time = Some(now);
+                            let ttft = (now - gen_start_time).as_secs_f64();
+                            crate::llama::libinfer::update_inference_telemetry(|t| {
+                                t.ttft_secs = ttft;
+                            });
+                        }
                         if let Some(ref think) = resp.thinking {
                             if !think.is_empty() {
+                                token_count += 1;
                                 if !thinking_active {
                                     thinking_active = true;
                                     full_text.push_str("<think>");
@@ -257,11 +269,12 @@ impl OllamaBackend {
                         }
 
                         if !resp.response.is_empty() {
+                            token_count += 1;
                             if thinking_active {
                                 thinking_active = false;
-                                full_text.push_str("</think>\n");
+                                full_text.push_str(" response\n");
                                 if let Ok(mut target) = stream_target.lock() {
-                                    target.push_str("</think>\n");
+                                    target.push_str(" response\n");
                                 }
                             }
                             full_text.push_str(&resp.response);
@@ -269,6 +282,14 @@ impl OllamaBackend {
                                 target.push_str(&resp.response);
                             }
                         }
+
+                        crate::llama::libinfer::update_inference_telemetry(|t| {
+                            t.generated_tokens = token_count;
+                            let elapsed = gen_start_time.elapsed().as_secs_f64();
+                            if elapsed > 0.0 {
+                                t.decode_tok_per_sec = token_count as f64 / elapsed;
+                            }
+                        });
 
                         if resp.done {
                             if thinking_active {
