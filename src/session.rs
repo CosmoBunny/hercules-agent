@@ -21,6 +21,16 @@ pub struct Session {
     pub messages: Vec<String>,
     #[serde(default)]
     pub selected_model: Option<String>,
+    #[serde(default)]
+    pub session_cpu_energy_joules: f64,
+    #[serde(default)]
+    pub session_gpu_energy_joules: f64,
+    #[serde(default)]
+    pub total_active_compute_secs: f64,
+    #[serde(default)]
+    pub cpu_load_sum_pct: f64,
+    #[serde(default)]
+    pub cpu_sample_count: u64,
 }
 
 impl Session {
@@ -33,6 +43,11 @@ impl Session {
             updated_at: now,
             messages: Vec::new(),
             selected_model: None,
+            session_cpu_energy_joules: 0.0,
+            session_gpu_energy_joules: 0.0,
+            total_active_compute_secs: 0.0,
+            cpu_load_sum_pct: 0.0,
+            cpu_sample_count: 0,
         }
     }
 }

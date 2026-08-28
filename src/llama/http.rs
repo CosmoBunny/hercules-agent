@@ -91,9 +91,17 @@ impl HttpInferenceClient {
                 cur_buf = rest.to_string();
             } else if let Some(rest) = t.strip_prefix("Tool result:") {
                 flush(&mut turns, &mut cur_role, &mut cur_buf);
-                // Tool output must be a **user** turn for OpenAI/llama-server chat API
+                // Tool output must be a **user** turn for OpenAI/llama-server/ChatML
                 cur_role = Some("user".into());
                 cur_buf = format!("[Tool result]\n{}", rest.trim_start());
+            } else if let Some(rest) = t.strip_prefix("Result:") {
+                flush(&mut turns, &mut cur_role, &mut cur_buf);
+                cur_role = Some("user".into());
+                cur_buf = format!("[Action result]\n{}", rest.trim_start());
+            } else if t.starts_with("<tool_result>") || t.starts_with("<tool_instruction>") {
+                flush(&mut turns, &mut cur_role, &mut cur_buf);
+                cur_role = Some("user".into());
+                cur_buf = t.to_string();
             } else if t.starts_with("[Hercules]") || t.starts_with("[Instruction]") {
                 flush(&mut turns, &mut cur_role, &mut cur_buf);
                 cur_role = Some("user".into());
@@ -139,10 +147,6 @@ impl HttpInferenceClient {
         }
         for (role, content) in turns {
             messages.push(json!({"role": role, "content": content}));
-        }
-        // If the only content after system is missing, add a minimal user turn.
-        if messages.len() == 1 {
-            messages.push(json!({"role": "user", "content": "hello"}));
         }
         messages
     }

@@ -4,8 +4,7 @@
 //!
 //! | Track | Module | C/FFI |
 //! |-------|--------|-------|
-//! | **llama.cpp lib** | `llama::ffi`, `llama::libinfer` | `libllama.so` (in-process C FFI) |
-//! | **llama.cpp server** | `llama::server`, `llama::cpp` | Managed subprocess |
+//! | **llama.cpp lib** | `llama::ffi`, `llama::libinfer` | In-process static / direct FFI engine |
 //! | **Ollama** | `backend::OllamaBackend` | HTTP |
 
 #![allow(clippy::too_many_arguments)]

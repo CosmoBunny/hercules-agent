@@ -58,7 +58,6 @@ pub struct Cli {
 static REQUEST_QUIT: AtomicBool = AtomicBool::new(false);
 
 fn cleanup_engines() {
-    llama::server::shutdown_managed_server();
     llama::libinfer::shutdown_warm_lib_engine();
 }
 
@@ -74,8 +73,17 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) 
     let _ = terminal.show_cursor();
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    let res = rt.block_on(async_main());
+    rt.shutdown_timeout(std::time::Duration::from_millis(50));
+    res
+}
+
+async fn async_main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     let cwd = std::env::current_dir()?;
@@ -193,12 +201,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("{:?}", err);
     }
 
-    // Use _exit() instead of process::exit() to bypass llama.cpp's atexit
-    // handlers. Those handlers call llama_backend_free / context/model free
-    // which can block for several seconds freeing a 1-2GB model on slow
-    // hardware, causing the process to hang visibly at 99% exit.
-    // The OS reclaims all memory immediately on _exit — no cleanup needed.
-    unsafe { libc::_exit(0) };
+    Ok(())
 }
 
 async fn run_app(

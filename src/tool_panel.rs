@@ -86,7 +86,11 @@ pub const CHIP_ROW_HEIGHT: u16 = 3;
 
 impl ToolChip {
     pub fn label_text(&self) -> String {
-        match self.kind {
+        self.label_text_with_duration(None)
+    }
+
+    pub fn label_text_with_duration(&self, duration: Option<&str>) -> String {
+        let base = match self.kind {
             ToolPanelKind::Write => {
                 let short = self.target.rsplit('/').next().unwrap_or(&self.target);
                 let lines = line_count(&self.body);
@@ -124,9 +128,25 @@ impl ToolChip {
             ToolPanelKind::Agent => {
                 format!("AGENT {}", self.target)
             }
-            ToolPanelKind::Mcp | ToolPanelKind::Skill | ToolPanelKind::WebSearch => {
+            ToolPanelKind::WebSearch => {
+                let q = trunc(&self.target, 50);
+                if self.tag_closed {
+                    format!("SEARCH {q}")
+                } else {
+                    format!("SEARCH {q}…")
+                }
+            }
+            ToolPanelKind::Skill => {
+                format!("SKILL {}", self.target)
+            }
+            ToolPanelKind::Mcp => {
                 format!("MCP {}", self.target)
             }
+        };
+        if let Some(dur) = duration {
+            format!("{} [{dur}]", base)
+        } else {
+            base
         }
     }
 
@@ -455,13 +475,19 @@ fn detect_skill(text: &str) -> Vec<StreamToolView> {
 fn detect_websearch(text: &str) -> Vec<StreamToolView> {
     let mut out = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find("<websearch ") {
+    while let Some(start) = rest.find("<websearch") {
         let r = &rest[start..];
         if let Some(close_bracket) = r.find('>') {
             let header = &r[..close_bracket + 1];
-            let action = crate::agent::AgentEngine::extract_attribute(header, "query").unwrap_or_else(|| "search".to_string());
+            let mut action = crate::agent::AgentEngine::extract_attribute(header, "query").unwrap_or_else(|| "search".to_string());
             let end = r.find("</websearch>").unwrap_or(r.len());
-            let body = r[close_bracket + 1..end].trim().to_string();
+            let mut body = r[close_bracket + 1..end].trim().to_string();
+            
+            for stop in ["<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|endoftext|>", "</s>"] {
+                action = action.replace(stop, "").trim().to_string();
+                body = body.replace(stop, "").trim().to_string();
+            }
+
             out.push(StreamToolView {
                 kind: ToolPanelKind::WebSearch,
                 target: action,

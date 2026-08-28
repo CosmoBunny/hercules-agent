@@ -145,6 +145,7 @@ type FnVocabEos = unsafe extern "C" fn(*const LlamaVocab) -> LlamaToken;
 type FnVocabGetAddBos = unsafe extern "C" fn(*const LlamaVocab) -> bool;
 type FnTokenIsEog = unsafe extern "C" fn(*const LlamaVocab, LlamaToken) -> bool;
 type FnBatchGetOne = unsafe extern "C" fn(*mut LlamaToken, c_int) -> LlamaBatch;
+type FnBatchInit = unsafe extern "C" fn(c_int, c_int, c_int) -> LlamaBatch;
 type FnBatchFree = unsafe extern "C" fn(LlamaBatch);
 type FnDecode = unsafe extern "C" fn(*mut LlamaContext, LlamaBatch) -> c_int;
 type FnGetLogitsIth = unsafe extern "C" fn(*mut LlamaContext, c_int) -> *mut f32;
@@ -154,6 +155,7 @@ type FnSamplerChainAdd = unsafe extern "C" fn(*mut LlamaSampler, *mut LlamaSampl
 type FnSamplerInitTemp = unsafe extern "C" fn(f32) -> *mut LlamaSampler;
 type FnSamplerInitTopP = unsafe extern "C" fn(f32, usize) -> *mut LlamaSampler;
 type FnSamplerInitDist = unsafe extern "C" fn(u32) -> *mut LlamaSampler;
+type FnSamplerInitGreedy = unsafe extern "C" fn() -> *mut LlamaSampler;
 type FnSamplerSample = unsafe extern "C" fn(*mut LlamaSampler, *mut LlamaContext, c_int) -> LlamaToken;
 type FnSamplerFree = unsafe extern "C" fn(*mut LlamaSampler);
 /// Callback type for llama_log_set — (level: i32, text: *const c_char, user_data: *mut c_void)
@@ -163,6 +165,8 @@ type FnLogSet = unsafe extern "C" fn(
 );
 type FnGetMemory = unsafe extern "C" fn(*const LlamaContext) -> *mut c_void;
 type FnMemoryClear = unsafe extern "C" fn(*mut c_void, bool);
+type FnMemorySeqRm = unsafe extern "C" fn(*mut c_void, i32, i32, i32) -> bool;
+type FnMemorySeqPosMax = unsafe extern "C" fn(*mut c_void, i32) -> i32;
 /// llama_state_get_size(ctx) → number of bytes needed to serialise the full KV state.
 type FnStateGetSize = unsafe extern "C" fn(*const LlamaContext) -> usize;
 /// llama_state_get_data(ctx, dst, size) → bytes written.
@@ -199,6 +203,7 @@ pub struct LlamaLib {
     pub vocab_get_add_bos: FnVocabGetAddBos,
     pub token_is_eog: FnTokenIsEog,
     pub batch_get_one: FnBatchGetOne,
+    pub batch_init: FnBatchInit,
     pub batch_free: FnBatchFree,
     pub decode: FnDecode,
     pub get_logits_ith: FnGetLogitsIth,
@@ -208,12 +213,15 @@ pub struct LlamaLib {
     pub sampler_init_temp: FnSamplerInitTemp,
     pub sampler_init_top_p: FnSamplerInitTopP,
     pub sampler_init_dist: FnSamplerInitDist,
+    pub sampler_init_greedy: FnSamplerInitGreedy,
     pub sampler_sample: FnSamplerSample,
     pub sampler_free: FnSamplerFree,
     pub log_set: FnLogSet,
     /// Optional: clear KV between turns (newer llama.cpp).
     pub get_memory: Option<FnGetMemory>,
     pub memory_clear: Option<FnMemoryClear>,
+    pub memory_seq_rm: Option<FnMemorySeqRm>,
+    pub memory_seq_pos_max: Option<FnMemorySeqPosMax>,
     /// Optional: serialise / restore the full KV-cache state (llama.cpp ≥ b3000).
     pub state_get_size: Option<FnStateGetSize>,
     pub state_get_data: Option<FnStateGetData>,
@@ -253,6 +261,7 @@ unsafe extern "C" {
     fn llama_vocab_get_add_bos(vocab: *const LlamaVocab) -> bool;
     fn llama_vocab_is_eog(vocab: *const LlamaVocab, token: LlamaToken) -> bool;
     fn llama_batch_get_one(tokens: *mut LlamaToken, n_tokens: c_int) -> LlamaBatch;
+    fn llama_batch_init(n_tokens: c_int, embd: c_int, n_seq_max: c_int) -> LlamaBatch;
     fn llama_batch_free(batch: LlamaBatch);
     fn llama_decode(ctx: *mut LlamaContext, batch: LlamaBatch) -> c_int;
     fn llama_get_logits_ith(ctx: *mut LlamaContext, i: c_int) -> *mut f32;
@@ -262,6 +271,7 @@ unsafe extern "C" {
     fn llama_sampler_init_temp(t: f32) -> *mut LlamaSampler;
     fn llama_sampler_init_top_p(p: f32, min_keep: usize) -> *mut LlamaSampler;
     fn llama_sampler_init_dist(seed: u32) -> *mut LlamaSampler;
+    fn llama_sampler_init_greedy() -> *mut LlamaSampler;
     fn llama_sampler_sample(sampler: *mut LlamaSampler, ctx: *mut LlamaContext, idx: c_int) -> LlamaToken;
     fn llama_sampler_free(sampler: *mut LlamaSampler);
     fn llama_log_set(
@@ -270,6 +280,8 @@ unsafe extern "C" {
     );
     fn llama_get_memory(ctx: *const LlamaContext) -> *mut c_void;
     fn llama_memory_clear(mem: *mut c_void, data: bool);
+    fn llama_memory_seq_rm(mem: *mut c_void, seq_id: i32, p0: i32, p1: i32) -> bool;
+    fn llama_memory_seq_pos_max(mem: *mut c_void, seq_id: i32) -> i32;
     // KV state serialisation — present in llama.cpp ≥ b3000
     fn llama_state_get_size(ctx: *const LlamaContext) -> usize;
     fn llama_state_get_data(ctx: *mut LlamaContext, dst: *mut u8, size: usize) -> usize;
@@ -299,6 +311,7 @@ impl LlamaLib {
             vocab_get_add_bos:             llama_vocab_get_add_bos,
             token_is_eog:                  llama_vocab_is_eog,
             batch_get_one:                 llama_batch_get_one,
+            batch_init:                    llama_batch_init,
             batch_free:                    llama_batch_free,
             decode:                        llama_decode,
             get_logits_ith:                llama_get_logits_ith,
@@ -308,11 +321,14 @@ impl LlamaLib {
             sampler_init_temp:             llama_sampler_init_temp,
             sampler_init_top_p:            llama_sampler_init_top_p,
             sampler_init_dist:             llama_sampler_init_dist,
+            sampler_init_greedy:           llama_sampler_init_greedy,
             sampler_sample:                llama_sampler_sample,
             sampler_free:                  llama_sampler_free,
             log_set:                       llama_log_set,
             get_memory:                    Some(llama_get_memory),
             memory_clear:                  Some(llama_memory_clear),
+            memory_seq_rm:                 Some(llama_memory_seq_rm),
+            memory_seq_pos_max:            Some(llama_memory_seq_pos_max),
             state_get_size:                Some(llama_state_get_size),
             state_get_data:                Some(llama_state_get_data),
             state_set_data:                Some(llama_state_set_data),
@@ -474,6 +490,7 @@ impl LlamaLib {
             vocab_get_add_bos: sym!(b"llama_vocab_get_add_bos"),
             token_is_eog,
             batch_get_one: sym!(b"llama_batch_get_one"),
+            batch_init: sym!(b"llama_batch_init"),
             batch_free: sym!(b"llama_batch_free"),
             decode: sym!(b"llama_decode"),
             get_logits_ith: sym!(b"llama_get_logits_ith"),
@@ -483,6 +500,7 @@ impl LlamaLib {
             sampler_init_temp: sym!(b"llama_sampler_init_temp"),
             sampler_init_top_p: sym!(b"llama_sampler_init_top_p"),
             sampler_init_dist: sym!(b"llama_sampler_init_dist"),
+            sampler_init_greedy: sym!(b"llama_sampler_init_greedy"),
             sampler_sample: sym!(b"llama_sampler_sample"),
             sampler_free: sym!(b"llama_sampler_free"),
             log_set: sym!(b"llama_log_set"),
@@ -495,6 +513,16 @@ impl LlamaLib {
                 lib.get(b"llama_memory_clear")
                     .ok()
                     .map(|s: libloading::Symbol<FnMemoryClear>| *s)
+            },
+            memory_seq_rm: unsafe {
+                lib.get(b"llama_memory_seq_rm")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMemorySeqRm>| *s)
+            },
+            memory_seq_pos_max: unsafe {
+                lib.get(b"llama_memory_seq_pos_max")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMemorySeqPosMax>| *s)
             },
             state_get_size: unsafe {
                 lib.get(b"llama_state_get_size")

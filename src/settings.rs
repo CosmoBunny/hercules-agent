@@ -134,10 +134,46 @@ impl WebSearchProvider {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MtpMode {
+    Disabled,
+    NativeMtp,
+    PromptLookup3,
+    PromptLookup4,
+    PromptLookup5,
+}
+
+impl MtpMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "Disabled (Single-Token)",
+            Self::NativeMtp => "Native MTP (Model Multi-Token Prediction Layers)",
+            Self::PromptLookup3 => "Prompt Lookup Speculative (3-gram)",
+            Self::PromptLookup4 => "Prompt Lookup Speculative (4-gram)",
+            Self::PromptLookup5 => "Prompt Lookup Speculative (5-gram)",
+        }
+    }
+
+    pub fn is_native_mtp(self) -> bool {
+        matches!(self, Self::NativeMtp)
+    }
+
+    pub fn ngram_size(self) -> usize {
+        match self {
+            Self::Disabled | Self::NativeMtp => 0,
+            Self::PromptLookup3 => 3,
+            Self::PromptLookup4 => 4,
+            Self::PromptLookup5 => 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeSettings {
     #[serde(default = "default_power_mode")]
     pub power_mode: PowerMode,
+    #[serde(default = "default_mtp_mode")]
+    pub mtp_mode: MtpMode,
     #[serde(default = "default_web_search_provider")]
     pub web_search_provider: WebSearchProvider,
     #[serde(default = "default_max_subagents")]
@@ -176,15 +212,39 @@ pub struct RuntimeSettings {
     /// HuggingFace API token for authenticated searches & downloads.
     #[serde(default)]
     pub hf_token: Option<String>,
+    /// Google Custom Search API Key
+    #[serde(default)]
+    pub google_api_key: Option<String>,
+    /// Google Custom Search CX Engine ID
+    #[serde(default)]
+    pub google_cx: Option<String>,
+    /// Brave Search API Key
+    #[serde(default)]
+    pub brave_api_key: Option<String>,
+    /// Tavily Search API Key
+    #[serde(default)]
+    pub tavily_api_key: Option<String>,
+    /// SearXNG Instance URL
+    #[serde(default)]
+    pub searxng_url: Option<String>,
+    /// Auto-collapse previous streaming chips/messages on turn completion.
+    #[serde(default = "default_false")]
+    pub auto_collapse_previous: bool,
+    /// Target UI Render FPS: 30, 60 (default), 90, 120, 240
+    #[serde(default = "default_target_fps")]
+    pub target_fps: u32,
 }
 
+fn default_target_fps() -> u32 { 60 }
 fn default_power_mode() -> PowerMode { PowerMode::Normal }
+fn default_mtp_mode() -> MtpMode { MtpMode::PromptLookup3 }
 fn default_web_search_provider() -> WebSearchProvider { WebSearchProvider::DuckDuckGo }
 fn default_max_subagents() -> usize { 4 }
 fn default_max_subagent_depth() -> usize { 3 }
 fn default_stall_timeout_secs() -> u64 { 300 }
 fn default_repeat_threshold() -> usize { 10 }
 fn default_true() -> bool { true }
+fn default_false() -> bool { false }
 fn default_compact_ratio() -> f32 { CONTEXT_COMPACT_RATIO }
 fn default_temperature() -> f32 { DEFAULT_TEMPERATURE }
 fn default_none() -> String { "none".to_string() }
@@ -194,6 +254,7 @@ impl Default for RuntimeSettings {
         let env_tok = std::env::var("HF_TOKEN").ok().filter(|s| !s.trim().is_empty());
         Self {
             power_mode: PowerMode::Normal,
+            mtp_mode: MtpMode::PromptLookup3,
             web_search_provider: WebSearchProvider::DuckDuckGo,
             max_subagents: 4,
             max_subagent_depth: 3,
@@ -208,8 +269,96 @@ impl Default for RuntimeSettings {
             image_gen_model: "none".to_string(),
             video_gen_model: "none".to_string(),
             hf_token: env_tok,
+            google_api_key: None,
+            google_cx: None,
+            brave_api_key: None,
+            tavily_api_key: None,
+            searxng_url: None,
+            auto_collapse_previous: false,
+            target_fps: 60,
         }
     }
+}
+
+pub fn get_mtp_mode() -> MtpMode {
+    get_settings().mtp_mode
+}
+
+pub fn set_mtp_mode(mode: MtpMode) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.mtp_mode = mode;
+        save_settings_to_disk(s);
+    }
+}
+
+pub fn cycle_mtp_mode(dir: i32) -> MtpMode {
+    let cur = get_mtp_mode();
+    let next = if dir > 0 {
+        match cur {
+            MtpMode::Disabled => MtpMode::NativeMtp,
+            MtpMode::NativeMtp => MtpMode::PromptLookup3,
+            MtpMode::PromptLookup3 => MtpMode::PromptLookup4,
+            MtpMode::PromptLookup4 => MtpMode::PromptLookup5,
+            MtpMode::PromptLookup5 => MtpMode::Disabled,
+        }
+    } else {
+        match cur {
+            MtpMode::Disabled => MtpMode::PromptLookup5,
+            MtpMode::NativeMtp => MtpMode::Disabled,
+            MtpMode::PromptLookup3 => MtpMode::NativeMtp,
+            MtpMode::PromptLookup4 => MtpMode::PromptLookup3,
+            MtpMode::PromptLookup5 => MtpMode::PromptLookup4,
+        }
+    };
+    set_mtp_mode(next);
+    next
+}
+
+pub fn get_auto_collapse_previous() -> bool {
+    get_settings().auto_collapse_previous
+}
+
+pub fn set_auto_collapse_previous(val: bool) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.auto_collapse_previous = val;
+        save_settings_to_disk(s);
+    }
+}
+
+pub fn toggle_auto_collapse_previous() -> bool {
+    let cur = get_auto_collapse_previous();
+    set_auto_collapse_previous(!cur);
+    !cur
+}
+
+pub fn get_target_fps() -> u32 {
+    get_settings().target_fps
+}
+
+pub fn set_target_fps(fps: u32) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.target_fps = fps;
+        save_settings_to_disk(s);
+    }
+}
+
+pub fn nudge_target_fps(dir: i32) -> u32 {
+    let presets = [30, 60, 90, 120, 240];
+    let cur = get_target_fps();
+    let idx = presets.iter().position(|&x| x == cur).unwrap_or(1);
+    let new_idx = if dir > 0 {
+        (idx + 1) % presets.len()
+    } else if idx == 0 {
+        presets.len() - 1
+    } else {
+        idx - 1
+    };
+    let next = presets[new_idx];
+    set_target_fps(next);
+    next
 }
 
 pub fn format_stall_timeout(secs: u64) -> String {
@@ -219,6 +368,40 @@ pub fn format_stall_timeout(secs: u64) -> String {
         format!("{}s", secs)
     } else {
         format!("{}m", secs / 60)
+    }
+}
+
+/// Format a duration adaptively: <60s → "34s", <1h → "2m 5s", <24h → "1hrs 3m 54s", else "2d 4hrs"
+pub fn format_duration_adaptive(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        let mins = secs / 60;
+        let rem = secs % 60;
+        if rem == 0 {
+            format!("{}m", mins)
+        } else {
+            format!("{}m {}s", mins, rem)
+        }
+    } else if secs < 86400 {
+        let hrs = secs / 3600;
+        let rem_mins = (secs % 3600) / 60;
+        let rem_secs = secs % 60;
+        if rem_mins == 0 && rem_secs == 0 {
+            format!("{}hrs", hrs)
+        } else if rem_secs == 0 {
+            format!("{}hrs {}m", hrs, rem_mins)
+        } else {
+            format!("{}hrs {}m {}s", hrs, rem_mins, rem_secs)
+        }
+    } else {
+        let days = secs / 86400;
+        let rem_hrs = (secs % 86400) / 3600;
+        if rem_hrs == 0 {
+            format!("{}d", days)
+        } else {
+            format!("{}d {}hrs", days, rem_hrs)
+        }
     }
 }
 
@@ -256,20 +439,35 @@ pub fn nudge_stall_timeout(dir: i32) -> u64 {
     next
 }
 
-pub fn cycle_web_search_provider() -> WebSearchProvider {
-    let next = match get_settings().web_search_provider {
-        WebSearchProvider::DuckDuckGo => WebSearchProvider::Google,
-        WebSearchProvider::Google => WebSearchProvider::Brave,
-        WebSearchProvider::Brave => WebSearchProvider::Tavily,
-        WebSearchProvider::Tavily => WebSearchProvider::Searxng,
-        WebSearchProvider::Searxng => WebSearchProvider::Arxiv,
-        WebSearchProvider::Arxiv => WebSearchProvider::DuckDuckGo,
+pub fn nudge_web_search_provider(dir: i32) -> WebSearchProvider {
+    let providers = [
+        WebSearchProvider::DuckDuckGo,
+        WebSearchProvider::Google,
+        WebSearchProvider::Brave,
+        WebSearchProvider::Tavily,
+        WebSearchProvider::Searxng,
+        WebSearchProvider::Arxiv,
+    ];
+    let current = get_settings().web_search_provider;
+    let idx = providers.iter().position(|&p| p == current).unwrap_or(0);
+    let new_idx = if dir > 0 {
+        (idx + 1) % providers.len()
+    } else if idx == 0 {
+        providers.len() - 1
+    } else {
+        idx - 1
     };
+    let next = providers[new_idx];
     if let Ok(mut g) = SETTINGS.lock() {
         let s = g.get_or_insert_with(RuntimeSettings::default);
         s.web_search_provider = next;
+        save_settings_to_disk(s);
     }
     next
+}
+
+pub fn cycle_web_search_provider() -> WebSearchProvider {
+    nudge_web_search_provider(1)
 }
 
 pub fn toggle_subagent_quick_response() -> bool {
@@ -363,6 +561,47 @@ pub fn clear_hf_token() {
     }
 }
 
+pub fn get_search_token(provider: WebSearchProvider) -> Option<String> {
+    let s = get_settings();
+    match provider {
+        WebSearchProvider::Google => s.google_api_key,
+        WebSearchProvider::Brave => s.brave_api_key,
+        WebSearchProvider::Tavily => s.tavily_api_key,
+        WebSearchProvider::Searxng => s.searxng_url,
+        _ => None,
+    }
+}
+
+pub fn set_search_token(provider: WebSearchProvider, tok: String) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        let trimmed = tok.trim().to_string();
+        let val = if trimmed.is_empty() { None } else { Some(trimmed) };
+        match provider {
+            WebSearchProvider::Google => s.google_api_key = val,
+            WebSearchProvider::Brave => s.brave_api_key = val,
+            WebSearchProvider::Tavily => s.tavily_api_key = val,
+            WebSearchProvider::Searxng => s.searxng_url = val,
+            _ => {}
+        }
+        save_settings_to_disk(s);
+    }
+}
+
+pub fn clear_search_token(provider: WebSearchProvider) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        match provider {
+            WebSearchProvider::Google => s.google_api_key = None,
+            WebSearchProvider::Brave => s.brave_api_key = None,
+            WebSearchProvider::Tavily => s.tavily_api_key = None,
+            WebSearchProvider::Searxng => s.searxng_url = None,
+            _ => {}
+        }
+        save_settings_to_disk(s);
+    }
+}
+
 pub fn context_token_limit() -> usize {
     // Menu value wins; HERCULES_CTX only seeds default at first init
     get_settings()
@@ -374,6 +613,7 @@ pub fn set_context_token_limit(n: usize) {
     if let Ok(mut g) = SETTINGS.lock() {
         let s = g.get_or_insert_with(RuntimeSettings::default);
         s.context_token_limit = n.clamp(2048, MAX_CONTEXT_TOKEN_LIMIT);
+        save_settings_to_disk(s);
     }
 }
 

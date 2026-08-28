@@ -20,6 +20,40 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
+// Inference Live & Session Diagnostics
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct InferenceTelemetry {
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub prefill_duration_secs: f64,
+    pub decode_duration_secs: f64,
+    pub ttft_secs: f64,
+    pub prefill_tok_per_sec: f64,
+    pub decode_tok_per_sec: f64,
+    pub session_total_prompt_tokens: usize,
+    pub session_total_gen_tokens: usize,
+    pub session_total_inference_secs: f64,
+}
+
+static LIVE_TELEMETRY: Mutex<Option<InferenceTelemetry>> = Mutex::new(None);
+
+pub fn get_inference_telemetry() -> InferenceTelemetry {
+    LIVE_TELEMETRY.lock().unwrap().clone().unwrap_or_default()
+}
+
+pub fn update_inference_telemetry<F: FnOnce(&mut InferenceTelemetry)>(f: F) {
+    let mut lock = LIVE_TELEMETRY.lock().unwrap();
+    if lock.is_none() {
+        *lock = Some(InferenceTelemetry::default());
+    }
+    if let Some(ref mut t) = *lock {
+        f(t);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // KV-cache system-prompt snapshot
 // ---------------------------------------------------------------------------
 
@@ -30,6 +64,8 @@ struct SyspromptSnapshot {
     system_text: String,
     /// Number of tokens in the system-prompt batch (= KV position after prefill).
     n_sys_tokens: usize,
+    /// Token IDs representing the prefilled system-prompt prefix.
+    system_tokens: Vec<i32>,
     /// Raw serialised KV-cache bytes from `llama_state_get_data`.
     data: Vec<u8>,
 }
@@ -55,6 +91,11 @@ unsafe impl Send for LlamaCppLib {}
 unsafe impl Sync for LlamaCppLib {}
 
 impl LlamaCppLib {
+    /// Get the actual model context limit (n_ctx)
+    pub fn context_limit(&self) -> usize {
+        self.n_ctx as usize
+    }
+
     /// Load the model into process memory via libllama.so.
     pub fn new(model_path: PathBuf) -> Result<Self, String> {
         let lib = get_lib()?;
@@ -76,8 +117,10 @@ impl LlamaCppLib {
             .map_err(|e| format!("Invalid model path: {}", e))?;
 
         // Model params — start from C defaults, then override only known-safe fields.
+        let power_mode = crate::settings::get_settings().power_mode;
         let mut mparams = unsafe { (lib.model_default_params)() };
-        mparams.n_gpu_layers = 0; // CPU-only safe default
+        mparams.n_gpu_layers = power_mode.n_gpu_layers();
+        mparams.load_mtp = crate::settings::get_mtp_mode().is_native_mtp();
 
         let model = unsafe { (lib.model_load_from_file)(path_cstr.as_ptr(), mparams) };
         if model.is_null() {
@@ -90,13 +133,15 @@ impl LlamaCppLib {
         // Context params — must match installed libllama struct layout exactly.
         let mut cparams = unsafe { (lib.context_default_params)() };
         let n_ctx_train = unsafe { (lib.n_ctx_train)(model) };
-        // Use min(4096, train_ctx) for sensible RAM usage
-        cparams.n_ctx = (n_ctx_train.max(0) as u32).min(4096).max(512);
+        let user_ctx = crate::settings::context_token_limit() as u32;
+        let train_max = if n_ctx_train > 0 { n_ctx_train as u32 } else { 4096 };
+        cparams.n_ctx = user_ctx.min(train_max).max(512);
         // Prefill is chunked to this size — never pass more tokens than n_batch to decode.
         cparams.n_batch = 512;
         cparams.n_ubatch = 512;
-        cparams.n_threads = num_cpus();
-        cparams.n_threads_batch = num_cpus();
+        let th = power_mode.threads() as i32;
+        cparams.n_threads = th;
+        cparams.n_threads_batch = th;
         // flash_attn_type: 0 = disabled (enum, not bool)
         cparams.flash_attn_type = 0;
         cparams.offload_kqv = false;
@@ -203,28 +248,28 @@ impl LlamaCppLib {
         let lib = get_lib()?;
 
         let system = crate::agent::AgentEngine::system_prompt_compact_for_cwd();
-        // After tools already ran, the host sends "Tool results are above" — do NOT
-        // re-apply tool-force nudge (that re-emits the same <read> and clears the answer).
-        let already_has_tool_result = user_prompt.contains("Tool results are above")
-            || user_prompt.contains("Do NOT re-call")
-            || user_prompt.contains("Result:\n");
-        let user = if already_has_tool_result {
-            user_prompt.to_string()
-        } else {
-            crate::agent::AgentEngine::with_tool_nudge(user_prompt)
-        };
-
-        // Build the system-only prefix and the full prompt.
-        // We'll encode the system part once and snapshot it; subsequent calls restore.
         let sys_prefix = format!(
             "<|im_start|>system\n{}<|im_end|>\n",
             system
         );
-        let user_suffix = format!(
-            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            user
-        );
-        let prompt = format!("{}{}", sys_prefix, user_suffix);
+
+        // Parse conversational history into structured ChatML turns (<|im_start|>role...<|im_end|>)
+        // so the model sees genuine separate turns instead of flattening prior assistant turns
+        // into training text within a single user block.
+        let chat_json = crate::llama::http::HttpInferenceClient::chat_messages("", user_prompt);
+        let mut formatted_suffix = String::new();
+        for msg in chat_json {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            if role == "system" {
+                continue;
+            }
+            formatted_suffix.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
+        }
+
+        // Prime the generation turn with assistant role without forcing <think> tag
+        formatted_suffix.push_str("<|im_start|>assistant\n");
+        let user_suffix = formatted_suffix;
 
         let add_bos = unsafe { (lib.vocab_get_add_bos)(self.vocab) };
         let max_ctx = self.n_ctx as usize;
@@ -235,6 +280,10 @@ impl LlamaCppLib {
         // -------------------------------------------------------------------
         // PREFILL: try to restore system-prompt snapshot, fall back to full prefill
         // -------------------------------------------------------------------
+        let gen_start_time = std::time::Instant::now();
+        let mut prefill_start_time = std::time::Instant::now();
+        let mut total_prompt_tokens = 0usize;
+
         let mut snap_guard = self.sys_snapshot.lock().unwrap();
 
         let can_restore = snap_guard
@@ -260,44 +309,80 @@ impl LlamaCppLib {
                         if user_tokens.len() > available {
                             user_tokens.truncate(available);
                         }
-                        // Re-encode user tokens starting from sys position
+                        total_prompt_tokens = sys_tokens + user_tokens.len();
+                        // Re-encode user tokens starting from sys position with explicit absolute positions
+                        let mut user_prefill_ok = true;
                         let mut i = 0;
-                        while i < user_tokens.len() {
+                        let total_user_tokens = user_tokens.len();
+                        while i < total_user_tokens {
                             if let Ok(is_gen) = is_generating.lock() {
                                 if !*is_gen { return Ok(String::new()); }
                             }
-                            let end = (i + n_batch).min(user_tokens.len());
-                            // Build a batch with explicit positions
-                            let chunk = &mut user_tokens[i..end];
-                            let batch = unsafe { (lib.batch_get_one)(chunk.as_mut_ptr(), chunk.len() as i32) };
+                            let end = (i + n_batch).min(total_user_tokens);
+                            let is_last_chunk = end == total_user_tokens;
+                            let chunk = &user_tokens[i..end];
+                            let chunk_len = chunk.len();
+
+                            let mut batch = unsafe { (lib.batch_init)(chunk_len as i32, 0, 1) };
+                            batch.n_tokens = chunk_len as i32;
+                            unsafe {
+                                for (c_idx, &tok) in chunk.iter().enumerate() {
+                                    *batch.token.add(c_idx) = tok;
+                                    *batch.pos.add(c_idx) = (sys_tokens + i + c_idx) as i32;
+                                    *batch.n_seq_id.add(c_idx) = 1;
+                                    *(*batch.seq_id.add(c_idx)).add(0) = 0;
+                                    *batch.logits.add(c_idx) = if is_last_chunk && c_idx == chunk_len - 1 { 1 } else { 0 };
+                                }
+                            }
+
                             let ret = unsafe { (lib.decode)(self.ctx, batch) };
+                            unsafe { (lib.batch_free)(batch) };
                             if ret != 0 {
-                                // Fall through to full prefill on error
+                                user_prefill_ok = false;
                                 break;
                             }
                             i = end;
                         }
-                        // If user prefill succeeded, jump straight to sample loop
-                        let chain_params = unsafe { (lib.sampler_chain_default_params)() };
-                        let chain = unsafe { (lib.sampler_chain_init)(chain_params) };
-                        if !chain.is_null() {
-                            unsafe {
-                                (lib.sampler_chain_add)(chain, (lib.sampler_init_top_p)(0.9, 1));
-                                (lib.sampler_chain_add)(chain, (lib.sampler_init_temp)(0.7));
-                                (lib.sampler_chain_add)(chain, (lib.sampler_init_dist)(0));
+                        if user_prefill_ok {
+                            let prefill_dur = prefill_start_time.elapsed().as_secs_f64().max(0.0001);
+                            let prefill_toks_sec = total_prompt_tokens as f64 / prefill_dur;
+                            update_inference_telemetry(|t| {
+                                t.prompt_tokens = total_prompt_tokens;
+                                t.prefill_duration_secs = prefill_dur;
+                                t.prefill_tok_per_sec = prefill_toks_sec;
+                                t.session_total_prompt_tokens += total_prompt_tokens;
+                            });
+
+                            // If user prefill succeeded, jump straight to sample loop with full token history
+                            let chain_params = unsafe { (lib.sampler_chain_default_params)() };
+                            let chain = unsafe { (lib.sampler_chain_init)(chain_params) };
+                            if !chain.is_null() {
+                                let mtp_mode = crate::settings::get_mtp_mode();
+                                unsafe {
+                                    if mtp_mode.ngram_size() >= 2 {
+                                        (lib.sampler_chain_add)(chain, (lib.sampler_init_greedy)());
+                                    } else {
+                                        (lib.sampler_chain_add)(chain, (lib.sampler_init_top_p)(0.9, 1));
+                                        (lib.sampler_chain_add)(chain, (lib.sampler_init_temp)(0.7));
+                                        (lib.sampler_chain_add)(chain, (lib.sampler_init_dist)(0));
+                                    }
+                                }
+                                let mut all_tokens = snap.system_tokens.clone();
+                                all_tokens.extend_from_slice(&user_tokens);
+                                let result = self.sample_loop(chain, &lib, &stream_target, &is_generating, n_predict, all_tokens, gen_start_time);
+                                unsafe { (lib.sampler_free)(chain) };
+                                return result;
                             }
-                            let result = self.sample_loop(chain, &lib, &stream_target, &is_generating, n_predict);
-                            unsafe { (lib.sampler_free)(chain) };
-                            return result;
                         }
                     }
                 }
             }
-            // Snapshot size mismatch or set_data unavailable — invalidate and fall through
+            // Snapshot size mismatch, decode failure, or set_data unavailable — invalidate and fall through
             *snap_guard = None;
         }
 
         // Full prefill path (first call, or snapshot invalid/unavailable).
+        prefill_start_time = std::time::Instant::now();
         // Clear KV first.
         if let (Some(get_mem), Some(clear)) = (lib.get_memory, lib.memory_clear) {
             unsafe {
@@ -308,34 +393,68 @@ impl LlamaCppLib {
             }
         }
 
-        let mut tokens = self.tokenize(&prompt, add_bos)?;
-        if tokens.len() >= max_ctx.saturating_sub(32) {
-            let keep = max_ctx.saturating_sub(64);
-            let skip = tokens.len() - keep;
-            tokens.drain(1..=skip);
-        }
-
-        // Encode system-prompt tokens first, then snapshot the KV state.
+        // Tokenize system-prompt prefix and user suffix separately so that the token count
+        // and boundary match the snapshot exactly with zero tokenizer-merge ambiguity.
         let sys_tokens = self.tokenize(&sys_prefix, add_bos)?;
         let n_sys = sys_tokens.len();
+        if n_sys > max_ctx.saturating_sub(64) {
+            return Err(format!(
+                "[llama.cpp lib] system prompt too large: {} tokens for context {}",
+                n_sys, max_ctx
+            ));
+        }
+        let mut user_tokens = self.tokenize(&user_suffix, false)?;
+
+        // Ensure system tokens + user tokens stay safely within context limits by trimming
+        // user tokens from the front/tail rather than corrupting the system prefix and n_sys.
+        let max_user_tokens = max_ctx.saturating_sub(64).saturating_sub(n_sys);
+        if user_tokens.len() > max_user_tokens {
+            user_tokens.truncate(max_user_tokens);
+        }
+
+        let mut tokens = sys_tokens.clone();
+        tokens.extend_from_slice(&user_tokens);
         {
             let mut offset = 0usize;
-            while offset < tokens.len() {
+            let total_tokens = tokens.len();
+            while offset < total_tokens {
                 if let Ok(is_gen) = is_generating.lock() {
                     if !*is_gen { return Ok(String::new()); }
                 }
-                let end = (offset + n_batch).min(tokens.len());
-                let chunk = &mut tokens[offset..end];
-                let batch = unsafe { (lib.batch_get_one)(chunk.as_mut_ptr(), chunk.len() as i32) };
+                // If we have not yet reached n_sys, cap the chunk end strictly at n_sys
+                // so the KV snapshot contains ONLY the system tokens and no trailing user tokens.
+                let max_end = if offset < n_sys {
+                    (offset + n_batch).min(n_sys)
+                } else {
+                    (offset + n_batch).min(total_tokens)
+                };
+                let end = max_end;
+                let is_last_chunk = end == total_tokens;
+                let chunk = &tokens[offset..end];
+                let chunk_len = chunk.len();
+
+                let mut batch = unsafe { (lib.batch_init)(chunk_len as i32, 0, 1) };
+                batch.n_tokens = chunk_len as i32;
+                unsafe {
+                    for (c_idx, &tok) in chunk.iter().enumerate() {
+                        *batch.token.add(c_idx) = tok;
+                        *batch.pos.add(c_idx) = (offset + c_idx) as i32;
+                        *batch.n_seq_id.add(c_idx) = 1;
+                        *(*batch.seq_id.add(c_idx)).add(0) = 0;
+                        *batch.logits.add(c_idx) = if is_last_chunk && c_idx == chunk_len - 1 { 1 } else { 0 };
+                    }
+                }
+
                 let ret = unsafe { (lib.decode)(self.ctx, batch) };
+                unsafe { (lib.batch_free)(batch) };
                 if ret != 0 {
                     return Err(format!(
                         "[llama.cpp lib] decode (prefill {}..{}) failed: {}",
                         offset, end, ret
                     ));
                 }
-                // After finishing system-prefix tokens, take the KV snapshot.
-                if offset + chunk.len() >= n_sys
+                // Exactly after finishing system-prefix tokens, take the KV snapshot.
+                if offset + chunk.len() == n_sys
                     && snap_guard.is_none()
                 {
                     if let (Some(get_size), Some(get_data)) = (lib.state_get_size, lib.state_get_data) {
@@ -348,6 +467,7 @@ impl LlamaCppLib {
                                 *snap_guard = Some(SyspromptSnapshot {
                                     system_text: system.clone(),
                                     n_sys_tokens: n_sys,
+                                    system_tokens: sys_tokens.clone(),
                                     data: buf,
                                 });
                             }
@@ -357,6 +477,16 @@ impl LlamaCppLib {
                 offset = end;
             }
         }
+        let prefill_dur = prefill_start_time.elapsed().as_secs_f64().max(0.0001);
+        let total_prompt_tokens = tokens.len();
+        let prefill_toks_sec = total_prompt_tokens as f64 / prefill_dur;
+        update_inference_telemetry(|t| {
+            t.prompt_tokens = total_prompt_tokens;
+            t.prefill_duration_secs = prefill_dur;
+            t.prefill_tok_per_sec = prefill_toks_sec;
+            t.session_total_prompt_tokens += total_prompt_tokens;
+        });
+
         drop(snap_guard);
 
         // Build sampler chain and run the token generation loop.
@@ -365,17 +495,23 @@ impl LlamaCppLib {
         if chain.is_null() {
             return Err("[llama.cpp lib] sampler_chain_init returned null".into());
         }
+        let mtp_mode = crate::settings::get_mtp_mode();
         unsafe {
-            (lib.sampler_chain_add)(chain, (lib.sampler_init_top_p)(0.9, 1));
-            (lib.sampler_chain_add)(chain, (lib.sampler_init_temp)(0.7));
-            (lib.sampler_chain_add)(chain, (lib.sampler_init_dist)(0));
+            if mtp_mode.ngram_size() >= 2 {
+                (lib.sampler_chain_add)(chain, (lib.sampler_init_greedy)());
+            } else {
+                (lib.sampler_chain_add)(chain, (lib.sampler_init_top_p)(0.9, 1));
+                (lib.sampler_chain_add)(chain, (lib.sampler_init_temp)(0.7));
+                (lib.sampler_chain_add)(chain, (lib.sampler_init_dist)(0));
+            }
         }
-        let result = self.sample_loop(chain, &lib, &stream_target, &is_generating, n_predict);
+        let result = self.sample_loop(chain, &lib, &stream_target, &is_generating, n_predict, tokens, gen_start_time);
         unsafe { (lib.sampler_free)(chain) };
         result
     }
 
     /// Token sampling loop — called after prefill is done.
+    /// Supports Prompt Lookup Speculative Decoding when ngram_size >= 2.
     /// `chain` must already be initialised; caller is responsible for freeing it.
     fn sample_loop(
         &self,
@@ -384,6 +520,8 @@ impl LlamaCppLib {
         stream_target: &Arc<Mutex<String>>,
         is_generating: &Arc<Mutex<bool>>,
         n_predict: usize,
+        mut all_tokens: Vec<i32>,
+        gen_start_time: std::time::Instant,
     ) -> Result<String, String> {
         // String-based stop sequences — same set as the HTTP backend.
         const STOP_SEQS: &[&str] = &[
@@ -399,18 +537,35 @@ impl LlamaCppLib {
         ];
 
         let mut full_text = String::new();
+        if let Ok(mut t) = stream_target.lock() {
+            *t = full_text.clone();
+        }
         let mut n_generated = 0usize;
+        let ngram_size = crate::settings::get_mtp_mode().ngram_size();
+        let mem = lib.get_memory.map(|f| unsafe { f(self.ctx) });
+        let decode_start_time = std::time::Instant::now();
+        let mut first_token_time: Option<std::time::Instant> = None;
+
+        // Sample the first token from prefill logits
+        let mut token = unsafe { (lib.sampler_sample)(chain, self.ctx, -1) };
 
         loop {
             if let Ok(is_gen) = is_generating.lock() {
                 if !*is_gen { break; }
             }
 
-            let token = unsafe { (lib.sampler_sample)(chain, self.ctx, -1) };
-
             let is_eog = unsafe { (lib.token_is_eog)(self.vocab, token) };
             if is_eog || n_generated >= n_predict {
                 break;
+            }
+
+            if first_token_time.is_none() {
+                let now = std::time::Instant::now();
+                first_token_time = Some(now);
+                let ttft = (now - gen_start_time).as_secs_f64();
+                update_inference_telemetry(|t| {
+                    t.ttft_secs = ttft;
+                });
             }
 
             let piece = self.token_to_piece(token);
@@ -440,14 +595,192 @@ impl LlamaCppLib {
             }
 
             n_generated += 1;
+            all_tokens.push(token);
 
-            let mut tok = token;
-            let batch = unsafe { (lib.batch_get_one)(&mut tok, 1) };
-            let ret = unsafe { (lib.decode)(self.ctx, batch) };
-            if ret != 0 { break; }
+            // -----------------------------------------------------------------
+            // Prompt Lookup Speculative Decoding:
+            // Draft candidate tokens from earlier token history matching trailing n-gram.
+            // -----------------------------------------------------------------
+            let mut drafts: Vec<i32> = Vec::new();
+            if ngram_size >= 2 && all_tokens.len() > ngram_size + 1 && mem.is_some() {
+                let cur_len = all_tokens.len();
+                let pattern = &all_tokens[cur_len - ngram_size..];
+
+                // Search backwards in history (excluding the current match at the tail)
+                let max_draft_len = 4.min(n_predict.saturating_sub(n_generated));
+                let search_end = cur_len.saturating_sub(ngram_size + 1);
+                for j in (0..search_end).rev() {
+                    if &all_tokens[j..j + ngram_size] == pattern {
+                        let draft_start = j + ngram_size;
+                        let available = cur_len.saturating_sub(draft_start);
+                        let draft_len = max_draft_len.min(available);
+                        if draft_len > 0 {
+                            drafts = all_tokens[draft_start..draft_start + draft_len].to_vec();
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if !drafts.is_empty() {
+                let n_draft = drafts.len();
+                let total_eval = 1 + n_draft;
+
+                let pos_max = if let (Some(m), Some(pos_max_fn)) = (mem, lib.memory_seq_pos_max) {
+                    unsafe { pos_max_fn(m, 0) }
+                } else {
+                    (all_tokens.len() as i32).saturating_sub(1)
+                };
+
+                // Allocate a batch and explicitly populate all metadata fields
+                let mut batch = unsafe { (lib.batch_init)(total_eval as i32, 0, 1) };
+                batch.n_tokens = total_eval as i32;
+
+                unsafe {
+                    *batch.token.add(0) = token;
+                    *batch.pos.add(0) = pos_max + 1;
+                    *batch.n_seq_id.add(0) = 1;
+                    *(*batch.seq_id.add(0)).add(0) = 0;
+                    *batch.logits.add(0) = 1;
+
+                    for (d_i, &d_tok) in drafts.iter().enumerate() {
+                        let idx = d_i + 1;
+                        *batch.token.add(idx) = d_tok;
+                        *batch.pos.add(idx) = pos_max + 1 + idx as i32;
+                        *batch.n_seq_id.add(idx) = 1;
+                        *(*batch.seq_id.add(idx)).add(0) = 0;
+                        *batch.logits.add(idx) = 1;
+                    }
+                }
+
+                let ret = unsafe { (lib.decode)(self.ctx, batch) };
+                unsafe { (lib.batch_free)(batch) };
+                if ret != 0 {
+                    break;
+                }
+
+                // Verify draft predictions sequentially:
+                // logits at index 0 predict the token following `token` (i.e. draft[0])
+                // logits at index k predict the token following `draft[k-1]` (i.e. draft[k])
+                let mut accepted_count = 0usize;
+                let mut next_token = unsafe { (lib.sampler_sample)(chain, self.ctx, 0) };
+                let mut should_stop_generation = false;
+
+                for (i, &draft_tok) in drafts.iter().enumerate() {
+                    let is_draft_eog = unsafe { (lib.token_is_eog)(self.vocab, draft_tok) };
+                    if is_draft_eog {
+                        // Do not accept EOG as speculative token; terminate generation and rollback
+                        should_stop_generation = true;
+                        break;
+                    }
+
+                    if next_token == draft_tok {
+                        // Draft accepted!
+                        let p = self.token_to_piece(draft_tok);
+                        if !p.is_empty() {
+                            full_text.push_str(&p);
+
+                            let tail_start = full_text
+                                .char_indices()
+                                .rev()
+                                .nth(31)
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            let tail = &full_text[tail_start..];
+                            if let Some(stop) = STOP_SEQS.iter().find(|&&s| tail.contains(s)) {
+                                if let Some(idx) = full_text.rfind(stop) {
+                                    full_text.truncate(idx);
+                                }
+                                if let Ok(mut t) = stream_target.lock() {
+                                    *t = full_text.clone();
+                                }
+                                n_generated += 1;
+                                all_tokens.push(draft_tok);
+                                accepted_count += 1;
+                                should_stop_generation = true;
+                                break;
+                            }
+
+                            if let Ok(mut t) = stream_target.lock() {
+                                t.push_str(&p);
+                            }
+                        }
+                        n_generated += 1;
+                        all_tokens.push(draft_tok);
+                        accepted_count += 1;
+
+                        if n_generated >= n_predict {
+                            should_stop_generation = true;
+                            break;
+                        }
+
+                        // Sample prediction after this accepted draft token
+                        next_token = unsafe { (lib.sampler_sample)(chain, self.ctx, (i + 1) as i32) };
+                    } else {
+                        // Diverged: `next_token` is the true sampled replacement from the model
+                        break;
+                    }
+                }
+
+                // Rollback unaccepted draft positions in KV memory
+                if accepted_count < n_draft {
+                    if let (Some(m), Some(rm_fn), Some(pos_max_fn)) = (mem, lib.memory_seq_rm, lib.memory_seq_pos_max) {
+                        let cur_pos_max = unsafe { pos_max_fn(m, 0) };
+                        let excess = (n_draft - accepted_count) as i32;
+                        let keep_pos = cur_pos_max - excess + 1;
+                        unsafe {
+                            rm_fn(m, 0, keep_pos, -1);
+                        }
+                    }
+                }
+
+                if should_stop_generation {
+                    break;
+                }
+
+                token = next_token;
+            } else {
+                // Standard 1-token decode step with explicit continuous KV position
+                let pos = if let (Some(m), Some(pos_max_fn)) = (mem, lib.memory_seq_pos_max) {
+                    unsafe { pos_max_fn(m, 0) + 1 }
+                } else {
+                    all_tokens.len() as i32
+                };
+
+                let mut batch = unsafe { (lib.batch_init)(1, 0, 1) };
+                batch.n_tokens = 1;
+                unsafe {
+                    *batch.token.add(0) = token;
+                    *batch.pos.add(0) = pos;
+                    *batch.n_seq_id.add(0) = 1;
+                    *(*batch.seq_id.add(0)).add(0) = 0;
+                    *batch.logits.add(0) = 1;
+                }
+
+                let ret = unsafe { (lib.decode)(self.ctx, batch) };
+                unsafe { (lib.batch_free)(batch) };
+                if ret != 0 { break; }
+
+                token = unsafe { (lib.sampler_sample)(chain, self.ctx, -1) };
+            }
         }
 
         let cancelled = is_generating.lock().map(|g| !*g).unwrap_or(false);
+        let decode_dur = decode_start_time.elapsed().as_secs_f64().max(0.0001);
+        let decode_toks_sec = if decode_dur > 0.0 {
+            n_generated as f64 / decode_dur
+        } else {
+            0.0
+        };
+        let total_gen_duration = gen_start_time.elapsed().as_secs_f64();
+        update_inference_telemetry(|t| {
+            t.generated_tokens = n_generated;
+            t.decode_duration_secs = decode_dur;
+            t.decode_tok_per_sec = decode_toks_sec;
+            t.session_total_gen_tokens += n_generated;
+            t.session_total_inference_secs += total_gen_duration;
+        });
+
         if full_text.is_empty() {
             if cancelled {
                 Ok(String::new())
@@ -637,12 +970,7 @@ impl LlamaCppLibRuntime {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn num_cpus() -> i32 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() as i32)
-        .unwrap_or(2)
-        .min(8)
-}
+
 
 /// Redirect stderr to /dev/null for the duration of llama.cpp calls so
 /// ggml_abort backtraces do not paint over the ratatui alternate screen.

@@ -99,34 +99,8 @@ impl LlamaCppRuntime {
                     .await
             }
             LlamaCppMode::Cli { model_path } => {
-                // Warm llama-server: load once, then every prompt is a fast HTTP chat turn
-                // with the full Hercules system instruction.
-                if let Ok(mut t) = stream_target.lock() {
-                    if crate::llama::server::managed_server_info()
-                        .map(|(p, _, _)| p != *model_path)
-                        .unwrap_or(true)
-                    {
-                        t.push_str(
-                            "Starting llama-server (loads GGUF once; GPU layers via -ngl if available)…\n",
-                        );
-                    }
-                }
-
-                let (base_url, model_name) =
-                    crate::llama::server::ensure_server_for_model(model_path).await?;
-
-                if let Ok(mut t) = stream_target.lock() {
-                    // Clear loading banner before tokens arrive
-                    if t.contains("Starting llama-server") || t.contains("Loading model") {
-                        t.clear();
-                    }
-                }
-
-                let client = HttpInferenceClient::new(base_url, model_name);
-                // `prompt` may be full You:/Agent: history — HTTP client expands system + turns
-                client
-                    .generate_stream(prompt, stream_target, is_generating)
-                    .await
+                let runtime = crate::llama::libinfer::LlamaCppLibRuntime::with_gguf(model_path.clone());
+                runtime.generate_stream(prompt, stream_target, is_generating).await
             }
         }
     }

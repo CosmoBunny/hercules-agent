@@ -164,6 +164,11 @@ impl LlamaCppLibBackend {
             .generate_stream(prompt, stream_target, is_generating)
             .await
     }
+
+    /// Get the actual model context limit (n_ctx) if using in-process llama.cpp
+    pub fn actual_context_limit(&self) -> Option<usize> {
+        crate::llama::libinfer::get_warm_lib_engine().map(|e| e.context_limit())
+    }
 }
 
 // Backward compat alias
@@ -224,6 +229,11 @@ impl OllamaBackend {
         while let Some(chunk_result) = stream.next().await {
             if let Ok(active_gen) = is_generating.lock() {
                 if !*active_gen {
+                    if thinking_active {
+                        if let Ok(mut target) = stream_target.lock() {
+                            target.push_str(" response\n");
+                        }
+                    }
                     return Err("[Generation Cancelled by User (CTRL+C)]".to_string());
                 }
             }
@@ -272,8 +282,17 @@ impl OllamaBackend {
                     }
                 }
                 Err(e) => {
+                    if let Ok(mut target) = stream_target.lock() {
+                        target.push_str(" response\n");
+                    }
                     return Err(format!("[Ollama Stream Error] {}", e));
                 }
+            }
+        }
+
+        if thinking_active {
+            if let Ok(mut target) = stream_target.lock() {
+                target.push_str(" response\n");
             }
         }
 

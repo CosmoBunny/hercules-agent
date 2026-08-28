@@ -13,7 +13,6 @@ pub mod cpp;
 pub mod ffi;
 pub mod http;
 pub mod libinfer;
-pub mod server;
 
 // ---------------------------------------------------------------------------
 // Legacy pure-Rust modules (not active at runtime; kept for reference)

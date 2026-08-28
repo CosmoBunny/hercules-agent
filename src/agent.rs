@@ -152,27 +152,32 @@ When performing file or shell operations, emit the appropriate tool tags directl
 Working directory token: $CURRENT (host expands it to the real project root).
 
 ## How to call tools (raw tags only — NO markdown fences)
-List dir:             <ls path="$CURRENT">
-List a subfolder:     <ls path="$CURRENT/subdir">
-Read a file:          <read src="$CURRENT/path/to/file">
-Read lines:           <read src="$CURRENT/path/to/file" line=1..=40>
-Write file:           <write src="$CURRENT/path/to/file">
-content
+List directory:       <ls path="$CURRENT/path">
+Read file:            <read src="$CURRENT/path/to/file">
+Read line range:      <read src="$CURRENT/path/to/file" line=1..=50>
+Write / create file:  <write src="$CURRENT/path/to/file">
+[file content to be written]
 </write>
-Shell:                <cmd>shell command</cmd>
-Spawn sub-agent:      <agent action="spawn" role="ROLE" model="MODEL">task</agent>
-Memory push:          <memory push>note</memory>
+Replace line range:   <write src="$CURRENT/path/to/file" line=10..=15>
+[replacement content for lines 10 through 15]
+</write>
+Run tool / command:   <cmd> tool run here </cmd>
+Web search:           <websearch query="search terms"> or <websearch>search terms</websearch>
+Spawn sub-agent:      <agent action="spawn" role="ROLE" model="MODEL">task description</agent>
+Memory push:          <memory push>text</memory>
 Memory read:          <memory read>
-Help (only in think): <help>
+Help (inside think):  <help>
 
-## Rules
-1. If the user asks to create or write content to a file → emit <write src="...">...</write> with full body.
-2. If the user asks to read/inspect files or directories → emit <read ...> or <ls ...> immediately.
-3. If the user asks to run commands, scripts, or programs → emit <cmd>...</cmd> immediately.
-4. If the user asks a general question, chat, or request not requiring tools → answer directly in natural language.
-5. Do NOT wrap normal answers or tools in <think> unless performing private reasoning.
-6. After tool results are provided, summarize or answer the user directly. Do not re-call the same tool repeatedly.
-7. No destructive commands (e.g. rm -rf /, disk wipe) unless user explicitly requests them.
+## Operational Rules
+1. To create, write, or create folders, use `<write src="...">` containing the COMPLETE file content from start to finish in a single tag. Parent folders are created automatically. NEVER chunk or write a single file across multiple partial `<write>` tags line by line. Multi-write is ONLY for writing distinct separate files (different src).
+2. To read or inspect files/directories, use `<read ...>` or `<ls ...>`.
+3. To replace a specific range of lines in an existing file, use `<write src="..." line=START..=END>` with the replacement block.
+4. For web search or online documentation, use `<websearch query="..."/>` or `<websearch>query</websearch>`.
+5. For running shell utilities, git (clone, status, commit), web fetching (curl, wget), build tools, process management, or OS operations, use `<cmd> tool run here </cmd>`.
+6. When using CLI tools, only consult help/manual flags (`--help`, `man`, `/?`) if you are unsure of the tool's exact usage syntax and require clarification. Do not run help commands in the first place without actual need.
+7. For pure conversation, planning, or questions, reply directly in natural language.
+8. Reasoning inside `<think>...</think>` is optional. If you use it, close with `</think>` and emit your tool calls or response outside `<think>`.
+9. Never state you lack access to the local machine or tools.
 "#;
 
 /// Compact system prompt for small GGUFs / llama-server chat.
@@ -181,24 +186,31 @@ pub const SYSTEM_PROMPT_COMPACT: &str = r#"You are Hercules, an autonomous agent
 cwd token: $CURRENT (host expands it).
 
 Tools (raw tags only, no markdown fences):
-<ls path="$CURRENT">
-<ls path="$CURRENT/subdir">
+<ls path="$CURRENT/path">
 <read src="$CURRENT/path/to/file">
-<read src="$CURRENT/path/to/file" line=1..=40>
+<read src="$CURRENT/path/to/file" line=1..=50>
 <write src="$CURRENT/path/to/file">
-content
+[file content to be written]
 </write>
-<cmd>shell command</cmd>
+<write src="$CURRENT/path/to/file" line=10..=15>
+[replacement lines]
+</write>
+<websearch query="search terms">
+<cmd> tool run here </cmd>
 <agent action="spawn" role="role" model="model">task</agent>
-<memory push>note</memory>
+<memory push>text</memory>
 <memory read>
 
 Rules:
-- Questions, conversation, reasoning → answer directly in natural language.
-- Reading or inspecting files → use <read> or <ls>.
-- Creating or editing files → use <write src="...">content</write>.
-- Running shell commands → use <cmd>command</cmd>.
-- Never say you lack file access or tools.
+- Questions and conversation: respond directly in natural language.
+- Inspecting or reading: use `<ls>` or `<read>`.
+- Searching web / documentation: use `<websearch query="...">`.
+- Creating or editing files (and dirs): use `<write src="...">` with the COMPLETE file content in ONE single block. NEVER split or write one file line-by-line across multiple write tags. Multiple writes are only for separate files.
+- Line replacements: use `<write src="..." line=START..=END>`.
+- Git, web fetch (curl/wget), packages, file moves/deletes, or OS utilities: use `<cmd> tool run here </cmd>`.
+- Only check tool help (`--help`, `man`, `/?`) when syntax clarification is genuinely required, not by default.
+- Reasoning inside `<think>...</think>` is optional. If used, close with `</think>` and emit tool calls or response outside.
+- Never claim you lack file access or tools.
 "#;
 
 /// Destructive / mutating action awaiting user accept (Ask mode).
@@ -385,8 +397,47 @@ impl AgentEngine {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string());
+
+        let os_commands = if cfg!(target_os = "windows") {
+            "Host Environment: Windows (cmd / PowerShell)
+Tool Run Format: <cmd> tool run here </cmd>
+Common Tasks:
+- Web fetch / URL:  curl.exe -sL \"url\" or powershell -Command \"Invoke-WebRequest -Uri 'url' -OutFile 'dest'\"
+- Git / Repository: git clone <url>, git status, git diff, git commit -m \"...\"
+- Move / Rename:    move \"src\" \"dst\" or ren \"old\" \"new\"
+- Copy:             copy \"src\" \"dst\" or xcopy \"src\" \"dst\" /E /I
+- Remove / Delete:  del \"file\" or rmdir /S /Q \"dir\"
+- Find in files:    findstr /S /I /N \"pattern\" *.*
+- Processes:        tasklist
+- Syntax Help:      Only use `/?` or `--help` on a tool when you genuinely need syntax clarification, not in the first place."
+        } else if cfg!(target_os = "macos") {
+            "Host Environment: macOS (zsh / bash / BSD utils)
+Tool Run Format: <cmd> tool run here </cmd>
+Common Tasks:
+- Web fetch / URL:  curl -sL \"url\" or wget \"url\"
+- Git / Repository: git clone <url>, git status, git diff, git commit -m \"...\"
+- Move / Rename:    mv \"src\" \"dst\"
+- Copy:             cp \"src\" \"dst\" or cp -R \"src\" \"dst\"
+- Remove / Delete:  rm \"file\" or rm -rf \"dir\"
+- Find in files:    grep -rn \"pattern\" . or find . -name \"pattern\"
+- Processes:        ps aux
+- Syntax Help:      Only use `man <tool>` or `<tool> --help` when you genuinely need syntax clarification, not in the first place."
+        } else {
+            "Host Environment: Linux (bash / sh / GNU coreutils)
+Tool Run Format: <cmd> tool run here </cmd>
+Common Tasks:
+- Web fetch / URL:  curl -sL \"url\" or wget \"url\"
+- Git / Repository: git clone <url>, git status, git diff, git commit -m \"...\"
+- Move / Rename:    mv \"src\" \"dst\"
+- Copy:             cp \"src\" \"dst\" or cp -r \"src\" \"dst\"
+- Remove / Delete:  rm \"file\" or rm -rf \"dir\"
+- Find in files:    grep -rn \"pattern\" . or find . -name \"pattern\"
+- Processes:        ps aux
+- Syntax Help:      Only use `man <tool>` or `<tool> --help` when you genuinely need syntax clarification, not in the first place."
+        };
+
         format!(
-            "{base}\n\nLive: $CURRENT → {cwd}. Prefer path=\"$CURRENT\" or path=\"$CURRENT/subdir\".\n"
+            "{base}\n\nLive Environment:\n- Working Directory: $CURRENT → {cwd}\n- {os_commands}\n"
         )
     }
 
@@ -558,6 +609,10 @@ impl AgentEngine {
             || t.contains("<ls>")
             || t.contains("<write src=")
             || t.contains("<cmd>")
+            || t.contains("<websearch")
+            || t.contains("<mcp")
+            || t.contains("<skill")
+            || t.contains("<agent")
             || t.contains("<memory ")
             || t.contains("<memory>")
     }
@@ -752,10 +807,94 @@ impl AgentEngine {
         if tag.contains("<ls") && !user_text.to_ascii_lowercase().contains("list") {
             return None;
         }
-        Some(tag)
+Some(tag)
     }
 
-    /// Strip `<think>...</think>` blocks from response text.
+    /// When a small model answers with a fenced code block (```lang ... ```)
+    /// instead of emitting a `<write>` tool tag, recover the block as a pending
+    /// write action so the user isn't left with dead text they must copy by hand.
+    pub fn recover_write_from_fenced_code(
+        user_text: &str,
+        assistant_text: &str,
+    ) -> Option<ProposedAction> {
+        if Self::response_has_tool_tags(assistant_text) {
+            return None;
+        }
+        if !assistant_text.contains("```") && !assistant_text.contains("~~~") {
+            return None;
+        }
+
+        let fence = "```";
+        let Some(start) = assistant_text.find(fence) else {
+            return None;
+        };
+        let after_start = &assistant_text[start + 3..];
+        let lang = after_start
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('~')
+            .to_ascii_lowercase();
+        let body_start_rel = after_start.find('\n').map(|i| i + 1).unwrap_or(0);
+        let body_source = &after_start[body_start_rel..];
+        let Some(end_rel) = body_source.find(fence) else {
+            return None;
+        };
+        let body = body_source[..end_rel].trim().to_string();
+        if body.is_empty() || body.len() > 200_000 {
+            return None;
+        }
+
+        let path = Self::filename_from_fence_lang(&lang)
+            .map(|f| format!("$CURRENT/{f}"))
+            .or_else(|| {
+                let from_body = Self::infer_filename_from_body(&body);
+                if from_body != "output.txt" {
+                    Some(format!("$CURRENT/{from_body}"))
+                } else {
+                    let from_user = Self::suggested_path_from_user_text(user_text);
+                    (from_user != "$CURRENT/output.txt").then_some(from_user)
+                }
+            })
+            .unwrap_or_else(|| "$CURRENT/output.txt".to_string());
+
+        Some(ProposedAction {
+            kind: ProposedKind::Write,
+            target: path,
+            body,
+            line_attr: None,
+            from_think: false,
+            chip_id: None,
+        })
+    }
+
+    fn filename_from_fence_lang(lang: &str) -> Option<String> {
+        if lang.is_empty() {
+            return None;
+        }
+        let l = lang.trim();
+        Some(match l {
+            "html" | "htm" | "xml" | "xhtml" => "index.html".to_string(),
+            "css" => "style.css".to_string(),
+            "javascript" | "js" | "jsx" => "script.js".to_string(),
+            "typescript" | "ts" | "tsx" => "script.ts".to_string(),
+            "python" | "py" => "main.py".to_string(),
+            "rust" | "rs" => "main.rs".to_string(),
+            "c" => "main.c".to_string(),
+            "cpp" | "c++" => "main.cpp".to_string(),
+            "go" => "main.go".to_string(),
+            "java" => "Main.java".to_string(),
+            "sh" | "bash" | "shell" | "zsh" => "script.sh".to_string(),
+            "json" => "data.json".to_string(),
+            "yaml" | "yml" => "config.yaml".to_string(),
+            "toml" => "config.toml".to_string(),
+            "md" | "markdown" => "README.md".to_string(),
+            _ => return None,
+        })
+    }
+
+    /// Strip ` thinking... response` blocks from response text.
     pub fn strip_think_blocks(response: &str) -> String {
         let mut cleaned = String::new();
         let mut text = response;
@@ -1120,39 +1259,20 @@ impl AgentEngine {
         false
     }
 
-    /// Suggest a write path from the latest user wording (no hardcoded landing page).
+    /// Suggest a default fallback filename when no path is provided.
     pub fn suggested_path_from_user_text(user_text: &str) -> String {
-        let t = user_text.to_ascii_lowercase();
-        let name = if (t.contains("rotat") || t.contains("spin")) && t.contains("cube") {
-            "rotating_cube.html"
-        } else if t.contains("cube")
-            && (t.contains("html") || t.contains("js") || t.contains("webgl"))
-        {
-            "cube.html"
-        } else if t.contains("three.js") || t.contains("threejs") || t.contains("webgl") {
-            "webgl_demo.html"
-        } else if t.contains("canvas") {
-            "canvas_demo.html"
-        } else if t.contains("landing") {
-            "landing_page.html"
-        } else if t.contains("introduction") || t.contains("intro.md") {
-            "introduction.md"
-        } else if t.contains("readme") {
-            "README.md"
-        } else if t.contains(".md") || t.contains("markdown") {
-            "notes.md"
-        } else if t.contains("python") || t.contains(".py") {
-            "main.py"
-        } else if t.contains("rust") || t.contains(".rs") {
-            "main.rs"
-        } else if t.contains("html") || t.contains("javascript") || t.contains(" js") {
-            "index.html"
+        let name = if let Some(candidate) = Self::extract_path_candidate(user_text) {
+            candidate
         } else {
-            "output.txt"
+            let slug = Self::slugify_filename(user_text, 32);
+            if slug.is_empty() || slug == "file" {
+                "output.txt".to_string()
+            } else {
+                format!("{slug}.txt")
+            }
         };
-        // Prefer dummy_folder for demo HTML/md when user didn't specify a path
-        if name.ends_with(".html") || name.ends_with(".md") {
-            format!("$CURRENT/dummy_folder/{name}")
+        if name.starts_with("$CURRENT") || name.starts_with('/') {
+            name
         } else {
             format!("$CURRENT/{name}")
         }
@@ -1177,7 +1297,7 @@ impl AgentEngine {
         if out.is_empty() { "file".into() } else { out }
     }
 
-    /// Infer a sensible filename from file body (never force landing_page.html).
+    /// Infer a sensible filename from file body content.
     pub fn infer_filename_from_body(body: &str) -> String {
         let body_l = body.to_ascii_lowercase();
         // <title>…</title>
@@ -1192,17 +1312,6 @@ impl AgentEngine {
                     }
                 }
             }
-        }
-        if (body_l.contains("rotat") || body_l.contains("requestanimationframe"))
-            && (body_l.contains("cube") || body_l.contains("webgl") || body_l.contains("three"))
-        {
-            return "rotating_cube.html".into();
-        }
-        if body_l.contains("webgl") || body_l.contains("three.js") || body_l.contains("three.min") {
-            return "webgl_demo.html".into();
-        }
-        if body_l.contains("<canvas") {
-            return "canvas_demo.html".into();
         }
         let html = body_l.contains("<html")
             || body_l.contains("<!doctype")
@@ -1220,90 +1329,28 @@ impl AgentEngine {
         if body_l.contains("def ") || body_l.contains("import ") {
             return "main.py".into();
         }
-        // Avoid "file.txt" mid-stream — prefer index.html for HTML-ish / empty drafts
-        if body.trim().is_empty() || body.len() < 40 {
-            return "index.html".into();
+        if body.trim().is_empty() {
+            return "output.txt".into();
         }
-        "notes.txt".into()
+        "output.txt".into()
     }
 
-    /// Collapse multi-write spam for a single-page user request (landing/html page).
-    /// Keeps the best HTML write (largest body with doctype/html), drops junk file.txt.
+    /// Deduplicate identical write targets if generated multiple times.
     pub fn collapse_write_actions_for_user(
-        user_text: &str,
+        _user_text: &str,
         actions: Vec<ProposedAction>,
     ) -> Vec<ProposedAction> {
-        let writes: Vec<_> = actions
-            .iter()
-            .filter(|a| a.kind == ProposedKind::Write)
-            .cloned()
-            .collect();
-        let others: Vec<_> = actions
-            .into_iter()
-            .filter(|a| a.kind != ProposedKind::Write)
-            .collect();
-        if writes.len() <= 1 {
-            let mut out = writes;
-            out.extend(others);
-            return out;
-        }
-        let low = user_text.to_ascii_lowercase();
-        let single_page = user_text.is_empty()
-            || low.contains("landing")
-            || low.contains("html")
-            || low.contains("web page")
-            || low.contains("webpage")
-            || low.contains("about you")
-            || (low.contains("create") && (low.contains("page") || low.contains("site")));
-        // Without user text: only collapse when junk .txt sits next to real HTML
-        if user_text.is_empty() {
-            let has_html = writes.iter().any(|w| {
-                let b = w.body.to_ascii_lowercase();
-                b.contains("<html") || b.contains("<!doctype")
-            });
-            let has_junk = writes.iter().any(|w| {
-                let n = w.target.to_ascii_lowercase();
-                (n.ends_with(".txt") || n.ends_with("file.txt")) && w.body.len() < 200
-            });
-            if !(has_html && has_junk) {
-                let mut out = writes;
-                out.extend(others);
-                return out;
-            }
-        } else if !single_page {
-            let mut out = writes;
-            out.extend(others);
-            return out;
-        }
-        // Score: prefer closed HTML with real content
-        let best = writes.into_iter().max_by_key(|w| {
-            let b = w.body.to_ascii_lowercase();
-            let mut score = w.body.len() as i64;
-            if b.contains("<!doctype") || b.contains("<html") {
-                score += 50_000;
-            }
-            if b.contains("<style") || b.contains("<body") {
-                score += 10_000;
-            }
-            let name = w.target.to_ascii_lowercase();
-            if name.ends_with("index.html") || name.ends_with("landing_page.html") {
-                score += 5_000;
-            }
-            if name.ends_with("file.txt") || name.ends_with("notes.txt") || name.ends_with(".txt") {
-                score -= 20_000;
-            }
-            score
-        });
+        let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
-        if let Some(w) = best {
-            // Force a clean path for landing pages
-            let mut w = w;
-            if !w.target.ends_with(".html") {
-                w.target = Self::suggested_path_from_user_text(user_text);
+        for a in actions {
+            if a.kind == ProposedKind::Write {
+                if seen.insert(a.target.clone()) {
+                    out.push(a);
+                }
+            } else {
+                out.push(a);
             }
-            out.push(w);
         }
-        out.extend(others);
         out
     }
 
@@ -1320,102 +1367,26 @@ impl AgentEngine {
     ) -> String {
         let p = path_str.trim().trim_end_matches('/');
         let expanded = Self::expand_path(p);
-        let base_name = Path::new(p)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-
-        // Known bad/generic defaults the model (or old host text) loves to emit.
-        let generic_html = matches!(
-            base_name.as_str(),
-            "landing_page.html"
-                | "landing.html"
-                | "page.html"
-                | "file.html"
-                | "output.html"
-                | "index.htm"
-        );
 
         let looks_like_dir = expanded.is_dir()
             || p.ends_with('/')
             || (!p.contains('.')
                 && (expanded.exists() && expanded.is_dir()
                     || !Path::new(p).extension().is_some_and(|e| !e.is_empty())));
-        let no_ext = Path::new(p)
-            .extension()
-            .map(|e| e.is_empty())
-            .unwrap_or(true);
 
-        let body_l = body.to_ascii_lowercase();
-        let html = body_l.contains("<html")
-            || body_l.contains("<!doctype")
-            || body_l.contains("<head")
-            || body_l.contains("<body")
-            || body_l.contains("<canvas");
-        let md = body_l.contains("# ") || body_l.starts_with("---");
-
-        // Replace generic landing_page.html when body/user clearly mean something else.
-        if generic_html {
-            let better = user_hint
-                .map(Self::suggested_path_from_user_text)
-                .filter(|s| !s.contains("landing_page") && !s.contains("output.txt"))
-                .unwrap_or_else(|| {
-                    let name = if body.trim().is_empty() {
-                        user_hint
-                            .map(|u| {
-                                Self::suggested_path_from_user_text(u)
-                                    .rsplit('/')
-                                    .next()
-                                    .unwrap_or("index.html")
-                                    .to_string()
-                            })
-                            .unwrap_or_else(|| "index.html".into())
-                    } else {
-                        Self::infer_filename_from_body(body)
-                    };
-                    if p.contains("dummy_folder") || p.contains("$CURRENT") {
-                        // keep directory prefix
-                        if let Some(parent) = Path::new(p).parent() {
-                            let parent = parent.to_string_lossy();
-                            if parent.is_empty() || parent == "." {
-                                format!("$CURRENT/dummy_folder/{name}")
-                            } else {
-                                format!("{parent}/{name}")
-                            }
-                        } else {
-                            format!("$CURRENT/dummy_folder/{name}")
-                        }
-                    } else {
-                        format!("$CURRENT/dummy_folder/{name}")
-                    }
-                });
-            // If suggested_path is full $CURRENT/... use it; else join
-            if better.starts_with("$CURRENT") || better.contains('/') {
-                return better;
-            }
-        }
-
-        if looks_like_dir || (no_ext && (html || md || !body.trim().is_empty()) && !p.contains('.'))
-        {
+        if looks_like_dir {
             let name = if !body.trim().is_empty() {
                 Self::infer_filename_from_body(body)
             } else if let Some(u) = user_hint {
                 Self::suggested_path_from_user_text(u)
                     .rsplit('/')
                     .next()
-                    .unwrap_or("file.txt")
+                    .unwrap_or("output.txt")
                     .to_string()
-            } else if html {
-                "index.html".into()
-            } else if md {
-                "README.md".into()
             } else {
-                "file.txt".into()
+                "output.txt".into()
             };
-            if expanded.is_dir() || p.ends_with('/') || !p.contains('.') {
-                return format!("{p}/{name}");
-            }
+            return format!("{p}/{name}");
         }
         p.to_string()
     }
@@ -1473,6 +1444,45 @@ impl AgentEngine {
             }
             break;
         }
+        rest = text;
+        while let Some(start_tag) = rest.find("<websearch") {
+            let r = &rest[start_tag..];
+            if let Some(close_bracket) = r.find('>') {
+                let header = &r[..close_bracket + 1];
+                let mut query_attr = Self::extract_attribute(header, "query");
+                let after = &r[close_bracket + 1..];
+                let (body, advance) = if let Some(end_tag) = after.find("</websearch>") {
+                    (after[..end_tag].trim().to_string(), end_tag + 12)
+                } else {
+                    let b = after.lines().next().unwrap_or("").trim().to_string();
+                    (b, after.len())
+                };
+
+                for stop in ["<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|endoftext|>", "</s>"] {
+                    if let Some(ref mut q) = query_attr {
+                        *q = q.replace(stop, "").trim().to_string();
+                    }
+                }
+
+                let target = query_attr.unwrap_or_else(|| {
+                    if !body.is_empty() { body.clone() } else { "search".to_string() }
+                });
+
+                if !target.is_empty() && target != "search" {
+                    out.push(ProposedAction {
+                        kind: ProposedKind::WebSearch,
+                        target,
+                        body,
+                        line_attr: None,
+                        from_think,
+                        chip_id: None,
+                    });
+                }
+                rest = &after[advance.min(after.len())..];
+                continue;
+            }
+            break;
+        }
         out
     }
 
@@ -1504,22 +1514,24 @@ impl AgentEngine {
     fn parse_write_cmd_actions(text: &str, from_think: bool) -> Vec<ProposedAction> {
         let mut out = Vec::new();
         let mut rest = text;
-        while let Some(start_tag) = rest.find("<write src=") {
+        while let Some(start_tag) = rest.find("<write") {
             let r = &rest[start_tag..];
             if let Some(close_bracket) = r.find('>') {
                 let tag_header = &r[..close_bracket + 1];
                 let path_attr = Self::extract_attribute(tag_header, "src");
                 let line_attr = Self::extract_attribute(tag_header, "line");
-                let (body, next) = if let Some(end_tag) = r.find("</write") {
-                    let body = &r[close_bracket + 1..end_tag];
-                    let after = if let Some(ec) = r[end_tag..].find('>') {
-                        &r[end_tag + ec + 1..]
+                let content_after_header = &r[close_bracket + 1..];
+
+                let (body, next) = if let Some(end_tag) = content_after_header.find("</write") {
+                    let body = &content_after_header[..end_tag];
+                    let after = if let Some(ec) = content_after_header[end_tag..].find('>') {
+                        &content_after_header[end_tag + ec + 1..]
                     } else {
                         ""
                     };
                     (body.to_string(), after)
                 } else {
-                    (r[close_bracket + 1..].to_string(), "")
+                    (content_after_header.to_string(), "")
                 };
                 if let Some(path_str) = path_attr {
                     let body = body.trim_matches(|c| c == '\n' || c == '\r').to_string();
@@ -1592,11 +1604,49 @@ impl AgentEngine {
             ProposedKind::WebSearch => {
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
-                        let provider = websearch::providers::duckduckgo::DuckDuckGoProvider::new();
+                        let settings = crate::settings::get_settings();
+                        let provider_setting = settings.web_search_provider;
+                        let provider_box: Box<dyn websearch::SearchProvider> = match provider_setting {
+                            crate::settings::WebSearchProvider::DuckDuckGo => {
+                                Box::new(websearch::providers::duckduckgo::DuckDuckGoProvider::new())
+                            }
+                            crate::settings::WebSearchProvider::Google => {
+                                let key = settings.google_api_key.or_else(|| std::env::var("GOOGLE_API_KEY").ok()).unwrap_or_default();
+                                let cx = settings.google_cx.or_else(|| std::env::var("GOOGLE_CX").ok()).unwrap_or_default();
+                                match websearch::providers::google::GoogleProvider::new(&key, &cx) {
+                                    Ok(p) => Box::new(p),
+                                    Err(_) => Box::new(websearch::providers::duckduckgo::DuckDuckGoProvider::new()),
+                                }
+                            }
+                            crate::settings::WebSearchProvider::Brave => {
+                                let key = settings.brave_api_key.or_else(|| std::env::var("BRAVE_API_KEY").ok()).unwrap_or_default();
+                                match websearch::providers::brave::BraveProvider::new(&key) {
+                                    Ok(p) => Box::new(p),
+                                    Err(_) => Box::new(websearch::providers::duckduckgo::DuckDuckGoProvider::new()),
+                                }
+                            }
+                            crate::settings::WebSearchProvider::Tavily => {
+                                let key = settings.tavily_api_key.or_else(|| std::env::var("TAVILY_API_KEY").ok()).unwrap_or_default();
+                                match websearch::providers::tavily::TavilyProvider::new(&key) {
+                                    Ok(p) => Box::new(p),
+                                    Err(_) => Box::new(websearch::providers::duckduckgo::DuckDuckGoProvider::new()),
+                                }
+                            }
+                            crate::settings::WebSearchProvider::Searxng => {
+                                let url = settings.searxng_url.or_else(|| std::env::var("SEARXNG_URL").ok()).unwrap_or_else(|| "http://localhost:8080".to_string());
+                                match websearch::providers::searxng::SearxNGProvider::new(&url) {
+                                    Ok(p) => Box::new(p),
+                                    Err(_) => Box::new(websearch::providers::duckduckgo::DuckDuckGoProvider::new()),
+                                }
+                            }
+                            crate::settings::WebSearchProvider::Arxiv => {
+                                Box::new(websearch::providers::arxiv::ArxivProvider::new())
+                            }
+                        };
                         let options = websearch::SearchOptions {
                             query: action.target.clone(),
                             max_results: Some(3),
-                            provider: Box::new(provider),
+                            provider: provider_box,
                             ..Default::default()
                         };
                         match websearch::web_search(options).await {
@@ -1630,13 +1680,71 @@ impl AgentEngine {
         }
     }
 
-    /// Process agent tags and return tool execution output.
+    /// Validates syntax of tool tags in the response and returns System error messages if malformed.
+    pub fn validate_tool_tags(response: &str) -> Vec<String> {
+        let outside = Self::strip_think_blocks(response);
+        let mut errors = Vec::new();
+
+        // Check <write> tags
+        let mut text = outside.as_str();
+        while let Some(start) = text.find("<write") {
+            let rest = &text[start..];
+            if let Some(close_bracket) = rest.find('>') {
+                let header = &rest[..close_bracket + 1];
+                let src_attr = Self::extract_attribute(header, "src");
+                let action_attr = Self::extract_attribute(header, "action");
+                let line_attr = Self::extract_attribute(header, "line");
+
+                if src_attr.is_none() {
+                    errors.push("System Error: `<write>` tag is missing the required `src=\"...\"` attribute. Example: `<write src=\"index.html\">...content...</write>`.".to_string());
+                }
+
+                if let Some(action) = action_attr {
+                    if action == "replace" && line_attr.is_none() {
+                        errors.push("System Error: `<write action=\"replace\">` is missing the required `line=START..=END` attribute. Example: `<write src=\"path\" line=10..=15>...replacement...</write>`.".to_string());
+                    }
+                }
+
+                if let Some(line) = line_attr {
+                    if Self::parse_range(&line).is_none() {
+                        errors.push(format!("System Error: Invalid line range format in `<write line={line}>`. Use format `line=START..=END` (e.g., `line=5..=20`)."));
+                    }
+                }
+                text = &rest[close_bracket + 1..];
+            } else {
+                break;
+            }
+        }
+
+        // Check <read> tags
+        text = outside.as_str();
+        while let Some(start) = text.find("<read") {
+            let rest = &text[start..];
+            if let Some(close_bracket) = rest.find('>') {
+                let header = &rest[..close_bracket + 1];
+                if Self::extract_attribute(header, "src").is_none() {
+                    errors.push("System Error: `<read>` tag is missing the required `src=\"...\"` attribute. Example: `<read src=\"path/to/file\">`.".to_string());
+                }
+                text = &rest[close_bracket + 1..];
+            } else {
+                break;
+            }
+        }
+
+        errors
+    }
+
+    /// Process tool tags in an agent response.
     ///
     /// - **Inside `<think>`:** only `<help>` is auto-executed.
     /// - **Outside:** `<read>`, `<ls>`, `<memory>` auto-run.
     /// - **Write/cmd:** auto-run only if AlwaysAllow / session `/allow`; otherwise
     ///   returned as [`ProposedAction`] via [`extract_proposed_actions`] (caller must accept).
     pub fn process_response(response: &str) -> Option<String> {
+        let tag_errors = Self::validate_tool_tags(response);
+        if !tag_errors.is_empty() {
+            return Some(tag_errors.join("\n"));
+        }
         let executable_outside_think = Self::strip_think_blocks(response);
         let cleaned_outside_think = Self::strip_code_fences(&executable_outside_think);
         let think_body = Self::strip_code_fences(&Self::extract_think_contents(response));
