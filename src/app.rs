@@ -7343,8 +7343,8 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 } else {
                     Style::default().fg(Color::White).bg(Color::Rgb(46, 52, 64))
                 };
-                let icon = if sug.ends_with('/') { "📁 " } else { "📄 " };
-                list_items.push(ListItem::new(Span::styled(format!(" {icon}{sug} "), style)));
+                let tag = if sug.ends_with('/') { "[DIR] " } else { "[FILE] " };
+                list_items.push(ListItem::new(Span::styled(format!(" {tag}{sug} "), style)));
             }
 
             let block = Block::default()
