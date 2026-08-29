@@ -20,6 +20,8 @@ pub mod tool_panel;
 pub mod diagram;
 pub mod graphic;
 pub mod markdown;
+pub mod media;
+pub mod ocr;
 pub mod session;
 pub mod smart_system;
 

@@ -588,6 +588,46 @@ pub fn set_search_token(provider: WebSearchProvider, tok: String) {
     }
 }
 
+pub fn get_ocr_engine_mode() -> crate::ocr::OcrEngineMode {
+    let s = get_settings();
+    match s.ocr_model.to_ascii_lowercase().as_str() {
+        "tesseract" => crate::ocr::OcrEngineMode::Tesseract,
+        "native" => crate::ocr::OcrEngineMode::Native,
+        "pdftotext" => crate::ocr::OcrEngineMode::Pdftotext,
+        _ => crate::ocr::OcrEngineMode::Auto,
+    }
+}
+
+pub fn nudge_ocr_engine_mode(dir: i32) -> crate::ocr::OcrEngineMode {
+    let cur = get_ocr_engine_mode();
+    let modes = [
+        crate::ocr::OcrEngineMode::Auto,
+        crate::ocr::OcrEngineMode::Tesseract,
+        crate::ocr::OcrEngineMode::Native,
+        crate::ocr::OcrEngineMode::Pdftotext,
+    ];
+    let idx = modes.iter().position(|m| *m == cur).unwrap_or(0);
+    let next_idx = if dir > 0 {
+        (idx + 1) % modes.len()
+    } else if idx == 0 {
+        modes.len() - 1
+    } else {
+        idx - 1
+    };
+    let next = modes[next_idx];
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.ocr_model = match next {
+            crate::ocr::OcrEngineMode::Auto => "auto".into(),
+            crate::ocr::OcrEngineMode::Tesseract => "tesseract".into(),
+            crate::ocr::OcrEngineMode::Native => "native".into(),
+            crate::ocr::OcrEngineMode::Pdftotext => "pdftotext".into(),
+        };
+        save_settings_to_disk(s);
+    }
+    next
+}
+
 pub fn clear_search_token(provider: WebSearchProvider) {
     if let Ok(mut g) = SETTINGS.lock() {
         let s = g.get_or_insert_with(RuntimeSettings::default);

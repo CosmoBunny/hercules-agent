@@ -148,6 +148,7 @@ pub const SETTINGS_TAB_NAMES: &[&str] = &[
     "Permissions",
     "Web Search",
     "HF Token",
+    "OCR Engine",
 ];
 
 pub struct App {
@@ -262,6 +263,13 @@ pub struct App {
     pub hf_models: Vec<String>,
     pub registry_search_query: String,
     pub search_results: Arc<Mutex<Option<Vec<String>>>>,
+
+    // Multimodal attachments & Path Autocomplete
+    pub attachments: Vec<crate::media::MediaAttachment>,
+    pub next_attachment_id: usize,
+    pub path_suggestions: Vec<String>,
+    pub path_suggestion_index: usize,
+    pub path_suggestion_active: bool,
 
     // Live Activity Logs (Split Pane Console)
     pub activity_logs: Arc<Mutex<Vec<String>>>,
@@ -435,6 +443,11 @@ impl App {
             hf_models: Vec::new(),
             registry_search_query: String::new(),
             search_results: Arc::new(Mutex::new(None)),
+            attachments: Vec::new(),
+            next_attachment_id: 1,
+            path_suggestions: Vec::new(),
+            path_suggestion_index: 0,
+            path_suggestion_active: false,
             activity_logs: Arc::new(Mutex::new(vec![
                 "[SYSTEM] Hercules Engine initialized.".to_string(),
                 "[HARDWARE] Vulkan/WGPU GPU acceleration active.".to_string(),
@@ -2054,6 +2067,28 @@ impl App {
             parts.push(chat[start..].join("\n\n"));
         }
 
+        // Multimodal & OCR attachments
+        if !self.attachments.is_empty() {
+            let mut att_context = String::new();
+            for att in &self.attachments {
+                let ocr_block = if let Some(ref text) = att.ocr_text {
+                    format!("\n<ocr_extracted_text>\n{}\n</ocr_extracted_text>", trunc_chars(text.trim(), 4000))
+                } else {
+                    String::new()
+                };
+                att_context.push_str(&format!(
+                    "<attachment type=\"{:?}\" name=\"{}\" path=\"{}\">{}</attachment>\n",
+                    att.media_type,
+                    att.original_name,
+                    att.staged_path.display(),
+                    ocr_block
+                ));
+            }
+            if !att_context.is_empty() {
+                parts.push(format!("<multimodal_context>\n{}</multimodal_context>", att_context.trim()));
+            }
+        }
+
         // 2. Structured tool result turns (always included after conversation)
         for r in self.tool_result_context.iter().rev().take(6).rev() {
             let trimmed = r.trim();
@@ -2631,6 +2666,11 @@ impl App {
                     self.status_message = "HuggingFace token removed.".to_string();
                 }
             }
+            10 => {
+                // OCR Engine
+                let next = crate::settings::nudge_ocr_engine_mode(if dir != 0 { dir } else { 1 });
+                self.status_message = format!("OCR Engine Mode: {}", next.label());
+            }
             _ => {}
         }
     }
@@ -2728,6 +2768,164 @@ impl App {
         }
 
         (lines, cursor_col, cursor_row)
+    }
+
+    /// Check if the text before the cursor matches a path prefix (`$CURRENT/`, `~/`, `/`, `./`)
+    pub fn update_path_autocomplete(&mut self) {
+        let prefix_before_cursor: String = self.input.chars().take(self.input_cursor_position).collect();
+        let last_word = prefix_before_cursor
+            .split_whitespace()
+            .last()
+            .unwrap_or("");
+
+        if last_word.starts_with("$CURRENT")
+            || last_word.starts_with('~')
+            || last_word.starts_with('/')
+            || last_word.starts_with("./")
+            || last_word.starts_with("../")
+        {
+            let resolved_prefix = if last_word.starts_with("$CURRENT") {
+                let rest = last_word.trim_start_matches("$CURRENT").trim_start_matches('/');
+                std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join(rest)
+            } else if last_word.starts_with('~') {
+                let rest = last_word.trim_start_matches('~').trim_start_matches('/');
+                dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")).join(rest)
+            } else {
+                std::path::PathBuf::from(last_word)
+            };
+
+            let search_dir = if resolved_prefix.is_dir() {
+                resolved_prefix.clone()
+            } else {
+                resolved_prefix.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."))
+            };
+
+            let filter_name = if resolved_prefix.is_dir() {
+                String::new()
+            } else {
+                resolved_prefix.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase()
+            };
+
+            let mut suggestions = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&search_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with('.') && !filter_name.starts_with('.') {
+                        continue;
+                    }
+                    if filter_name.is_empty() || name.to_lowercase().contains(&filter_name) {
+                        let path = entry.path();
+                        let is_dir = path.is_dir();
+                        let display_name = if is_dir { format!("{name}/") } else { name };
+                        suggestions.push(display_name);
+                        if suggestions.len() >= 15 {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !suggestions.is_empty() {
+                self.path_suggestions = suggestions;
+                self.path_suggestion_index = self.path_suggestion_index.min(self.path_suggestions.len().saturating_sub(1));
+                self.path_suggestion_active = true;
+                return;
+            }
+        }
+
+        self.path_suggestions.clear();
+        self.path_suggestion_active = false;
+        self.path_suggestion_index = 0;
+    }
+
+    pub fn accept_path_suggestion(&mut self) -> bool {
+        if !self.path_suggestion_active || self.path_suggestions.is_empty() {
+            return false;
+        }
+
+        let selected = self.path_suggestions[self.path_suggestion_index].clone();
+        let prefix_before_cursor: String = self.input.chars().take(self.input_cursor_position).collect();
+        let last_word = prefix_before_cursor.split_whitespace().last().unwrap_or("").to_string();
+
+        let replacement = if last_word.ends_with('/') {
+            format!("{last_word}{selected}")
+        } else if let Some(idx) = last_word.rfind('/') {
+            format!("{}{selected}", &last_word[..=idx])
+        } else {
+            selected.clone()
+        };
+
+        // Replace last word in input
+        let start_pos = self.input_cursor_position.saturating_sub(last_word.chars().count());
+        let mut chars: Vec<char> = self.input.chars().collect();
+        chars.splice(start_pos..self.input_cursor_position, replacement.chars());
+        self.input = chars.into_iter().collect();
+        self.input_cursor_position = start_pos + replacement.chars().count();
+
+        // If file is an image, video, or pdf, also automatically attach it
+        let clean_path_str = replacement
+            .trim_start_matches("$CURRENT/")
+            .trim_start_matches("$CURRENT");
+        let path = std::path::Path::new(clean_path_str);
+        if path.is_file() {
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            let mtype = crate::media::MediaType::from_extension(ext);
+            if mtype != crate::media::MediaType::Other {
+                self.attach_file_path(path);
+            }
+        }
+
+        self.update_path_autocomplete();
+        true
+    }
+
+    pub fn attach_file_path(&mut self, path: &std::path::Path) {
+        if let Ok(mut att) = crate::media::stage_file_path(path) {
+            att.id = self.next_attachment_id;
+            self.next_attachment_id += 1;
+            let tag = format!("[{} {}: {}]", att.media_type.label(), att.id, att.original_name);
+            self.status_message = format!("Attached: {tag}");
+            self.trigger_ocr_for_attachment(att.clone());
+            self.attachments.push(att);
+        }
+    }
+
+    pub fn attach_image_bytes(&mut self, bytes: &[u8], ext: &'static str) {
+        if let Ok(mut att) = crate::media::stage_image_bytes(bytes, ext) {
+            att.id = self.next_attachment_id;
+            self.next_attachment_id += 1;
+            let tag = format!("[Image {}: {}]", att.id, att.original_name);
+            self.input_insert_text(&format!(" {tag} "));
+            self.status_message = format!("Pasted Image: {tag}");
+            self.trigger_ocr_for_attachment(att.clone());
+            self.attachments.push(att);
+        }
+    }
+
+    pub fn trigger_ocr_for_attachment(&self, att: crate::media::MediaAttachment) {
+        let logs = self.activity_logs.clone();
+        let path = att.staged_path.clone();
+        let mode = crate::settings::get_ocr_engine_mode();
+
+        tokio::spawn(async move {
+            if let Ok(mut l) = logs.lock() {
+                l.push(format!("[OCR] Starting text extraction for {}...", att.original_name));
+            }
+            match crate::ocr::OcrService::extract_text(&path, mode).await {
+                Ok(text) => {
+                    if let Ok(mut l) = logs.lock() {
+                        l.push(format!("[OCR SUCCESS] Extracted {} chars from {}", text.len(), att.original_name));
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut l) = logs.lock() {
+                        l.push(format!("[OCR NOTICE] {e}"));
+                    }
+                }
+            }
+        });
     }
 
     pub fn input_cursor_col_row(&self, width: usize) -> (usize, usize) {
@@ -4340,7 +4538,7 @@ impl App {
                                         self.status_message = format!("Type or paste key/URL for {}...", s.web_search_provider.label());
                                     } else if self.settings_tab == 8 && self.search_token_editing {
                                         self.search_token_input.push('k');
-                                    } else if self.settings_tab == SETTINGS_TAB_NAMES.len() - 1 && self.hf_token_editing {
+                                    } else if self.settings_tab == 9 && self.hf_token_editing {
                                         self.hf_token_input.push('k');
                                     }
                                 }
@@ -4351,7 +4549,7 @@ impl App {
                                                 let s = crate::settings::get_settings();
                                                 crate::settings::clear_search_token(s.web_search_provider);
                                                 self.status_message = format!("Cleared key for provider {}", s.web_search_provider.label());
-                                            } else if self.settings_tab == SETTINGS_TAB_NAMES.len() - 1 {
+                                            } else if self.settings_tab == 9 {
                                                 crate::settings::clear_hf_token();
                                                 self.status_message = "HuggingFace token removed.".to_string();
                                             } else {
@@ -4494,7 +4692,13 @@ impl App {
                                     }
                                 }
                                 KeyCode::Up => {
-                                    if self.input_focused {
+                                    if !self.show_menu && self.path_suggestion_active {
+                                        if self.path_suggestion_index == 0 {
+                                            self.path_suggestion_index = self.path_suggestions.len().saturating_sub(1);
+                                        } else {
+                                            self.path_suggestion_index -= 1;
+                                        }
+                                    } else if self.input_focused {
                                         self.input_cursor_up(80);
                                     } else {
                                         self.scroll_offset = self.scroll_offset.saturating_sub(1);
@@ -4502,7 +4706,9 @@ impl App {
                                     }
                                 }
                                 KeyCode::Down => {
-                                    if self.input_focused {
+                                    if !self.show_menu && self.path_suggestion_active {
+                                        self.path_suggestion_index = (self.path_suggestion_index + 1) % self.path_suggestions.len().max(1);
+                                    } else if self.input_focused {
                                         self.input_cursor_down(80);
                                     } else {
                                         self.scroll_offset = self.scroll_offset.saturating_add(1);
@@ -4682,14 +4888,36 @@ impl App {
                                         self.delete_word_backward();
                                     }
                                 }
+                                KeyCode::Tab if !self.show_menu && self.path_suggestion_active => {
+                                    self.accept_path_suggestion();
+                                }
                                 KeyCode::Char('v') | KeyCode::Char('V')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
-                                    if let Some(text) = crate::clipboard::read_clipboard_silent() {
-                                        if self.show_menu && self.menu_section == 3 && self.settings_tab == 5 && self.hf_token_editing {
-                                            self.hf_token_input.push_str(text.trim());
+                                    // 1. Check if clipboard has raw image bytes
+                                    if let Some((img_bytes, ext)) = crate::clipboard::read_clipboard_image_bytes() {
+                                        self.attach_image_bytes(&img_bytes, ext);
+                                    } else if let Some(text) = crate::clipboard::read_clipboard_silent() {
+                                        let trimmed = text.trim();
+                                        // Check if pasted text is a local file path
+                                        let path = std::path::Path::new(trimmed);
+                                        if path.exists() && path.is_file() {
+                                            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                                            let mtype = crate::media::MediaType::from_extension(ext);
+                                            if mtype != crate::media::MediaType::Other {
+                                                self.attach_file_path(path);
+                                                let tag = format!("[{} {}: {}]", mtype.label(), self.next_attachment_id - 1, path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
+                                                self.input_insert_text(&format!(" {tag} "));
+                                            } else {
+                                                self.input_insert_text(&text);
+                                            }
+                                        } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 9 && self.hf_token_editing {
+                                            self.hf_token_input.push_str(trimmed);
+                                        } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 8 && self.search_token_editing {
+                                            self.search_token_input.push_str(trimmed);
                                         } else if self.input_focused && !self.show_menu {
                                             self.input_insert_text(&text);
+                                            self.update_path_autocomplete();
                                         }
                                     }
                                 }
@@ -4778,7 +5006,7 @@ impl App {
                                             if c != '\n' && c != '\r' {
                                                 self.search_token_input.push(c);
                                             }
-                                        } else if self.show_menu && self.menu_section == 3 && self.settings_tab == SETTINGS_TAB_NAMES.len() - 1 && self.hf_token_editing {
+                                        } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 9 && self.hf_token_editing {
                                             if c != '\n' && c != '\r' {
                                                 self.hf_token_input.push(c);
                                             }
@@ -4789,6 +5017,7 @@ impl App {
                                             } else {
                                                 self.input_insert_char(c);
                                             }
+                                            self.update_path_autocomplete();
                                         }
                                     }
                                 }
@@ -4808,7 +5037,7 @@ impl App {
                                         });
                                     } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 8 && self.search_token_editing {
                                         self.search_token_input.pop();
-                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == SETTINGS_TAB_NAMES.len() - 1 && self.hf_token_editing {
+                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 9 && self.hf_token_editing {
                                         self.hf_token_input.pop();
                                     } else if self.input_focused && !self.show_menu {
                                         if self.input_cursor_position > 0 && !self.input.is_empty()
@@ -4821,6 +5050,7 @@ impl App {
                                             chars.remove(pos - 1);
                                             self.input = chars.into_iter().collect();
                                             self.input_cursor_position -= 1;
+                                            self.update_path_autocomplete();
                                         }
                                     }
                                 }
@@ -4840,7 +5070,7 @@ impl App {
                                             crate::settings::clear_search_token(s.web_search_provider);
                                             self.status_message = format!("Cleared key for provider {}", s.web_search_provider.label());
                                         }
-                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == SETTINGS_TAB_NAMES.len() - 1 {
+                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 9 {
                                         if self.hf_token_editing {
                                             self.hf_token_input.clear();
                                         } else {
@@ -4868,6 +5098,8 @@ impl App {
 
                                     if want_newline {
                                         self.input_insert_char('\n');
+                                    } else if !self.show_menu && self.path_suggestion_active {
+                                        self.accept_path_suggestion();
                                     } else if self.show_menu {
                                         if self.menu_section == 0 {
                                             // Help tab: Enter closes menu
@@ -5161,7 +5393,7 @@ impl App {
                                                 } else {
                                                     self.adjust_setting_value(1);
                                                 }
-                                            } else if self.settings_tab == SETTINGS_TAB_NAMES.len() - 1 {
+                                            } else if self.settings_tab == 9 {
                                                 if self.hf_token_editing {
                                                     // Save token
                                                     let tok = self.hf_token_input.trim().to_string();
@@ -7016,11 +7248,57 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 for (r, line_str) in wrapped_prompt_lines[start_idx..end_idx].iter().enumerate() {
                     let mut row_spans = vec![
                         Span::raw(" "), // 1-character left padding for user text input
-                        Span::styled(
-                            line_str.clone(),
-                            Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
-                        ),
                     ];
+
+                    // Parse inline badges like [Image 1: file.png], [Video 1: vid.mp4], [PDF 1: doc.pdf]
+                    let mut cur_pos = 0;
+                    let line_chars = line_str.as_str();
+                    while let Some(open_idx) = line_chars[cur_pos..].find('[') {
+                        let actual_open = cur_pos + open_idx;
+                        if let Some(close_idx) = line_chars[actual_open..].find(']') {
+                            let actual_close = actual_open + close_idx;
+                            let badge_body = &line_chars[actual_open + 1..actual_close];
+
+                            if badge_body.starts_with("Image ")
+                                || badge_body.starts_with("Video ")
+                                || badge_body.starts_with("PDF ")
+                                || badge_body.starts_with("PDF/Doc ")
+                                || badge_body.starts_with("File ")
+                            {
+                                // Push leading text
+                                if actual_open > cur_pos {
+                                    row_spans.push(Span::styled(
+                                        line_chars[cur_pos..actual_open].to_string(),
+                                        Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    ));
+                                }
+
+                                let bg_color = if badge_body.starts_with("Image ") {
+                                    Color::Rgb(59, 130, 246) // Vibrant Blue
+                                } else if badge_body.starts_with("Video ") {
+                                    Color::Rgb(139, 92, 246) // Purple
+                                } else {
+                                    Color::Rgb(16, 185, 129) // Emerald Green
+                                };
+
+                                row_spans.push(Span::styled(
+                                    format!(" {} ", badge_body),
+                                    Style::default().fg(Color::White).bg(bg_color).add_modifier(Modifier::BOLD),
+                                ));
+
+                                cur_pos = actual_close + 1;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+
+                    if cur_pos < line_chars.len() {
+                        row_spans.push(Span::styled(
+                            line_chars[cur_pos..].to_string(),
+                            Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                        ));
+                    }
 
                     if has_scrollbar {
                         let line_len = line_str.chars().count();
@@ -7042,6 +7320,41 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
         let input_box = Paragraph::new(input_ui_lines)
             .style(Style::default().bg(NORDIC_BG));
         frame.render_widget(input_box, input_area);
+
+        // Path Autocomplete Popup floating above input
+        if !self.show_menu && self.path_suggestion_active && !self.path_suggestions.is_empty() {
+            let num_items = self.path_suggestions.len().min(8);
+            let pop_h = (num_items as u16) + 2;
+            let pop_y = input_area.y.saturating_sub(pop_h);
+            let pop_w = 40.min(area.width.saturating_sub(4));
+            let pop_area = Rect {
+                x: input_area.x.saturating_add(2),
+                y: pop_y,
+                width: pop_w,
+                height: pop_h,
+            };
+
+            frame.render_widget(Clear, pop_area);
+            let mut list_items = Vec::new();
+            for (idx, sug) in self.path_suggestions.iter().take(num_items).enumerate() {
+                let is_sel = idx == self.path_suggestion_index;
+                let style = if is_sel {
+                    Style::default().fg(Color::Black).bg(Color::Rgb(143, 218, 255)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White).bg(Color::Rgb(46, 52, 64))
+                };
+                let icon = if sug.ends_with('/') { "📁 " } else { "📄 " };
+                list_items.push(ListItem::new(Span::styled(format!(" {icon}{sug} "), style)));
+            }
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Suggestions (Tab/Enter: select) ")
+                .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
+                .style(Style::default().bg(Color::Rgb(46, 52, 64)));
+            let list_widget = List::new(list_items).block(block);
+            frame.render_widget(list_widget, pop_area);
+        }
 
         let is_downloading = self.download_progress.lock().unwrap().is_some();
         if self.input_focused && !self.show_menu && !is_downloading && input_box_h > 1 {
@@ -7833,7 +8146,7 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                 }
                                 val_lines.push(Line::from(Span::styled("Left/Right/A/D: Cycle Provider | Enter: Edit | Esc: Back", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
                             }
-                            _ => {
+                            9 => {
                                 // HuggingFace Token
                                 let tok_opt = crate::settings::get_hf_token();
                                 let has_token = tok_opt.is_some();
@@ -7883,6 +8196,43 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                     }
                                 }
                             }
+                            10 => {
+                                // OCR Engine
+                                let ocr_mode = crate::settings::get_ocr_engine_mode();
+                                val_lines.push(Line::from(vec![
+                                    Span::styled("Active OCR Backend: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(
+                                        ocr_mode.label(),
+                                        Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                    ),
+                                ]));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Used for extracting text from pasted images, PDFs, screenshots, and video keyframes.",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+
+                                let modes = [
+                                    (crate::ocr::OcrEngineMode::Auto, "Auto (Tesseract CLI / pdftotext / Native fallbacks)"),
+                                    (crate::ocr::OcrEngineMode::Tesseract, "Tesseract CLI (Uses system tesseract with 100+ languages)"),
+                                    (crate::ocr::OcrEngineMode::Native, "Native (In-memory neural net / fallback parser)"),
+                                    (crate::ocr::OcrEngineMode::Pdftotext, "pdftotext (Fast vector document parser)"),
+                                ];
+
+                                for (m, desc) in modes {
+                                    let active = ocr_mode == m;
+                                    let sym = if active { "  ● " } else { "  ○ " };
+                                    let color = if active { Color::Rgb(163, 190, 140) } else { Color::Rgb(160, 175, 195) };
+                                    val_lines.push(Line::from(vec![
+                                        Span::styled(sym, Style::default().fg(color).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                        Span::styled(desc, Style::default().fg(if active { Color::White } else { color }).bg(NORDIC_BG).add_modifier(if active { Modifier::BOLD } else { Modifier::empty() })),
+                                    ]));
+                                }
+
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled("Left/Right/A/D or Enter: Cycle OCR Engine | Esc: Back", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
+                            }
+                            _ => {}
                         }
 
                         frame.render_widget(Paragraph::new(val_lines).style(Style::default().bg(NORDIC_BG)), cols[2]);

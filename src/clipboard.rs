@@ -79,6 +79,34 @@ pub fn read_clipboard_silent() -> Option<String> {
     std::fs::read_to_string(CLIP_FILE).ok().filter(|s| !s.is_empty())
 }
 
+pub fn read_clipboard_image_bytes() -> Option<(Vec<u8>, &'static str)> {
+    // 1. Try Wayland wl-paste for PNG
+    if let Some(bytes) = try_read_cmd_bytes("wl-paste", &["--type", "image/png"]) {
+        if !bytes.is_empty() {
+            return Some((bytes, "png"));
+        }
+    }
+    // Try Wayland wl-paste for JPEG
+    if let Some(bytes) = try_read_cmd_bytes("wl-paste", &["--type", "image/jpeg"]) {
+        if !bytes.is_empty() {
+            return Some((bytes, "jpg"));
+        }
+    }
+    // 2. Try X11 xclip
+    if let Some(bytes) = try_read_cmd_bytes("xclip", &["-selection", "clipboard", "-t", "image/png", "-out"]) {
+        if !bytes.is_empty() {
+            return Some((bytes, "png"));
+        }
+    }
+    if let Some(bytes) = try_read_cmd_bytes("xclip", &["-selection", "clipboard", "-t", "image/jpeg", "-out"]) {
+        if !bytes.is_empty() {
+            return Some((bytes, "jpg"));
+        }
+    }
+
+    None
+}
+
 fn try_read_cmd(bin: &str, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
@@ -93,6 +121,21 @@ fn try_read_cmd(bin: &str, args: &[&str]) -> Option<String> {
     }
 }
 
+fn try_read_cmd_bytes(bin: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let output = cmd.output().ok()?;
+    if output.status.success() && !output.stdout.is_empty() {
+        Some(output.stdout)
+    } else {
+        None
+    }
+}
+
 pub fn clipboard_file_path() -> &'static str {
     CLIP_FILE
 }
+
