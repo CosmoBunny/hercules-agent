@@ -4313,7 +4313,7 @@ impl App {
                                         }
                                     } else if self.search_token_editing {
                                         self.search_token_input.push('a');
-                                    } else {
+                                    } else if self.hf_token_editing {
                                         self.hf_token_input.push('a');
                                     }
                                 }
@@ -4333,12 +4333,12 @@ impl App {
                                     }
                                 }
                                 KeyCode::Char('k') if self.show_menu && self.menu_section == 3 => {
-                                    if self.settings_tab == 7 && !self.search_token_editing {
+                                    if self.settings_tab == 8 && !self.search_token_editing {
                                         let s = crate::settings::get_settings();
                                         self.search_token_input = crate::settings::get_search_token(s.web_search_provider).unwrap_or_default();
                                         self.search_token_editing = true;
                                         self.status_message = format!("Type or paste key/URL for {}...", s.web_search_provider.label());
-                                    } else if self.settings_tab == 7 && self.search_token_editing {
+                                    } else if self.settings_tab == 8 && self.search_token_editing {
                                         self.search_token_input.push('k');
                                     } else if self.settings_tab == SETTINGS_TAB_NAMES.len() - 1 && self.hf_token_editing {
                                         self.hf_token_input.push('k');
@@ -4347,7 +4347,7 @@ impl App {
                                 KeyCode::Char('d') if self.show_menu && self.menu_section == 3 => {
                                     if !self.hf_token_editing && !self.search_token_editing {
                                         if self.settings_col == 1 {
-                                            if self.settings_tab == 7 {
+                                            if self.settings_tab == 8 {
                                                 let s = crate::settings::get_settings();
                                                 crate::settings::clear_search_token(s.web_search_provider);
                                                 self.status_message = format!("Cleared key for provider {}", s.web_search_provider.label());
@@ -4362,7 +4362,7 @@ impl App {
                                         }
                                     } else if self.search_token_editing {
                                         self.search_token_input.push('d');
-                                    } else {
+                                    } else if self.hf_token_editing {
                                         self.hf_token_input.push('d');
                                     }
                                 }
@@ -4774,7 +4774,7 @@ impl App {
                                                     manager.search_all_models(&query).await;
                                                 *results.lock().unwrap() = Some(matches);
                                             });
-                                        } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 7 && self.search_token_editing {
+                                        } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 8 && self.search_token_editing {
                                             if c != '\n' && c != '\r' {
                                                 self.search_token_input.push(c);
                                             }
@@ -4806,7 +4806,7 @@ impl App {
                                             let matches = manager.search_all_models(&query).await;
                                             *results.lock().unwrap() = Some(matches);
                                         });
-                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 7 && self.search_token_editing {
+                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 8 && self.search_token_editing {
                                         self.search_token_input.pop();
                                     } else if self.show_menu && self.menu_section == 3 && self.settings_tab == SETTINGS_TAB_NAMES.len() - 1 && self.hf_token_editing {
                                         self.hf_token_input.pop();
@@ -4832,7 +4832,7 @@ impl App {
                                                     Some(self.installed_models[idx].clone());
                                             }
                                         }
-                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 7 {
+                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 8 {
                                         if self.search_token_editing {
                                             self.search_token_input.clear();
                                         } else {
@@ -5135,15 +5135,27 @@ impl App {
                                             }
                                         } else if self.menu_section == 3 {
                                             // Settings tab (2-column)
-                                            if self.settings_tab == 7 {
+                                            if self.settings_tab == 8 {
+                                                let s = crate::settings::get_settings();
+                                                let provider_needs_token = matches!(
+                                                    s.web_search_provider,
+                                                    crate::settings::WebSearchProvider::Google
+                                                        | crate::settings::WebSearchProvider::Brave
+                                                        | crate::settings::WebSearchProvider::Tavily
+                                                        | crate::settings::WebSearchProvider::Searxng
+                                                );
                                                 if self.search_token_editing {
                                                     // Save search token
-                                                    let s = crate::settings::get_settings();
                                                     let tok = self.search_token_input.trim().to_string();
                                                     crate::settings::set_search_token(s.web_search_provider, tok.clone());
                                                     self.search_token_editing = false;
                                                     self.search_token_input.clear();
                                                     self.status_message = format!("Saved token for provider {}", s.web_search_provider.label());
+                                                } else if provider_needs_token {
+                                                    // Enter starts editing if token required
+                                                    self.search_token_input = crate::settings::get_search_token(s.web_search_provider).unwrap_or_default();
+                                                    self.search_token_editing = true;
+                                                    self.status_message = format!("Type or paste key/URL for {}...", s.web_search_provider.label());
                                                 } else if self.settings_col == 0 {
                                                     self.settings_col = 1;
                                                 } else {
