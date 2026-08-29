@@ -3125,39 +3125,6 @@ impl App {
                                 effective_stream = tag;
                                 tool_output_opt =
                                     crate::agent::AgentEngine::process_response(&effective_stream);
-                            } else if let Some(fenced_action) = crate::agent::AgentEngine::recover_write_from_fenced_code(
-                                &user,
-                                &effective_stream,
-                            ) {
-                                if let Ok(mut l) = self.activity_logs.lock() {
-                                    l.push(format!(
-                                        "[HERCULES] fenced-code recovery → write to {} ({} bytes)",
-                                        fenced_action.target, fenced_action.body.len()
-                                    ));
-                                }
-                                let _action_kind = crate::agent::ProposedKind::Write;
-                                let chip_id = crate::agent::ProposedAction {
-                                    kind: fenced_action.kind,
-                                    target: fenced_action.target.clone(),
-                                    body: fenced_action.body.clone(),
-                                    line_attr: None,
-                                    from_think: false,
-                                    chip_id: Some(self.next_chip_id),
-                                };
-                                self.next_chip_id += 1;
-                                self.pending_actions.push(chip_id);
-                                if let Some(last) = self.messages.last_mut() {
-                                    if last.starts_with("Agent: ") {
-                                        *last = format!(
-                                            "Agent: {}\n[Host recovered file from fenced code block]",
-                                            fenced_action.target
-                                        );
-                                    }
-                                }
-                                tool_output_opt = Some(format!(
-                                    "Host recovered fenced code as pending write: {}",
-                                    fenced_action.target
-                                ));
                             }
                         }
                     }
