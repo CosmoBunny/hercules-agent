@@ -347,10 +347,175 @@ pub fn render_markdown_to_lines<'a>(
     let mut current_header_line_idx: usize = 0;
     let mut current_copy_start: u16 = 0;
     let mut current_copy_end: u16 = 0;
+    let mut current_table_lines: Vec<&str> = Vec::new();
     let code_bg = Color::Rgb(36, 41, 51);
     let gutter_fg = Color::Rgb(94, 129, 172);
     let target_block_width: usize = target_width.saturating_sub(4).max(40);
     let max_code_chars_per_line: usize = target_block_width.saturating_sub(12).max(20);
+
+    fn flush_table<'a>(
+        lines_out: &mut Vec<Line<'a>>,
+        table_lines: &[&str],
+        _target_block_width: usize,
+        _theme_color: Color,
+        dark_gray: Color,
+        available_output: usize,
+        global_out_ch: &mut usize,
+        is_generating: bool,
+        is_last_message: bool,
+    ) {
+        if table_lines.is_empty() { return; }
+
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        let mut sep_row_idx: Option<usize> = None;
+
+        for (_idx, line) in table_lines.iter().enumerate() {
+            let mut parts: Vec<&str> = line.split('|').collect();
+            if let Some(first) = parts.first() {
+                if first.trim().is_empty() {
+                    parts.remove(0);
+                }
+            }
+            if let Some(last) = parts.last() {
+                if last.trim().is_empty() {
+                    parts.pop();
+                }
+            }
+            if parts.is_empty() { continue; }
+
+            let is_sep = parts.iter().all(|c| !c.trim().is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '));
+            if is_sep {
+                if sep_row_idx.is_none() {
+                    sep_row_idx = Some(rows.len());
+                }
+                continue;
+            }
+
+            let mut row = Vec::new();
+            for p in parts {
+                row.push(p.trim().to_string());
+            }
+            if !row.is_empty() {
+                rows.push(row);
+            }
+        }
+
+        if rows.is_empty() { return; }
+
+        let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        if num_cols == 0 { return; }
+
+        let mut col_widths = vec![0usize; num_cols];
+        for row in &rows {
+            for (i, cell) in row.iter().enumerate() {
+                let cell_clean = cell.replace("**", "").replace("`", "").replace("*", "").replace("~~", "");
+                col_widths[i] = col_widths[i].max(cell_clean.chars().count());
+            }
+        }
+
+        // Add padding: minimum 4 chars wide per column
+        for w in &mut col_widths {
+            *w = (*w).max(4);
+        }
+
+        let border_fg = dark_gray;
+
+        // Top Border: ┌─────────┬─────────┐
+        let mut top_spans = vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("┌", Style::default().fg(border_fg)),
+        ];
+        for (i, w) in col_widths.iter().enumerate() {
+            top_spans.push(Span::styled("─".repeat(*w + 2), Style::default().fg(border_fg)));
+            if i + 1 < num_cols {
+                top_spans.push(Span::styled("┬", Style::default().fg(border_fg)));
+            } else {
+                top_spans.push(Span::styled("┐", Style::default().fg(border_fg)));
+            }
+        }
+        lines_out.push(Line::from(top_spans));
+
+        // Render Data Rows & Separators
+        for (r_idx, row) in rows.iter().enumerate() {
+            let is_header = r_idx == 0 && sep_row_idx.is_some();
+            let mut row_spans = vec![
+                Span::styled("  ", Style::default()),
+                Span::styled("│", Style::default().fg(border_fg)),
+            ];
+
+            for (c_idx, w) in col_widths.iter().enumerate() {
+                let cell_text = row.get(c_idx).map(|s| s.as_str()).unwrap_or("");
+                let cell_clean = cell_text.replace("**", "").replace("`", "").replace("*", "").replace("~~", "");
+                let text_w = cell_clean.chars().count();
+                let pad_spaces = w.saturating_sub(text_w);
+
+                row_spans.push(Span::styled(" ", Style::default()));
+
+                let inline = parse_inline(cell_text, is_header, false);
+                for span in inline {
+                    for ch in span.text.chars() {
+                        if *global_out_ch >= available_output {
+                            break;
+                        }
+                        let age = available_output.saturating_sub(*global_out_ch);
+                        let is_streaming = is_generating && is_last_message;
+                        let base_c = if span.code {
+                            Color::Rgb(140, 220, 255)
+                        } else if is_header || span.bold {
+                            Color::Rgb(0, 230, 255)
+                        } else {
+                            Color::Rgb(220, 235, 250)
+                        };
+                        let mut style = Style::default().fg(stream_token_color(base_c, age, is_streaming));
+                        if is_header || span.bold { style = style.add_modifier(Modifier::BOLD); }
+                        if span.italic { style = style.add_modifier(Modifier::ITALIC); }
+                        row_spans.push(Span::styled(ch.to_string(), style));
+                        *global_out_ch += 1;
+                    }
+                }
+
+                if pad_spaces > 0 {
+                    row_spans.push(Span::styled(" ".repeat(pad_spaces), Style::default()));
+                }
+                row_spans.push(Span::styled(" │", Style::default().fg(border_fg)));
+            }
+
+            lines_out.push(Line::from(row_spans));
+
+            // Mid separator: ├─────────┼─────────┤
+            if is_header {
+                let mut mid_spans = vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled("├", Style::default().fg(border_fg)),
+                ];
+                for (i, w) in col_widths.iter().enumerate() {
+                    mid_spans.push(Span::styled("─".repeat(*w + 2), Style::default().fg(border_fg)));
+                    if i + 1 < num_cols {
+                        mid_spans.push(Span::styled("┼", Style::default().fg(border_fg)));
+                    } else {
+                        mid_spans.push(Span::styled("┤", Style::default().fg(border_fg)));
+                    }
+                }
+                lines_out.push(Line::from(mid_spans));
+            }
+        }
+
+        // Bottom Border: └─────────┴─────────┘
+        let mut bot_spans = vec![
+            Span::styled("  ", Style::default()),
+            Span::styled("└", Style::default().fg(border_fg)),
+        ];
+        for (i, w) in col_widths.iter().enumerate() {
+            bot_spans.push(Span::styled("─".repeat(*w + 2), Style::default().fg(border_fg)));
+            if i + 1 < num_cols {
+                bot_spans.push(Span::styled("┴", Style::default().fg(border_fg)));
+            } else {
+                bot_spans.push(Span::styled("┘", Style::default().fg(border_fg)));
+            }
+        }
+        lines_out.push(Line::from(bot_spans));
+        *global_out_ch += 2;
+    }
 
     for (l_idx, raw_line) in text.lines().enumerate() {
         let is_last_line = l_idx + 1 == total_lines;
@@ -714,25 +879,11 @@ pub fn render_markdown_to_lines<'a>(
 
         // 4. Markdown Table Formatting
         if trimmed.starts_with('|') && trimmed.contains('|') {
-            let mut line_spans = vec![Span::styled("  ", Style::default())];
-            for cell in trimmed.split('|').filter(|s| !s.trim().is_empty()) {
-                if cell.chars().all(|c| c == '-' || c == ':' || c == ' ') {
-                    line_spans.push(Span::styled(
-                        "─────┼─────",
-                        Style::default().fg(dark_gray),
-                    ));
-                } else {
-                    line_spans.push(Span::styled(
-                        format!(" {} │", cell.trim()),
-                        Style::default()
-                            .fg(Color::Rgb(0, 230, 255))
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                }
-            }
-            *global_out_ch += raw_line.chars().count() + 1;
-            lines_out.push(Line::from(line_spans));
+            current_table_lines.push(raw_line);
             continue;
+        } else if !current_table_lines.is_empty() {
+            flush_table(&mut lines_out, &current_table_lines, target_block_width, theme_color, dark_gray, available_output, global_out_ch, is_generating, is_last_message);
+            current_table_lines.clear();
         }
 
         // 5. Headings: # h1 (green), ## (blue), ### (yellow), ####+ (red)
@@ -1013,6 +1164,10 @@ pub fn render_markdown_to_lines<'a>(
         }
 
         lines_out.push(Line::from(line_spans));
+    }
+
+    if !current_table_lines.is_empty() {
+        flush_table(&mut lines_out, &current_table_lines, target_block_width, theme_color, dark_gray, available_output, global_out_ch, is_generating, is_last_message);
     }
 
     if in_code_block {
