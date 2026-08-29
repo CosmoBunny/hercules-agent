@@ -640,9 +640,35 @@ impl App {
         app.total_active_compute_secs = session.total_active_compute_secs;
         app.cpu_load_sum_pct = session.cpu_load_sum_pct;
         app.cpu_sample_count = session.cpu_sample_count;
-        app.status_message = format!("Resumed session {}", sid);
         app.session_id = Some(sid);
         app
+    }
+
+    /// Returns the currently filtered list of models in the Registry tab.
+    pub fn filtered_registry_models(&self) -> Vec<String> {
+        let q_raw = self.registry_search_query.trim();
+        let q_lower = q_raw.to_lowercase();
+        let sub = if let Some(idx) = q_lower.rfind('/') {
+            &q_lower[idx + 1..]
+        } else {
+            &q_lower
+        };
+        let source_list = if self.registry_tab == 0 {
+            &self.hf_models
+        } else {
+            &self.registry_models
+        };
+        source_list
+            .iter()
+            .filter(|m| {
+                if q_lower.is_empty() {
+                    return true;
+                }
+                let m_lower = m.to_lowercase();
+                m_lower.contains(&q_lower) || (!sub.is_empty() && m_lower.contains(sub))
+            })
+            .cloned()
+            .collect()
     }
 
     pub fn save_current_session(&self) {
@@ -3412,6 +3438,18 @@ impl App {
                 self.hf_models = hf_items;
                 self.registry_models = ollama_items;
                 self.krama.restart_progress("list_fade", 0);
+
+                // Auto-clamp selection to the updated filtered list count
+                let filtered_count = self.filtered_registry_models().len();
+                if filtered_count == 0 {
+                    self.registry_state.select(None);
+                } else if let Some(cur) = self.registry_state.selected() {
+                    if cur >= filtered_count {
+                        self.registry_state.select(Some(filtered_count - 1));
+                    }
+                } else {
+                    self.registry_state.select(Some(0));
+                }
             }
         }
 
@@ -4398,17 +4436,12 @@ impl App {
                                 }
                                 KeyCode::Up if self.show_menu => {
                                     if self.menu_section == 1 {
-                                        let q_lower = self.registry_search_query.trim().to_lowercase();
-                                        let total = if self.registry_tab == 0 {
-                                            self.hf_models.iter().filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower)).count()
-                                        } else {
-                                            self.registry_models.iter().filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower)).count()
-                                        };
+                                        let total = self.filtered_registry_models().len();
                                         let i = match self.registry_state.selected() {
-                                            Some(i) => if i == 0 { total.saturating_sub(1) } else { i - 1 },
+                                            Some(i) => if total == 0 { 0 } else if i == 0 { total.saturating_sub(1) } else { i - 1 },
                                             None => 0,
                                         };
-                                        self.registry_state.select(Some(i));
+                                        self.registry_state.select(if total == 0 { None } else { Some(i) });
                                     } else if self.menu_section == 2 {
                                         let i = match self.installed_state.selected() {
                                             Some(i) => if i == 0 { self.installed_models.len().saturating_sub(1) } else { i - 1 },
@@ -4450,17 +4483,12 @@ impl App {
                                 }
                                 KeyCode::Down if self.show_menu => {
                                     if self.menu_section == 1 {
-                                        let q_lower = self.registry_search_query.trim().to_lowercase();
-                                        let total = if self.registry_tab == 0 {
-                                            self.hf_models.iter().filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower)).count()
-                                        } else {
-                                            self.registry_models.iter().filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower)).count()
-                                        };
+                                        let total = self.filtered_registry_models().len();
                                         let i = match self.registry_state.selected() {
-                                            Some(i) => if i >= total.saturating_sub(1) { 0 } else { i + 1 },
+                                            Some(i) => if total == 0 { 0 } else if i >= total.saturating_sub(1) { 0 } else { i + 1 },
                                             None => 0,
                                         };
-                                        self.registry_state.select(Some(i));
+                                        self.registry_state.select(if total == 0 { None } else { Some(i) });
                                     } else if self.menu_section == 2 {
                                         let i = match self.installed_state.selected() {
                                             Some(i) => if i >= self.installed_models.len().saturating_sub(1) { 0 } else { i + 1 },
@@ -4879,24 +4907,7 @@ impl App {
                                             self.menu_closing = true;
                                         } else if self.menu_section == 1 {
                                             // Registry tab: download selected model
-                                            let q_lower = self.registry_search_query.trim().to_lowercase();
-                                            let filtered_models: Vec<String> = if self.registry_tab == 0 {
-                                                self.hf_models.iter()
-                                                    .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
-                                                        let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
-                                                        !sub.is_empty() && m.to_lowercase().contains(sub)
-                                                    })
-                                                    .cloned()
-                                                    .collect()
-                                            } else {
-                                                self.registry_models.iter()
-                                                    .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
-                                                        let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
-                                                        !sub.is_empty() && m.to_lowercase().contains(sub)
-                                                    })
-                                                    .cloned()
-                                                    .collect()
-                                            };
+                                            let filtered_models = self.filtered_registry_models();
                                             if let Some(i) = self.registry_state.selected() {
                                                 if i < filtered_models.len() {
                                                     let item_str = filtered_models[i].clone();
@@ -7322,7 +7333,6 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                         frame.render_widget(Paragraph::new(Line::from(vec![search_text])).style(Style::default().bg(NORDIC_BG)), chunks[1]);
 
                         let q_raw = self.registry_search_query.trim();
-                        let q_lower = q_raw.to_lowercase();
                         let total_w = chunks[2].width as usize;
 
                         // Helper closure to build highlighted spans with bold matching chars
@@ -7355,28 +7365,12 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                     spans.push(Span::styled(text[last_idx..].to_string(), base_style));
                                 }
                             } else {
-                                spans.push(Span::styled(text.to_string(), base_style));
+                        spans.push(Span::styled(text.to_string(), base_style));
                             }
                             spans
                         };
 
-                        let filtered_models: Vec<String> = if self.registry_tab == 0 {
-                            self.hf_models.iter()
-                                .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
-                                    let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
-                                    !sub.is_empty() && m.to_lowercase().contains(sub)
-                                })
-                                .cloned()
-                                .collect()
-                        } else {
-                            self.registry_models.iter()
-                                .filter(|m| q_lower.is_empty() || m.to_lowercase().contains(&q_lower) || {
-                                    let sub = if let Some(idx) = q_lower.rfind('/') { &q_lower[idx+1..] } else { &q_lower };
-                                    !sub.is_empty() && m.to_lowercase().contains(sub)
-                                })
-                                .cloned()
-                                .collect()
-                        };
+                        let filtered_models = self.filtered_registry_models();
 
                         // Lively adjust selection cap to match filtered items length
                         if filtered_models.is_empty() {
