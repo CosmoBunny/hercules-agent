@@ -79,6 +79,7 @@ pub struct LlamaCppLib {
     model: *mut LlamaModel,
     ctx: *mut LlamaContext,
     vocab: *const LlamaVocab,
+    mtmd_ctx: Option<*mut crate::llama::ffi::MtmdContext>,
     n_ctx: u32,
     /// Max tokens per llama_decode call (must match context params).
     n_batch: u32,
@@ -115,6 +116,8 @@ impl LlamaCppLib {
 
         let path_cstr = CString::new(model_path.to_str().unwrap_or(""))
             .map_err(|e| format!("Invalid model path: {}", e))?;
+
+        let _init_silence = StderrSilence::enter();
 
         // Model params — start from C defaults, then override only known-safe fields.
         let power_mode = crate::settings::get_settings().power_mode;
@@ -163,11 +166,75 @@ impl LlamaCppLib {
             return Err("[llama.cpp lib] n_ctx=0 (context params layout mismatch?)".into());
         }
 
+        // ViT / Vision Projector (mmproj) initialization based on settings or auto-discovery
+        let mut mtmd_ctx = None;
+        let selected_vit = crate::settings::get_selected_vit_model();
+
+        if !selected_vit.eq_ignore_ascii_case("disabled") {
+            if let (Some(init_mtmd), Some(def_params)) = (lib.mtmd_init_from_file, lib.mtmd_context_params_default) {
+                let mut mmproj_path = None;
+
+                if !selected_vit.eq_ignore_ascii_case("auto") {
+                    // Explicit filename or path selected
+                    let explicit_p = PathBuf::from(&selected_vit);
+                    if explicit_p.exists() {
+                        mmproj_path = Some(explicit_p);
+                    } else {
+                        // Check inside models_dir and model_dir
+                        let in_models = crate::manager::models_dir().join(&selected_vit);
+                        let in_local = crate::manager::local_hercules_dir().join(&selected_vit);
+                        let in_model_dir = model_path.parent().unwrap_or(&model_path).join(&selected_vit);
+                        if in_models.exists() {
+                            mmproj_path = Some(in_models);
+                        } else if in_local.exists() {
+                            mmproj_path = Some(in_local);
+                        } else if in_model_dir.exists() {
+                            mmproj_path = Some(in_model_dir);
+                        }
+                    }
+                }
+
+                // Fallback to auto-detection if "auto" or if explicit path wasn't found
+                if mmproj_path.is_none() && selected_vit.eq_ignore_ascii_case("auto") {
+                    let model_dir = model_path.parent().unwrap_or(&model_path);
+                    let search_dirs = vec![model_dir.to_path_buf(), crate::manager::models_dir(), crate::manager::local_hercules_dir()];
+                    for dir in search_dirs {
+                        if let Ok(entries) = std::fs::read_dir(dir) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+                                if (name.contains("mmproj") || name.contains("vit") || name.contains("clip")) && name.ends_with(".gguf") {
+                                    mmproj_path = Some(p);
+                                    break;
+                                }
+                            }
+                        }
+                        if mmproj_path.is_some() {
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(m_path) = mmproj_path {
+                    if let Ok(m_cstr) = CString::new(m_path.to_string_lossy().as_bytes()) {
+                        let mut m_params = unsafe { def_params() };
+                        m_params.use_gpu = power_mode.n_gpu_layers() > 0;
+                        m_params.n_threads = th;
+                        let m_ctx = unsafe { init_mtmd(m_cstr.as_ptr(), model, m_params) };
+                        if !m_ctx.is_null() {
+                            mtmd_ctx = Some(m_ctx);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             model_path,
             model,
             ctx,
             vocab,
+            mtmd_ctx,
             n_ctx,
             n_batch: 512,
             sys_snapshot: Mutex::new(None),
@@ -285,6 +352,153 @@ impl LlamaCppLib {
         let mut total_prompt_tokens = 0usize;
 
         let mut snap_guard = self.sys_snapshot.lock().unwrap();
+
+        // -------------------------------------------------------------------
+        // 1. Multimodal Evaluation Path: If images are attached and mtmd_ctx is active,
+        // evaluate the image through the Vision Transformer first.
+        // -------------------------------------------------------------------
+        let mut attached_images = Vec::new();
+        if let Some(m_ctx) = self.mtmd_ctx {
+            if let (Some(bitmap_from_file), Some(eval_chunks), Some(chunks_init), Some(chunks_free), Some(bitmap_free), Some(tokenize_mtmd)) = (
+                lib.mtmd_helper_bitmap_init_from_file,
+                lib.mtmd_helper_eval_chunks,
+                lib.mtmd_input_chunks_init,
+                lib.mtmd_input_chunks_free,
+                lib.mtmd_bitmap_free,
+                lib.mtmd_tokenize,
+            ) {
+                // Extract any attached image file paths from <attachment ... path="..."> tags
+                let mut search_idx = 0;
+                while let Some(att_pos) = user_prompt[search_idx..].find("path=\"") {
+                    let real_start = search_idx + att_pos + 6;
+                    if let Some(quote_end) = user_prompt[real_start..].find('"') {
+                        let path_str = &user_prompt[real_start..real_start + quote_end];
+                        let p = PathBuf::from(path_str);
+                        if p.exists() {
+                            attached_images.push(p);
+                        }
+                        search_idx = real_start + quote_end + 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if !attached_images.is_empty() {
+                    let mut bitmaps: Vec<*const crate::llama::ffi::MtmdBitmap> = Vec::new();
+                    let mut wrappers = Vec::new();
+                    for img_p in &attached_images {
+                        if let Ok(c_path) = CString::new(img_p.to_string_lossy().as_bytes()) {
+                            let wrapper = unsafe { bitmap_from_file(m_ctx, c_path.as_ptr(), false) };
+                            if !wrapper.bitmap.is_null() {
+                                bitmaps.push(wrapper.bitmap);
+                                wrappers.push(wrapper);
+                            }
+                        }
+                    }
+
+                    if !bitmaps.is_empty() {
+                        // Clear KV memory before evaluating multimodal chunks
+                        if let (Some(get_mem), Some(clear)) = (lib.get_memory, lib.memory_clear) {
+                            unsafe {
+                                let mem = get_mem(self.ctx);
+                                if !mem.is_null() {
+                                    clear(mem, false);
+                                }
+                            }
+                        }
+
+                        let default_marker = unsafe {
+                            lib.mtmd_default_marker.map(|m| {
+                                let c_str = m();
+                                std::ffi::CStr::from_ptr(c_str).to_string_lossy().into_owned()
+                            }).unwrap_or_else(|| "<__media__>".to_string())
+                        };
+
+                        let mut full_multimodal_text = format!("{}\n<|im_start|>user\n", sys_prefix);
+                        for _ in 0..bitmaps.len() {
+                            full_multimodal_text.push_str(&default_marker);
+                            full_multimodal_text.push('\n');
+                        }
+                        full_multimodal_text.push_str(&user_suffix);
+
+                        if let Ok(c_text) = CString::new(full_multimodal_text) {
+                            let input_text = crate::llama::ffi::MtmdInputText {
+                                text: c_text.as_ptr(),
+                                text_len: c_text.as_bytes().len(),
+                                add_special: true,
+                                parse_special: true,
+                            };
+                            let chunks = unsafe { chunks_init() };
+                            let tok_res = unsafe {
+                                tokenize_mtmd(m_ctx, chunks, &input_text, bitmaps.as_ptr(), bitmaps.len())
+                            };
+                            if tok_res == 0 {
+                                let mut new_n_past: i32 = 0;
+                                let eval_res = unsafe {
+                                    eval_chunks(
+                                        m_ctx,
+                                        self.ctx,
+                                        chunks,
+                                        0,
+                                        0,
+                                        n_batch as i32,
+                                        true,
+                                        &mut new_n_past,
+                                    )
+                                };
+                                unsafe { chunks_free(chunks) };
+                                for w in wrappers {
+                                    unsafe { bitmap_free(w.bitmap) };
+                                }
+
+                                if eval_res == 0 {
+                                    total_prompt_tokens = new_n_past.max(1) as usize;
+                                    let prefill_dur = prefill_start_time.elapsed().as_secs_f64().max(0.0001);
+                                    let prefill_toks_sec = total_prompt_tokens as f64 / prefill_dur;
+                                    update_inference_telemetry(|t| {
+                                        t.prompt_tokens = total_prompt_tokens;
+                                        t.prefill_duration_secs = prefill_dur;
+                                        t.prefill_tok_per_sec = prefill_toks_sec;
+                                        t.session_total_prompt_tokens += total_prompt_tokens;
+                                    });
+
+                                    let chain_params = unsafe { (lib.sampler_chain_default_params)() };
+                                    let chain = unsafe { (lib.sampler_chain_init)(chain_params) };
+                                    if !chain.is_null() {
+                                        let mtp_mode = crate::settings::get_mtp_mode();
+                                        unsafe {
+                                            if mtp_mode.ngram_size() >= 2 {
+                                                (lib.sampler_chain_add)(chain, (lib.sampler_init_greedy)());
+                                            } else {
+                                                (lib.sampler_chain_add)(chain, (lib.sampler_init_top_p)(0.9, 1));
+                                                (lib.sampler_chain_add)(chain, (lib.sampler_init_temp)(0.7));
+                                                (lib.sampler_chain_add)(chain, (lib.sampler_init_dist)(0));
+                                            }
+                                        }
+                                        let result = self.sample_loop(
+                                            chain,
+                                            &lib,
+                                            &stream_target,
+                                            &is_generating,
+                                            n_predict,
+                                            Vec::new(),
+                                            gen_start_time,
+                                        );
+                                        unsafe { (lib.sampler_free)(chain) };
+                                        return result;
+                                    }
+                                }
+                            } else {
+                                unsafe { chunks_free(chunks) };
+                                for w in wrappers {
+                                    unsafe { bitmap_free(w.bitmap) };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let can_restore = snap_guard
             .as_ref()
@@ -808,6 +1022,11 @@ impl Drop for LlamaCppLib {
         // shutdown_warm_lib_engine holds it causes a deadlock (Mutex is not reentrant).
         if let Ok(lib) = get_lib() {
             unsafe {
+                if let Some(m_ctx) = self.mtmd_ctx.take() {
+                    if let Some(mtmd_free) = lib.mtmd_free {
+                        mtmd_free(m_ctx);
+                    }
+                }
                 if !self.ctx.is_null() {
                     let ctx = self.ctx;
                     self.ctx = std::ptr::null_mut();

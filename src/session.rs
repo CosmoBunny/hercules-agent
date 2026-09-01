@@ -342,6 +342,9 @@ pub fn clear_session_for_dir(dir: &Path) -> (usize, usize) {
                         } else {
                             let _ = fs::remove_file(&path);
                             let _ = fs::remove_file(lock_file_path(stem));
+                            if crate::settings::get_media_storage_delete_on_clear() == crate::settings::MediaStorageDeleteOnClear::AlwaysDelete {
+                                crate::media::delete_session_media(stem);
+                            }
                             cleared += 1;
                         }
                     }
@@ -370,11 +373,18 @@ pub fn clear_all_sessions() -> (usize, usize) {
                     } else {
                         let _ = fs::remove_file(&path);
                         let _ = fs::remove_file(lock_file_path(stem));
+                        if crate::settings::get_media_storage_delete_on_clear() == crate::settings::MediaStorageDeleteOnClear::AlwaysDelete {
+                            crate::media::delete_session_media(stem);
+                        }
                         cleared += 1;
                     }
                 }
             }
         }
+    }
+
+    if crate::settings::get_media_storage_delete_on_clear() == crate::settings::MediaStorageDeleteOnClear::AlwaysDelete && skipped == 0 {
+        crate::media::delete_all_sessions_media();
     }
 
     (cleared, skipped)

@@ -679,6 +679,7 @@ impl ModelManager {
                 ]
             } else {
                 vec![
+                    format!("https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&limit=30", trimmed),
                     format!("https://huggingface.co/api/models?author={}&search={}&blobs=true&full=true&limit=30", author, sub),
                     format!("https://huggingface.co/api/models?search={}&blobs=true&full=true&limit=30", trimmed),
                 ]
@@ -690,9 +691,9 @@ impl ModelManager {
             ]
         } else {
             vec![
-                format!("https://huggingface.co/api/models?search={}&tags=gguf&sort=downloads&direction=-1&blobs=true&full=true&limit=30", trimmed),
-                format!("https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&blobs=true&full=true&limit=30", trimmed),
-                format!("https://huggingface.co/api/models?author={}&blobs=true&full=true&limit=30", trimmed),
+                format!("https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&limit=30", trimmed),
+                format!("https://huggingface.co/api/models?search={}&tags=gguf&sort=downloads&direction=-1&limit=30", trimmed),
+                format!("https://huggingface.co/api/models?author={}&limit=30", trimmed),
             ]
         };
 
@@ -1637,6 +1638,74 @@ impl ModelManager {
         }
 
         let installed_path = first_installed_path.unwrap();
+
+        // If this model is a Vision-Language Model (VL/LLaVA/Qwen-VL), check for companion mmproj
+        let is_vl_model = model_name.to_lowercase().contains("vl")
+            || clean_repo.to_lowercase().contains("vl")
+            || base_name.to_lowercase().contains("vl")
+            || model_name.to_lowercase().contains("llava")
+            || model_name.to_lowercase().contains("vision");
+
+        if is_vl_model && !filename.to_lowercase().contains("mmproj") {
+            if let Ok(mut l) = logs.lock() {
+                l.push("[VISION] Checking for companion mmproj vision weights in HuggingFace repo...".to_string());
+            }
+
+            // Query HF API for mmproj in the same repository
+            let info_url = format!("https://huggingface.co/api/models/{}", clean_repo);
+            let mut req = client.get(&info_url).header("User-Agent", "Hercules-CLI/1.0");
+            if let Some(tok) = crate::settings::get_hf_token() {
+                req = req.header("Authorization", format!("Bearer {}", tok));
+            }
+
+            if let Ok(resp) = req.send().await {
+                if let Ok(text) = resp.text().await {
+                    if let Ok(body) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(siblings) = body.get("siblings").and_then(|s| s.as_array()) {
+                            let mmproj_entry = siblings.iter().find_map(|s| {
+                                let rname = s.get("rfilename").and_then(|r| r.as_str())?;
+                                let low = rname.to_lowercase();
+                                if low.contains("mmproj") && low.ends_with(".gguf") {
+                                    Some(rname.to_string())
+                                } else {
+                                    None
+                                }
+                            });
+
+                            if let Some(mmproj_rfile) = mmproj_entry {
+                                let mmproj_base = mmproj_rfile.rsplit('/').next().unwrap_or(&mmproj_rfile).to_string();
+                                let mmproj_dest = models_dir().join(&mmproj_base);
+                                if !mmproj_dest.exists() {
+                                    if let Ok(mut l) = logs.lock() {
+                                        l.push(format!("[VISION] Auto-downloading companion Vision weights '{}'...", mmproj_base));
+                                    }
+
+                                    let mmproj_url = format!("https://huggingface.co/{}/resolve/main/{}", clean_repo, mmproj_rfile);
+                                    let mut dl_req = client.get(&mmproj_url).header("User-Agent", "Hercules-CLI/1.0");
+                                    if let Some(tok) = crate::settings::get_hf_token() {
+                                        dl_req = dl_req.header("Authorization", format!("Bearer {}", tok));
+                                    }
+
+                                    if let Ok(dl_resp) = dl_req.send().await {
+                                        if dl_resp.status().is_success() {
+                                            if let Ok(bytes) = dl_resp.bytes().await {
+                                                if let Ok(()) = std::fs::write(&mmproj_dest, &bytes) {
+                                                    if let Ok(mut l) = logs.lock() {
+                                                        l.push(format!("[VISION] Companion mmproj installed: {}", mmproj_dest.display()));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if let Ok(mut l) = logs.lock() {
+                                    l.push(format!("[VISION] Companion mmproj already present: {}", mmproj_dest.display()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Cleanup staging + lock after successful install
         let _ = std::fs::remove_dir_all(&staging_dir);

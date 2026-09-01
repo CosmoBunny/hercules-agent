@@ -6,6 +6,7 @@ use crate::backend::{AgentBackend, LlamaCppLibBackend, OllamaBackend};
 use crate::manager::ModelManager;
 use crate::task_manager::{QUICK_SECS, TaskEvent, TaskManager};
 use crate::tool_panel::{self, PanelChromeHit, ToolChip, ToolPanel, ToolPanelKind};
+use crate::ask_mode::{AskModeParser, AskModeState, AskModeResponse};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use kramaframe::prelude::{KeyFrameFunction, KeyList};
 use kramaframe::{BTclasslist, BTframelist, KramaFrame, keylist::TRES16Bits};
@@ -350,6 +351,9 @@ pub struct App {
     /// Targets already written mid-stream this turn (AlwaysAllow furious mode).
     /// Prevents double-execution when the post-gen path also sees the same tags.
     pub streamed_writes_done: Vec<String>,
+
+    /// Ask Mode interactive state
+    pub ask_mode_state: Option<AskModeState>,
 }
 
 impl App {
@@ -556,6 +560,7 @@ impl App {
             model_context_limit: None,
             term_input: String::new(),
             streamed_writes_done: Vec::new(),
+            ask_mode_state: None,
         };
 
         let manager_clone = app.manager.clone();
@@ -1910,6 +1915,35 @@ impl App {
         }
     }
 
+    fn handle_ask_mode_response(&mut self, response: AskModeResponse) {
+        let mut parts = Vec::new();
+        
+        if !response.checks.is_empty() {
+            parts.push(format!("Checks: {}", response.checks.join(", ")));
+        }
+        if let Some(radio) = response.radio {
+            parts.push(format!("Radio: {}", radio));
+        }
+        if !response.inputs.is_empty() {
+            parts.push(format!("Inputs: {}", response.inputs.join(", ")));
+        }
+        
+        let summary = if parts.is_empty() {
+            "(no selection)".to_string()
+        } else {
+            parts.join("; ")
+        };
+        
+        // Add to tool_result_context so it's included in the next generation's context
+        self.tool_result_context.push(format!("[Ask Mode Response]\n{}", summary));
+        
+        // Also show in chat
+        self.messages.push(format!("System: Ask Mode response — {}", summary));
+        
+        // Trigger next generation with the response in context
+        self.trigger_generation_from_context();
+    }
+
     fn reject_pending_actions(&mut self) {
         if self.pending_actions.is_empty() {
             return;
@@ -2531,7 +2565,7 @@ impl App {
                 let is_gen_task = is_gen.clone();
                 tokio::spawn(async move {
                     match backend_clone
-                        .generate_stream(&context_prompt, stream_target, is_gen_task)
+                        .generate_stream(&context_prompt, vec![], stream_target, is_gen_task)
                         .await
                     {
                         Ok(_) => {}
@@ -3524,7 +3558,13 @@ impl App {
                     }
                     self.streamed_writes_done.clear();
 
-                    if !prose.is_empty() {
+                    // Check for Ask Mode in agent response
+                    if let Some(ask_mode) = AskModeParser::parse(&current_stream).ok().flatten() {
+                        let state = AskModeState::new(ask_mode);
+                        self.ask_mode_state = Some(state);
+                        self.status_message = "Ask Mode: awaiting response".to_string();
+                        // Don't trigger next generation - wait for user response
+                    } else if !prose.is_empty() {
                         self.context_tokens_est = self.estimate_full_session_tokens();
                         if let Ok(mut l) = self.activity_logs.lock() {
                             l.push(format!("[SESSION] tokens ≈ {}", self.context_tokens_est));
@@ -4358,7 +4398,40 @@ impl App {
                             self.esc_hold_start = None;
                         }
 
-                        if pending_consumed {
+                        // Ask Mode key handling (takes priority when active)
+                        if let Some(ref mut state) = self.ask_mode_state {
+                            match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    state.move_focus_prev();
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    state.move_focus_next();
+                                }
+                                KeyCode::Enter | KeyCode::Char(' ') => {
+                                    state.toggle_focused();
+                                }
+                                KeyCode::Char('s') => {
+                                    // Submit
+                                    let response = state.submit();
+                                    self.ask_mode_state = None;
+                                    self.handle_ask_mode_response(response);
+                                    self.status_message = "Ask Mode: submitted, resuming…".to_string();
+                                }
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    // Cancel
+                                    state.cancel();
+                                    self.ask_mode_state = None;
+                                    self.status_message = "Ask Mode: cancelled".to_string();
+                                }
+                                KeyCode::Backspace => {
+                                    state.handle_input_backspace();
+                                }
+                                KeyCode::Char(c) => {
+                                    state.handle_input_char(c);
+                                }
+                                _ => {}
+                            }
+                        } else if pending_consumed {
                             // already handled accept/reject
                         } else {
                             match key.code {
@@ -7405,7 +7478,7 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 };
 
                 // Color transition with opacity fade
-                let border_alpha = (255.0 * anim_p).round() as u8;
+                let border_alpha = (255.0_f32 * anim_p).round() as u8;
                 let border_color = Color::Rgb(border_alpha, border_alpha, border_alpha);
                 let close_btn_str = " x ";
                 let close_btn_len = close_btn_str.chars().count() as u16;
@@ -8460,6 +8533,153 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 }
             }
         }
+    }
+
+    /// Render Ask Mode overlay
+    pub fn render_ask_mode(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+
+        // Centered overlay
+        let overlay_w = (area.width as f32 * 0.8).round() as u16;
+        let overlay_h = (area.height as f32 * 0.7).round() as u16;
+        let overlay_x = area.x + (area.width.saturating_sub(overlay_w)) / 2;
+        let overlay_y = area.y + (area.height.saturating_sub(overlay_h)) / 2;
+        let overlay_rect = Rect {
+            x: overlay_x,
+            y: overlay_y,
+            width: overlay_w,
+            height: overlay_h,
+        };
+
+        // Clear background
+        frame.render_widget(Clear, overlay_rect);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(Color::Rgb(30, 35, 45))),
+            overlay_rect,
+        );
+
+        let state = self.ask_mode_state.as_ref().unwrap();
+        let ask_mode = &state.ask_mode;
+
+        // Layout: Question at top, elements in middle, hints at bottom
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),  // Question header
+                Constraint::Min(5),     // Elements list
+                Constraint::Length(3),  // Hints
+            ].as_ref())
+            .margin(1)
+            .split(overlay_rect);
+
+        // Question header
+        let question_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Ask Mode ")
+            .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
+            .style(Style::default().bg(Color::Rgb(30, 35, 45)));
+        let question_text = Paragraph::new(ask_mode.question.clone())
+            .style(Style::default().fg(Color::White).bg(Color::Rgb(30, 35, 45)))
+            .block(question_block);
+        frame.render_widget(question_text, chunks[0]);
+
+        // Elements list
+        let mut items = Vec::new();
+        for (idx, elem) in ask_mode.elements.iter().enumerate() {
+            let is_focused = idx == state.focused_index;
+            let is_editing = state.input_editing && is_focused && elem.is_input();
+
+            let (prefix, style, content) = if elem.is_check() {
+                let checked = if elem.selected() { "☑" } else { "☐" };
+                let prefix = format!(" {} ", checked);
+                let s = if is_focused {
+                    Style::default().fg(Color::Rgb(143, 218, 255)).bg(Color::Rgb(50, 60, 75)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White).bg(Color::Rgb(30, 35, 45))
+                };
+                (prefix, s, elem.label().to_string())
+            } else if elem.is_radio() {
+                let checked = if elem.selected() { "●" } else { "○" };
+                let prefix = format!(" {} ", checked);
+                let s = if is_focused {
+                    Style::default().fg(Color::Rgb(163, 190, 140)).bg(Color::Rgb(50, 60, 75)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White).bg(Color::Rgb(30, 35, 45))
+                };
+                (prefix, s, elem.label().to_string())
+            } else if elem.is_input() {
+                let prefix = if is_editing { " ▏ " } else { " ▎ " };
+                let s = if is_focused && is_editing {
+                    Style::default().fg(Color::Black).bg(Color::Rgb(143, 218, 255)).add_modifier(Modifier::BOLD)
+                } else if is_focused {
+                    Style::default().fg(Color::Rgb(143, 218, 255)).bg(Color::Rgb(50, 60, 75)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White).bg(Color::Rgb(30, 35, 45))
+                };
+                let value = if elem.value().is_empty() {
+                    elem.label().to_string()
+                } else {
+                    elem.value().to_string()
+                };
+                (prefix.to_string(), s, value)
+            } else if elem.is_question() {
+                let prefix = " ❓ ";
+                let s = if is_focused {
+                    Style::default().fg(Color::Rgb(235, 203, 139)).bg(Color::Rgb(50, 60, 75)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Rgb(235, 203, 139)).bg(Color::Rgb(30, 35, 45))
+                };
+                (prefix.to_string(), s, format!("{} ({})", elem.label(), elem.action()))
+            } else {
+                ("".to_string(), Style::default().fg(Color::White).bg(Color::Rgb(30, 35, 45)), String::new())
+            };
+
+            let mut spans = vec![
+                Span::styled(prefix, style),
+            ];
+            if is_editing {
+                spans.push(Span::styled(content, style));
+                // Show cursor position
+                spans.push(Span::styled("█", style));
+            } else {
+                spans.push(Span::styled(content, style));
+            }
+
+            items.push(ListItem::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(30, 35, 45))));
+        }
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Options ")
+                    .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
+                    .style(Style::default().bg(Color::Rgb(30, 35, 45))),
+            )
+            .style(Style::default().bg(Color::Rgb(30, 35, 45)))
+            .highlight_style(Style::default().bg(Color::Rgb(50, 60, 75)).add_modifier(Modifier::BOLD));
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(state.focused_index));
+        frame.render_stateful_widget(list, chunks[1], &mut list_state);
+
+        // Hints
+        let hints = if state.input_editing {
+            "Type to edit | Enter/Esc: exit edit | s: submit | q: cancel"
+        } else {
+            "↑/↓ or j/k: navigate | Space/Enter: toggle | s: submit | q: cancel"
+        };
+        let hints_para = Paragraph::new(hints)
+            .style(Style::default().fg(Color::Rgb(120, 140, 160)).bg(Color::Rgb(30, 35, 45)))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Rgb(76, 86, 106)))
+                    .style(Style::default().bg(Color::Rgb(30, 35, 45))),
+            );
+        frame.render_widget(hints_para, chunks[2]);
     }
 }
 

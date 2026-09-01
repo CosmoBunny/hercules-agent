@@ -902,18 +902,23 @@ pub fn render_markdown_to_lines<'a>(
 
             let inline_spans = parse_inline(header_text, true, false);
             for span in inline_spans {
-                for ch in span.text.chars() {
-                    if *global_out_ch >= available_output {
-                        break;
-                    }
-                    let age = available_output.saturating_sub(*global_out_ch);
-                    let is_streaming = is_generating && is_last_message;
-                    let style = Style::default()
-                        .fg(stream_token_color(h_color, age, is_streaming))
-                        .add_modifier(Modifier::BOLD);
-                    line_spans.push(Span::styled(ch.to_string(), style));
-                    *global_out_ch += 1;
+                let span_len = span.text.chars().count();
+                if *global_out_ch >= available_output {
+                    break;
                 }
+                let take_len = (available_output - *global_out_ch).min(span_len);
+                let age = available_output.saturating_sub(*global_out_ch);
+                let is_streaming = is_generating && is_last_message;
+                let style = Style::default()
+                    .fg(stream_token_color(h_color, age, is_streaming))
+                    .add_modifier(Modifier::BOLD);
+                let rendered_text: String = if take_len == span_len {
+                    span.text
+                } else {
+                    span.text.chars().take(take_len).collect()
+                };
+                line_spans.push(Span::styled(rendered_text, style));
+                *global_out_ch += take_len;
             }
             *global_out_ch += hash_count + 1; // Account for stripped '# '
 
@@ -943,26 +948,31 @@ pub fn render_markdown_to_lines<'a>(
 
             let inline_spans = parse_inline(quote_text, false, true);
             for span in inline_spans {
-                for ch in span.text.chars() {
-                    if *global_out_ch >= available_output {
-                        break;
-                    }
-                    let age = available_output.saturating_sub(*global_out_ch);
-                    let is_streaming = is_generating && is_last_message;
-                    let base_c = if span.code {
-                        Color::Rgb(255, 190, 100)
-                    } else {
-                        Color::Rgb(180, 195, 210)
-                    };
-                    let mut style = Style::default()
-                        .fg(stream_token_color(base_c, age, is_streaming))
-                        .add_modifier(Modifier::ITALIC);
-                    if span.bold {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    line_spans.push(Span::styled(ch.to_string(), style));
-                    *global_out_ch += 1;
+                let span_len = span.text.chars().count();
+                if *global_out_ch >= available_output {
+                    break;
                 }
+                let take_len = (available_output - *global_out_ch).min(span_len);
+                let age = available_output.saturating_sub(*global_out_ch);
+                let is_streaming = is_generating && is_last_message;
+                let base_c = if span.code {
+                    Color::Rgb(255, 190, 100)
+                } else {
+                    Color::Rgb(180, 195, 210)
+                };
+                let mut style = Style::default()
+                    .fg(stream_token_color(base_c, age, is_streaming))
+                    .add_modifier(Modifier::ITALIC);
+                if span.bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                let rendered_text: String = if take_len == span_len {
+                    span.text
+                } else {
+                    span.text.chars().take(take_len).collect()
+                };
+                line_spans.push(Span::styled(rendered_text, style));
+                *global_out_ch += take_len;
             }
             *global_out_ch += 2; // for '> '
 
@@ -1015,37 +1025,42 @@ pub fn render_markdown_to_lines<'a>(
             let task_text = &trimmed[6..];
             let inline_spans = parse_inline(task_text, false, false);
             for span in inline_spans {
-                for ch in span.text.chars() {
-                    if *global_out_ch >= available_output {
-                        break;
-                    }
-                    let age = available_output.saturating_sub(*global_out_ch);
-                    let is_streaming = is_generating && is_last_message;
-                    let base_c = if span.code {
-                        Color::Rgb(255, 190, 100)
-                    } else if span.link_url.is_some() {
-                        Color::Rgb(0, 200, 255)
-                    } else if is_task_checked {
-                        Color::Rgb(150, 160, 170)
-                    } else {
-                        Color::Rgb(235, 240, 250)
-                    };
-                    let mut style = Style::default().fg(stream_token_color(base_c, age, is_streaming));
-                    if span.bold {
-                        style = style.add_modifier(Modifier::BOLD);
-                    }
-                    if span.italic {
-                        style = style.add_modifier(Modifier::ITALIC);
-                    }
-                    if span.strikethrough || is_task_checked {
-                        style = style.add_modifier(Modifier::CROSSED_OUT);
-                    }
-                    if span.link_url.is_some() {
-                        style = style.add_modifier(Modifier::UNDERLINED);
-                    }
-                    line_spans.push(Span::styled(ch.to_string(), style));
-                    *global_out_ch += 1;
+                let span_len = span.text.chars().count();
+                if *global_out_ch >= available_output {
+                    break;
                 }
+                let take_len = (available_output - *global_out_ch).min(span_len);
+                let age = available_output.saturating_sub(*global_out_ch);
+                let is_streaming = is_generating && is_last_message;
+                let base_c = if span.code {
+                    Color::Rgb(255, 190, 100)
+                } else if span.link_url.is_some() {
+                    Color::Rgb(0, 200, 255)
+                } else if is_task_checked {
+                    Color::Rgb(150, 160, 170)
+                } else {
+                    Color::Rgb(235, 240, 250)
+                };
+                let mut style = Style::default().fg(stream_token_color(base_c, age, is_streaming));
+                if span.bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if span.italic {
+                    style = style.add_modifier(Modifier::ITALIC);
+                }
+                if span.strikethrough || is_task_checked {
+                    style = style.add_modifier(Modifier::CROSSED_OUT);
+                }
+                if span.link_url.is_some() {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                let rendered_text: String = if take_len == span_len {
+                    span.text
+                } else {
+                    span.text.chars().take(take_len).collect()
+                };
+                line_spans.push(Span::styled(rendered_text, style));
+                *global_out_ch += take_len;
             }
             *global_out_ch += 6; // for marker
 
@@ -1116,38 +1131,44 @@ pub fn render_markdown_to_lines<'a>(
 
         let inline_spans = parse_inline(text_to_parse, false, false);
         for span in inline_spans {
-            for ch in span.text.chars() {
-                if *global_out_ch >= available_output {
-                    break;
-                }
-                let age = available_output.saturating_sub(*global_out_ch);
-                let is_streaming = is_generating && is_last_message;
-
-                let base_c = if span.code {
-                    Color::Rgb(255, 190, 100)
-                } else if span.link_url.is_some() {
-                    Color::Rgb(0, 200, 255)
-                } else {
-                    Color::Rgb(240, 245, 255)
-                };
-
-                let mut style = Style::default().fg(stream_token_color(base_c, age, is_streaming));
-                if span.bold {
-                    style = style.add_modifier(Modifier::BOLD);
-                }
-                if span.italic {
-                    style = style.add_modifier(Modifier::ITALIC);
-                }
-                if span.strikethrough {
-                    style = style.add_modifier(Modifier::CROSSED_OUT);
-                }
-                if span.link_url.is_some() {
-                    style = style.add_modifier(Modifier::UNDERLINED);
-                }
-
-                line_spans.push(Span::styled(ch.to_string(), style));
-                *global_out_ch += 1;
+            let span_len = span.text.chars().count();
+            if *global_out_ch >= available_output {
+                break;
             }
+            let take_len = (available_output - *global_out_ch).min(span_len);
+            let age = available_output.saturating_sub(*global_out_ch);
+            let is_streaming = is_generating && is_last_message;
+
+            let base_c = if span.code {
+                Color::Rgb(255, 190, 100)
+            } else if span.link_url.is_some() {
+                Color::Rgb(0, 200, 255)
+            } else {
+                Color::Rgb(240, 245, 255)
+            };
+
+            let mut style = Style::default().fg(stream_token_color(base_c, age, is_streaming));
+            if span.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if span.italic {
+                style = style.add_modifier(Modifier::ITALIC);
+            }
+            if span.strikethrough {
+                style = style.add_modifier(Modifier::CROSSED_OUT);
+            }
+            if span.link_url.is_some() {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+
+            let rendered_text: String = if take_len == span_len {
+                span.text
+            } else {
+                span.text.chars().take(take_len).collect()
+            };
+
+            line_spans.push(Span::styled(rendered_text, style));
+            *global_out_ch += take_len;
         }
         *global_out_ch += 1;
 

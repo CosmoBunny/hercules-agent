@@ -162,6 +162,11 @@ Replace line range:   <write src="$CURRENT/path/to/file" line=10..=15>
 [replacement content for lines 10 through 15]
 </write>
 Run tool / command:   <cmd> tool run here </cmd>
+MCP tool call:        <mcp server="SERVER_NAME" tool="TOOL_NAME">
+{
+  "arg_name": "arg_value"
+}
+</mcp>
 Web search:           <websearch query="search terms"> or <websearch>search terms</websearch>
 Spawn sub-agent:      <agent action="spawn" role="ROLE" model="MODEL">task description</agent>
 Memory push:          <memory push>text</memory>
@@ -174,10 +179,11 @@ Help (inside think):  <help>
 3. To replace a specific range of lines in an existing file, use `<write src="..." line=START..=END>` with the replacement block.
 4. For web search or online documentation, use `<websearch query="..."/>` or `<websearch>query</websearch>`.
 5. For running shell utilities, git (clone, status, commit), web fetching (curl, wget), build tools, process management, or OS operations, use `<cmd> tool run here </cmd>`.
-6. When using CLI tools, only consult help/manual flags (`--help`, `man`, `/?`) if you are unsure of the tool's exact usage syntax and require clarification. Do not run help commands in the first place without actual need.
-7. For pure conversation, planning, or questions, reply directly in natural language.
-8. Reasoning inside `<think>...</think>` is optional. If you use it, close with `</think>` and emit your tool calls or response outside `<think>`.
-9. Never state you lack access to the local machine or tools.
+6. For external tools provided via Model Context Protocol, use `<mcp server="..." tool="...">{"arg": "val"}</mcp>`.
+7. When using CLI tools, only consult help/manual flags (`--help`, `man`, `/?`) if you are unsure of the tool's exact usage syntax and require clarification. Do not run help commands in the first place without actual need.
+8. For pure conversation, planning, or questions, reply directly in natural language.
+9. Reasoning inside `<think>...</think>` is optional. If you use it, close with `</think>` and emit your tool calls or response outside `<think>`.
+10. Never state you lack access to the local machine or tools.
 "#;
 
 /// Compact system prompt for small GGUFs / llama-server chat.
@@ -195,6 +201,7 @@ Tools (raw tags only, no markdown fences):
 <write src="$CURRENT/path/to/file" line=10..=15>
 [replacement lines]
 </write>
+<mcp server="server" tool="tool">{"param": "value"}</mcp>
 <websearch query="search terms">
 <cmd> tool run here </cmd>
 <agent action="spawn" role="role" model="model">task</agent>
@@ -205,6 +212,7 @@ Rules:
 - Questions and conversation: respond directly in natural language.
 - Inspecting or reading: use `<ls>` or `<read>`.
 - Searching web / documentation: use `<websearch query="...">`.
+- Calling MCP tools: use `<mcp server="..." tool="...">{"param": "value"}</mcp>`.
 - Creating or editing files (and dirs): use `<write src="...">` with the COMPLETE file content in ONE single block. NEVER split or write one file line-by-line across multiple write tags. Multiple writes are only for separate files.
 - Line replacements: use `<write src="..." line=START..=END>`.
 - Git, web fetch (curl/wget), packages, file moves/deletes, or OS utilities: use `<cmd> tool run here </cmd>`.
@@ -436,8 +444,21 @@ Common Tasks:
 - Syntax Help:      Only use `man <tool>` or `<tool> --help` when you genuinely need syntax clarification, not in the first place."
         };
 
+        let mcp_tools_section = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mcp_mgr_lock = crate::mcp::McpManager::instance().await;
+                let mut mcp_guard = mcp_mgr_lock.lock().await;
+                if let Some(ref mut mgr) = *mcp_guard {
+                    mgr.sync_with_settings().await;
+                    mgr.generate_prompt_tools_section().await
+                } else {
+                    String::new()
+                }
+            })
+        });
+
         format!(
-            "{base}\n\nLive Environment:\n- Working Directory: $CURRENT → {cwd}\n- {os_commands}\n"
+            "{base}\n\nLive Environment:\n- Working Directory: $CURRENT → {cwd}\n- {os_commands}\n{mcp_tools_section}"
         )
     }
 
@@ -1399,17 +1420,25 @@ Some(tag)
     fn parse_mcp_skill_actions(text: &str, from_think: bool) -> Vec<ProposedAction> {
         let mut out = Vec::new();
         let mut rest = text;
-        while let Some(start_tag) = rest.find("<mcp ") {
+        while let Some(start_tag) = rest.find("<mcp") {
             let r = &rest[start_tag..];
             if let Some(close_bracket) = r.find('>') {
                 let header = &r[..close_bracket + 1];
-                let action = Self::extract_attribute(header, "action").unwrap_or_else(|| "search".to_string());
+                let server = Self::extract_attribute(header, "server");
+                let tool = Self::extract_attribute(header, "tool")
+                    .or_else(|| Self::extract_attribute(header, "action"))
+                    .unwrap_or_default();
+                let target = if let Some(srv) = server {
+                    format!("{srv}:{tool}")
+                } else {
+                    tool
+                };
                 let after = &r[close_bracket + 1..];
                 if let Some(end_tag) = after.find("</mcp>") {
                     let body = after[..end_tag].trim().to_string();
                     out.push(ProposedAction {
                         kind: ProposedKind::Mcp,
-                        target: action,
+                        target,
                         body,
                         line_attr: None,
                         from_think,
@@ -1679,7 +1708,29 @@ Some(tag)
                     })
                 })
             }
-            ProposedKind::Mcp | ProposedKind::Skill | ProposedKind::Agent => String::new(), // handled elsewhere
+            ProposedKind::Mcp => {
+                let (server_opt, tool_name) = if let Some((s, t)) = action.target.split_once(':') {
+                    (Some(s), t)
+                } else {
+                    (None, action.target.as_str())
+                };
+tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            let mcp_mgr_lock = crate::mcp::McpManager::instance().await;
+                            let mut mcp_guard = mcp_mgr_lock.lock().await;
+                            if let Some(ref mut mgr) = *mcp_guard {
+                                mgr.sync_with_settings().await;
+                                match mgr.execute_tool(server_opt, tool_name, &action.body).await {
+                                    Ok(res) => res.to_plain_text(),
+                                    Err(e) => e,
+                                }
+                            } else {
+                                "Error: MCP Manager is not initialized.".to_string()
+                            }
+                        })
+                    })
+            }
+            ProposedKind::Skill | ProposedKind::Agent => String::new(), // handled elsewhere
             ProposedKind::Cmd => {
  
                 if !Self::looks_like_shell_cmd(&action.target) {

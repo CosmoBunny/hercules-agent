@@ -1,4 +1,8 @@
-use ollama_rs::{generation::completion::request::GenerationRequest, Ollama};
+use ollama_rs::{
+    generation::completion::request::GenerationRequest,
+    generation::images::Image,
+    Ollama,
+};
 #[cfg(feature = "gpu")]
 use burn::backend::wgpu::WgpuDevice;
 #[cfg(feature = "gpu")]
@@ -44,7 +48,7 @@ impl AgentBackend {
             }
             Self::Ollama(backend) => {
                 backend
-                    .generate_stream(prompt, stream_target, is_generating)
+                    .generate_stream(prompt, Vec::new(), stream_target, is_generating)
                     .await
             }
             #[cfg(feature = "gpu")]
@@ -209,13 +213,17 @@ impl OllamaBackend {
     pub async fn generate_stream(
         &self,
         prompt: &str,
+        images: Vec<Image>,
         stream_target: Arc<Mutex<String>>,
         is_generating: Arc<Mutex<bool>>,
     ) -> Result<String, String> {
         use futures_util::StreamExt;
 
         let system = crate::agent::AgentEngine::system_prompt_for_cwd();
-        let req = GenerationRequest::new(self.model.clone(), prompt.to_string()).system(system);
+        let mut req = GenerationRequest::new(self.model.clone(), prompt.to_string()).system(system);
+        if !images.is_empty() {
+            req = req.images(images);
+        }
         let mut stream = self.ollama.generate_stream(req).await.map_err(|e| {
             format!(
                 "[Ollama Error] Stream failed for model '{}': {}. Ensure local Ollama daemon is active.",

@@ -77,7 +77,7 @@ fn link_from_install_dir(dir: &Path) {
     let core_names = [
         "llama", "ggml", "ggml-base", "ggml-cpu",
         "ggml-rpc", "ggml-cuda", "ggml-vulkan", "ggml-metal",
-        "llama-common",
+        "llama-common", "mtmd",
     ];
 
     println!("cargo:rustc-link-search=native={}", dir.display());
@@ -182,10 +182,11 @@ fn lib_stem(p: &Path) -> String {
 fn sort_libs(mut libs: Vec<PathBuf>) -> Vec<PathBuf> {
     libs.sort_by_key(|p| {
         let s = lib_stem(p);
-        if s == "llama"               { 0u8 }
-        else if s.starts_with("ggml-") { 2 }
-        else if s == "ggml"            { 3 }
-        else                           { 1 }
+        if s == "mtmd"                 { 0u8 }
+        else if s == "llama"           { 1 }
+        else if s.starts_with("ggml-") { 3 }
+        else if s == "ggml"            { 4 }
+        else                           { 2 }
     });
     // Deduplicate by logical name (libllama.so / libllama.so.0 / libllama.so.0.0.1)
     let mut seen = HashSet::new();
@@ -302,6 +303,7 @@ fn cmake_configure(src: &Path, build: &Path) {
         .arg("-DLLAMA_BUILD_EXAMPLES=OFF")
         .arg("-DLLAMA_BUILD_SERVER=OFF")
         .arg("-DLLAMA_BUILD_TOOLS=OFF")
+        .arg("-DLLAMA_BUILD_MTMD=ON")
         .arg("-DLLAMA_STANDALONE=OFF");
 
     // PIC: needed on Unix for linking into a Rust binary; harmless on Windows.
@@ -338,7 +340,7 @@ fn cmake_build_libs(build: &Path) {
     
     // By explicitly targeting libraries, we avoid building `llama-app` 
     // which has a known Ninja dependency race condition for build-info.h
-    for t in ["llama", "ggml", "ggml-base"] {
+    for t in ["llama", "ggml", "ggml-base", "mtmd"] {
         args.push("--target".to_string());
         args.push(t.to_string());
     }

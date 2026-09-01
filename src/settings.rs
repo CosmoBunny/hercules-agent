@@ -1,5 +1,6 @@
 //! Runtime settings: power mode + repeat detector.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use sysinfo::System;
 
@@ -168,6 +169,65 @@ impl MtpMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MediaStorageLocation {
+    Local,
+    Tmp,
+}
+
+impl MediaStorageLocation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Local => "Local Data (Persistent in session media storage)",
+            Self::Tmp => "Tmp (/tmp/hercules/media volatile cache)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MediaStorageDeleteOnClear {
+    AlwaysDelete,
+    KeepStorage,
+}
+
+impl MediaStorageDeleteOnClear {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AlwaysDelete => "Delete (Wipe local session media when clearing session)",
+            Self::KeepStorage => "Keep (Preserve media files on disk when clearing session)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct McpToolConfig {
+    pub name: String,
+    pub command_path: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env_vars: HashMap<String, String>,
+}
+
+impl McpToolConfig {
+    /// Sanitize MCP name: no spaces, no `<` or `>` or quotes (anti-injection)
+    pub fn sanitize_name(input: &str) -> String {
+        input
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '<' && *c != '>' && *c != '"' && *c != '\'' && *c != '&')
+            .collect()
+    }
+
+    /// Sanitize command path: no injection characters (`<`, `>`, `\n`, `\r`)
+    pub fn sanitize_path(input: &str) -> String {
+        input
+            .chars()
+            .filter(|c| *c != '<' && *c != '>' && *c != '\n' && *c != '\r')
+            .collect()
+    }
+}
+
+/// Runtime settings persisted to `~/.config/hercules/settings.toml` or `settings.toml`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RuntimeSettings {
     #[serde(default = "default_power_mode")]
@@ -203,6 +263,9 @@ pub struct RuntimeSettings {
     /// OCR model / engine (auto, llava, qwen2-vl, tesseract).
     #[serde(default = "default_none")]
     pub ocr_model: String,
+    /// ViT Vision Projector / mmproj model (auto, none, or explicit path/filename).
+    #[serde(default = "default_auto")]
+    pub vit_model: String,
     /// Image generative model / engine (auto, sd-webui, ollama, diffusers).
     #[serde(default = "default_none")]
     pub image_gen_model: String,
@@ -233,9 +296,20 @@ pub struct RuntimeSettings {
     /// Target UI Render FPS: 30, 60 (default), 90, 120, 240
     #[serde(default = "default_target_fps")]
     pub target_fps: u32,
+    /// Storage location for pasted/attached media (local session directory vs volatile /tmp).
+    #[serde(default = "default_media_storage_location")]
+    pub media_storage_location: MediaStorageLocation,
+    /// Delete or keep session media files when clearing session.
+    #[serde(default = "default_media_storage_delete_on_clear")]
+    pub media_storage_delete_on_clear: MediaStorageDeleteOnClear,
+    /// Configured MCP tools (name + command path)
+    #[serde(default)]
+    pub mcp_tools: Vec<McpToolConfig>,
 }
 
 fn default_target_fps() -> u32 { 60 }
+fn default_media_storage_location() -> MediaStorageLocation { MediaStorageLocation::Local }
+fn default_media_storage_delete_on_clear() -> MediaStorageDeleteOnClear { MediaStorageDeleteOnClear::AlwaysDelete }
 fn default_power_mode() -> PowerMode { PowerMode::Normal }
 fn default_mtp_mode() -> MtpMode { MtpMode::PromptLookup3 }
 fn default_web_search_provider() -> WebSearchProvider { WebSearchProvider::DuckDuckGo }
@@ -248,6 +322,7 @@ fn default_false() -> bool { false }
 fn default_compact_ratio() -> f32 { CONTEXT_COMPACT_RATIO }
 fn default_temperature() -> f32 { DEFAULT_TEMPERATURE }
 fn default_none() -> String { "none".to_string() }
+fn default_auto() -> String { "auto".to_string() }
 
 impl Default for RuntimeSettings {
     fn default() -> Self {
@@ -266,6 +341,7 @@ impl Default for RuntimeSettings {
             temperature: DEFAULT_TEMPERATURE,
             subagent_quick_response: true,
             ocr_model: "none".to_string(),
+            vit_model: "auto".to_string(),
             image_gen_model: "none".to_string(),
             video_gen_model: "none".to_string(),
             hf_token: env_tok,
@@ -276,7 +352,83 @@ impl Default for RuntimeSettings {
             searxng_url: None,
             auto_collapse_previous: false,
             target_fps: 60,
+            media_storage_location: MediaStorageLocation::Local,
+            media_storage_delete_on_clear: MediaStorageDeleteOnClear::AlwaysDelete,
+            mcp_tools: Vec::new(),
         }
+    }
+}
+
+pub fn get_media_storage_location() -> MediaStorageLocation {
+    get_settings().media_storage_location
+}
+
+pub fn set_media_storage_location(loc: MediaStorageLocation) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.media_storage_location = loc;
+        save_settings_to_disk(s);
+    }
+}
+
+pub fn cycle_media_storage_location() -> MediaStorageLocation {
+    let next = match get_media_storage_location() {
+        MediaStorageLocation::Local => MediaStorageLocation::Tmp,
+        MediaStorageLocation::Tmp => MediaStorageLocation::Local,
+    };
+    set_media_storage_location(next);
+    next
+}
+
+pub fn get_media_storage_delete_on_clear() -> MediaStorageDeleteOnClear {
+    get_settings().media_storage_delete_on_clear
+}
+
+pub fn set_media_storage_delete_on_clear(val: MediaStorageDeleteOnClear) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.media_storage_delete_on_clear = val;
+        save_settings_to_disk(s);
+    }
+}
+
+pub fn cycle_media_storage_delete_on_clear() -> MediaStorageDeleteOnClear {
+    let next = match get_media_storage_delete_on_clear() {
+        MediaStorageDeleteOnClear::AlwaysDelete => MediaStorageDeleteOnClear::KeepStorage,
+        MediaStorageDeleteOnClear::KeepStorage => MediaStorageDeleteOnClear::AlwaysDelete,
+    };
+    set_media_storage_delete_on_clear(next);
+    next
+}
+
+pub fn get_mcp_tools() -> Vec<McpToolConfig> {
+    get_settings().mcp_tools
+}
+
+pub fn add_mcp_tool(name: String, command_path: String, args: Vec<String>, env_vars: HashMap<String, String>) {
+    let clean_name = McpToolConfig::sanitize_name(&name);
+    let clean_path = McpToolConfig::sanitize_path(&command_path);
+    if clean_name.is_empty() || clean_path.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.mcp_tools.retain(|t| t.name != clean_name);
+        s.mcp_tools.push(McpToolConfig {
+            name: clean_name,
+            command_path: clean_path,
+            args,
+            env_vars,
+        });
+        save_settings_to_disk(s);
+    }
+}
+
+pub fn remove_mcp_tool(name: &str) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.mcp_tools.retain(|t| t.name != name);
+        save_settings_to_disk(s);
     }
 }
 
@@ -625,6 +777,80 @@ pub fn nudge_ocr_engine_mode(dir: i32) -> crate::ocr::OcrEngineMode {
         };
         save_settings_to_disk(s);
     }
+    next
+}
+
+/// Discover all available ViT mmproj models on disk across model directories and search paths.
+pub fn available_vit_models() -> Vec<String> {
+    let mut models = vec!["auto".to_string(), "disabled".to_string()];
+    let mut seen = std::collections::HashSet::new();
+
+    let search_dirs = vec![
+        crate::manager::models_dir(),
+        crate::manager::local_hercules_dir(),
+        std::env::current_dir().unwrap_or_default(),
+    ];
+
+    for dir in search_dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    let low = name.to_lowercase();
+                    if (low.contains("mmproj") || low.contains("vit") || low.contains("clip"))
+                        && low.ends_with(".gguf")
+                    {
+                        // If it's a sharded tensor part like mmproj-...-00001-of-00299.gguf, collapse to base or first shard
+                        let canonical_name = if low.contains("-00001-of-") {
+                            // First shard represents the whole model
+                            name
+                        } else if low.contains("-of-") {
+                            // Skip non-first shards from cluttering list
+                            continue;
+                        } else {
+                            name
+                        };
+
+                        if !seen.contains(&canonical_name) {
+                            seen.insert(canonical_name.clone());
+                            models.push(canonical_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    models
+}
+
+pub fn get_selected_vit_model() -> String {
+    let s = get_settings();
+    if s.vit_model.trim().is_empty() {
+        "auto".to_string()
+    } else {
+        s.vit_model
+    }
+}
+
+pub fn nudge_vit_model(dir: i32) -> String {
+    let avail = available_vit_models();
+    let current = get_selected_vit_model();
+    let idx = avail.iter().position(|m| m.eq_ignore_ascii_case(&current)).unwrap_or(0);
+    let next_idx = if dir > 0 {
+        (idx + 1) % avail.len()
+    } else if idx == 0 {
+        avail.len() - 1
+    } else {
+        idx - 1
+    };
+    let next = avail[next_idx].clone();
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.vit_model = next.clone();
+        save_settings_to_disk(s);
+    }
+    crate::llama::libinfer::shutdown_warm_lib_engine();
     next
 }
 

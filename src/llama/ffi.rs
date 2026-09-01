@@ -28,6 +28,44 @@ pub type LlamaContext = c_void;
 pub type LlamaVocab = c_void;
 pub type LlamaSampler = c_void;
 
+// mtmd (multimodal / Vision Language / LLaVA / Qwen-VL) types
+pub type MtmdContext = c_void;
+pub type MtmdBitmap = c_void;
+pub type MtmdInputChunks = c_void;
+pub type MtmdInputChunk = c_void;
+
+#[repr(C)]
+pub struct MtmdContextParams {
+    pub use_gpu: bool,
+    pub print_timings: bool,
+    pub n_threads: i32,
+    pub image_marker: *const c_char,
+    pub media_marker: *const c_char,
+    pub flash_attn_type: i32,
+    pub warmup: bool,
+    pub image_min_tokens: i32,
+    pub image_max_tokens: i32,
+    pub cb_eval: *const c_void,
+    pub cb_eval_user_data: *const c_void,
+    pub batch_max_tokens: i32,
+    pub progress_callback: *const c_void,
+    pub progress_callback_user_data: *const c_void,
+}
+
+#[repr(C)]
+pub struct MtmdInputText {
+    pub text: *const c_char,
+    pub text_len: usize,
+    pub add_special: bool,
+    pub parse_special: bool,
+}
+
+#[repr(C)]
+pub struct MtmdHelperBitmapWrapper {
+    pub bitmap: *mut MtmdBitmap,
+    pub video_ctx: *mut c_void,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct LlamaBatch {
@@ -174,6 +212,20 @@ type FnStateGetData = unsafe extern "C" fn(*mut LlamaContext, *mut u8, usize) ->
 /// llama_state_set_data(ctx, src, size) → bytes read.
 type FnStateSetData = unsafe extern "C" fn(*mut LlamaContext, *const u8, usize) -> usize;
 
+// mtmd (Vision-Language / Multimodal) function pointers
+type FnMtmdDefaultMarker = unsafe extern "C" fn() -> *const c_char;
+type FnMtmdContextParamsDefault = unsafe extern "C" fn() -> MtmdContextParams;
+type FnMtmdInitFromFile = unsafe extern "C" fn(*const c_char, *const LlamaModel, MtmdContextParams) -> *mut MtmdContext;
+type FnMtmdFree = unsafe extern "C" fn(*mut MtmdContext);
+type FnMtmdSupportVision = unsafe extern "C" fn(*const MtmdContext) -> bool;
+type FnMtmdSupportAudio = unsafe extern "C" fn(*const MtmdContext) -> bool;
+type FnMtmdHelperBitmapInitFromFile = unsafe extern "C" fn(*mut MtmdContext, *const c_char, bool) -> MtmdHelperBitmapWrapper;
+type FnMtmdBitmapFree = unsafe extern "C" fn(*mut MtmdBitmap);
+type FnMtmdInputChunksInit = unsafe extern "C" fn() -> *mut MtmdInputChunks;
+type FnMtmdInputChunksFree = unsafe extern "C" fn(*mut MtmdInputChunks);
+type FnMtmdTokenize = unsafe extern "C" fn(*mut MtmdContext, *mut MtmdInputChunks, *const MtmdInputText, *const *const MtmdBitmap, usize) -> i32;
+type FnMtmdHelperEvalChunks = unsafe extern "C" fn(*mut MtmdContext, *mut LlamaContext, *const MtmdInputChunks, LlamaPos, LlamaSeqId, i32, bool, *mut LlamaPos) -> i32;
+
 // ---------------------------------------------------------------------------
 // LlamaLib
 // ---------------------------------------------------------------------------
@@ -226,6 +278,20 @@ pub struct LlamaLib {
     pub state_get_size: Option<FnStateGetSize>,
     pub state_get_data: Option<FnStateGetData>,
     pub state_set_data: Option<FnStateSetData>,
+
+    // Mtmd Multimodal / Vision Projector (optional for pure text models)
+    pub mtmd_default_marker: Option<FnMtmdDefaultMarker>,
+    pub mtmd_context_params_default: Option<FnMtmdContextParamsDefault>,
+    pub mtmd_init_from_file: Option<FnMtmdInitFromFile>,
+    pub mtmd_free: Option<FnMtmdFree>,
+    pub mtmd_support_vision: Option<FnMtmdSupportVision>,
+    pub mtmd_support_audio: Option<FnMtmdSupportAudio>,
+    pub mtmd_helper_bitmap_init_from_file: Option<FnMtmdHelperBitmapInitFromFile>,
+    pub mtmd_bitmap_free: Option<FnMtmdBitmapFree>,
+    pub mtmd_input_chunks_init: Option<FnMtmdInputChunksInit>,
+    pub mtmd_input_chunks_free: Option<FnMtmdInputChunksFree>,
+    pub mtmd_tokenize: Option<FnMtmdTokenize>,
+    pub mtmd_helper_eval_chunks: Option<FnMtmdHelperEvalChunks>,
 }
 
 unsafe impl Send for LlamaLib {}
@@ -286,6 +352,20 @@ unsafe extern "C" {
     fn llama_state_get_size(ctx: *const LlamaContext) -> usize;
     fn llama_state_get_data(ctx: *mut LlamaContext, dst: *mut u8, size: usize) -> usize;
     fn llama_state_set_data(ctx: *mut LlamaContext, src: *const u8, size: usize) -> usize;
+
+    // mtmd symbols
+    fn mtmd_default_marker() -> *const c_char;
+    fn mtmd_context_params_default() -> MtmdContextParams;
+    fn mtmd_init_from_file(mmproj_fname: *const c_char, text_model: *const LlamaModel, ctx_params: MtmdContextParams) -> *mut MtmdContext;
+    fn mtmd_free(ctx: *mut MtmdContext);
+    fn mtmd_support_vision(ctx: *const MtmdContext) -> bool;
+    fn mtmd_support_audio(ctx: *const MtmdContext) -> bool;
+    fn mtmd_helper_bitmap_init_from_file(ctx: *mut MtmdContext, fname: *const c_char, placeholder: bool) -> MtmdHelperBitmapWrapper;
+    fn mtmd_bitmap_free(bitmap: *mut MtmdBitmap);
+    fn mtmd_input_chunks_init() -> *mut MtmdInputChunks;
+    fn mtmd_input_chunks_free(chunks: *mut MtmdInputChunks);
+    fn mtmd_tokenize(ctx: *mut MtmdContext, output: *mut MtmdInputChunks, text: *const MtmdInputText, bitmaps: *const *const MtmdBitmap, n_bitmaps: usize) -> i32;
+    fn mtmd_helper_eval_chunks(ctx: *mut MtmdContext, lctx: *mut LlamaContext, chunks: *const MtmdInputChunks, n_past: LlamaPos, seq_id: LlamaSeqId, n_batch: i32, logits_last: bool, new_n_past: *mut LlamaPos) -> i32;
 }
 
 #[cfg(feature = "llama-cpp-static")]
@@ -332,6 +412,19 @@ impl LlamaLib {
             state_get_size:                Some(llama_state_get_size),
             state_get_data:                Some(llama_state_get_data),
             state_set_data:                Some(llama_state_set_data),
+
+            mtmd_default_marker:           Some(mtmd_default_marker),
+            mtmd_context_params_default:   Some(mtmd_context_params_default),
+            mtmd_init_from_file:           Some(mtmd_init_from_file),
+            mtmd_free:                     Some(mtmd_free),
+            mtmd_support_vision:           Some(mtmd_support_vision),
+            mtmd_support_audio:            Some(mtmd_support_audio),
+            mtmd_helper_bitmap_init_from_file: Some(mtmd_helper_bitmap_init_from_file),
+            mtmd_bitmap_free:              Some(mtmd_bitmap_free),
+            mtmd_input_chunks_init:        Some(mtmd_input_chunks_init),
+            mtmd_input_chunks_free:        Some(mtmd_input_chunks_free),
+            mtmd_tokenize:                 Some(mtmd_tokenize),
+            mtmd_helper_eval_chunks:       Some(mtmd_helper_eval_chunks),
         }
     }
 }
@@ -538,6 +631,66 @@ impl LlamaLib {
                 lib.get(b"llama_state_set_data")
                     .ok()
                     .map(|s: libloading::Symbol<FnStateSetData>| *s)
+            },
+            mtmd_default_marker: unsafe {
+                lib.get(b"mtmd_default_marker")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdDefaultMarker>| *s)
+            },
+            mtmd_context_params_default: unsafe {
+                lib.get(b"mtmd_context_params_default")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdContextParamsDefault>| *s)
+            },
+            mtmd_init_from_file: unsafe {
+                lib.get(b"mtmd_init_from_file")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdInitFromFile>| *s)
+            },
+            mtmd_free: unsafe {
+                lib.get(b"mtmd_free")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdFree>| *s)
+            },
+            mtmd_support_vision: unsafe {
+                lib.get(b"mtmd_support_vision")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdSupportVision>| *s)
+            },
+            mtmd_support_audio: unsafe {
+                lib.get(b"mtmd_support_audio")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdSupportAudio>| *s)
+            },
+            mtmd_helper_bitmap_init_from_file: unsafe {
+                lib.get(b"mtmd_helper_bitmap_init_from_file")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdHelperBitmapInitFromFile>| *s)
+            },
+            mtmd_bitmap_free: unsafe {
+                lib.get(b"mtmd_bitmap_free")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdBitmapFree>| *s)
+            },
+            mtmd_input_chunks_init: unsafe {
+                lib.get(b"mtmd_input_chunks_init")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdInputChunksInit>| *s)
+            },
+            mtmd_input_chunks_free: unsafe {
+                lib.get(b"mtmd_input_chunks_free")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdInputChunksFree>| *s)
+            },
+            mtmd_tokenize: unsafe {
+                lib.get(b"mtmd_tokenize")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdTokenize>| *s)
+            },
+            mtmd_helper_eval_chunks: unsafe {
+                lib.get(b"mtmd_helper_eval_chunks")
+                    .ok()
+                    .map(|s: libloading::Symbol<FnMtmdHelperEvalChunks>| *s)
             },
             _deps: deps,
             _lib: lib,
