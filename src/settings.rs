@@ -305,6 +305,12 @@ pub struct RuntimeSettings {
     /// Configured MCP tools (name + command path)
     #[serde(default)]
     pub mcp_tools: Vec<McpToolConfig>,
+    /// Include comments/docstrings in code graph nodes.
+    #[serde(default = "default_true")]
+    pub code_graph_include_comments: bool,
+    /// Enable focused/bounce graph for AI write responses.
+    #[serde(default = "default_true")]
+    pub code_graph_bounce_response_write: bool,
 }
 
 fn default_target_fps() -> u32 { 60 }
@@ -355,6 +361,8 @@ impl Default for RuntimeSettings {
             media_storage_location: MediaStorageLocation::Local,
             media_storage_delete_on_clear: MediaStorageDeleteOnClear::AlwaysDelete,
             mcp_tools: Vec::new(),
+            code_graph_include_comments: true,
+            code_graph_bounce_response_write: true,
         }
     }
 }
@@ -403,6 +411,30 @@ pub fn cycle_media_storage_delete_on_clear() -> MediaStorageDeleteOnClear {
 
 pub fn get_mcp_tools() -> Vec<McpToolConfig> {
     get_settings().mcp_tools
+}
+
+pub fn get_code_graph_include_comments() -> bool {
+    get_settings().code_graph_include_comments
+}
+
+pub fn set_code_graph_include_comments(val: bool) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.code_graph_include_comments = val;
+        save_settings_to_disk(s);
+    }
+}
+
+pub fn get_code_graph_bounce_response_write() -> bool {
+    get_settings().code_graph_bounce_response_write
+}
+
+pub fn set_code_graph_bounce_response_write(val: bool) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.code_graph_bounce_response_write = val;
+        save_settings_to_disk(s);
+    }
 }
 
 pub fn add_mcp_tool(name: String, command_path: String, args: Vec<String>, env_vars: HashMap<String, String>) {

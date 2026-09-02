@@ -68,4 +68,14 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 ratatui-markdown = "0.3.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
 ratatui-image = "4.0"
+tree-sitter = "0.27"
+tree-sitter-rust = "0.24"
+lsp-types = "0.97"
+anyhow = "1.0"
+which = "6.0"
+url = "2.5"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.10"
 

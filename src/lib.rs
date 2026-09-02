@@ -26,6 +26,8 @@ pub mod session;
 pub mod smart_system;
 pub mod mcp;
 pub mod ask_mode;
+pub mod code_graph;
+pub mod lsp;
 
 // TUI lives with the binary but is part of the crate so `app` can use `crate::`.
 pub mod app;
