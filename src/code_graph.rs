@@ -1,10 +1,10 @@
 //! Code Graph — local code structure extraction using Tree-sitter and LSP.
 
+use lsp_types::{Location, Range, SymbolKind, Uri};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tree_sitter::{Node, Parser};
-use lsp_types::{Location, Range, SymbolKind, Uri};
 use url::Url;
 
 /// Create a CodeGraphConfig from the global settings.
@@ -175,6 +175,20 @@ impl CodeGraph {
 
     pub fn add_node(&mut self, node: CodeNode) -> NodeId {
         let id = node.id.clone();
+        // Deduplicate: LSP enrichment can discover nodes belonging to other
+        // files, and merging per-file graphs would otherwise push the same
+        // NodeId twice (leaving node_index pointing at the last copy).
+        if let Some(&idx) = self.node_index.get(&id) {
+            // Reconcile missing metadata into the existing entry
+            let existing = &mut self.nodes[idx];
+            if existing.documentation.is_none() {
+                existing.documentation = node.documentation;
+            }
+            if existing.parent.is_none() {
+                existing.parent = node.parent;
+            }
+            return id;
+        }
         let idx = self.nodes.len();
         self.nodes.push(node);
         self.node_index.insert(id.clone(), idx);
@@ -183,7 +197,11 @@ impl CodeGraph {
 
     pub fn add_edge(&mut self, from: NodeId, to: NodeId, kind: EdgeKind) {
         // Check if edge already exists (deduplication)
-        if !self.edges.iter().any(|e| e.from == from && e.to == to && e.kind == kind) {
+        if !self
+            .edges
+            .iter()
+            .any(|e| e.from == from && e.to == to && e.kind == kind)
+        {
             self.edges.push(CodeEdge { from, to, kind });
         }
     }
@@ -191,7 +209,8 @@ impl CodeGraph {
     /// Remove all Calls edges originating from a specific node.
     /// Used to replace Tree-sitter name-based calls with LSP semantic calls.
     pub fn remove_calls_edges_from(&mut self, from: &NodeId) {
-        self.edges.retain(|e| !(e.kind == EdgeKind::Calls && e.from == *from));
+        self.edges
+            .retain(|e| !(e.kind == EdgeKind::Calls && e.from == *from));
     }
 
     pub fn get_node(&self, id: &NodeId) -> Option<&CodeNode> {
@@ -207,10 +226,7 @@ impl CodeGraph {
     }
 
     pub fn nodes_by_file(&self, file: &PathBuf) -> Vec<&CodeNode> {
-        self.nodes
-            .iter()
-            .filter(|n| &n.file_path == file)
-            .collect()
+        self.nodes.iter().filter(|n| &n.file_path == file).collect()
     }
 
     pub fn edges_from(&self, from: &NodeId) -> Vec<&CodeEdge> {
@@ -275,13 +291,17 @@ impl CodeGraph {
 
     /// Create a subgraph affected by changes in the given file ranges.
     /// Each entry is a tuple of (file_path, start_line, end_line).
-    pub fn affected_by_changes_ranges(&self, changed_ranges: &[(PathBuf, usize, usize)]) -> CodeGraph {
+    pub fn affected_by_changes_ranges(
+        &self,
+        changed_ranges: &[(PathBuf, usize, usize)],
+    ) -> CodeGraph {
         let mut affected_nodes = Vec::new();
         for node in &self.nodes {
             for (file, start_line, end_line) in changed_ranges {
-                if &node.file_path == file 
-                    && node.range.start_line >= *start_line 
-                    && node.range.end_line <= *end_line {
+                if &node.file_path == file
+                    && node.range.start_line >= *start_line
+                    && node.range.end_line <= *end_line
+                {
                     affected_nodes.push(node.id.clone());
                     break;
                 }
@@ -304,6 +324,179 @@ impl Default for CodeGraphConfig {
             include_comments: true,
             bounce_response_write: true,
         }
+    }
+}
+
+/// Source language a code graph can be built from (Settings → Code Graph).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GraphLanguage {
+    Rust,
+    Python,
+    JavaScript,
+    TypeScript,
+}
+
+impl GraphLanguage {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "rust" => Some(Self::Rust),
+            "python" => Some(Self::Python),
+            "javascript" => Some(Self::JavaScript),
+            "typescript" => Some(Self::TypeScript),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::JavaScript => "javascript",
+            Self::TypeScript => "typescript",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Rust => "Rust",
+            Self::Python => "Python",
+            Self::JavaScript => "JavaScript",
+            Self::TypeScript => "TypeScript",
+        }
+    }
+
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext {
+            "rs" => Some(Self::Rust),
+            "py" => Some(Self::Python),
+            "js" | "mjs" | "cjs" | "jsx" => Some(Self::JavaScript),
+            "ts" | "tsx" | "mts" | "cts" => Some(Self::TypeScript),
+            _ => None,
+        }
+    }
+}
+
+/// Language-agnostic Tree-sitter extractor for Python / JavaScript / TypeScript.
+/// Captures functions, classes and (nested) methods into the same CodeNode
+/// model the Rust extractor produces; call resolution is left to LSP
+/// enrichment (call hierarchy) rather than name matching.
+pub struct GenericTreeSitterExtractor {
+    parser: Parser,
+    language: GraphLanguage,
+    #[allow(dead_code)]
+    config: CodeGraphConfig,
+}
+
+impl GenericTreeSitterExtractor {
+    pub fn new(language: GraphLanguage, config: CodeGraphConfig) -> Result<Self, String> {
+        let mut parser = Parser::new();
+        let lang_ref = match language {
+            GraphLanguage::Python => tree_sitter_python::LANGUAGE.into(),
+            GraphLanguage::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            GraphLanguage::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            GraphLanguage::Rust => return Err("Use RustTreeSitterExtractor for Rust".into()),
+        };
+        parser
+            .set_language(&lang_ref)
+            .map_err(|e| format!("Failed to set {:?} grammar: {:?}", language, e))?;
+        Ok(Self {
+            parser,
+            language,
+            config,
+        })
+    }
+
+    pub fn extract(&mut self, source: &str, file_path: PathBuf) -> Result<CodeGraph, String> {
+        let tree = self
+            .parser
+            .parse(source, None)
+            .ok_or_else(|| "Failed to parse source".to_string())?;
+
+        let mut graph = CodeGraph::new();
+        let root = tree.root_node();
+
+        // Module node per file
+        let module_name = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let module_range = SourceRange::from_node(&root, source);
+        let module_id = graph.add_node(CodeNode::new(
+            NodeKind::Module,
+            module_name,
+            file_path.clone(),
+            module_range,
+            None,
+            None,
+        ));
+
+        self.walk(root, source, &file_path, Some(&module_id), &mut graph);
+        Ok(graph)
+    }
+
+    fn walk(
+        &mut self,
+        node: Node,
+        source: &str,
+        file_path: &PathBuf,
+        parent: Option<&NodeId>,
+        graph: &mut CodeGraph,
+    ) {
+        let kind = match node.kind() {
+            "function_definition" => Some(NodeKind::Function), // Python
+            "function_declaration" | "generator_function_declaration" => Some(NodeKind::Function),
+            "method_definition" => Some(NodeKind::Method),
+            "class_definition" | "class_declaration" => Some(NodeKind::Struct),
+            _ => None,
+        };
+
+        let own_id: Option<NodeId> = if let Some(kind) = kind {
+            let name = Self::child_name(&node, source).unwrap_or_else(|| "<anonymous>".to_string());
+            let range = SourceRange::from_node(&node, source);
+            // A function nested inside a class body is a Method (Python)
+            let kind = if kind == NodeKind::Function {
+                match parent.and_then(|p| graph.get_node(p)) {
+                    Some(p) if p.kind == NodeKind::Struct => NodeKind::Method,
+                    _ => kind,
+                }
+            } else {
+                kind
+            };
+            let id = graph.add_node(CodeNode::new(
+                kind,
+                name,
+                file_path.clone(),
+                range,
+                parent.cloned(),
+                None,
+            ));
+            Some(id)
+        } else {
+            None
+        };
+
+        let child_parent = own_id.as_ref().or(parent);
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.walk(child, source, file_path, child_parent, graph);
+        }
+    }
+
+    fn child_name(node: &Node, source: &str) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "identifier"
+                || child.kind() == "type_identifier"
+                || child.kind() == "property_identifier"
+            {
+                let r = child.byte_range();
+                if r.end <= source.len() {
+                    return Some(source[r].to_string());
+                }
+            }
+        }
+        None
     }
 }
 
@@ -332,24 +525,34 @@ impl RustTreeSitterExtractor {
         let root_node = tree.root_node();
 
         self.extract_module(root_node, source, &file_path, None, &mut graph)?;
-        
+
         // Second pass: resolve function calls
         self.resolve_calls(&mut graph, source, &file_path)?;
 
         Ok(graph)
     }
 
-    fn resolve_calls(&mut self, graph: &mut CodeGraph, source: &str, file_path: &PathBuf) -> Result<(), String> {
+    fn resolve_calls(
+        &mut self,
+        graph: &mut CodeGraph,
+        source: &str,
+        file_path: &PathBuf,
+    ) -> Result<(), String> {
         // Collect all function nodes with their source ranges
-        let functions: Vec<(NodeId, String, SourceRange)> = graph.nodes.iter()
+        let functions: Vec<(NodeId, String, SourceRange)> = graph
+            .nodes
+            .iter()
             .filter(|n| n.kind == NodeKind::Function || n.kind == NodeKind::Method)
             .map(|n| (n.id.clone(), n.name.clone(), n.range))
             .collect();
 
         // For each function, find calls in its body
-        let tree = self.parser.parse(source, None).ok_or_else(|| "Failed to parse source".to_string())?;
+        let tree = self
+            .parser
+            .parse(source, None)
+            .ok_or_else(|| "Failed to parse source".to_string())?;
         let root_node = tree.root_node();
-        
+
         self.find_calls_in_tree(root_node, source, file_path, &functions, graph)?;
 
         Ok(())
@@ -367,9 +570,10 @@ impl RustTreeSitterExtractor {
             // Find which function this is
             let range = SourceRange::from_node(&node, source);
             let func_name = self.extract_name(&node, source, "function_item")?;
-            
+
             // Find matching function in our list
-            let caller_id = functions.iter()
+            let caller_id = functions
+                .iter()
                 .find(|(_, name, r)| name == &func_name && r.start_line == range.start_line)
                 .map(|(id, _, _)| id.clone());
 
@@ -502,6 +706,18 @@ impl RustTreeSitterExtractor {
                 None
             };
 
+            // Classify a function inside an impl as Method BEFORE constructing
+            // the node, so the NodeId is generated consistently ("method:…")
+            // rather than being created as "function:…" and mutated afterwards.
+            let kind = if kind == NodeKind::Function {
+                match parent.and_then(|p| graph.get_node(p)) {
+                    Some(parent_node) if parent_node.kind == NodeKind::Impl => NodeKind::Method,
+                    _ => kind,
+                }
+            } else {
+                kind
+            };
+
             let node_id = graph.add_node(CodeNode::new(
                 kind,
                 name,
@@ -510,22 +726,6 @@ impl RustTreeSitterExtractor {
                 parent.cloned(),
                 doc,
             ));
-
-            // If the parent is an Impl node, classify this function as a Method
-            if kind == NodeKind::Function {
-                if let Some(parent_id) = parent {
-                    if let Some(parent_node) = graph.get_node(&parent_id) {
-                        if parent_node.kind == NodeKind::Impl {
-                            // Change the function kind to Method
-                            if let Some(func_node) = graph.get_node_mut(&node_id) {
-                                func_node.kind = NodeKind::Method;
-                            }
-                            // Also update the function's name to include the impl type
-                            // and its parent reference
-                        }
-                    }
-                }
-            }
 
             // Extract children based on kind
             match kind {
@@ -573,7 +773,7 @@ impl RustTreeSitterExtractor {
         let mut trait_name = None;
         let mut type_name = None;
         let mut found_for = false;
-        
+
         for child in node.children(&mut node.walk()) {
             if child.kind() == "type_identifier" {
                 let name = self.get_node_text(child, source)?;
@@ -586,7 +786,7 @@ impl RustTreeSitterExtractor {
                 found_for = true;
             }
         }
-        
+
         // Update the impl node's name to the type name if available
         if let Some(p) = parent {
             if let Some(type_name) = type_name {
@@ -594,14 +794,15 @@ impl RustTreeSitterExtractor {
                     impl_node.name = type_name;
                 }
             }
-            
+
             // Find existing trait node and add implements edge
             if let Some(trait_name) = trait_name {
                 // Look for existing trait node with this name in the same file
                 for existing_node in &graph.nodes {
-                    if existing_node.kind == NodeKind::Trait 
+                    if existing_node.kind == NodeKind::Trait
                         && existing_node.name == trait_name
-                        && existing_node.file_path == *file_path {
+                        && existing_node.file_path == *file_path
+                    {
                         graph.add_edge(p.clone(), existing_node.id.clone(), EdgeKind::Implements);
                         break;
                     }
@@ -609,13 +810,9 @@ impl RustTreeSitterExtractor {
             }
         }
 
-        // Extract methods
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "function_item" {
-                self.extract_item(child, source, file_path, parent, graph)?;
-            }
-        }
+        // Note: impl methods are extracted by the generic recursion in
+        // extract_item(); do NOT also walk function_item children here or
+        // every method would be extracted twice.
 
         Ok(())
     }
@@ -630,7 +827,10 @@ impl RustTreeSitterExtractor {
     ) -> Result<(), String> {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if child.kind() == "function_item" || child.kind() == "type_item" || child.kind() == "const_item" {
+            if child.kind() == "function_item"
+                || child.kind() == "type_item"
+                || child.kind() == "const_item"
+            {
                 self.extract_item(child, source, file_path, parent, graph)?;
             }
         }
@@ -711,9 +911,10 @@ impl RustTreeSitterExtractor {
         // for child in node.children(&mut node.walk()) {
         //     println!("  Child: kind={}, text={:?}", child.kind(), self.get_node_text(child, source));
         // }
-        
+
         match kind {
-            "function_item" | "struct_item" | "enum_item" | "trait_item" | "const_item" | "static_item" | "type_item" => {
+            "function_item" | "struct_item" | "enum_item" | "trait_item" | "const_item"
+            | "static_item" | "type_item" => {
                 for child in node.children(&mut node.walk()) {
                     if child.kind() == "identifier" || child.kind() == "type_identifier" {
                         return self.get_node_text(child, source);
@@ -730,7 +931,8 @@ impl RustTreeSitterExtractor {
             }
             "trait_ref" => {
                 for child in node.children(&mut node.walk()) {
-                    if child.kind() == "type_identifier" || child.kind() == "scoped_type_identifier" {
+                    if child.kind() == "type_identifier" || child.kind() == "scoped_type_identifier"
+                    {
                         return self.get_node_text(child, source);
                     }
                 }
@@ -752,7 +954,7 @@ impl RustTreeSitterExtractor {
                 }
             }
         }
-        
+
         // Check for outer doc comments (attributes) - look at preceding siblings
         if let Some(prev_sibling) = node.prev_sibling() {
             if prev_sibling.kind() == "line_comment" || prev_sibling.kind() == "block_comment" {
@@ -763,19 +965,21 @@ impl RustTreeSitterExtractor {
                 }
             }
         }
-        
+
         // Check for attributes
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == "attribute" {
                 let text = self.get_node_text(child, source).ok()?;
-                let trimmed = text.trim_start_matches(['/', '*', '!', '#', '[', ']']).trim();
+                let trimmed = text
+                    .trim_start_matches(['/', '*', '!', '#', '[', ']'])
+                    .trim();
                 if !trimmed.is_empty() && (text.contains("doc") || text.starts_with("///")) {
                     return Some(trimmed.to_string());
                 }
             }
         }
-        
+
         None
     }
 
@@ -793,6 +997,7 @@ impl RustTreeSitterExtractor {
 pub struct CodeGraphBuilder {
     config: CodeGraphConfig,
     extractor: Option<RustTreeSitterExtractor>,
+    generic_extractors: HashMap<GraphLanguage, GenericTreeSitterExtractor>,
     lsp_manager: Option<crate::lsp::LspManager>,
 }
 
@@ -808,16 +1013,21 @@ impl CodeGraphBuilder {
         Ok(Self {
             config,
             extractor: Some(extractor),
+            generic_extractors: HashMap::new(),
             lsp_manager: None,
         })
     }
 
     /// Create a new builder with LSP semantic enrichment enabled.
-    pub fn with_lsp(config: CodeGraphConfig, lsp_manager: crate::lsp::LspManager) -> Result<Self, String> {
+    pub fn with_lsp(
+        config: CodeGraphConfig,
+        lsp_manager: crate::lsp::LspManager,
+    ) -> Result<Self, String> {
         let extractor = RustTreeSitterExtractor::new(config.clone())?;
         Ok(Self {
             config,
             extractor: Some(extractor),
+            generic_extractors: HashMap::new(),
             lsp_manager: Some(lsp_manager),
         })
     }
@@ -827,86 +1037,145 @@ impl CodeGraphBuilder {
         self.lsp_manager = Some(lsp_manager);
     }
 
+    /// Extract a file's Tree-sitter graph, dispatching on the file extension:
+    /// .rs uses the Rust extractor, other supported languages use their
+    /// generic extractor (created lazily on first use).
+    fn extract_by_extension(
+        &mut self,
+        source: &str,
+        file_path: &PathBuf,
+    ) -> Result<CodeGraph, String> {
+        let ext = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+        match GraphLanguage::from_extension(ext) {
+            Some(GraphLanguage::Rust) | None => self
+                .extractor
+                .as_mut()
+                .ok_or_else(|| "Extractor not initialized".to_string())?
+                .extract(source, file_path.clone()),
+            Some(lang) => {
+                // Lazily create the per-language extractor
+                if !self.generic_extractors.contains_key(&lang) {
+                    let ex = GenericTreeSitterExtractor::new(lang, self.config.clone())?;
+                    self.generic_extractors.insert(lang, ex);
+                }
+                self.generic_extractors
+                    .get_mut(&lang)
+                    .unwrap()
+                    .extract(source, file_path.clone())
+            }
+        }
+    }
+
     pub fn add_file(&mut self, source: &str, file_path: PathBuf) -> Result<CodeGraph, String> {
-        let mut graph = self.extractor
-            .as_mut()
-            .ok_or_else(|| "Extractor not initialized".to_string())?
-            .extract(source, file_path.clone())?;
-        
+        let mut graph = self.extract_by_extension(source, &file_path)?;
+
         // Note: LSP semantic enrichment is only available via add_file_async()
-        // when called from within a Tokio runtime. The synchronous add_file() 
+        // when called from within a Tokio runtime. The synchronous add_file()
         // uses only Tree-sitter extraction to avoid blocking runtime issues.
-        
+
         Ok(graph)
     }
 
     /// Async version of add_file for LSP enrichment without blocking.
     /// Must be called from within a Tokio runtime.
-    pub async fn add_file_async(&mut self, source: &str, file_path: PathBuf) -> Result<CodeGraph, String> {
-        let mut graph = self.extractor
-            .as_mut()
-            .ok_or_else(|| "Extractor not initialized".to_string())?
-            .extract(source, file_path.clone())?;
-        
+    /// Uses extract_by_extension to support all languages (Rust, Python, JS, TS).
+    pub async fn add_file_async(
+        &mut self,
+        source: &str,
+        file_path: PathBuf,
+    ) -> Result<CodeGraph, String> {
+        let mut graph = self.extract_by_extension(source, &file_path)?;
+
         // Enrich with LSP semantic information if available
         if let Some(lsp_manager) = &self.lsp_manager {
             if lsp_manager.is_available() {
                 // First sync the file with LSP so it has current source
-                lsp_manager.sync_file(&file_path, source).await.map_err(|e| e.to_string())?;
-                
+                lsp_manager
+                    .sync_file(&file_path, source)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
                 // Then enrich with LSP semantic information
-                self.enrich_with_lsp_async(&mut graph, &file_path, source).await;
+                self.enrich_with_lsp_async(&mut graph, &file_path, source)
+                    .await;
             }
         }
-        
+
         Ok(graph)
     }
 
     /// Enrich the graph with LSP semantic information (async version).
-    pub async fn enrich_with_lsp_async(&self, graph: &mut CodeGraph, file_path: &PathBuf, source: &str) {
+    pub async fn enrich_with_lsp_async(
+        &self,
+        graph: &mut CodeGraph,
+        file_path: &PathBuf,
+        source: &str,
+    ) {
         if let Some(lsp_manager) = &self.lsp_manager {
             if lsp_manager.is_available() {
                 // Enrich with document symbols (better symbol detection)
                 if let Ok(symbols) = lsp_manager.get_semantic_symbols(file_path).await {
                     self.merge_lsp_symbols(graph, &symbols, file_path);
                 }
-                
+
                 // Enrich calls with LSP call hierarchy for each function
-                let functions: Vec<_> = graph.nodes.iter()
+                let functions: Vec<_> = graph
+                    .nodes
+                    .iter()
                     .filter(|n| n.kind == NodeKind::Function || n.kind == NodeKind::Method)
                     .cloned()
                     .collect();
-                
+
                 for func in functions {
-                    let position = lsp_types::Position {
-                        line: func.range.start_line.saturating_sub(1) as u32,
-                        character: func.range.start_col.saturating_sub(1) as u32,
-                    };
-                    
+                    let position = Self::name_position(
+                        source,
+                        &func.name,
+                        func.range.start_line,
+                        func.range.start_col,
+                    );
+
                     // Get call hierarchy for this function (incoming + outgoing)
                     // LSP success = authoritative result; replace Tree-sitter edges even if empty
-                    if let Ok((incoming, outgoing)) = lsp_manager.get_call_hierarchy(file_path, position).await {
-                        self.add_lsp_call_edges_for_function(graph, &func.name, file_path, &func.range, &incoming, &outgoing);
+                    if let Ok((incoming, outgoing)) =
+                        lsp_manager.get_call_hierarchy(file_path, position).await
+                    {
+                        self.add_lsp_call_edges_for_function(
+                            graph,
+                            &func.name,
+                            file_path,
+                            &func.range,
+                            &incoming,
+                            &outgoing,
+                        );
                     }
                 }
-                
+
                 // Enrich definitions/references/implementations for all functions
-                self.enrich_definitions_references(graph, lsp_manager, file_path, source).await;
+                self.enrich_definitions_references(graph, lsp_manager, file_path, source)
+                    .await;
             }
         }
     }
 
     /// Merge LSP symbols into the graph, avoiding duplicates.
-    fn merge_lsp_symbols(&self, graph: &mut CodeGraph, symbols: &[crate::lsp::DocumentSymbol], file_path: &PathBuf) {
+    fn merge_lsp_symbols(
+        &self,
+        graph: &mut CodeGraph,
+        symbols: &[crate::lsp::DocumentSymbol],
+        file_path: &PathBuf,
+    ) {
         for symbol in symbols {
             // Check if we already have a node with this name and location
             let sym_start_line = (symbol.range.start.line + 1) as usize;
-            let exists = graph.nodes.iter().any(|n| 
-                n.name == symbol.name 
-                && n.file_path == *file_path
-                && n.range.start_line == sym_start_line
-            );
-            
+            let exists = graph.nodes.iter().any(|n| {
+                n.name == symbol.name
+                    && n.file_path == *file_path
+                    && n.range.start_line == sym_start_line
+            });
+
             if !exists {
                 let kind = lsp_symbol_kind_to_node_kind(symbol.kind);
                 let range = SourceRange {
@@ -915,11 +1184,22 @@ impl CodeGraphBuilder {
                     end_line: (symbol.range.end.line + 1) as usize,
                     end_col: (symbol.range.end.character + 1) as usize,
                 };
-                let doc = if self.config.include_comments { symbol.detail.clone() } else { None };
-                let node = CodeNode::new(kind, symbol.name.clone(), file_path.clone(), range, None, doc);
+                let doc = if self.config.include_comments {
+                    symbol.detail.clone()
+                } else {
+                    None
+                };
+                let node = CodeNode::new(
+                    kind,
+                    symbol.name.clone(),
+                    file_path.clone(),
+                    range,
+                    None,
+                    doc,
+                );
                 graph.add_node(node);
             }
-            
+
             // Recurse into children
             self.merge_lsp_symbols(graph, &symbol.children, file_path);
         }
@@ -936,14 +1216,14 @@ impl CodeGraphBuilder {
         outgoing: &[crate::lsp::CallHierarchyOutgoingCall],
     ) {
         // Find the function node in our graph using exact range match
-        let func_node = graph.nodes.iter().find(|n| 
-            n.name == function_name 
-            && n.file_path == *function_file
-            && n.range.start_line == function_range.start_line
-            && n.range.end_line == function_range.end_line
-            && n.range.start_col == function_range.start_col
-            && n.range.end_col == function_range.end_col
-        );
+        let func_node = graph.nodes.iter().find(|n| {
+            n.name == function_name
+                && n.file_path == *function_file
+                && n.range.start_line == function_range.start_line
+                && n.range.end_line == function_range.end_line
+                && n.range.start_col == function_range.start_col
+                && n.range.end_col == function_range.end_col
+        });
         let Some(func_node) = func_node else { return };
         let func_id = func_node.id.clone();
 
@@ -953,70 +1233,104 @@ impl CodeGraphBuilder {
         // For incoming calls: callers of this function
         for call in incoming {
             let caller_name = call.from.name.clone();
-            let caller_file = Url::parse(call.from.uri.as_str()).ok().and_then(|u| u.to_file_path().ok());
+            let caller_file = Url::parse(call.from.uri.as_str())
+                .ok()
+                .and_then(|u| u.to_file_path().ok());
             if let Some(caller_file) = caller_file {
                 // Find or create the caller node
-                if let Ok(caller_node_id) = self.find_or_create_node(graph, &caller_name, &caller_file, &call.from.range) {
-                    // Add edge: caller -> this function (callee)
-                    graph.add_edge(caller_node_id.clone(), func_id.clone(), EdgeKind::Calls);
-                    // Also add Defines edge: caller defines the callee
-                    graph.add_edge(caller_node_id, func_id.clone(), EdgeKind::Defines);
+                if let Ok(caller_node_id) =
+                    self.find_or_create_node(graph, &caller_name, &caller_file, &call.from.range)
+                {
+                    // Add edge: caller -> this function (callee).
+                    // Only Calls — Defines must come from Definition relationships, not call sites.
+                    graph.add_edge(caller_node_id, func_id.clone(), EdgeKind::Calls);
                 }
             }
         }
-        
+
         // For outgoing calls: callees of this function
         for call in outgoing {
             let callee_name = call.to.name.clone();
-            let callee_file = Url::parse(call.to.uri.as_str()).ok().and_then(|u| u.to_file_path().ok());
+            let callee_file = Url::parse(call.to.uri.as_str())
+                .ok()
+                .and_then(|u| u.to_file_path().ok());
             if let Some(callee_file) = callee_file {
                 // Find or create the callee node
-                if let Ok(callee_node_id) = self.find_or_create_node(graph, &callee_name, &callee_file, &call.to.range) {
-                    // Add edge: this function (caller) -> callee
-                    graph.add_edge(func_id.clone(), callee_node_id.clone(), EdgeKind::Calls);
-                    // Also add Defines edge: caller defines the callee
-                    graph.add_edge(func_id.clone(), callee_node_id, EdgeKind::Defines);
+                if let Ok(callee_node_id) =
+                    self.find_or_create_node(graph, &callee_name, &callee_file, &call.to.range)
+                {
+                    // Add edge: this function (caller) -> callee.
+                    // Only Calls — Defines must come from Definition relationships, not call sites.
+                    graph.add_edge(func_id.clone(), callee_node_id, EdgeKind::Calls);
                 }
             }
         }
     }
 
     /// Add call edges from LSP call hierarchy (placeholder for full implementation).
-    fn add_lsp_call_edges(&self, graph: &mut CodeGraph, incoming: &[crate::lsp::CallHierarchyIncomingCall], outgoing: &[crate::lsp::CallHierarchyOutgoingCall]) {
+    fn add_lsp_call_edges(
+        &self,
+        graph: &mut CodeGraph,
+        incoming: &[crate::lsp::CallHierarchyIncomingCall],
+        outgoing: &[crate::lsp::CallHierarchyOutgoingCall],
+    ) {
         // Legacy placeholder - use add_lsp_call_edges_for_function instead
         let _ = (incoming, outgoing);
     }
 
     /// Find an existing node or create a new one from LSP call hierarchy item.
     /// Uses LSP item range/location for precise matching to avoid duplicates.
-    fn find_or_create_node(&self, graph: &mut CodeGraph, name: &str, file_path: &PathBuf, range: &Range) -> Result<NodeId, String> {
+    fn find_or_create_node(
+        &self,
+        graph: &mut CodeGraph,
+        name: &str,
+        file_path: &PathBuf,
+        range: &Range,
+    ) -> Result<NodeId, String> {
         // Try to find existing node by matching LSP item range (more precise than name+file)
         let target_start_line = (range.start.line + 1) as usize;
         let target_end_line = (range.end.line + 1) as usize;
         let target_start_col = (range.start.character + 1) as usize;
         let target_end_col = (range.end.character + 1) as usize;
-        
+
         // First try exact range match
         for node in &graph.nodes {
-            if node.name == name 
+            if node.name == name
                 && node.file_path == *file_path
                 && node.range.start_line == target_start_line
                 && node.range.end_line == target_end_line
                 && node.range.start_col == target_start_col
-                && node.range.end_col == target_end_col {
+                && node.range.end_col == target_end_col
+            {
                 return Ok(node.id.clone());
             }
         }
-        
+
         // Fallback: name + file + start line match (for cases where column info differs)
         for node in &graph.nodes {
-            if node.name == name 
+            if node.name == name
                 && node.file_path == *file_path
-                && node.range.start_line == target_start_line {
+                && node.range.start_line == target_start_line
+            {
                 return Ok(node.id.clone());
             }
         }
-        
+
+        // Last resort: name + file match (LSP may report a different line than
+        // Tree-sitter, e.g. the name token vs. the whole item range).
+        // Ambiguity guard: only adopt this match when it is UNAMBIGUOUS —
+        // Rust allows multiple same-name methods across impl blocks in one
+        // file, and attaching a call/reference to the wrong one is worse than
+        // creating a fresh node.
+        let same_name_file: Vec<&CodeNode> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.name == name && n.file_path == *file_path)
+            .collect();
+        if same_name_file.len() == 1 {
+            return Ok(same_name_file[0].id.clone());
+        }
+
         // Create new node
         let kind = NodeKind::Function; // Default
         let source_range = SourceRange {
@@ -1025,27 +1339,71 @@ impl CodeGraphBuilder {
             end_line: target_end_line,
             end_col: target_end_col,
         };
-        let node = CodeNode::new(kind, name.to_string(), file_path.clone(), source_range, None, None);
+        let node = CodeNode::new(
+            kind,
+            name.to_string(),
+            file_path.clone(),
+            source_range,
+            None,
+            None,
+        );
         Ok(graph.add_node(node))
     }
 
+    /// Best-effort LSP position on the symbol name within its declaration line.
+    /// rust-analyzer only resolves call hierarchy / references when the query
+    /// lands on the name token, not on the item start (e.g. the `pub` keyword).
+    fn name_position(
+        source: &str,
+        name: &str,
+        start_line: usize,
+        start_col: usize,
+    ) -> lsp_types::Position {
+        let line_idx = start_line.saturating_sub(1);
+        let line = source.lines().nth(line_idx).unwrap_or("");
+        let from = start_col
+            .saturating_sub(1)
+            .min(line.len().saturating_sub(1));
+        let offset = line
+            .char_indices()
+            .map(|(b, _)| b)
+            .filter(|&b| b >= from)
+            .find(|&b| line[b..].starts_with(name))
+            .unwrap_or(from);
+        lsp_types::Position {
+            line: line_idx as u32,
+            character: line[..offset].chars().count() as u32,
+        }
+    }
+
     /// Enrich definitions, references, and implementations for functions.
-    async fn enrich_definitions_references(&self, graph: &mut CodeGraph, lsp_manager: &crate::lsp::LspManager, file_path: &PathBuf, _source: &str) {
-        let functions: Vec<_> = graph.nodes.iter()
+    async fn enrich_definitions_references(
+        &self,
+        graph: &mut CodeGraph,
+        lsp_manager: &crate::lsp::LspManager,
+        file_path: &PathBuf,
+        source: &str,
+    ) {
+        let functions: Vec<_> = graph
+            .nodes
+            .iter()
             .filter(|n| n.kind == NodeKind::Function || n.kind == NodeKind::Method)
             .cloned()
             .collect();
-        
+
         for func in functions {
-            let position = lsp_types::Position {
-                line: func.range.start_line.saturating_sub(1) as u32,
-                character: func.range.start_col.saturating_sub(1) as u32,
-            };
-            
+            // Query on the symbol name itself (LSP servers resolve the item only there)
+            let position = Self::name_position(
+                source,
+                &func.name,
+                func.range.start_line,
+                func.range.start_col,
+            );
+
             // Definitions: query at call sites, not declaration.
             // We'll track definitions from call sites to target function.
             // (This is handled by call hierarchy; Defines from call edges already captures this)
-            
+
             // References: find all references to this function, then map each reference
             // to its OWNER function (the function containing the reference).
             // Edge: owner_function -> referenced_function
@@ -1054,20 +1412,25 @@ impl CodeGraphBuilder {
                     // Skip the declaration itself
                     let func_start_line = (func.range.start_line - 1) as u32;
                     let func_start_col = (func.range.start_col - 1) as u32;
-                    if ref_loc.uri.as_str() == file_path.to_string_lossy().as_ref() 
+                    if ref_loc.uri.as_str() == file_path.to_string_lossy().as_ref()
                         && ref_loc.range.start.line == func_start_line
-                        && ref_loc.range.start.character == func_start_col {
+                        && ref_loc.range.start.character == func_start_col
+                    {
                         continue;
                     }
                     if let Some(owner_node) = self.find_owner_function(graph, &ref_loc) {
                         if owner_node.id != func.id {
                             // Edge: reference owner -> referenced function
-                            graph.add_edge(owner_node.id.clone(), func.id.clone(), EdgeKind::References);
+                            graph.add_edge(
+                                owner_node.id.clone(),
+                                func.id.clone(),
+                                EdgeKind::References,
+                            );
                         }
                     }
                 }
             }
-            
+
             // Implementations
             if let Ok(impls) = lsp_manager.get_implementations(file_path, position).await {
                 for impl_loc in impls {
@@ -1082,19 +1445,23 @@ impl CodeGraphBuilder {
     /// Convert an LSP Location to a CodeNode (find existing or create).
     /// Uses fuzzy matching - finds the node whose range contains the location.
     fn location_to_node(&self, graph: &mut CodeGraph, location: &Location) -> Option<CodeNode> {
-        let file_path = Url::parse(location.uri.as_str()).ok()?.to_file_path().ok()?;
+        let file_path = Url::parse(location.uri.as_str())
+            .ok()?
+            .to_file_path()
+            .ok()?;
         let loc_line = (location.range.start.line + 1) as usize;
         let loc_col = (location.range.start.character + 1) as usize;
-        
+
         // Find the node whose range contains this location
         // Prefer the most specific (smallest) containing node
         let mut best_match: Option<&CodeNode> = None;
         let mut best_range_size = usize::MAX;
-        
+
         for node in &graph.nodes {
-            if node.file_path == file_path 
+            if node.file_path == file_path
                 && node.range.start_line <= loc_line
-                && node.range.end_line >= loc_line {
+                && node.range.end_line >= loc_line
+            {
                 // Location is within this node's line range
                 // Check column if on same start/end line
                 let col_ok = if node.range.start_line == node.range.end_line {
@@ -1106,7 +1473,7 @@ impl CodeGraphBuilder {
                 } else {
                     true // Location is in middle of multi-line node
                 };
-                
+
                 if col_ok {
                     let range_size = node.range.end_line.saturating_sub(node.range.start_line);
                     if range_size < best_range_size {
@@ -1116,27 +1483,31 @@ impl CodeGraphBuilder {
                 }
             }
         }
-        
+
         best_match.cloned()
     }
 
     /// Find the function/method node that owns a given LSP location (reference site owner).
     /// This is used to find which function contains a reference to another symbol.
     fn find_owner_function(&self, graph: &mut CodeGraph, location: &Location) -> Option<CodeNode> {
-        let file_path = Url::parse(location.uri.as_str()).ok()?.to_file_path().ok()?;
+        let file_path = Url::parse(location.uri.as_str())
+            .ok()?
+            .to_file_path()
+            .ok()?;
         let loc_line = (location.range.start.line + 1) as usize;
         let loc_col = (location.range.start.character + 1) as usize;
-        
+
         // Find the function/method node whose range contains this location
         // Prefer the most specific (smallest) containing node
         let mut best_match: Option<&CodeNode> = None;
         let mut best_range_size = usize::MAX;
-        
+
         for node in &graph.nodes {
             if (node.kind == NodeKind::Function || node.kind == NodeKind::Method)
-                && node.file_path == file_path 
+                && node.file_path == file_path
                 && node.range.start_line <= loc_line
-                && node.range.end_line >= loc_line {
+                && node.range.end_line >= loc_line
+            {
                 // Location is within this function's line range
                 let col_ok = if node.range.start_line == node.range.end_line {
                     node.range.start_col <= loc_col && node.range.end_col >= loc_col
@@ -1147,7 +1518,7 @@ impl CodeGraphBuilder {
                 } else {
                     true // Location is in middle of multi-line function
                 };
-                
+
                 if col_ok {
                     let range_size = node.range.end_line.saturating_sub(node.range.start_line);
                     if range_size < best_range_size {
@@ -1157,7 +1528,7 @@ impl CodeGraphBuilder {
                 }
             }
         }
-        
+
         best_match.cloned()
     }
 
@@ -1201,43 +1572,225 @@ fn draw() {}
     fn test_extract_function() {
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file("fn foo() {}", PathBuf::from("test.rs")).unwrap();
-        assert!(graph.nodes.iter().any(|n| n.kind == NodeKind::Function && n.name == "foo"));
+        let graph = builder
+            .add_file("fn foo() {}", PathBuf::from("test.rs"))
+            .unwrap();
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::Function && n.name == "foo"));
     }
 
     #[test]
     fn test_extract_struct() {
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file("struct Bar { field: i32 }", PathBuf::from("test.rs")).unwrap();
-        assert!(graph.nodes.iter().any(|n| n.kind == NodeKind::Struct && n.name == "Bar"));
+        let graph = builder
+            .add_file("struct Bar { field: i32 }", PathBuf::from("test.rs"))
+            .unwrap();
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::Struct && n.name == "Bar"));
     }
 
     #[test]
     fn test_extract_trait() {
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file("trait Baz { fn qux(); }", PathBuf::from("test.rs")).unwrap();
-        assert!(graph.nodes.iter().any(|n| n.kind == NodeKind::Trait && n.name == "Baz"));
+        let graph = builder
+            .add_file("trait Baz { fn qux(); }", PathBuf::from("test.rs"))
+            .unwrap();
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::Trait && n.name == "Baz"));
     }
 
     #[test]
     fn test_extract_impl() {
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file("impl Foo { fn bar() {} }", PathBuf::from("test.rs")).unwrap();
-        assert!(graph.nodes.iter().any(|n| n.kind == NodeKind::Impl && n.name == "Foo"));
+        let graph = builder
+            .add_file("impl Foo { fn bar() {} }", PathBuf::from("test.rs"))
+            .unwrap();
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|n| n.kind == NodeKind::Impl && n.name == "Foo"));
+    }
+
+    #[test]
+    fn test_impl_methods_extracted_exactly_once() {
+        // Regression: extract_impl_contents() used to walk function_item children
+        // in addition to extract_item()'s generic recursion, duplicating methods.
+        let config = CodeGraphConfig::default();
+        let mut builder = CodeGraphBuilder::new(config).unwrap();
+        let graph = builder
+            .add_file(
+                "impl Foo {\n    fn method1() {}\n    fn method2() {}\n}\n",
+                PathBuf::from("test.rs"),
+            )
+            .unwrap();
+        let methods: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Method)
+            .collect();
+        assert_eq!(
+            methods.len(),
+            2,
+            "impl methods must be extracted exactly once"
+        );
+        assert_eq!(
+            graph.nodes.iter().filter(|n| n.name == "method1").count(),
+            1,
+            "no duplicate node entries for the same method"
+        );
+    }
+
+    #[test]
+    fn test_add_node_deduplicates_same_id() {
+        let mut graph = CodeGraph::new();
+        let node = CodeNode::new(
+            NodeKind::Function,
+            "foo".to_string(),
+            PathBuf::from("a.rs"),
+            SourceRange {
+                start_line: 1,
+                start_col: 1,
+                end_line: 2,
+                end_col: 10,
+            },
+            None,
+            Some("doc".to_string()),
+        );
+        let id1 = graph.add_node(node.clone());
+        let id2 = graph.add_node(node);
+        assert_eq!(id1, id2);
+        assert_eq!(
+            graph.nodes.len(),
+            1,
+            "duplicate NodeId must not push a second node entry"
+        );
+    }
+
+    #[test]
+    fn test_merge_deduplicates_nodes_across_graphs() {
+        // LSP enrichment can discover bar@file_b while processing file_a;
+        // when file_b is merged later the same NodeId arrives again.
+        let config = CodeGraphConfig::default();
+        let mut builder = CodeGraphBuilder::new(config).unwrap();
+        let file_b = builder
+            .add_file("pub fn bar() {}", PathBuf::from("file_b.rs"))
+            .unwrap();
+        let mut enriched = CodeGraph::new();
+        for node in &file_b.nodes {
+            enriched.add_node(node.clone());
+        }
+        let merged = builder.merge(vec![enriched, file_b]);
+        let bars: Vec<_> = merged
+            .nodes
+            .iter()
+            .filter(|n| n.name == "bar" && n.file_path == PathBuf::from("file_b.rs"))
+            .collect();
+        assert_eq!(
+            bars.len(),
+            1,
+            "merge must deduplicate nodes with equal NodeIds"
+        );
+    }
+
+    #[test]
+    fn test_method_node_id_matches_kind() {
+        // Regression: functions inside impl blocks used to be created with a
+        // "function:…" NodeId and only afterwards re-classified as Method.
+        let config = CodeGraphConfig::default();
+        let mut builder = CodeGraphBuilder::new(config).unwrap();
+        let graph = builder
+            .add_file(
+                "impl Foo {\n    fn method1() {}\n}\n",
+                PathBuf::from("test.rs"),
+            )
+            .unwrap();
+        let m = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Method && n.name == "method1")
+            .expect("method node must exist");
+        assert!(
+            m.id.0.starts_with("method:"),
+            "NodeId must be generated as Method, got {}",
+            m.id.0
+        );
+    }
+
+    #[test]
+    fn test_find_or_create_node_never_guesses_on_ambiguous_name() {
+        use lsp_types::{Position, Range as LspRange};
+        let config = CodeGraphConfig::default();
+        let mut builder = CodeGraphBuilder::new(config).unwrap();
+        // Two same-name functions in the same file (different impl contexts)
+        let mut graph = builder
+            .add_file(
+                "impl A { fn make() {} }\nimpl B { fn make() {} }\n",
+                PathBuf::from("dup.rs"),
+            )
+            .unwrap();
+        let before = graph.nodes.len();
+        let existing: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.name == "make")
+            .map(|n| n.id.clone())
+            .collect();
+        assert_eq!(existing.len(), 2);
+
+        // LSP reports a range that matches neither node — the resolver must
+        // create a fresh node rather than attach to an arbitrary same-name one.
+        let range = LspRange::new(Position::new(10, 0), Position::new(10, 5));
+        let id = builder
+            .find_or_create_node(&mut graph, "make", &PathBuf::from("dup.rs"), &range)
+            .unwrap();
+        assert!(
+            !existing.contains(&id),
+            "ambiguous name+file fallback must not attach to an arbitrary node"
+        );
+        assert_eq!(
+            graph.nodes.len(),
+            before + 1,
+            "a fresh node must be created"
+        );
+
+        // Unambiguous case: a single same-name node in the file is adopted
+        let id2 = builder
+            .find_or_create_node(
+                &mut graph,
+                "make",
+                &PathBuf::from("dup.rs"),
+                &LspRange::new(Position::new(99, 0), Position::new(99, 5)),
+            )
+            .unwrap();
+        // graph now has two "make" nodes → still ambiguous → new node again
+        assert_eq!(graph.nodes.len(), before + 2);
+        assert_ne!(id, id2);
     }
 
     #[test]
     fn test_extract_methods() {
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file(
-            "impl Foo { fn method1() {} fn method2() {} }",
-            PathBuf::from("test.rs"),
-        ).unwrap();
-        let methods: Vec<_> = graph.nodes.iter().filter(|n| n.kind == NodeKind::Method).collect();
+        let graph = builder
+            .add_file(
+                "impl Foo { fn method1() {} fn method2() {} }",
+                PathBuf::from("test.rs"),
+            )
+            .unwrap();
+        let methods: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Method)
+            .collect();
         assert_eq!(methods.len(), 2);
     }
 
@@ -1245,9 +1798,19 @@ fn draw() {}
     fn test_module_containment() {
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file("fn foo() {}", PathBuf::from("test.rs")).unwrap();
-        let module = graph.nodes.iter().find(|n| n.kind == NodeKind::Module).unwrap();
-        let func = graph.nodes.iter().find(|n| n.kind == NodeKind::Function).unwrap();
+        let graph = builder
+            .add_file("fn foo() {}", PathBuf::from("test.rs"))
+            .unwrap();
+        let module = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Module)
+            .unwrap();
+        let func = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Function)
+            .unwrap();
         assert_eq!(func.parent, Some(module.id.clone()));
     }
 
@@ -1255,28 +1818,65 @@ fn draw() {}
     fn test_fixture_relationships() {
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file(test_source(), PathBuf::from("fixture.rs")).unwrap();
+        let graph = builder
+            .add_file(test_source(), PathBuf::from("fixture.rs"))
+            .unwrap();
 
         // Debug: print all nodes and edges
         for node in &graph.nodes {
-            println!("Node: kind={:?}, name={}, parent={:?}", node.kind, node.name, node.parent);
+            println!(
+                "Node: kind={:?}, name={}, parent={:?}",
+                node.kind, node.name, node.parent
+            );
         }
         for edge in &graph.edges {
             println!("Edge: {:?} -> {:?} ({:?})", edge.from, edge.to, edge.kind);
         }
 
-        let app_struct = graph.nodes.iter().find(|n| n.kind == NodeKind::Struct && n.name == "App").unwrap();
-        let renderer_trait = graph.nodes.iter().find(|n| n.kind == NodeKind::Trait && n.name == "Renderer").unwrap();
-        let app_impl = graph.nodes.iter().find(|n| n.kind == NodeKind::Impl).unwrap();
-        let render_method = graph.nodes.iter().find(|n| n.kind == NodeKind::Method && n.name == "render" && n.parent.as_ref() == Some(&app_impl.id)).unwrap();
-        let draw_func = graph.nodes.iter().find(|n| n.kind == NodeKind::Function && n.name == "draw").unwrap();
+        let app_struct = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Struct && n.name == "App")
+            .unwrap();
+        let renderer_trait = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Trait && n.name == "Renderer")
+            .unwrap();
+        let app_impl = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Impl)
+            .unwrap();
+        let render_method = graph
+            .nodes
+            .iter()
+            .find(|n| {
+                n.kind == NodeKind::Method
+                    && n.name == "render"
+                    && n.parent.as_ref() == Some(&app_impl.id)
+            })
+            .unwrap();
+        let draw_func = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Function && n.name == "draw")
+            .unwrap();
 
         // App --implements--> Renderer
-        let implements_edges: Vec<_> = graph.edges.iter().filter(|e| e.kind == EdgeKind::Implements).collect();
+        let implements_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Implements)
+            .collect();
         assert!(!implements_edges.is_empty());
 
         // render --calls--> draw
-        let calls_edges: Vec<_> = graph.edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
+        let calls_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
         assert!(!calls_edges.is_empty());
     }
 
@@ -1284,7 +1884,9 @@ fn draw() {}
     fn test_mermaid_generation() {
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file("fn foo() {}", PathBuf::from("test.rs")).unwrap();
+        let graph = builder
+            .add_file("fn foo() {}", PathBuf::from("test.rs"))
+            .unwrap();
         let mermaid = graph.to_mermaid();
         assert!(mermaid.contains("graph TD"));
         assert!(mermaid.contains("foo"));
@@ -1294,7 +1896,9 @@ fn draw() {}
     fn test_mermaid_identifier_escaping() {
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file("fn foo-bar() {}", PathBuf::from("test.rs")).unwrap();
+        let graph = builder
+            .add_file("fn foo-bar() {}", PathBuf::from("test.rs"))
+            .unwrap();
         let mermaid = graph.to_mermaid();
         // Should not contain invalid Mermaid identifiers
         assert!(!mermaid.contains("foo-bar"));
@@ -1302,19 +1906,37 @@ fn draw() {}
 
     #[test]
     fn test_include_comments_true() {
-        let config = CodeGraphConfig { include_comments: true, ..Default::default() };
+        let config = CodeGraphConfig {
+            include_comments: true,
+            ..Default::default()
+        };
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file("/// Doc comment\nfn foo() {}", PathBuf::from("test.rs")).unwrap();
-        let func = graph.nodes.iter().find(|n| n.kind == NodeKind::Function).unwrap();
+        let graph = builder
+            .add_file("/// Doc comment\nfn foo() {}", PathBuf::from("test.rs"))
+            .unwrap();
+        let func = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Function)
+            .unwrap();
         assert!(func.documentation.is_some());
     }
 
     #[test]
     fn test_include_comments_false() {
-        let config = CodeGraphConfig { include_comments: false, ..Default::default() };
+        let config = CodeGraphConfig {
+            include_comments: false,
+            ..Default::default()
+        };
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file("/// Doc comment\nfn foo() {}", PathBuf::from("test.rs")).unwrap();
-        let func = graph.nodes.iter().find(|n| n.kind == NodeKind::Function).unwrap();
+        let graph = builder
+            .add_file("/// Doc comment\nfn foo() {}", PathBuf::from("test.rs"))
+            .unwrap();
+        let func = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Function)
+            .unwrap();
         assert!(func.documentation.is_none());
     }
 
@@ -1322,11 +1944,16 @@ fn draw() {}
     fn test_focused_subgraph() {
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        let graph = builder.add_file("fn foo() { bar(); } fn bar() { baz(); } fn baz() {}", PathBuf::from("test.rs")).unwrap();
-        
+        let graph = builder
+            .add_file(
+                "fn foo() { bar(); } fn bar() { baz(); } fn baz() {}",
+                PathBuf::from("test.rs"),
+            )
+            .unwrap();
+
         let bar = graph.nodes.iter().find(|n| n.name == "bar").unwrap();
         let subgraph = graph.subgraph_around(&[bar.id.clone()], 1);
-        
+
         assert!(subgraph.nodes.iter().any(|n| n.name == "foo"));
         assert!(subgraph.nodes.iter().any(|n| n.name == "bar"));
         assert!(subgraph.nodes.iter().any(|n| n.name == "baz"));
@@ -1337,23 +1964,35 @@ fn draw() {}
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
         // Use multi-line source to get different line numbers
-        let graph = builder.add_file(
-            "fn foo() {\n    bar();\n}\n\nfn bar() {\n    baz();\n}\n\nfn baz() {}\n",
-            PathBuf::from("test.rs")
-        ).unwrap();
-        
+        let graph = builder
+            .add_file(
+                "fn foo() {\n    bar();\n}\n\nfn bar() {\n    baz();\n}\n\nfn baz() {}\n",
+                PathBuf::from("test.rs"),
+            )
+            .unwrap();
+
         // Debug: print all nodes with their line numbers
         for node in &graph.nodes {
-            println!("Node: name={}, kind={:?}, start_line={}, end_line={}", node.name, node.kind, node.range.start_line, node.range.end_line);
+            println!(
+                "Node: name={}, kind={:?}, start_line={}, end_line={}",
+                node.name, node.kind, node.range.start_line, node.range.end_line
+            );
         }
-        
+
         // Find bar's line range
         let bar = graph.nodes.iter().find(|n| n.name == "bar").unwrap();
-        println!("bar range: {} - {}", bar.range.start_line, bar.range.end_line);
-        
+        println!(
+            "bar range: {} - {}",
+            bar.range.start_line, bar.range.end_line
+        );
+
         // Change range covering only bar
-        let subgraph = graph.affected_by_changes_ranges(&[(PathBuf::from("test.rs"), bar.range.start_line, bar.range.end_line)]);
-        
+        let subgraph = graph.affected_by_changes_ranges(&[(
+            PathBuf::from("test.rs"),
+            bar.range.start_line,
+            bar.range.end_line,
+        )]);
+
         // Should only include bar and its direct connections (foo, baz)
         let names: Vec<_> = subgraph.nodes.iter().map(|n| n.name.clone()).collect();
         assert!(names.contains(&"bar".to_string()));
@@ -1367,7 +2006,11 @@ fn draw() {}
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
         let graph = builder.add_file("", PathBuf::from("empty.rs")).unwrap();
-        let module = graph.nodes.iter().find(|n| n.kind == NodeKind::Module).unwrap();
+        let module = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Module)
+            .unwrap();
         assert_eq!(module.name, "empty");
     }
 
@@ -1386,34 +2029,31 @@ fn draw() {}
         // (without actual LSP - tests Tree-sitter fallback behavior)
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        
+
         // Create two files with cross-file calls - Tree-sitter only resolves within file
         // For LSP-based cross-file resolution, rust-analyzer would be needed
-        let file_a = builder.add_file(
-            "fn foo() { bar(); }",
-            PathBuf::from("file_a.rs")
-        ).unwrap();
-        
-        let file_b = builder.add_file(
-            "fn bar() {}",
-            PathBuf::from("file_b.rs")
-        ).unwrap();
-        
+        let file_a = builder
+            .add_file("fn foo() { bar(); }", PathBuf::from("file_a.rs"))
+            .unwrap();
+
+        let file_b = builder
+            .add_file("fn bar() {}", PathBuf::from("file_b.rs"))
+            .unwrap();
+
         // Merge graphs
         let merged = builder.merge(vec![file_a, file_b]);
-        
+
         // Verify both files are in the merged graph
-        let files: std::collections::HashSet<_> = merged.nodes.iter()
-            .map(|n| n.file_path.clone())
-            .collect();
+        let files: std::collections::HashSet<_> =
+            merged.nodes.iter().map(|n| n.file_path.clone()).collect();
         assert_eq!(files.len(), 2, "Should have nodes from both files");
-        
+
         // Verify both functions exist
         let foo = merged.nodes.iter().find(|n| n.name == "foo").unwrap();
         let bar = merged.nodes.iter().find(|n| n.name == "bar").unwrap();
         assert_eq!(foo.file_path, PathBuf::from("file_a.rs"));
         assert_eq!(bar.file_path, PathBuf::from("file_b.rs"));
-        
+
         // Note: Tree-sitter only resolves calls within a single file
         // Cross-file call resolution requires LSP (rust-analyzer)
         // This test verifies the architecture supports cross-file graphs
@@ -1422,12 +2062,103 @@ fn draw() {}
     }
 
     #[test]
-    #[ignore] // Requires rust-analyzer to be installed
+    fn test_calls_not_duplicated_as_defines() {
+        // LSP call-hierarchy enrichment must create Calls edges only —
+        // Defines edges must come from Definition relationships, never call sites.
+        use lsp_types::{
+            CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall, Position,
+            Range as LspRange, Uri,
+        };
+        let config = CodeGraphConfig::default();
+        let mut builder = CodeGraphBuilder::new(config).unwrap();
+        // Use an absolute path: LSP URIs resolve to absolute file paths
+        let abs_path = std::env::temp_dir().join("cg_test_calls_not_defines.rs");
+        let mut graph = builder
+            .add_file(
+                "fn caller() {\n    callee();\n}\n\nfn callee() {}\n",
+                abs_path.clone(),
+            )
+            .unwrap();
+
+        let uri_str = format!("file://{}", abs_path.to_string_lossy());
+        let uri: Uri = uri_str.parse().unwrap();
+        let caller = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "caller")
+            .unwrap()
+            .clone();
+        let callee = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "callee")
+            .unwrap()
+            .clone();
+
+        let item = |name: &str, uri: Uri, r: LspRange| CallHierarchyItem {
+            name: name.to_string(),
+            kind: lsp_types::SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri,
+            range: r,
+            selection_range: r,
+            data: None,
+        };
+        let caller_item = item(
+            "caller",
+            uri.clone(),
+            LspRange::new(
+                Position::new(caller.range.start_line as u32 - 1, 0),
+                Position::new(caller.range.end_line as u32 - 1, 0),
+            ),
+        );
+        let callee_item = item(
+            "callee",
+            uri.clone(),
+            LspRange::new(
+                Position::new(callee.range.start_line as u32 - 1, 0),
+                Position::new(callee.range.end_line as u32 - 1, 0),
+            ),
+        );
+
+        let incoming = vec![CallHierarchyIncomingCall {
+            from: caller_item.clone(),
+            from_ranges: vec![LspRange::new(Position::new(1, 4), Position::new(1, 10))],
+        }];
+        let outgoing = vec![CallHierarchyOutgoingCall {
+            to: callee_item.clone(),
+            from_ranges: vec![LspRange::new(Position::new(1, 4), Position::new(1, 10))],
+        }];
+
+        builder.add_lsp_call_edges_for_function(
+            &mut graph,
+            "caller",
+            &abs_path,
+            &caller.range,
+            &incoming,
+            &outgoing,
+        );
+
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Calls && e.from == caller.id && e.to == callee.id),
+            "Calls edge caller->callee must exist"
+        );
+        assert!(
+            !graph.edges.iter().any(|e| e.kind == EdgeKind::Defines),
+            "no Defines edge may be created from call relationships"
+        );
+    }
+
+    #[test]
     fn test_cross_file_lsp_semantic_resolution() {
-        // This test requires rust-analyzer to be installed and in PATH
+        // Requires rust-analyzer; self-skips (with a warning) when it is not installed.
         // It tests real cross-file LSP semantic resolution in a valid Rust workspace
         let temp_dir = tempfile::tempdir().unwrap();
-        
+
         // Create a valid Rust workspace structure
         let cargo_toml = r#"[package]
 name = "test_cross_file"
@@ -1448,52 +2179,90 @@ pub fn foo() {
         let file_b_rs = r#"
 pub fn bar() {}
 "#;
-        
+
         std::fs::write(temp_dir.path().join("Cargo.toml"), cargo_toml).unwrap();
         std::fs::create_dir_all(temp_dir.path().join("src")).unwrap();
         std::fs::write(temp_dir.path().join("src/lib.rs"), lib_rs).unwrap();
         std::fs::write(temp_dir.path().join("src/file_a.rs"), file_a_rs).unwrap();
         std::fs::write(temp_dir.path().join("src/file_b.rs"), file_b_rs).unwrap();
-        
+
         let file_a_path = temp_dir.path().join("src/file_a.rs");
         let file_b_path = temp_dir.path().join("src/file_b.rs");
-        
+
         let config = CodeGraphConfig::default();
         let mut builder = CodeGraphBuilder::new(config).unwrap();
-        
+
         // Check if rust-analyzer is available
         if which::which("rust-analyzer").is_err() {
             eprintln!("Skipping test: rust-analyzer not found");
             return;
         }
-        
+
         let mut lsp_manager = crate::lsp::LspManager::new(temp_dir.path().to_path_buf());
         let rt = tokio::runtime::Runtime::new().unwrap();
         if rt.block_on(lsp_manager.start()).is_err() {
             eprintln!("Skipping test: failed to start rust-analyzer");
             return;
         }
+
+        // Wait for rust-analyzer to finish indexing before enrichment
+        // (call hierarchy is empty until the workspace has been analyzed)
+        let lib_path = temp_dir.path().join("src/lib.rs");
+        let _ = rt.block_on(lsp_manager.sync_file(&lib_path, lib_rs));
+
+        // Probe: prepareCallHierarchy readiness (rust-analyzer returns empty until fully analyzed)
+        let fa = temp_dir.path().join("src/file_a.rs");
+        let _ = rt.block_on(lsp_manager.sync_file(&fa, file_a_rs));
+        let mut indexed = false;
+        for _ in 0..300 {
+            use lsp_types::Position;
+            let prep = rt.block_on(
+                lsp_manager
+                    .client()
+                    .unwrap()
+                    .prepare_call_hierarchy(&fa, Position::new(3, 7)),
+            );
+            match prep {
+                Ok(items) if !items.is_empty() => {
+                    indexed = true;
+                    break;
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        }
+        eprintln!("rust-analyzer call-hierarchy ready: {}", indexed);
+
         builder.set_lsp_manager(lsp_manager);
-        
-        let file_a = rt.block_on(builder.add_file_async(
-            "use crate::file_b::bar;\n\npub fn foo() {\n    bar();\n}",
-            file_a_path.clone(),
-        )).unwrap();
-        
-        let file_b = rt.block_on(builder.add_file_async(
-            "pub fn bar() {}",
-            file_b_path.clone(),
-        )).unwrap();
-        
+
+        let file_a = rt
+            .block_on(builder.add_file_async(
+                "use crate::file_b::bar;\n\npub fn foo() {\n    bar();\n}",
+                file_a_path.clone(),
+            ))
+            .unwrap();
+
+        let file_b = rt
+            .block_on(builder.add_file_async("pub fn bar() {}", file_b_path.clone()))
+            .unwrap();
+
         let merged = builder.merge(vec![file_a, file_b]);
-        
+
         // Verify LSP found the cross-file call
         let foo = merged.nodes.iter().find(|n| n.name == "foo").unwrap();
         let bar = merged.nodes.iter().find(|n| n.name == "bar").unwrap();
-        
-        let calls_edges: Vec<_> = merged.edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect();
-        let has_cross_file_call = calls_edges.iter().any(|e| e.from == foo.id && e.to == bar.id);
-        assert!(has_cross_file_call, "LSP should find cross-file call foo -> bar");
+
+        let calls_edges: Vec<_> = merged
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .collect();
+        let has_cross_file_call = calls_edges
+            .iter()
+            .any(|e| e.from == foo.id && e.to == bar.id);
+        assert!(
+            has_cross_file_call,
+            "LSP should find cross-file call foo -> bar"
+        );
     }
 }
 
@@ -1501,7 +2270,7 @@ pub fn bar() {}
 impl CodeGraph {
     pub fn to_mermaid(&self) -> String {
         let mut out = String::from("graph TD\n");
-        
+
         // Group by file
         let mut files: HashMap<PathBuf, Vec<&CodeNode>> = HashMap::new();
         for node in &self.nodes {
@@ -1513,12 +2282,23 @@ impl CodeGraph {
 
         for (file, nodes) in &files {
             let file_id = sanitize_mermaid_id(&file.to_string_lossy());
-            let file_name = file.file_name().and_then(|s| s.to_str()).unwrap_or("unknown");
-            out.push_str(&format!("    {}[\"{}\"]\n", file_id, escape_mermaid_label(file_name)));
-            
+            let file_name = file
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
+            out.push_str(&format!(
+                "    {}[\"{}\"]\n",
+                file_id,
+                escape_mermaid_label(file_name)
+            ));
+
             for node in nodes {
                 let node_id = sanitize_mermaid_id(&node.id.0);
-                let label = format!("{} {}", kind_prefix(node.kind), escape_mermaid_label(&node.name));
+                let label = format!(
+                    "{} {}",
+                    kind_prefix(node.kind),
+                    escape_mermaid_label(&node.name)
+                );
                 out.push_str(&format!("    {}[\"{}\"]\n", node_id, label));
                 out.push_str(&format!("    {} --> {}\n", file_id, node_id));
             }
@@ -1565,7 +2345,13 @@ fn kind_prefix(kind: NodeKind) -> &'static str {
 
 fn sanitize_mermaid_id(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 

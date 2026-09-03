@@ -29,6 +29,156 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+/// Normalized LSP server configuration from editor configs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspServerConfig {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub file_extensions: Vec<String>,
+    pub root_markers: Vec<String>,
+    pub initialization_options: Option<Value>,
+}
+
+/// Source of the LSP configuration
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LspConfigSource {
+    Project,
+    User,
+    Hercules,
+    Builtin,
+}
+
+/// Discovered LSP configuration with source tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredLspConfig {
+    pub server: LspServerConfig,
+    pub source: LspConfigSource,
+    pub config_path: PathBuf,
+}
+
+/// Discover LSP configurations from common editor config locations
+pub async fn discover_lsp_configs(workspace_root: &Path) -> Vec<DiscoveredLspConfig> {
+    let mut configs = Vec::new();
+
+    // Priority 1: Project-local editor configs
+    configs.extend(discover_helix_configs(workspace_root, LspConfigSource::Project).await);
+    configs.extend(discover_neovim_configs(workspace_root, LspConfigSource::Project).await);
+    configs.extend(discover_vscode_configs(workspace_root, LspConfigSource::Project).await);
+    configs.extend(discover_zed_configs(workspace_root, LspConfigSource::Project).await);
+
+    // Priority 2: User-level editor configs
+    if let Some(home) = dirs::home_dir() {
+        configs.extend(discover_helix_configs(&home.join(".config/helix"), LspConfigSource::User).await);
+        configs.extend(discover_neovim_configs(&home.join(".config/nvim"), LspConfigSource::User).await);
+        configs.extend(discover_vscode_configs(&home.join(".config/Code/User"), LspConfigSource::User).await);
+        configs.extend(discover_vscode_configs(&home.join(".config/VSCodium/User"), LspConfigSource::User).await);
+        configs.extend(discover_zed_configs(&home.join(".config/zed"), LspConfigSource::User).await);
+    }
+
+    configs
+}
+
+async fn discover_helix_configs(dir: &Path, source: LspConfigSource) -> Vec<DiscoveredLspConfig> {
+    let mut configs = Vec::new();
+    let config_file = dir.join("languages.toml");
+    if config_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_file) {
+            if let Ok(value) = content.parse::<toml::Value>() {
+                if let Some(languages) = value.get("language-server") {
+                    for (name, config) in languages.as_table().unwrap_or(&toml::Table::new()) {
+                        if let Some(server_config) = parse_helix_server(name, config, &config_file, source) {
+                            configs.push(server_config);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    configs
+}
+
+fn parse_helix_server(name: &str, config: &toml::Value, config_path: &Path, source: LspConfigSource) -> Option<DiscoveredLspConfig> {
+    let command = config.get("command")?.as_str()?.to_string();
+    let args = config.get("args")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let file_extensions = config.get("file-types")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let root_markers = config.get("root-markers")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+
+    Some(DiscoveredLspConfig {
+        server: LspServerConfig {
+            name: name.to_string(),
+            command,
+            args,
+            env: HashMap::new(),
+            file_extensions,
+            root_markers,
+            initialization_options: None,
+        },
+        source,
+        config_path: config_path.to_path_buf(),
+    })
+}
+
+async fn discover_neovim_configs(dir: &Path, source: LspConfigSource) -> Vec<DiscoveredLspConfig> {
+    let mut configs = Vec::new();
+    let lsp_dir = dir.join("lsp");
+    if lsp_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&lsp_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("lua") {
+                    // Could parse lua config, for now skip
+                }
+            }
+        }
+    }
+    let init_lua = dir.join("init.lua");
+    if init_lua.exists() {
+        // Parse for LSP configs - simplified for now
+    }
+    configs
+}
+
+async fn discover_vscode_configs(dir: &Path, source: LspConfigSource) -> Vec<DiscoveredLspConfig> {
+    let mut configs = Vec::new();
+    let settings_file = dir.join("settings.json");
+    if settings_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&settings_file) {
+            if let Ok(value) = content.parse::<serde_json::Value>() {
+                if let Some(lsp_config) = value.get("languageServerExample") {
+                    // VS Code language server config
+                }
+            }
+        }
+    }
+    configs
+}
+
+async fn discover_zed_configs(dir: &Path, source: LspConfigSource) -> Vec<DiscoveredLspConfig> {
+    let mut configs = Vec::new();
+    let settings_file = dir.join("settings.json");
+    if settings_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&settings_file) {
+            if let Ok(value) = content.parse::<serde_json::Value>() {
+                if let Some(lsp) = value.get("lsp") {
+                    // Parse Zed LSP config
+                }
+            }
+        }
+    }
+    configs
+}
+
 /// LSP message with JSON-RPC framing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspMessage {
@@ -78,11 +228,25 @@ pub struct LspClient {
     workspace_root: PathBuf,
     initialized: Arc<std::sync::atomic::AtomicBool>,
     shutdown_tx: Option<mpsc::Sender<()>>,
+    server_config: LspServerConfig,
 }
 
 impl LspClient {
-    /// Create a new LSP client for the given workspace root
+    /// Create a new LSP client for the given workspace root with default rust-analyzer
     pub fn new(workspace_root: PathBuf) -> Self {
+        Self::with_config(workspace_root, LspServerConfig {
+            name: "rust-analyzer".to_string(),
+            command: "rust-analyzer".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            file_extensions: vec!["rs".to_string()],
+            root_markers: vec!["Cargo.toml".to_string()],
+            initialization_options: None,
+        })
+    }
+
+    /// Create a new LSP client with a specific server configuration
+    pub fn with_config(workspace_root: PathBuf, server_config: LspServerConfig) -> Self {
         Self {
             process: Arc::new(Mutex::new(None)),
             stdin: Arc::new(Mutex::new(None)),
@@ -91,6 +255,7 @@ impl LspClient {
             workspace_root,
             initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_tx: None,
+            server_config,
         }
     }
 
@@ -102,19 +267,25 @@ impl LspClient {
         Ok(Uri::from_str(&uri_str)?)
     }
 
-    /// Start rust-analyzer and initialize the LSP connection
+    /// Start the configured LSP server and initialize the LSP connection
     pub async fn start(&mut self) -> Result<()> {
-        info!("Starting rust-analyzer for workspace: {:?}", self.workspace_root);
+        info!("Starting LSP server '{}' for workspace: {:?}", self.server_config.name, self.workspace_root);
 
-        // Check if rust-analyzer is available
-        let ra_path = which::which("rust-analyzer")
-            .context("rust-analyzer not found in PATH. Install it with: rustup component add rust-analyzer")?;
+        // Check if the LSP server is available
+        let server_path = which::which(&self.server_config.command)
+            .context(format!("{} not found in PATH", self.server_config.command))?;
 
-        let mut cmd = Command::new(ra_path);
+        let mut cmd = Command::new(server_path);
+        cmd.args(&self.server_config.args);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .current_dir(&self.workspace_root);
+        
+        // Apply environment variables
+        for (key, value) in &self.server_config.env {
+            cmd.env(key, value);
+        }
 
         let mut child = tokio::process::Command::from(cmd)
             .spawn()
@@ -578,6 +749,7 @@ pub struct LspManager {
     client: Option<LspClient>,
     workspace_root: PathBuf,
     file_versions: std::sync::Mutex<HashMap<PathBuf, i32>>,
+    discovered_config: Option<DiscoveredLspConfig>,
 }
 
 impl LspManager {
@@ -586,12 +758,45 @@ impl LspManager {
             client: None,
             workspace_root,
             file_versions: std::sync::Mutex::new(HashMap::new()),
+            discovered_config: None,
         }
     }
 
-    /// Start the LSP client
+    /// Start the LSP client using discovered configuration
     pub async fn start(&mut self) -> Result<()> {
-        let mut client = LspClient::new(self.workspace_root.clone());
+        // Discover LSP configurations if not already done
+        if self.discovered_config.is_none() {
+            let configs = discover_lsp_configs(&self.workspace_root).await;
+            // Prefer Project > User > Builtin
+            self.discovered_config = configs.into_iter()
+                .max_by_key(|c| match c.source {
+                    LspConfigSource::Project => 3,
+                    LspConfigSource::User => 2,
+                    LspConfigSource::Hercules => 1,
+                    LspConfigSource::Builtin => 0,
+                });
+        }
+
+        let config = if let Some(ref discovered) = self.discovered_config {
+            discovered.clone()
+        } else {
+            // Fallback to builtin rust-analyzer
+            DiscoveredLspConfig {
+                server: LspServerConfig {
+                    name: "rust-analyzer".to_string(),
+                    command: "rust-analyzer".to_string(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    file_extensions: vec!["rs".to_string()],
+                    root_markers: vec!["Cargo.toml".to_string()],
+                    initialization_options: None,
+                },
+                source: LspConfigSource::Builtin,
+                config_path: PathBuf::from("builtin"),
+            }
+        };
+
+        let mut client = LspClient::with_config(self.workspace_root.clone(), config.server);
         client.start().await?;
         self.client = Some(client);
         Ok(())
@@ -610,6 +815,14 @@ impl LspManager {
     /// Check if LSP is available and initialized
     pub fn is_available(&self) -> bool {
         self.client.as_ref().map(|c| c.is_initialized()).unwrap_or(false)
+    }
+
+    /// Get the discovered LSP configuration info for display
+    pub fn get_config_info(&self) -> Option<(String, String, LspConfigSource, String)> {
+        self.discovered_config.as_ref().map(|c| {
+            let status = if self.is_available() { "Connected" } else { "Disconnected" };
+            (c.server.name.clone(), c.server.command.clone(), c.source, status.to_string())
+        })
     }
 
     /// Open or update a file in the LSP

@@ -1,21 +1,21 @@
 use crate::agent::{
-    FolderScope, PermissionMode, ProposedAction, allow_session_tools, get_tool_permissions,
-    set_folder_scope, set_permission_mode,
+    allow_session_tools, get_tool_permissions, set_folder_scope, set_permission_mode, FolderScope,
+    PermissionMode, ProposedAction,
 };
+use crate::ask_mode::{AskModeParser, AskModeResponse, AskModeState};
 use crate::backend::{AgentBackend, LlamaCppLibBackend, OllamaBackend};
 use crate::manager::ModelManager;
-use crate::task_manager::{QUICK_SECS, TaskEvent, TaskManager};
+use crate::task_manager::{TaskEvent, TaskManager, QUICK_SECS};
 use crate::tool_panel::{self, PanelChromeHit, ToolChip, ToolPanel, ToolPanelKind};
-use crate::ask_mode::{AskModeParser, AskModeState, AskModeResponse};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use kramaframe::prelude::{KeyFrameFunction, KeyList};
-use kramaframe::{BTclasslist, BTframelist, KramaFrame, keylist::TRES16Bits};
+use kramaframe::{keylist::TRES16Bits, BTclasslist, BTframelist, KramaFrame};
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    Frame,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -65,12 +65,60 @@ pub struct SectionLabelHit {
     pub kind: SectionKind,
 }
 
-pub const NORDIC_BG: Color = Color::Rgb(46, 52, 64);        // #2E3440 Polar Night
-pub const NORDIC_DARK_BG: Color = Color::Rgb(36, 41, 51);   // #242933
-pub const NORDIC_CARD_BG: Color = Color::Rgb(59, 66, 82);   // #3B4252
-pub const NORDIC_TEXT: Color = Color::Rgb(236, 239, 244);   // #ECEFF4 Snow Storm
-pub const NORDIC_MUTED: Color = Color::Rgb(129, 161, 193);  // #81A1C1 Frost Blue
+pub const NORDIC_BG: Color = Color::Rgb(46, 52, 64); // #2E3440 Polar Night
+pub const NORDIC_DARK_BG: Color = Color::Rgb(36, 41, 51); // #242933
+pub const NORDIC_CARD_BG: Color = Color::Rgb(59, 66, 82); // #3B4252
+pub const NORDIC_TEXT: Color = Color::Rgb(236, 239, 244); // #ECEFF4 Snow Storm
+pub const NORDIC_MUTED: Color = Color::Rgb(129, 161, 193); // #81A1C1 Frost Blue
 pub const NORDIC_ACCENT: Color = Color::Rgb(136, 192, 208); // #88C0D0 Frost Cyan
+
+/// Semantic colors for toggle states
+pub const TOGGLE_ON_GREEN: Color = Color::Rgb(163, 190, 140);  // #A3BE8C - Nord green
+pub const TOGGLE_OFF_RED: Color = Color::Rgb(191, 97, 106);    // #BF616A - Nord red
+pub const TOGGLE_CONTAINER_GRAY: Color = Color::Rgb(76, 86, 106); // #4C566A - Nord gray
+pub const TOGGLE_INACTIVE_FG: Color = Color::Rgb(129, 161, 193); // #81A1C1 - Frost blue (muted)
+
+/// Render a compact inline toggle with filled active cell:
+/// OFF: [ I | O ]   where I has red background
+/// ON:  [ I | O ]   where O has green background
+pub fn render_toggle<'a>(label: &'a str, enabled: bool, focused: bool) -> Line<'a> {
+    let focus_prefix = if focused { "► " } else { "  " };
+    let focus_style = if focused {
+        Style::default().fg(NORDIC_ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TOGGLE_INACTIVE_FG)
+    };
+
+    // Backgrounds for the three cells
+    let (i_bg, pipe_bg, o_bg) = if enabled {
+        (TOGGLE_CONTAINER_GRAY, TOGGLE_CONTAINER_GRAY, TOGGLE_ON_GREEN)
+    } else {
+        (TOGGLE_OFF_RED, TOGGLE_CONTAINER_GRAY, TOGGLE_CONTAINER_GRAY)
+    };
+    // Foregrounds: use dark text on colored cells, white on gray
+    let dark_fg = Color::Rgb(36, 41, 51); // NORDIC_DARK_BG
+    let white_fg = NORDIC_TEXT;
+    let (i_fg, pipe_fg, o_fg) = if enabled {
+        (TOGGLE_INACTIVE_FG, TOGGLE_INACTIVE_FG, dark_fg)
+    } else {
+        (dark_fg, TOGGLE_INACTIVE_FG, TOGGLE_INACTIVE_FG)
+    };
+
+    Line::from(vec![
+        Span::styled(if focused { "► " } else { "  " }, 
+            Style::default().fg(if focused { NORDIC_ACCENT } else { TOGGLE_INACTIVE_FG }).add_modifier(Modifier::BOLD)),
+        Span::styled(label, Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+        Span::styled(" ", Style::default().bg(NORDIC_BG)),
+        Span::styled("[", Style::default().fg(TOGGLE_CONTAINER_GRAY).bg(NORDIC_BG)),
+        // I cell
+        Span::styled(" I ", Style::default().fg(if enabled { TOGGLE_INACTIVE_FG } else { Color::Rgb(36,41,51) }).bg(if enabled { TOGGLE_CONTAINER_GRAY } else { TOGGLE_OFF_RED }).add_modifier(Modifier::BOLD)),
+        // separator
+        Span::styled(" | ", Style::default().fg(TOGGLE_INACTIVE_FG).bg(TOGGLE_CONTAINER_GRAY)),
+        // O cell
+        Span::styled(" O ", Style::default().fg(if enabled { Color::Rgb(36,41,51) } else { TOGGLE_INACTIVE_FG }).bg(if enabled { TOGGLE_ON_GREEN } else { TOGGLE_CONTAINER_GRAY }).add_modifier(Modifier::BOLD)),
+        Span::styled("]", Style::default().fg(TOGGLE_CONTAINER_GRAY).bg(NORDIC_BG)),
+    ])
+}
 
 pub fn interpolate_rgb(c1: (u8, u8, u8), c2: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
     let t = t.clamp(0.0, 1.0);
@@ -93,7 +141,11 @@ pub fn multi_stop_gradient(stops: &[(f32, (u8, u8, u8))], pos: f32) -> Color {
         let (p1, c1) = stops[i];
         let (p2, c2) = stops[i + 1];
         if pos >= p1 && pos <= p2 {
-            let seg_t = if (p2 - p1).abs() < 0.0001 { 0.0 } else { (pos - p1) / (p2 - p1) };
+            let seg_t = if (p2 - p1).abs() < 0.0001 {
+                0.0
+            } else {
+                (pos - p1) / (p2 - p1)
+            };
             let (r, g, b) = interpolate_rgb(c1, c2, seg_t);
             return Color::Rgb(r, g, b);
         }
@@ -150,7 +202,31 @@ pub const SETTINGS_TAB_NAMES: &[&str] = &[
     "Web Search",
     "HF Token",
     "OCR Engine",
+    "Code Graph",
+    "LSP Diagnostics",
 ];
+
+pub const SETTINGS_POWER_MODE: usize = 0;
+pub const SETTINGS_MTP: usize = 1;
+pub const SETTINGS_AUTO_COLLAPSE: usize = 2;
+pub const SETTINGS_TARGET_FPS: usize = 3;
+pub const SETTINGS_STALL_TIME: usize = 4;
+pub const SETTINGS_REPEAT_DETECTOR: usize = 5;
+pub const SETTINGS_CONTEXT_WINDOW: usize = 6;
+pub const SETTINGS_PERMISSIONS: usize = 7;
+pub const SETTINGS_WEB_SEARCH: usize = 8;
+pub const SETTINGS_HF_TOKEN: usize = 9;
+pub const SETTINGS_OCR_ENGINE: usize = 10;
+pub const SETTINGS_CODE_GRAPH: usize = 11;
+pub const SETTINGS_LSP_DIAGNOSTICS: usize = 12;
+
+/// Code Graph pane selection (three-pane layout)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeGraphPane {
+    Nodes,   // Left pane - file-grouped node list
+    Graph,   // Center pane - graph visualization
+    Details, // Right pane - node metadata
+}
 
 pub struct App {
     pub should_quit: bool,
@@ -182,15 +258,16 @@ pub struct App {
     pub menu_anim_progress: f32,   // 0.0 = closed, 1.0 = fully open (fade up/down)
     pub menu_closing: bool,        // true during closing animation
     pub header_bar_hit: Option<(u16, u16, u16)>, // (row, start_col, end_col)
-    pub menu_tab_hits: Vec<(usize, u16, u16)>,   // (section_idx, start_col, end_col) on row 0
+    pub menu_tab_hits: Vec<(usize, u16, u16)>, // (section_idx, start_col, end_col) on row 0
     pub container_close_hit: Option<(u16, u16, u16)>, // (row, start_col, end_col) for " x " close button
-    pub settings_col: usize,       // 0 = left category tabs, 1 = right values
-    pub settings_tab: usize,       // 0: Power, 1: Stall, 2: Repeat, 3: Context, 4: Permissions, 5: HF Token
+    pub settings_col: usize,                          // 0 = left category tabs, 1 = right values
+    pub settings_tab: usize, // 0: Power, 1: Stall, 2: Repeat, 3: Context, 4: Permissions, 5: HF Token
+    pub settings_option: usize, // selected option index within settings_tab (for multi-option tabs)
     pub hf_token_input: String,
     pub hf_token_editing: bool,
     pub search_token_input: String,
     pub search_token_editing: bool,
-    pub registry_tab: usize,       // 0: HuggingFace, 1: Ollama
+    pub registry_tab: usize, // 0: HuggingFace, 1: Ollama
     pub config_state: ListState,
 
     // Installed Models state
@@ -316,6 +393,23 @@ pub struct App {
     // F1 keyboard shortcuts overlay (off by default)
     pub show_shortcuts: bool,
 
+    // Code Graph (F6) - three-pane: Nodes | Graph | Details
+    pub code_graph: Option<crate::code_graph::CodeGraph>,
+    pub code_graph_loading: bool,
+    pub code_graph_error: Option<String>,
+    pub code_graph_selected: usize,
+    pub code_graph_scroll: usize,
+    pub code_graph_detail_scroll: usize,
+    pub code_graph_pane: CodeGraphPane,
+    // Adjacency maps built once on graph load (edge indices per node id)
+    pub code_graph_outgoing: std::collections::HashMap<crate::code_graph::NodeId, Vec<usize>>,
+    pub code_graph_incoming: std::collections::HashMap<crate::code_graph::NodeId, Vec<usize>>,
+    // Completed background code-graph build, consumed by the UI loop
+    pub code_graph_job:
+        Arc<Mutex<Option<Result<(crate::code_graph::CodeGraph, usize, usize), String>>>>,
+    // Cached LSP configuration info for display in settings
+    pub lsp_config_info: Option<(String, String, crate::lsp::LspConfigSource, String)>,
+
     // Permissions tab selection (menu_section == 4)
     pub perms_state: ListState,
     // Runtime tab (power mode + repeat detector) menu_section == 3
@@ -398,6 +492,7 @@ impl App {
             container_close_hit: None,
             settings_col: 0,
             settings_tab: 0,
+            settings_option: 0,
             hf_token_input: String::new(),
             hf_token_editing: false,
             search_token_input: String::new(),
@@ -561,6 +656,17 @@ impl App {
             term_input: String::new(),
             streamed_writes_done: Vec::new(),
             ask_mode_state: None,
+            code_graph: None,
+            code_graph_loading: false,
+            code_graph_error: None,
+            code_graph_selected: 0,
+            code_graph_scroll: 0,
+            code_graph_detail_scroll: 0,
+            code_graph_pane: CodeGraphPane::Graph,
+            code_graph_outgoing: std::collections::HashMap::new(),
+            code_graph_incoming: std::collections::HashMap::new(),
+            code_graph_job: Arc::new(Mutex::new(None)),
+            lsp_config_info: None,
         };
 
         let manager_clone = app.manager.clone();
@@ -617,9 +723,9 @@ impl App {
                             let path_str = &m[open + 1..close];
                             let path = std::path::PathBuf::from(path_str);
                             if path.exists() {
-                                app.backend = AgentBackend::LlamaCppLib(
-                                    LlamaCppLibBackend::gguf(path.clone()),
-                                );
+                                app.backend = AgentBackend::LlamaCppLib(LlamaCppLibBackend::gguf(
+                                    path.clone(),
+                                ));
                                 app.manager.set_active_gguf_path(path.display().to_string());
                                 break;
                             }
@@ -651,7 +757,8 @@ impl App {
                 }
             }
 
-            app.messages.push(format!("System: Resumed session {}", sid));
+            app.messages
+                .push(format!("System: Resumed session {}", sid));
         }
         app.session_cpu_energy_joules = session.session_cpu_energy_joules;
         app.session_gpu_energy_joules = session.session_gpu_energy_joules;
@@ -726,20 +833,18 @@ impl App {
     /// Returns list of available models for subagents, capped to the current backend's repository.
     pub fn available_swarm_models(&self) -> Vec<String> {
         match &self.backend {
-            AgentBackend::Ollama(_) => {
-                self.installed_models
-                    .iter()
-                    .filter(|m| m.starts_with("Ollama:"))
-                    .map(|m| m.trim_start_matches("Ollama:").trim().to_string())
-                    .collect()
-            }
-            AgentBackend::LlamaCppLib(_) => {
-                self.installed_models
-                    .iter()
-                    .filter(|m| !m.starts_with("Ollama:"))
-                    .cloned()
-                    .collect()
-            }
+            AgentBackend::Ollama(_) => self
+                .installed_models
+                .iter()
+                .filter(|m| m.starts_with("Ollama:"))
+                .map(|m| m.trim_start_matches("Ollama:").trim().to_string())
+                .collect(),
+            AgentBackend::LlamaCppLib(_) => self
+                .installed_models
+                .iter()
+                .filter(|m| !m.starts_with("Ollama:"))
+                .cloned()
+                .collect(),
             #[cfg(feature = "gpu")]
             AgentBackend::BurnWgpu(_) => vec![],
         }
@@ -749,8 +854,14 @@ impl App {
         let pretty = tool_panel::format_tool_output_for_chat(result);
 
         // Count +/- lines in the diff to tell the AI what changed
-        let added: usize = pretty.lines().filter(|l| l.starts_with("+ ") || *l == "+").count();
-        let removed: usize = pretty.lines().filter(|l| l.starts_with("- ") || *l == "-").count();
+        let added: usize = pretty
+            .lines()
+            .filter(|l| l.starts_with("+ ") || *l == "+")
+            .count();
+        let removed: usize = pretty
+            .lines()
+            .filter(|l| l.starts_with("- ") || *l == "-")
+            .count();
         let total_lines = if result.trim() == "No changes." {
             0usize
         } else {
@@ -765,7 +876,8 @@ impl App {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let file_name = action.target
+        let file_name = action
+            .target
             .split('/')
             .last()
             .unwrap_or(&action.target)
@@ -806,8 +918,10 @@ impl App {
             format!("+{added}/-{removed}")
         };
 
-        self.messages
-            .push(format!("System: [OK] Wrote {} ({change_summary})", file_name));
+        self.messages.push(format!(
+            "System: [OK] Wrote {} ({change_summary})",
+            file_name
+        ));
     }
 
     /// Upsert bordered chips from stream (write + run). Auto-opens on new/update.
@@ -875,7 +989,8 @@ impl App {
                     target,
                     body: view.body,
                     tag_closed: view.tag_closed,
-                    pending: false, spawned: false,
+                    pending: false,
+                    spawned: false,
                     rect: None,
                     anchor_msg: anchor,
                     expanded: false,
@@ -888,10 +1003,15 @@ impl App {
 
         let mut instant_cmds = Vec::new();
         let perms = crate::agent::get_tool_permissions();
-        let can_instant_cmd = perms.session_allow || perms.mode == crate::agent::PermissionMode::AlwaysAllow;
+        let can_instant_cmd =
+            perms.session_allow || perms.mode == crate::agent::PermissionMode::AlwaysAllow;
 
         for chip in self.tool_chips.iter_mut() {
-            if chip.kind == tool_panel::ToolPanelKind::Cmd && chip.tag_closed && !chip.spawned && can_instant_cmd {
+            if chip.kind == tool_panel::ToolPanelKind::Cmd
+                && chip.tag_closed
+                && !chip.spawned
+                && can_instant_cmd
+            {
                 chip.spawned = true;
                 instant_cmds.push(crate::agent::ProposedAction {
                     kind: crate::agent::ProposedKind::Cmd,
@@ -1261,8 +1381,6 @@ impl App {
 
     /// Logical lines of the prompt (split on `\n`).
 
-
-
     /// Queue write/cmd for user accept; open preview panel.
     fn propose_actions(&mut self, mut actions: Vec<ProposedAction>) {
         if actions.is_empty() {
@@ -1280,8 +1398,8 @@ impl App {
             };
             !self.tool_chips.iter().any(|c| {
                 c.kind == pkind
-                && tool_panel::same_tool_target(c.kind, &c.target, &a.target)
-                && c.spawned
+                    && tool_panel::same_tool_target(c.kind, &c.target, &a.target)
+                    && c.spawned
             })
         });
 
@@ -1336,7 +1454,8 @@ impl App {
                     target,
                     body: a.body.clone(),
                     tag_closed: true,
-                    pending: true, spawned: false,
+                    pending: true,
+                    spawned: false,
                     rect: None,
                     anchor_msg: anchor,
                     expanded: false,
@@ -1437,7 +1556,13 @@ impl App {
             }
             let summary = written
                 .iter()
-                .map(|(name, ok)| if *ok { format!("✓ {name}") } else { format!("✗ {name}") })
+                .map(|(name, ok)| {
+                    if *ok {
+                        format!("✓ {name}")
+                    } else {
+                        format!("✗ {name}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             self.status_message = format!("Written: {summary}");
@@ -1448,14 +1573,16 @@ impl App {
             }
         }
 
-
         if !mcps.is_empty() {
             let mut agent_ids = Vec::new();
             for a in &mcps {
                 if a.kind == crate::agent::ProposedKind::Agent {
-                    let role = crate::agent::AgentEngine::extract_attribute(&a.target, "role").unwrap_or_default();
-                    let to = crate::agent::AgentEngine::extract_attribute(&a.target, "to").unwrap_or_default();
-                    let model = crate::agent::AgentEngine::extract_attribute(&a.target, "model").unwrap_or_default();
+                    let role = crate::agent::AgentEngine::extract_attribute(&a.target, "role")
+                        .unwrap_or_default();
+                    let to = crate::agent::AgentEngine::extract_attribute(&a.target, "to")
+                        .unwrap_or_default();
+                    let model = crate::agent::AgentEngine::extract_attribute(&a.target, "model")
+                        .unwrap_or_default();
                     let sub_backend = self.backend.with_model(&model, &self.manager);
                     let instruction = a.body.clone();
                     let agent_id = self.task_manager.spawn_agent(
@@ -1464,10 +1591,14 @@ impl App {
                         to,
                         model.clone(),
                         instruction,
-                        0 // spawned_by host/orchestrator
+                        0, // spawned_by host/orchestrator
                     );
                     agent_ids.push(agent_id);
-                    let model_label = if model.is_empty() { String::new() } else { format!(" [model={model}]") };
+                    let model_label = if model.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [model={model}]")
+                    };
                     if let Some(chip_id) = a.chip_id {
                         if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
                             chip.pending = false;
@@ -1487,7 +1618,11 @@ impl App {
                         &a.body,
                     );
                     match res {
-                        crate::smart_system::SmartWriteResult::Committed { lines_written, new_revision, .. } => {
+                        crate::smart_system::SmartWriteResult::Committed {
+                            lines_written,
+                            new_revision,
+                            ..
+                        } => {
                             format!("[Smart System: Revision #{new_revision} Committed] Successfully wrote {lines_written} lines to {}", path.display())
                         }
                         crate::smart_system::SmartWriteResult::Conflict { message, .. } => {
@@ -1507,7 +1642,8 @@ impl App {
                     }
                     self.force_open_panel_from_chip(chip_id);
                 }
-                self.tool_result_context.push(format!("[{} result]\n{}", a.kind.label(), result));
+                self.tool_result_context
+                    .push(format!("[{} result]\n{}", a.kind.label(), result));
             }
             if !*self.is_generating.lock().unwrap() && agent_ids.is_empty() {
                 self.trigger_generation_from_context();
@@ -1519,7 +1655,8 @@ impl App {
             // Cmds still trigger re-prompt so the AI sees the shell output
         }
         // Record final action durations and clean up completed action start times
-        let completed_chip_ids: Vec<u64> = self.tool_chips
+        let completed_chip_ids: Vec<u64> = self
+            .tool_chips
             .iter()
             .filter(|c| c.tag_closed && !c.pending && self.action_start_times.contains_key(&c.id))
             .map(|c| c.id)
@@ -1554,7 +1691,8 @@ impl App {
                     target: cmd.clone(),
                     body: format!("[Task #{id} running]\n$ {cmd}\n…"),
                     tag_closed: true,
-                    pending: false, spawned: false,
+                    pending: false,
+                    spawned: false,
                     rect: None,
                     anchor_msg: self.latest_agent_msg_idx(),
                     expanded: false,
@@ -1584,7 +1722,14 @@ impl App {
         let new_events = self.task_manager.take_events();
         for ev in new_events {
             if is_busy {
-                if let TaskEvent::Done { id, cmd, output: _, killed: _, spawned_by } = &ev {
+                if let TaskEvent::Done {
+                    id,
+                    cmd,
+                    output: _,
+                    killed: _,
+                    spawned_by,
+                } = &ev
+                {
                     if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
                         (c.kind == ToolPanelKind::Cmd || c.kind == ToolPanelKind::Agent)
                             && tool_panel::same_tool_target(c.kind, &c.target, cmd)
@@ -1630,7 +1775,11 @@ impl App {
 
     fn deliver_task_event(&mut self, ev: TaskEvent) {
         match ev {
-            TaskEvent::Parked { id, cmd, spawned_by } => {
+            TaskEvent::Parked {
+                id,
+                cmd,
+                spawned_by,
+            } => {
                 self.messages.push(format!(
                     "System: [Task #{id} (Agent {spawned_by})] still running after {QUICK_SECS}s — pushed to task manager. \
                      Command: `{cmd}`. Agent may continue; output arrives when finished. \
@@ -1676,9 +1825,8 @@ impl App {
                     (c.kind == ToolPanelKind::Cmd || c.kind == ToolPanelKind::Agent)
                         && tool_panel::same_tool_target(c.kind, &c.target, &cmd)
                 }) {
-                    chip.body = format!(
-                        "[Task #{id} {label} (Agent {spawned_by})]\n$ {cmd}\n{pretty}"
-                    );
+                    chip.body =
+                        format!("[Task #{id} {label} (Agent {spawned_by})]\n$ {cmd}\n{pretty}");
                     chip.tag_closed = true;
                     chip.pending = false;
                     let cid = chip.id;
@@ -1859,7 +2007,9 @@ impl App {
         }
 
         let limit_secs = if has_tokens {
-            crate::settings::get_settings().stall_timeout_secs.clamp(60, 300)
+            crate::settings::get_settings()
+                .stall_timeout_secs
+                .clamp(60, 300)
         } else {
             crate::settings::get_settings().stall_timeout_secs
         };
@@ -1917,7 +2067,7 @@ impl App {
 
     fn handle_ask_mode_response(&mut self, response: AskModeResponse) {
         let mut parts = Vec::new();
-        
+
         if !response.checks.is_empty() {
             parts.push(format!("Checks: {}", response.checks.join(", ")));
         }
@@ -1927,19 +2077,21 @@ impl App {
         if !response.inputs.is_empty() {
             parts.push(format!("Inputs: {}", response.inputs.join(", ")));
         }
-        
+
         let summary = if parts.is_empty() {
             "(no selection)".to_string()
         } else {
             parts.join("; ")
         };
-        
+
         // Add to tool_result_context so it's included in the next generation's context
-        self.tool_result_context.push(format!("[Ask Mode Response]\n{}", summary));
-        
+        self.tool_result_context
+            .push(format!("[Ask Mode Response]\n{}", summary));
+
         // Also show in chat
-        self.messages.push(format!("System: Ask Mode response — {}", summary));
-        
+        self.messages
+            .push(format!("System: Ask Mode response — {}", summary));
+
         // Trigger next generation with the response in context
         self.trigger_generation_from_context();
     }
@@ -2106,7 +2258,10 @@ impl App {
             let mut att_context = String::new();
             for att in &self.attachments {
                 let ocr_block = if let Some(ref text) = att.ocr_text {
-                    format!("\n<ocr_extracted_text>\n{}\n</ocr_extracted_text>", trunc_chars(text.trim(), 4000))
+                    format!(
+                        "\n<ocr_extracted_text>\n{}\n</ocr_extracted_text>",
+                        trunc_chars(text.trim(), 4000)
+                    )
                 } else {
                     String::new()
                 };
@@ -2119,7 +2274,10 @@ impl App {
                 ));
             }
             if !att_context.is_empty() {
-                parts.push(format!("<multimodal_context>\n{}</multimodal_context>", att_context.trim()));
+                parts.push(format!(
+                    "<multimodal_context>\n{}</multimodal_context>",
+                    att_context.trim()
+                ));
             }
         }
 
@@ -2127,7 +2285,10 @@ impl App {
         for r in self.tool_result_context.iter().rev().take(6).rev() {
             let trimmed = r.trim();
             // Allocate generous budget depending on content (4000 for search/cmd, 6000 for read)
-            let limit = if trimmed.contains("WebSearch") || trimmed.contains("Title:") || trimmed.contains("URL:") {
+            let limit = if trimmed.contains("WebSearch")
+                || trimmed.contains("Title:")
+                || trimmed.contains("URL:")
+            {
                 4_000
             } else if trimmed.contains("<read") || trimmed.contains("READ") {
                 6_000
@@ -2349,7 +2510,10 @@ impl App {
 
         let want_kind = if kind_hint.contains("search") || kind_hint.contains("websearch") {
             ToolPanelKind::WebSearch
-        } else if kind_hint.contains("read") || kind_hint.contains("list") || kind_hint.contains("ls") {
+        } else if kind_hint.contains("read")
+            || kind_hint.contains("list")
+            || kind_hint.contains("ls")
+        {
             ToolPanelKind::Read
         } else if kind_hint.contains("write") {
             ToolPanelKind::Write
@@ -2404,7 +2568,8 @@ impl App {
                 target,
                 body: pretty.clone(),
                 tag_closed: true,
-                pending: false, spawned: false,
+                pending: false,
+                spawned: false,
                 rect: None,
                 anchor_msg: anchor,
                 expanded: false,
@@ -2594,14 +2759,14 @@ impl App {
     }
 
     pub fn adjust_setting_value(&mut self, dir: i32) {
-        use crate::settings::{
-            PowerMode, nudge_context_token_limit, cycle_repeat_threshold,
-            cycle_stall_timeout, format_context_tokens, format_stall_timeout,
-            get_settings, set_power_mode, toggle_repeat_thinking,
-        };
         use crate::app::{
-            get_tool_permissions, set_permission_mode, set_folder_scope,
-            PermissionMode, FolderScope,
+            get_tool_permissions, set_folder_scope, set_permission_mode, FolderScope,
+            PermissionMode,
+        };
+        use crate::settings::{
+            cycle_repeat_threshold, cycle_stall_timeout, format_context_tokens,
+            format_stall_timeout, get_settings, nudge_context_token_limit, set_power_mode,
+            toggle_repeat_thinking, PowerMode,
         };
         match self.settings_tab {
             0 => {
@@ -2632,7 +2797,14 @@ impl App {
             2 => {
                 // Auto Collapse Previous
                 let active = crate::settings::toggle_auto_collapse_previous();
-                self.status_message = format!("Auto-Collapse Previous: {}", if active { "ENABLED (Collapse chips after stream)" } else { "DISABLED" });
+                self.status_message = format!(
+                    "Auto-Collapse Previous: {}",
+                    if active {
+                        "ENABLED (Collapse chips after stream)"
+                    } else {
+                        "DISABLED"
+                    }
+                );
             }
             3 => {
                 // Target FPS (30, 60, 90, 120, 240)
@@ -2642,7 +2814,8 @@ impl App {
             4 => {
                 // Stall time
                 let t = cycle_stall_timeout();
-                self.status_message = format!("Stall Watchdog Timeout: {}", format_stall_timeout(t));
+                self.status_message =
+                    format!("Stall Watchdog Timeout: {}", format_stall_timeout(t));
             }
             5 => {
                 // Repeat detector
@@ -2655,7 +2828,11 @@ impl App {
                 self.status_message = format!(
                     "Repeat threshold: {} | Think detect: {}",
                     s.repeat_threshold,
-                    if s.repeat_detect_thinking { "ON" } else { "OFF" }
+                    if s.repeat_detect_thinking {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
                 );
             }
             6 => {
@@ -2681,7 +2858,8 @@ impl App {
                     set_folder_scope(next_scope);
                 }
                 let p2 = get_tool_permissions();
-                self.status_message = format!("Permissions: {} | {}", p2.mode_label(), p2.scope_label());
+                self.status_message =
+                    format!("Permissions: {} | {}", p2.mode_label(), p2.scope_label());
             }
             8 => {
                 // Web Search (nudge up or down with dir)
@@ -2704,6 +2882,83 @@ impl App {
                 // OCR Engine
                 let next = crate::settings::nudge_ocr_engine_mode(if dir != 0 { dir } else { 1 });
                 self.status_message = format!("OCR Engine Mode: {}", next.label());
+            }
+            11 => {
+                // Code Graph - 3 options: 0=Enabled, 1=Comments, 2=Bounce
+                use crate::settings::{
+                    get_code_graph_enabled, get_code_graph_include_comments, get_code_graph_bounce_response_write,
+                    set_code_graph_bounce_response_write, set_code_graph_enabled,
+                    set_code_graph_include_comments,
+                };
+                const NUM_OPTIONS: usize = 3;
+                let opt = self.settings_option.min(NUM_OPTIONS - 1);
+                let labels = ["Enabled", "Comments", "Bounce"];
+                if dir > 0 {
+                    // Right/D -> ON
+                    match opt {
+                        0 => { set_code_graph_enabled(true); self.status_message = "Code Graph Panel: ON".to_string(); }
+                        1 => { set_code_graph_include_comments(true); self.status_message = "Include Comments: ON".to_string(); }
+                        2 => { set_code_graph_bounce_response_write(true); self.status_message = "Bounce Response Write: ON".to_string(); }
+                        _ => {}
+                    }
+                } else if dir < 0 {
+                    // Left/A -> OFF
+                    match opt {
+                        0 => { set_code_graph_enabled(false); self.status_message = "Code Graph Panel: OFF".to_string(); }
+                        1 => { set_code_graph_include_comments(false); self.status_message = "Include Comments: OFF".to_string(); }
+                        2 => { set_code_graph_bounce_response_write(false); self.status_message = "Bounce Response Write: OFF".to_string(); }
+                        _ => {}
+                    }
+                } else {
+                    // Enter -> toggle
+                    match opt {
+                        0 => { let e = get_code_graph_enabled(); set_code_graph_enabled(!e); self.status_message = format!("Code Graph Panel: {}", if !e { "ON" } else { "OFF" }); }
+                        1 => { let e = get_code_graph_include_comments(); set_code_graph_include_comments(!e); self.status_message = format!("Include Comments: {}", if !e { "ON" } else { "OFF" }); }
+                        2 => { let e = get_code_graph_bounce_response_write(); set_code_graph_bounce_response_write(!e); self.status_message = format!("Bounce Response Write: {}", if !e { "ON" } else { "OFF" }); }
+                        _ => {}
+                    }
+                }
+                self.status_message = format!("Code Graph: {} → {}", labels[opt], self.status_message.split(": ").nth(1).unwrap_or(""));
+            }
+            12 => {
+                // LSP Diagnostics - 4 options: 0=Diagnostics, 1=Errors, 2=Warnings, 3=Info/Hints
+                use crate::settings::{
+                    get_lsp_diagnostics_enabled, get_lsp_show_errors, get_lsp_show_info,
+                    get_lsp_show_warnings, set_lsp_diagnostics_enabled, set_lsp_show_errors,
+                    set_lsp_show_info, set_lsp_show_warnings,
+                };
+                const NUM_OPTIONS: usize = 4;
+                let opt = self.settings_option.min(NUM_OPTIONS - 1);
+                let labels = ["Diagnostics", "Errors", "Warnings", "Info/Hints"];
+                if dir > 0 {
+                    // Right/D -> ON
+                    match opt {
+                        0 => { set_lsp_diagnostics_enabled(true); self.status_message = "LSP Diagnostics: ON".to_string(); }
+                        1 => { set_lsp_show_errors(true); self.status_message = "Show Errors: ON".to_string(); }
+                        2 => { set_lsp_show_warnings(true); self.status_message = "Show Warnings: ON".to_string(); }
+                        3 => { set_lsp_show_info(true); self.status_message = "Show Info/Hints: ON".to_string(); }
+                        _ => {}
+                    }
+                } else if dir < 0 {
+                    // Left/A -> OFF
+                    match opt {
+                        0 => { set_lsp_diagnostics_enabled(false); self.status_message = "LSP Diagnostics: OFF".to_string(); }
+                        1 => { set_lsp_show_errors(false); self.status_message = "Show Errors: OFF".to_string(); }
+                        2 => { set_lsp_show_warnings(false); self.status_message = "Show Warnings: OFF".to_string(); }
+                        3 => { set_lsp_show_info(false); self.status_message = "Show Info/Hints: OFF".to_string(); }
+                        _ => {}
+                    }
+                } else {
+                    // Enter -> toggle
+                    match opt {
+                        0 => { let e = get_lsp_diagnostics_enabled(); set_lsp_diagnostics_enabled(!e); self.status_message = format!("LSP Diagnostics: {}", if !e { "ON" } else { "OFF" }); }
+                        1 => { let e = get_lsp_show_errors(); set_lsp_show_errors(!e); self.status_message = format!("Show Errors: {}", if !e { "ON" } else { "OFF" }); }
+                        2 => { let e = get_lsp_show_warnings(); set_lsp_show_warnings(!e); self.status_message = format!("Show Warnings: {}", if !e { "ON" } else { "OFF" }); }
+                        3 => { let e = get_lsp_show_info(); set_lsp_show_info(!e); self.status_message = format!("Show Info/Hints: {}", if !e { "ON" } else { "OFF" }); }
+                        _ => {}
+                    }
+                }
+                self.status_message = format!("LSP: {} → {}", labels[opt], self.status_message.split(": ").nth(1).unwrap_or(""));
             }
             _ => {}
         }
@@ -2806,11 +3061,12 @@ impl App {
 
     /// Check if the text before the cursor matches a path prefix (`$CURRENT/`, `~/`, `/`, `./`)
     pub fn update_path_autocomplete(&mut self) {
-        let prefix_before_cursor: String = self.input.chars().take(self.input_cursor_position).collect();
-        let last_word = prefix_before_cursor
-            .split_whitespace()
-            .last()
-            .unwrap_or("");
+        let prefix_before_cursor: String = self
+            .input
+            .chars()
+            .take(self.input_cursor_position)
+            .collect();
+        let last_word = prefix_before_cursor.split_whitespace().last().unwrap_or("");
 
         if last_word.starts_with("$CURRENT")
             || last_word.starts_with('~')
@@ -2819,13 +3075,17 @@ impl App {
             || last_word.starts_with("../")
         {
             let resolved_prefix = if last_word.starts_with("$CURRENT") {
-                let rest = last_word.trim_start_matches("$CURRENT").trim_start_matches('/');
+                let rest = last_word
+                    .trim_start_matches("$CURRENT")
+                    .trim_start_matches('/');
                 std::env::current_dir()
                     .unwrap_or_else(|_| std::path::PathBuf::from("."))
                     .join(rest)
             } else if last_word.starts_with('~') {
                 let rest = last_word.trim_start_matches('~').trim_start_matches('/');
-                dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")).join(rest)
+                dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/"))
+                    .join(rest)
             } else {
                 std::path::PathBuf::from(last_word)
             };
@@ -2833,13 +3093,20 @@ impl App {
             let search_dir = if resolved_prefix.is_dir() {
                 resolved_prefix.clone()
             } else {
-                resolved_prefix.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."))
+                resolved_prefix
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
             };
 
             let filter_name = if resolved_prefix.is_dir() {
                 String::new()
             } else {
-                resolved_prefix.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase()
+                resolved_prefix
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase()
             };
 
             let mut suggestions = Vec::new();
@@ -2863,7 +3130,9 @@ impl App {
 
             if !suggestions.is_empty() {
                 self.path_suggestions = suggestions;
-                self.path_suggestion_index = self.path_suggestion_index.min(self.path_suggestions.len().saturating_sub(1));
+                self.path_suggestion_index = self
+                    .path_suggestion_index
+                    .min(self.path_suggestions.len().saturating_sub(1));
                 self.path_suggestion_active = true;
                 return;
             }
@@ -2880,8 +3149,16 @@ impl App {
         }
 
         let selected = self.path_suggestions[self.path_suggestion_index].clone();
-        let prefix_before_cursor: String = self.input.chars().take(self.input_cursor_position).collect();
-        let last_word = prefix_before_cursor.split_whitespace().last().unwrap_or("").to_string();
+        let prefix_before_cursor: String = self
+            .input
+            .chars()
+            .take(self.input_cursor_position)
+            .collect();
+        let last_word = prefix_before_cursor
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .to_string();
 
         let replacement = if last_word.ends_with('/') {
             format!("{last_word}{selected}")
@@ -2892,7 +3169,9 @@ impl App {
         };
 
         // Replace last word in input
-        let start_pos = self.input_cursor_position.saturating_sub(last_word.chars().count());
+        let start_pos = self
+            .input_cursor_position
+            .saturating_sub(last_word.chars().count());
         let mut chars: Vec<char> = self.input.chars().collect();
         chars.splice(start_pos..self.input_cursor_position, replacement.chars());
         self.input = chars.into_iter().collect();
@@ -2919,7 +3198,12 @@ impl App {
         if let Ok(mut att) = crate::media::stage_file_path(path) {
             att.id = self.next_attachment_id;
             self.next_attachment_id += 1;
-            let tag = format!("[{} {}: {}]", att.media_type.label(), att.id, att.original_name);
+            let tag = format!(
+                "[{} {}: {}]",
+                att.media_type.label(),
+                att.id,
+                att.original_name
+            );
             self.status_message = format!("Attached: {tag}");
             self.trigger_ocr_for_attachment(att.clone());
             self.attachments.push(att);
@@ -2945,12 +3229,19 @@ impl App {
 
         tokio::spawn(async move {
             if let Ok(mut l) = logs.lock() {
-                l.push(format!("[OCR] Starting text extraction for {}...", att.original_name));
+                l.push(format!(
+                    "[OCR] Starting text extraction for {}...",
+                    att.original_name
+                ));
             }
             match crate::ocr::OcrService::extract_text(&path, mode).await {
                 Ok(text) => {
                     if let Ok(mut l) = logs.lock() {
-                        l.push(format!("[OCR SUCCESS] Extracted {} chars from {}", text.len(), att.original_name));
+                        l.push(format!(
+                            "[OCR SUCCESS] Extracted {} chars from {}",
+                            text.len(),
+                            att.original_name
+                        ));
                     }
                 }
                 Err(e) => {
@@ -3019,7 +3310,8 @@ impl App {
             for _ in 0..batch_size {
                 if let Some((anim_id, is_reverse)) = self.pending_staggered_anims.pop_front() {
                     if !self.krama.is_id("collapse", anim_id) {
-                        self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+                        self.krama
+                            .insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
                     }
                     if is_reverse {
                         self.krama.reverse_start("collapse", anim_id);
@@ -3035,6 +3327,8 @@ impl App {
     }
 
     pub async fn handle_events(&mut self) -> Result<bool, std::io::Error> {
+        // Install completed background code-graph builds without blocking the loop
+        self.poll_code_graph_job();
         let now = std::time::Instant::now();
         let elapsed_secs = now.duration_since(self.last_metrics_time).as_secs_f64();
         self.last_metrics_time = now;
@@ -3048,12 +3342,18 @@ impl App {
             self.sys.refresh_processes_specifics(
                 sysinfo::ProcessesToUpdate::Some(&[current_pid]),
                 true,
-                sysinfo::ProcessRefreshKind::nothing().with_cpu().with_memory(),
+                sysinfo::ProcessRefreshKind::nothing()
+                    .with_cpu()
+                    .with_memory(),
             );
             self.live_gpu_power_w = query_active_gpu_power();
 
             let current_pid = sysinfo::Pid::from_u32(std::process::id());
-            let app_cpu = self.sys.process(current_pid).map(|p| p.cpu_usage()).unwrap_or(0.0);
+            let app_cpu = self
+                .sys
+                .process(current_pid)
+                .map(|p| p.cpu_usage())
+                .unwrap_or(0.0);
             let num_cpus = self.sys.cpus().len().max(1) as f32;
             let normalized_app_load = (app_cpu / num_cpus).clamp(0.0, 100.0);
             self.cpu_load_sum_pct += normalized_app_load as f64;
@@ -3061,7 +3361,11 @@ impl App {
         }
 
         let current_pid = sysinfo::Pid::from_u32(std::process::id());
-        let app_cpu = self.sys.process(current_pid).map(|p| p.cpu_usage()).unwrap_or(0.0);
+        let app_cpu = self
+            .sys
+            .process(current_pid)
+            .map(|p| p.cpu_usage())
+            .unwrap_or(0.0);
         let num_cpus = self.sys.cpus().len().max(1) as f32;
         let normalized_app_load = (app_cpu / num_cpus).clamp(0.0, 100.0);
 
@@ -3073,7 +3377,11 @@ impl App {
 
         // Accumulate active compute time (excluding idle waiting time)
         let is_gen = *self.is_generating.lock().unwrap();
-        let has_active_tasks = self.task_manager.list().iter().any(|t| matches!(t.status, crate::task_manager::TaskStatus::Running));
+        let has_active_tasks = self
+            .task_manager
+            .list()
+            .iter()
+            .any(|t| matches!(t.status, crate::task_manager::TaskStatus::Running));
         let has_active_tools = !self.action_start_times.is_empty();
         if is_gen || has_active_tasks || has_active_tools {
             self.total_active_compute_secs += elapsed_secs;
@@ -3093,7 +3401,9 @@ impl App {
                     panel.chip_rect = Some(r);
                 }
                 // Live-update body while write still streaming or when tag closes
-                if panel.kind == ToolPanelKind::Write && (panel.body.len() < chip.body.len() || panel.tag_closed != chip.tag_closed) {
+                if panel.kind == ToolPanelKind::Write
+                    && (panel.body.len() < chip.body.len() || panel.tag_closed != chip.tag_closed)
+                {
                     panel.set_body_streaming(chip.body.clone(), chip.tag_closed);
                 }
                 if panel.kind == ToolPanelKind::Cmd && !chip.body.is_empty() {
@@ -3150,7 +3460,10 @@ impl App {
                     }
                 }
 
-                if current_stream.contains("<think>") && !current_stream.contains("</think>") && self.thought_start_time.is_none() {
+                if current_stream.contains("<think>")
+                    && !current_stream.contains("</think>")
+                    && self.thought_start_time.is_none()
+                {
                     self.thought_start_time = Some(Instant::now());
                 }
 
@@ -3161,11 +3474,17 @@ impl App {
                         let dur = start.elapsed().as_secs().max(1);
                         self.thought_durations.insert(m_idx, dur);
                     }
-                    if !self.manually_toggled_thoughts.contains(&m_idx) && !self.collapsed_thoughts.contains(&m_idx) {
+                    if !self.manually_toggled_thoughts.contains(&m_idx)
+                        && !self.collapsed_thoughts.contains(&m_idx)
+                    {
                         self.collapsed_thoughts.insert(m_idx);
                         let anim_id = (m_idx as u32) | 0x4000_0000;
                         if !self.krama.is_id("collapse", anim_id) {
-                            self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+                            self.krama.insert_new_id(
+                                "collapse",
+                                anim_id,
+                                TRES16Bits::from_millis(250),
+                            );
                         }
                         self.krama.restart_progress("collapse", anim_id);
                     }
@@ -3177,7 +3496,8 @@ impl App {
                 // ── Furious AlwaysAllow: execute complete writes the instant their
                 //    closing tag arrives, without interrupting the AI stream. ──────
                 let perms = crate::agent::get_tool_permissions();
-                let auto_ok = matches!(perms.mode, PermissionMode::AlwaysAllow) || perms.session_allow;
+                let auto_ok =
+                    matches!(perms.mode, PermissionMode::AlwaysAllow) || perms.session_allow;
                 if auto_ok {
                     let raw = crate::agent::AgentEngine::extract_proposed_actions(&current_stream);
                     for action in raw {
@@ -3192,10 +3512,19 @@ impl App {
                         self.streamed_writes_done.push(action.target.clone());
 
                         // Record +/- stats into context so AI knows what changed next turn
-                        let added: usize = write_result.lines().filter(|l| l.starts_with("+ ")).count();
-                        let removed: usize = write_result.lines().filter(|l| l.starts_with("- ")).count();
-                        let file_name = action.target.split('/').last().unwrap_or(&action.target).trim_matches('"').to_string();
-                        let compact_diff: String = write_result.lines()
+                        let added: usize =
+                            write_result.lines().filter(|l| l.starts_with("+ ")).count();
+                        let removed: usize =
+                            write_result.lines().filter(|l| l.starts_with("- ")).count();
+                        let file_name = action
+                            .target
+                            .split('/')
+                            .last()
+                            .unwrap_or(&action.target)
+                            .trim_matches('"')
+                            .to_string();
+                        let compact_diff: String = write_result
+                            .lines()
                             .filter(|l| l.starts_with("+ ") || l.starts_with("- "))
                             .take(40)
                             .collect::<Vec<_>>()
@@ -3203,9 +3532,16 @@ impl App {
                         let context_entry = if write_result.trim() == "No changes." {
                             format!("[write: {}] No changes (file identical).", file_name)
                         } else if compact_diff.is_empty() {
-                            format!("[write: {}] Wrote {} lines.", file_name, write_result.lines().count())
+                            format!(
+                                "[write: {}] Wrote {} lines.",
+                                file_name,
+                                write_result.lines().count()
+                            )
                         } else {
-                            format!("[write: {}] +{} lines / -{} lines.\nChanges:\n{}", file_name, added, removed, compact_diff)
+                            format!(
+                                "[write: {}] +{} lines / -{} lines.\nChanges:\n{}",
+                                file_name, added, removed, compact_diff
+                            )
                         };
                         self.tool_result_context.push(context_entry);
                         if self.tool_result_context.len() > 8 {
@@ -3256,7 +3592,8 @@ impl App {
                 }
                 if let Some(err) = err_opt {
                     self.streamed_writes_done.clear();
-                    let recovered = crate::agent::AgentEngine::extract_proposed_actions(&current_stream);
+                    let recovered =
+                        crate::agent::AgentEngine::extract_proposed_actions(&current_stream);
                     if !recovered.is_empty() {
                         let count = recovered.len();
                         self.messages.push(format!(
@@ -3310,7 +3647,10 @@ impl App {
                     let perms = get_tool_permissions();
                     let auto_ok =
                         matches!(perms.mode, PermissionMode::AlwaysAllow) || perms.session_allow;
-                    let need_accept = !auto_ok && proposed.iter().any(|a| a.kind == crate::agent::ProposedKind::Write);
+                    let need_accept = !auto_ok
+                        && proposed
+                            .iter()
+                            .any(|a| a.kind == crate::agent::ProposedKind::Write);
 
                     // read/ls/memory/writes only — cmds never block here
                     let mut effective_stream = current_stream.clone();
@@ -3372,9 +3712,16 @@ impl App {
                                 self.spawn_cmds_to_task_manager(vec![a.clone()]);
                             }
                             crate::agent::ProposedKind::Agent => {
-                                let role = crate::agent::AgentEngine::extract_attribute(&a.target, "role").unwrap_or_default();
-                                let to = crate::agent::AgentEngine::extract_attribute(&a.target, "to").unwrap_or_default();
-                                let model = crate::agent::AgentEngine::extract_attribute(&a.target, "model").unwrap_or_default();
+                                let role =
+                                    crate::agent::AgentEngine::extract_attribute(&a.target, "role")
+                                        .unwrap_or_default();
+                                let to =
+                                    crate::agent::AgentEngine::extract_attribute(&a.target, "to")
+                                        .unwrap_or_default();
+                                let model = crate::agent::AgentEngine::extract_attribute(
+                                    &a.target, "model",
+                                )
+                                .unwrap_or_default();
                                 let sub_backend = self.backend.with_model(&model, &self.manager);
                                 let instruction = a.body.clone();
                                 let agent_id = self.task_manager.spawn_agent(
@@ -3385,10 +3732,16 @@ impl App {
                                     instruction,
                                     0,
                                 );
-                                let model_label = if model.is_empty() { String::new() } else { format!(" [model={model}]") };
-                                if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
-                                    c.kind == ToolPanelKind::Cmd && c.target == a.target
-                                }) {
+                                let model_label = if model.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" [model={model}]")
+                                };
+                                if let Some(chip) =
+                                    self.tool_chips.iter_mut().rev().find(|c| {
+                                        c.kind == ToolPanelKind::Cmd && c.target == a.target
+                                    })
+                                {
                                     chip.pending = false;
                                     chip.tag_closed = true;
                                     chip.body = format!("[Agent Task #{agent_id} ({role}{model_label}) spawning]\n(waiting for reply…)");
@@ -3398,9 +3751,12 @@ impl App {
                             | crate::agent::ProposedKind::Skill
                             | crate::agent::ProposedKind::WebSearch => {
                                 let result = crate::agent::AgentEngine::execute_proposed(a);
-                                if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
-                                    c.target == a.target
-                                }) {
+                                if let Some(chip) = self
+                                    .tool_chips
+                                    .iter_mut()
+                                    .rev()
+                                    .find(|c| c.target == a.target)
+                                {
                                     chip.pending = false;
                                     chip.tag_closed = true;
                                     chip.body = result.clone();
@@ -3474,7 +3830,8 @@ impl App {
                     } else if need_accept {
                         // "Ask" permission mode — auto-execute writes immediately for
                         // continuous operation. Ctrl+C is the user's stop signal.
-                        let tool_out = crate::agent::AgentEngine::process_response(&effective_stream);
+                        let tool_out =
+                            crate::agent::AgentEngine::process_response(&effective_stream);
                         for a in &proposed {
                             if a.kind == crate::agent::ProposedKind::Write {
                                 let path = crate::agent::AgentEngine::expand_path(&a.target);
@@ -3484,9 +3841,15 @@ impl App {
                                 let _ = std::fs::write(&path, &a.body);
                                 let anchor = self.latest_agent_msg_idx();
                                 let kind = tool_panel::ToolPanelKind::Write;
-                                let target_str = tool_panel::normalize_target(kind, &path.display().to_string());
+                                let target_str =
+                                    tool_panel::normalize_target(kind, &path.display().to_string());
                                 let chip_exists = self.tool_chips.iter().any(|c| {
-                                    c.kind == kind && tool_panel::same_tool_target(c.kind, &c.target, &target_str)
+                                    c.kind == kind
+                                        && tool_panel::same_tool_target(
+                                            c.kind,
+                                            &c.target,
+                                            &target_str,
+                                        )
                                 });
                                 if !chip_exists {
                                     let id = self.next_chip_id;
@@ -3497,7 +3860,8 @@ impl App {
                                         target: target_str,
                                         body: a.body.clone(),
                                         tag_closed: true,
-                                        pending: false, spawned: false,
+                                        pending: false,
+                                        spawned: false,
                                         rect: None,
                                         anchor_msg: anchor,
                                         expanded: false,
@@ -3674,14 +4038,21 @@ impl App {
 
             if let Some(path) = self.manager.latest_gguf_path() {
                 self.backend = AgentBackend::LlamaCppLib(LlamaCppLibBackend::gguf(path.clone()));
-                self.manager.set_active_gguf_path(path.display().to_string());
+                self.manager
+                    .set_active_gguf_path(path.display().to_string());
                 // Try to get actual model context limit after backend init
                 if let AgentBackend::LlamaCppLib(ref b) = self.backend {
                     if let Some(limit) = b.actual_context_limit() {
                         self.model_context_limit = Some(limit);
                     }
                 }
-                if let Some(entry) = self.manager.list_installed_entries().into_iter().rev().next() {
+                if let Some(entry) = self
+                    .manager
+                    .list_installed_entries()
+                    .into_iter()
+                    .rev()
+                    .next()
+                {
                     if !entry.name.is_empty() {
                         self.status_message = format!("Active Engine: {}", entry.name);
                     } else {
@@ -3811,7 +4182,9 @@ impl App {
             if self.krama.is_reversed("input_slide", 0) {
                 self.krama.reverse_animate("input_slide", 0);
             }
-            let t = self.krama.from_range_generic("input_slide", 0, 1.0..=target_input_h);
+            let t = self
+                .krama
+                .from_range_generic("input_slide", 0, 1.0..=target_input_h);
             if self.krama.is_animating("input_slide", 0) {
                 self.input_anim_height = t;
             } else {
@@ -3821,7 +4194,9 @@ impl App {
             if !self.krama.is_reversed("input_slide", 0) {
                 self.krama.reverse_animate("input_slide", 0);
             }
-            let t = self.krama.from_range_generic("input_slide", 0, 1.0..=target_input_h);
+            let t = self
+                .krama
+                .from_range_generic("input_slide", 0, 1.0..=target_input_h);
             self.input_anim_height = t;
             if !self.krama.is_animating("input_slide", 0) {
                 self.input_anim_height = 1.0;
@@ -3831,7 +4206,8 @@ impl App {
         let is_generating_val = *self.is_generating.lock().unwrap();
         let is_downloading = self.download_progress.lock().unwrap().is_some();
         let is_krama_animating = self.krama.is_any_animation_inprogress();
-        let is_menu_animating = self.show_menu && (self.menu_anim_progress < 1.0 || self.menu_closing);
+        let is_menu_animating =
+            self.show_menu && (self.menu_anim_progress < 1.0 || self.menu_closing);
         let is_header_animating = (self.header_dropdown_open && self.header_anim_progress < 1.0)
             || (!self.header_dropdown_open && self.header_anim_progress > 0.0);
 
@@ -3912,7 +4288,10 @@ impl App {
                     MouseEventKind::Down(MouseButton::Left) => {
                         // Check container close button " x " hit
                         if let Some((close_y, close_x0, close_x1)) = self.container_close_hit {
-                            if mouse.row == close_y && mouse.column >= close_x0 && mouse.column <= close_x1 {
+                            if mouse.row == close_y
+                                && mouse.column >= close_x0
+                                && mouse.column <= close_x1
+                            {
                                 self.menu_closing = true;
                                 self.clear_selection();
                                 self.exit_term_interactive();
@@ -3954,7 +4333,10 @@ impl App {
 
                         // Check click on Model Name badge to toggle input prompt focus
                         if let Some((badge_y, badge_x0, badge_x1)) = self.model_badge_hit {
-                            if mouse.row == badge_y && mouse.column >= badge_x0 && mouse.column <= badge_x1 {
+                            if mouse.row == badge_y
+                                && mouse.column >= badge_x0
+                                && mouse.column <= badge_x1
+                            {
                                 self.input_focused = !self.input_focused;
                                 if !self.input_focused {
                                     self.input_scroll_y = 0;
@@ -3975,7 +4357,10 @@ impl App {
                         // Check interactive code block Copy button first
                         let mut copy_action: Option<(usize, String)> = None;
                         for hit in &self.code_block_copy_hits {
-                            if mouse.row as i32 == hit.screen_y && mouse.column >= hit.copy_x.0 && mouse.column <= hit.copy_x.1 {
+                            if mouse.row as i32 == hit.screen_y
+                                && mouse.column >= hit.copy_x.0
+                                && mouse.column <= hit.copy_x.1
+                            {
                                 copy_action = Some((hit.block_idx, hit.code_body.clone()));
                                 break;
                             }
@@ -3984,12 +4369,24 @@ impl App {
                             let ok = crate::clipboard::copy_text_silent(&code_body);
                             let n = code_body.lines().count().max(1);
                             self.status_message = if ok {
-                                format!("Copied code block #{} ({} lines) → clipboard", b_idx + 1, n)
+                                format!(
+                                    "Copied code block #{} ({} lines) → clipboard",
+                                    b_idx + 1,
+                                    n
+                                )
                             } else {
-                                format!("Saved code block #{} to {}", b_idx + 1, crate::clipboard::clipboard_file_path())
+                                format!(
+                                    "Saved code block #{} to {}",
+                                    b_idx + 1,
+                                    crate::clipboard::clipboard_file_path()
+                                )
                             };
                             if let Ok(mut l) = self.activity_logs.lock() {
-                                l.push(format!("[CLIPBOARD] Code block #{} ({} lines)", b_idx + 1, n));
+                                l.push(format!(
+                                    "[CLIPBOARD] Code block #{} ({} lines)",
+                                    b_idx + 1,
+                                    n
+                                ));
                             }
                             self.clear_selection();
                             self.exit_term_interactive();
@@ -4001,16 +4398,29 @@ impl App {
                         let mut scroll_action: Option<(usize, usize)> = None;
                         for hit in &self.code_block_scroll_hits {
                             if mouse.row as i32 == hit.screen_y {
-                                let cur = self.code_block_scrolls.get(&hit.block_idx).copied().unwrap_or(0);
-                                if mouse.column >= hit.left_btn_x.0 && mouse.column <= hit.left_btn_x.1 {
+                                let cur = self
+                                    .code_block_scrolls
+                                    .get(&hit.block_idx)
+                                    .copied()
+                                    .unwrap_or(0);
+                                if mouse.column >= hit.left_btn_x.0
+                                    && mouse.column <= hit.left_btn_x.1
+                                {
                                     scroll_action = Some((hit.block_idx, cur.saturating_sub(8)));
                                     break;
-                                } else if mouse.column >= hit.right_btn_x.0 && mouse.column <= hit.right_btn_x.1 {
-                                    scroll_action = Some((hit.block_idx, (cur + 8).min(hit.max_scroll)));
+                                } else if mouse.column >= hit.right_btn_x.0
+                                    && mouse.column <= hit.right_btn_x.1
+                                {
+                                    scroll_action =
+                                        Some((hit.block_idx, (cur + 8).min(hit.max_scroll)));
                                     break;
-                                } else if mouse.column >= hit.track_x.0 && mouse.column <= hit.track_x.1 {
-                                    let track_w = (hit.track_x.1.saturating_sub(hit.track_x.0)).max(1) as f32;
-                                    let click_offset = (mouse.column.saturating_sub(hit.track_x.0)) as f32;
+                                } else if mouse.column >= hit.track_x.0
+                                    && mouse.column <= hit.track_x.1
+                                {
+                                    let track_w =
+                                        (hit.track_x.1.saturating_sub(hit.track_x.0)).max(1) as f32;
+                                    let click_offset =
+                                        (mouse.column.saturating_sub(hit.track_x.0)) as f32;
                                     let pct = (click_offset / track_w).clamp(0.0, 1.0);
                                     let target_sc = (pct * hit.max_scroll as f32).round() as usize;
                                     scroll_action = Some((hit.block_idx, target_sc));
@@ -4030,10 +4440,13 @@ impl App {
                         let mut toggle_action: Option<(usize, bool)> = None;
                         for hit in &self.code_block_hits {
                             if mouse.row as i32 == hit.screen_y {
-                                if mouse.column >= hit.normal_x.0 && mouse.column <= hit.normal_x.1 {
+                                if mouse.column >= hit.normal_x.0 && mouse.column <= hit.normal_x.1
+                                {
                                     toggle_action = Some((hit.block_idx, false));
                                     break;
-                                } else if mouse.column >= hit.preview_x.0 && mouse.column <= hit.preview_x.1 {
+                                } else if mouse.column >= hit.preview_x.0
+                                    && mouse.column <= hit.preview_x.1
+                                {
                                     toggle_action = Some((hit.block_idx, true));
                                     break;
                                 }
@@ -4042,18 +4455,28 @@ impl App {
                         if let Some((b_idx, is_preview)) = toggle_action {
                             if is_preview {
                                 self.code_block_previews.insert(b_idx);
-                                self.status_message = format!("Code block #{} set to Preview mode", b_idx + 1);
+                                self.status_message =
+                                    format!("Code block #{} set to Preview mode", b_idx + 1);
                             } else {
                                 self.code_block_previews.remove(&b_idx);
-                                self.status_message = format!("Code block #{} set to Normal mode", b_idx + 1);
+                                self.status_message =
+                                    format!("Code block #{} set to Normal mode", b_idx + 1);
                             }
-                            self.code_block_anims.insert(b_idx, (is_preview, std::time::Instant::now()));
+                            self.code_block_anims
+                                .insert(b_idx, (is_preview, std::time::Instant::now()));
                             self.clear_selection();
                             self.exit_term_interactive();
                             self.input_focused = false;
-                        } else if let Some(hit_kind) = self.section_label_hits.iter().find(|hit| {
-                            mouse.row as i32 == hit.screen_y && mouse.column >= hit.x0 && mouse.column <= hit.x1
-                        }).map(|h| h.kind) {
+                        } else if let Some(hit_kind) = self
+                            .section_label_hits
+                            .iter()
+                            .find(|hit| {
+                                mouse.row as i32 == hit.screen_y
+                                    && mouse.column >= hit.x0
+                                    && mouse.column <= hit.x1
+                            })
+                            .map(|h| h.kind)
+                        {
                             self.clear_selection();
                             self.exit_term_interactive();
                             self.is_selecting = false;
@@ -4061,27 +4484,41 @@ impl App {
                             self.selection_end = None;
 
                             match hit_kind {
-                                SectionKind::You(idx) | SectionKind::Agent(idx) | SectionKind::System(idx) => {
+                                SectionKind::You(idx)
+                                | SectionKind::Agent(idx)
+                                | SectionKind::System(idx) => {
                                     let is_collapsed = self.collapsed_messages.contains(&idx);
                                     let anim_id = idx as u32;
 
                                     if is_collapsed {
                                         self.collapsed_messages.remove(&idx);
                                         if !self.krama.is_id("collapse", anim_id) {
-                                            self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+                                            self.krama.insert_new_id(
+                                                "collapse",
+                                                anim_id,
+                                                TRES16Bits::from_millis(250),
+                                            );
                                         }
                                         self.krama.reverse_start("collapse", anim_id);
                                     } else {
                                         self.collapsed_messages.insert(idx);
                                         if !self.krama.is_id("collapse", anim_id) {
-                                            self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+                                            self.krama.insert_new_id(
+                                                "collapse",
+                                                anim_id,
+                                                TRES16Bits::from_millis(250),
+                                            );
                                         }
                                         self.krama.restart_progress("collapse", anim_id);
                                     }
                                     self.status_message = format!(
                                         "Section #{}: {}",
                                         idx + 1,
-                                        if !is_collapsed { "Collapsed" } else { "Expanded" }
+                                        if !is_collapsed {
+                                            "Collapsed"
+                                        } else {
+                                            "Expanded"
+                                        }
                                     );
                                 }
                                 SectionKind::Thought(idx) => {
@@ -4092,13 +4529,21 @@ impl App {
                                     if is_col {
                                         self.collapsed_thoughts.remove(&idx);
                                         if !self.krama.is_id("collapse", anim_id) {
-                                            self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+                                            self.krama.insert_new_id(
+                                                "collapse",
+                                                anim_id,
+                                                TRES16Bits::from_millis(250),
+                                            );
                                         }
                                         self.krama.reverse_start("collapse", anim_id);
                                     } else {
                                         self.collapsed_thoughts.insert(idx);
                                         if !self.krama.is_id("collapse", anim_id) {
-                                            self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+                                            self.krama.insert_new_id(
+                                                "collapse",
+                                                anim_id,
+                                                TRES16Bits::from_millis(250),
+                                            );
                                         }
                                         self.krama.restart_progress("collapse", anim_id);
                                     }
@@ -4108,13 +4553,19 @@ impl App {
                                     );
                                 }
                                 SectionKind::Action(chip_id) => {
-                                    if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
+                                    if let Some(chip) =
+                                        self.tool_chips.iter_mut().find(|c| c.id == chip_id)
+                                    {
                                         chip.tag_closed = true;
                                         chip.expanded = !chip.expanded;
                                         let anim_id = (chip.id as u32) | 0x8000_0000;
 
                                         if !self.krama.is_id("collapse", anim_id) {
-                                            self.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+                                            self.krama.insert_new_id(
+                                                "collapse",
+                                                anim_id,
+                                                TRES16Bits::from_millis(250),
+                                            );
                                         }
                                         if chip.expanded {
                                             self.krama.reverse_start("collapse", anim_id);
@@ -4123,7 +4574,11 @@ impl App {
                                         }
                                         self.status_message = format!(
                                             "Action: {}",
-                                            if chip.expanded { "Expanded" } else { "Collapsed" }
+                                            if chip.expanded {
+                                                "Expanded"
+                                            } else {
+                                                "Collapsed"
+                                            }
                                         );
                                     }
                                 }
@@ -4255,7 +4710,11 @@ impl App {
                 },
 
                 Event::Paste(text) => {
-                    if self.show_menu && self.menu_section == 3 && self.settings_tab == SETTINGS_TAB_NAMES.len() - 1 && self.hf_token_editing {
+                    if self.show_menu
+                        && self.menu_section == 3
+                        && self.settings_tab == SETTINGS_HF_TOKEN
+                        && self.hf_token_editing
+                    {
                         self.hf_token_input.push_str(text.trim());
                     } else if self.input_focused && !self.show_menu {
                         self.input_insert_text(&text);
@@ -4280,1489 +4739,15 @@ impl App {
                         false
                     };
 
+                    // v0.0.3 guarded the whole key handler with this flag; the
+                    // handle_key() extraction must preserve it, otherwise key
+                    // Release/Repeat events re-enter the handler and toggle
+                    // menu sections (F6 opens then instantly closes).
                     if !skip_key {
-                        // TERM interactive: keys go to term input (not main prompt)
-                        if self.term_is_interactive()
-                            && !key.modifiers.contains(KeyModifiers::CONTROL)
-                            && self.pending_actions.is_empty()
-                            && !self.show_menu
-                        {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    self.exit_term_interactive();
-                                }
-                                KeyCode::Enter => {
-                                    let line = std::mem::take(&mut self.term_input);
-                                    self.term_run_line(&line);
-                                }
-                                KeyCode::Backspace => {
-                                    self.term_input.pop();
-                                }
-                                KeyCode::PageUp => {
-                                    if let Some(ref mut p) = self.tool_panel {
-                                        p.scroll_by(-8);
-                                    }
-                                }
-                                KeyCode::PageDown => {
-                                    if let Some(ref mut p) = self.tool_panel {
-                                        p.scroll_by(8);
-                                    }
-                                }
-                                KeyCode::Up => {
-                                    if let Some(ref mut p) = self.tool_panel {
-                                        p.scroll_by(-1);
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    if let Some(ref mut p) = self.tool_panel {
-                                        p.scroll_by(1);
-                                    }
-                                }
-                                KeyCode::Char(c) => {
-                                    self.term_input.push(c);
-                                }
-                                _ => {}
-                            }
-                            // skip rest of key handling (TERM owns keyboard)
-                        } else if self.tool_panel.is_some()
-                            && !self.input_focused
-                            && !self.show_menu
-                            && matches!(
-                                key.code,
-                                KeyCode::PageUp | KeyCode::PageDown | KeyCode::Up | KeyCode::Down
-                            )
-                            && !key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            // Scroll WRITE/TERM panel without entering interactive
-                            if let Some(ref mut p) = self.tool_panel {
-                                match key.code {
-                                    KeyCode::PageUp => p.scroll_by(-8),
-                                    KeyCode::PageDown => p.scroll_by(8),
-                                    KeyCode::Up => p.scroll_by(-1),
-                                    KeyCode::Down => p.scroll_by(1),
-                                    _ => {}
-                                }
-                            }
-                        } else if !self.pending_actions.is_empty()
-                            && !key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                                    self.accept_pending_actions();
-                                }
-                                KeyCode::Char('n') | KeyCode::Char('N') => {
-                                    self.reject_pending_actions();
-                                }
-                                KeyCode::Char('a') | KeyCode::Char('A') => {
-                                    set_permission_mode(PermissionMode::AlwaysAllow);
-                                    allow_session_tools();
-                                    self.accept_pending_actions();
-                                    self.status_message =
-                                    "Always allow + accepted. Writes/cmds auto-run this session."
-                                        .to_string();
-                                }
-                                _ => {}
-                            }
-                            // Don't also type Y into input / other handlers for these keys
-                            if matches!(
-                                key.code,
-                                KeyCode::Char('y')
-                                    | KeyCode::Char('Y')
-                                    | KeyCode::Char('n')
-                                    | KeyCode::Char('N')
-                                    | KeyCode::Char('a')
-                                    | KeyCode::Char('A')
-                                    | KeyCode::Enter
-                            ) {
-                                // fall through only for non-accept keys below — skip rest
-                            } else {
-                                // other keys while pending still work
-                            }
+                        if let Some(ret) = self.handle_key(key).await {
+                            return Ok(ret);
                         }
-
-                        let pending_consumed = !self.pending_actions.is_empty()
-                            && matches!(
-                                key.code,
-                                KeyCode::Char('y')
-                                    | KeyCode::Char('Y')
-                                    | KeyCode::Char('n')
-                                    | KeyCode::Char('N')
-                                    | KeyCode::Char('a')
-                                    | KeyCode::Char('A')
-                                    | KeyCode::Enter
-                            )
-                            && !key.modifiers.contains(KeyModifiers::CONTROL);
-
-                        // Pressing anything else while not Esc cancels hold
-                        if key.code != KeyCode::Esc {
-                            self.esc_hold_start = None;
-                        }
-
-                        // Ask Mode key handling (takes priority when active)
-                        if let Some(ref mut state) = self.ask_mode_state {
-                            match key.code {
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    state.move_focus_prev();
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    state.move_focus_next();
-                                }
-                                KeyCode::Enter | KeyCode::Char(' ') => {
-                                    state.toggle_focused();
-                                }
-                                KeyCode::Char('s') => {
-                                    // Submit
-                                    let response = state.submit();
-                                    self.ask_mode_state = None;
-                                    self.handle_ask_mode_response(response);
-                                    self.status_message = "Ask Mode: submitted, resuming…".to_string();
-                                }
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    // Cancel
-                                    state.cancel();
-                                    self.ask_mode_state = None;
-                                    self.status_message = "Ask Mode: cancelled".to_string();
-                                }
-                                KeyCode::Backspace => {
-                                    state.handle_input_backspace();
-                                }
-                                KeyCode::Char(c) => {
-                                    state.handle_input_char(c);
-                                }
-                                _ => {}
-                            }
-                        } else if pending_consumed {
-                            // already handled accept/reject
-                        } else {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    // Ctrl+Esc → exit immediately (no hold)
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                        self.esc_hold_start = None;
-                                        if let Ok(mut g) = self.is_generating.lock() {
-                                            *g = false;
-                                        }
-                                        crate::llama::libinfer::shutdown_warm_lib_engine();
-                                        self.should_quit = true;
-                                        self.status_message = "Exiting…".to_string();
-                                    } else if self.delete_confirm_model.is_some() {
-                                        self.delete_confirm_model = None;
-                                        self.esc_hold_start = None;
-                                    } else if self.show_menu {
-                                        if self.search_token_editing {
-                                            self.search_token_editing = false;
-                                            self.search_token_input.clear();
-                                            self.status_message = "Search token editing cancelled.".to_string();
-                                        } else if self.hf_token_editing {
-                                            self.hf_token_editing = false;
-                                            self.hf_token_input.clear();
-                                            self.status_message = "Token editing cancelled.".to_string();
-                                        } else if self.settings_col == 1 {
-                                            // Exit second column back to tab column
-                                            self.settings_col = 0;
-                                        } else {
-                                            self.menu_closing = true;
-                                        }
-                                        self.esc_hold_start = None;
-                                    } else if self.header_dropdown_open {
-                                        self.header_dropdown_open = false;
-                                        self.esc_hold_start = None;
-                                    } else {
-                                        // Start / continue hold-to-exit (1s)
-                                        if self.esc_hold_start.is_none() {
-                                            self.esc_hold_start = Some(std::time::Instant::now());
-                                            self.status_message =
-                                        "Hold Esc to exit… (release to cancel) | Ctrl+Esc = quit now"
-                                            .to_string();
-                                        }
-                                    }
-                                }
-                                KeyCode::F(1) => {
-                                    if self.show_menu && self.menu_section == 0 {
-                                        self.menu_closing = true;
-                                    } else {
-                                        self.menu_section = 0; // Help
-                                        self.show_menu = true;
-                                        self.menu_closing = false;
-                                        self.header_dropdown_open = false;
-                                        self.krama.restart_progress("menu_fade", 0);
-                                    }
-                                }
-                                KeyCode::F(2) => {
-                                    if self.show_menu && self.menu_section == 1 {
-                                        self.menu_closing = true;
-                                    } else {
-                                        self.menu_section = 1; // Registry
-                                        self.show_menu = true;
-                                        self.menu_closing = false;
-                                        self.header_dropdown_open = false;
-                                        self.krama.restart_progress("menu_fade", 0);
-                                        self.krama.restart_progress("list_fade", 0);
-                                        let q = self.registry_search_query.clone();
-                                        let manager_clone = self.manager.clone();
-                                        let search_results_clone = self.search_results.clone();
-                                        tokio::spawn(async move {
-                                            let query_str = if q.trim().is_empty() { "gguf" } else { &q };
-                                            let results = manager_clone.search_all_models(query_str).await;
-                                            *search_results_clone.lock().unwrap() = Some(results);
-                                        });
-                                    }
-                                }
-                                KeyCode::F(3) => {
-                                    if self.show_menu && self.menu_section == 2 {
-                                        self.menu_closing = true;
-                                    } else {
-                                        self.menu_section = 2; // Modal (Installed models)
-                                        self.show_menu = true;
-                                        self.menu_closing = false;
-                                        self.header_dropdown_open = false;
-                                        self.krama.restart_progress("menu_fade", 0);
-                                        self.installed_models = self.manager.list_installed_local();
-                                    }
-                                }
-                                KeyCode::F(4) => {
-                                    if self.show_menu && self.menu_section == 3 {
-                                        self.menu_closing = true;
-                                    } else {
-                                        self.menu_section = 3; // Settings
-                                        self.settings_col = 0;
-                                        self.show_menu = true;
-                                        self.menu_closing = false;
-                                        self.header_dropdown_open = false;
-                                        self.krama.restart_progress("menu_fade", 0);
-                                    }
-                                }
-                                KeyCode::F(5) => {
-                                    if self.show_menu && self.menu_section == 4 {
-                                        self.menu_closing = true;
-                                    } else {
-                                        self.menu_section = 4; // Session Info
-                                        self.show_menu = true;
-                                        self.menu_closing = false;
-                                        self.header_dropdown_open = false;
-                                        self.krama.restart_progress("menu_fade", 0);
-                                    }
-                                }
-                                KeyCode::Char('f') | KeyCode::Char('F')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    self.input_focused = !self.input_focused;
-                                    if self.input_focused {
-                                        self.krama.restart_progress("input_slide", 0);
-                                    } else {
-                                        self.krama.reverse_animate("input_slide", 0);
-                                    }
-                                }
-                                KeyCode::Char('m') | KeyCode::Char('M')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    self.header_dropdown_open = !self.header_dropdown_open;
-                                }
-                                KeyCode::Left if self.show_menu => {
-                                    if self.menu_section == 1 {
-                                        // Registry tab: toggle HF / Ollama
-                                        self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
-                                        self.registry_state.select(Some(0));
-                                    } else if self.menu_section == 3 {
-                                        if !self.hf_token_editing && !self.search_token_editing {
-                                            if self.settings_col == 1 {
-                                                self.adjust_setting_value(-1);
-                                            } else {
-                                                let num_tabs = SETTINGS_TAB_NAMES.len();
-                                                self.settings_tab = if self.settings_tab == 0 { num_tabs - 1 } else { self.settings_tab - 1 };
-                                            }
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('a') if self.show_menu && self.menu_section == 3 => {
-                                    if !self.hf_token_editing && !self.search_token_editing {
-                                        if self.settings_col == 1 {
-                                            self.adjust_setting_value(-1);
-                                        } else {
-                                            let num_tabs = SETTINGS_TAB_NAMES.len();
-                                            self.settings_tab = if self.settings_tab == 0 { num_tabs - 1 } else { self.settings_tab - 1 };
-                                        }
-                                    } else if self.search_token_editing {
-                                        self.search_token_input.push('a');
-                                    } else if self.hf_token_editing {
-                                        self.hf_token_input.push('a');
-                                    }
-                                }
-                                KeyCode::Right if self.show_menu => {
-                                    if self.menu_section == 1 {
-                                        // Registry tab: toggle HF / Ollama
-                                        self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
-                                        self.registry_state.select(Some(0));
-                                    } else if self.menu_section == 3 {
-                                        if !self.hf_token_editing && !self.search_token_editing {
-                                            if self.settings_col == 1 {
-                                                self.adjust_setting_value(1);
-                                            } else {
-                                                self.settings_tab = (self.settings_tab + 1) % SETTINGS_TAB_NAMES.len();
-                                            }
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('k') if self.show_menu && self.menu_section == 3 => {
-                                    if self.settings_tab == 8 && !self.search_token_editing {
-                                        let s = crate::settings::get_settings();
-                                        self.search_token_input = crate::settings::get_search_token(s.web_search_provider).unwrap_or_default();
-                                        self.search_token_editing = true;
-                                        self.status_message = format!("Type or paste key/URL for {}...", s.web_search_provider.label());
-                                    } else if self.settings_tab == 8 && self.search_token_editing {
-                                        self.search_token_input.push('k');
-                                    } else if self.settings_tab == 9 && self.hf_token_editing {
-                                        self.hf_token_input.push('k');
-                                    }
-                                }
-                                KeyCode::Char('d') if self.show_menu && self.menu_section == 3 => {
-                                    if !self.hf_token_editing && !self.search_token_editing {
-                                        if self.settings_col == 1 {
-                                            if self.settings_tab == 8 {
-                                                let s = crate::settings::get_settings();
-                                                crate::settings::clear_search_token(s.web_search_provider);
-                                                self.status_message = format!("Cleared key for provider {}", s.web_search_provider.label());
-                                            } else if self.settings_tab == 9 {
-                                                crate::settings::clear_hf_token();
-                                                self.status_message = "HuggingFace token removed.".to_string();
-                                            } else {
-                                                self.adjust_setting_value(1);
-                                            }
-                                        } else {
-                                            self.settings_tab = (self.settings_tab + 1) % SETTINGS_TAB_NAMES.len();
-                                        }
-                                    } else if self.search_token_editing {
-                                        self.search_token_input.push('d');
-                                    } else if self.hf_token_editing {
-                                        self.hf_token_input.push('d');
-                                    }
-                                }
-                                KeyCode::Left => {
-                                    if self.input_focused {
-                                        if key.modifiers.contains(KeyModifiers::ALT) {
-                                            self.input_cursor_position = self.cursor_word_left();
-                                        } else {
-                                            self.input_cursor_position =
-                                                self.input_cursor_position.saturating_sub(1);
-                                        }
-                                    } else {
-                                        self.table_scroll_x = self.table_scroll_x.saturating_sub(4);
-                                    }
-                                }
-                                KeyCode::Right => {
-                                    if self.input_focused {
-                                        if key.modifiers.contains(KeyModifiers::ALT) {
-                                            self.input_cursor_position = self.cursor_word_right();
-                                        } else {
-                                            self.input_cursor_position =
-                                                (self.input_cursor_position + 1)
-                                                    .min(self.input.chars().count());
-                                        }
-                                    } else {
-                                        self.table_scroll_x = self.table_scroll_x.saturating_add(4);
-                                    }
-                                }
-                                KeyCode::Home => {
-                                    if self.input_focused && !self.show_menu {
-                                        self.input_cursor_position = 0;
-                                    }
-                                }
-                                KeyCode::End => {
-                                    if self.input_focused && !self.show_menu {
-                                        self.input_cursor_position = self.input.chars().count();
-                                    }
-                                }
-                                KeyCode::Up if self.show_menu => {
-                                    if self.menu_section == 1 {
-                                        let total = self.filtered_registry_models().len();
-                                        let i = match self.registry_state.selected() {
-                                            Some(i) => if total == 0 { 0 } else if i == 0 { total.saturating_sub(1) } else { i - 1 },
-                                            None => 0,
-                                        };
-                                        self.registry_state.select(if total == 0 { None } else { Some(i) });
-                                    } else if self.menu_section == 2 {
-                                        let i = match self.installed_state.selected() {
-                                            Some(i) => if i == 0 { self.installed_models.len().saturating_sub(1) } else { i - 1 },
-                                            None => 0,
-                                        };
-                                        self.installed_state.select(Some(i));
-                                    } else if self.menu_section == 3 {
-                                        if !self.hf_token_editing && !self.search_token_editing {
-                                            if self.settings_col == 0 {
-                                                let num_tabs = SETTINGS_TAB_NAMES.len();
-                                                self.settings_tab = if self.settings_tab == 0 { num_tabs - 1 } else { self.settings_tab - 1 };
-                                            } else {
-                                                self.adjust_setting_value(-1);
-                                            }
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('w') if self.show_menu && self.menu_section != 1 => {
-                                    if self.menu_section == 2 {
-                                        let i = match self.installed_state.selected() {
-                                            Some(i) => if i == 0 { self.installed_models.len().saturating_sub(1) } else { i - 1 },
-                                            None => 0,
-                                        };
-                                        self.installed_state.select(Some(i));
-                                    } else if self.menu_section == 3 {
-                                        if !self.hf_token_editing && !self.search_token_editing {
-                                            if self.settings_col == 0 {
-                                                let num_tabs = SETTINGS_TAB_NAMES.len();
-                                                self.settings_tab = if self.settings_tab == 0 { num_tabs - 1 } else { self.settings_tab - 1 };
-                                            } else {
-                                                self.adjust_setting_value(-1);
-                                            }
-                                        } else if self.search_token_editing {
-                                            self.search_token_input.push('w');
-                                        } else {
-                                            self.hf_token_input.push('w');
-                                        }
-                                    }
-                                }
-                                KeyCode::Down if self.show_menu => {
-                                    if self.menu_section == 1 {
-                                        let total = self.filtered_registry_models().len();
-                                        let i = match self.registry_state.selected() {
-                                            Some(i) => if total == 0 { 0 } else if i >= total.saturating_sub(1) { 0 } else { i + 1 },
-                                            None => 0,
-                                        };
-                                        self.registry_state.select(if total == 0 { None } else { Some(i) });
-                                    } else if self.menu_section == 2 {
-                                        let i = match self.installed_state.selected() {
-                                            Some(i) => if i >= self.installed_models.len().saturating_sub(1) { 0 } else { i + 1 },
-                                            None => 0,
-                                        };
-                                        self.installed_state.select(Some(i));
-                                    } else if self.menu_section == 3 {
-                                        if !self.hf_token_editing && !self.search_token_editing {
-                                            if self.settings_col == 0 {
-                                                self.settings_tab = (self.settings_tab + 1) % SETTINGS_TAB_NAMES.len();
-                                            } else {
-                                                self.adjust_setting_value(1);
-                                            }
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('s') if self.show_menu && self.menu_section != 1 => {
-                                    if self.menu_section == 2 {
-                                        let i = match self.installed_state.selected() {
-                                            Some(i) => if i >= self.installed_models.len().saturating_sub(1) { 0 } else { i + 1 },
-                                            None => 0,
-                                        };
-                                        self.installed_state.select(Some(i));
-                                    } else if self.menu_section == 3 {
-                                        if !self.hf_token_editing && !self.search_token_editing {
-                                            if self.settings_col == 0 {
-                                                self.settings_tab = (self.settings_tab + 1) % SETTINGS_TAB_NAMES.len();
-                                            } else {
-                                                self.adjust_setting_value(1);
-                                            }
-                                        } else if self.search_token_editing {
-                                            self.search_token_input.push('s');
-                                        } else {
-                                            self.hf_token_input.push('s');
-                                        }
-                                    }
-                                }
-                                KeyCode::Up => {
-                                    if !self.show_menu && self.path_suggestion_active {
-                                        if self.path_suggestion_index == 0 {
-                                            self.path_suggestion_index = self.path_suggestions.len().saturating_sub(1);
-                                        } else {
-                                            self.path_suggestion_index -= 1;
-                                        }
-                                    } else if self.input_focused {
-                                        self.input_cursor_up(80);
-                                    } else {
-                                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                                        self.auto_scroll_enabled = false;
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    if !self.show_menu && self.path_suggestion_active {
-                                        self.path_suggestion_index = (self.path_suggestion_index + 1) % self.path_suggestions.len().max(1);
-                                    } else if self.input_focused {
-                                        self.input_cursor_down(80);
-                                    } else {
-                                        self.scroll_offset = self.scroll_offset.saturating_add(1);
-                                        self.auto_scroll_enabled = false;
-                                    }
-                                }
-                                KeyCode::PageUp if !self.input_focused => {
-                                    self.scroll_offset = self.scroll_offset.saturating_sub(5);
-                                }
-                                KeyCode::PageDown if !self.input_focused => {
-                                    self.scroll_offset = self.scroll_offset.saturating_add(5);
-                                }
-                                KeyCode::Char('c')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    // Selection wins: Ctrl+C copies shaded text
-                                    if self.selection_active() {
-                                        if !self.copy_selection_to_clipboard() {
-                                            self.status_message = "Nothing to copy".into();
-                                        }
-                                    } else {
-                                        // Interrupt generation + kill background tasks
-                                        let was_gen = *self.is_generating.lock().unwrap();
-                                        let n_tasks = self.task_manager.running_count();
-                                        if was_gen {
-                                            // Signal cancel first; do not race process_response / re-prompt.
-                                            self.user_cancelled_gen = true;
-                                            self.auto_tool_turns = 0;
-                                            *self.is_generating.lock().unwrap() = false;
-                                            {
-                                                let mut target =
-                                                    self.streaming_response.lock().unwrap();
-                                                if !target.starts_with("__HERCULES") {
-                                                    // Close an open thinking block so the
-                                                    // "Thinking" chip resolves instead of
-                                                    // staying stuck in its streaming state.
-                                                    if target.contains(" thinking")
-                                                        && !target.contains(" response")
-                                                    {
-                                                        target.push_str(" response\n");
-                                                    }
-                                                    target.push_str(
-                                                "\n[Generation Interrupted by User (CTRL+C)]",
-                                            );
-                                                }
-                                            }
-                                            self.gen_last_progress = None;
-                                        }
-                                        if n_tasks > 0 {
-                                            self.task_manager.kill_all();
-                                            self.messages.push(format!(
-                                        "System: [CTRL+C] killed {n_tasks} background task(s)"
-                                    ));
-                                        }
-                                        self.auto_tool_turns = 0;
-                                        if was_gen || n_tasks > 0 {
-                                            self.status_message = format!(
-                                                "Interrupted (CTRL+C) — gen={} tasks_killed={}",
-                                                was_gen, n_tasks
-                                            );
-                                            if let Ok(mut l) = self.activity_logs.lock() {
-                                                l.push(format!(
-                                                    "[CANCEL] CTRL+C gen={was_gen} tasks={n_tasks}"
-                                                ));
-                                            }
-                                        } else {
-                                            self.input.clear();
-                                            self.input_cursor_position = 0;
-                                            self.status_message = "Input cleared.".to_string();
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('t') | KeyCode::Char('T')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    self.pending_staggered_anims.clear();
-                                    self.last_stagger_release = std::time::Instant::now()
-                                        .checked_sub(Duration::from_millis(20))
-                                        .unwrap_or_else(std::time::Instant::now);
-
-                                    // Collapse only messages and thoughts that were NOT already collapsed
-                                    for i in 0..self.messages.len() {
-                                        let m_id = i as u32;
-                                        if !self.collapsed_messages.contains(&i) {
-                                            self.collapsed_messages.insert(i);
-                                            self.pending_staggered_anims.push_back((m_id, false));
-                                        }
-                                        let t_id = (i as u32) | 0x4000_0000;
-                                        if !self.collapsed_thoughts.contains(&i) {
-                                            self.collapsed_thoughts.insert(i);
-                                            self.pending_staggered_anims.push_back((t_id, false));
-                                        }
-                                    }
-
-                                    // Collapse and close action chips that were open
-                                    for chip in &mut self.tool_chips {
-                                        if chip.expanded || !chip.tag_closed {
-                                            chip.expanded = false;
-                                            chip.tag_closed = true;
-                                            let c_id = (chip.id as u32) | 0x8000_0000;
-                                            self.pending_staggered_anims.push_back((c_id, false));
-                                        }
-                                    }
-
-                                    self.status_message = "Collapsed all sections (Ctrl+T)".to_string();
-                                }
-                                KeyCode::Char('o') | KeyCode::Char('O')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    self.pending_staggered_anims.clear();
-                                    self.last_stagger_release = std::time::Instant::now()
-                                        .checked_sub(Duration::from_millis(20))
-                                        .unwrap_or_else(std::time::Instant::now);
-
-                                    // Expand all messages in history
-                                    for &i in &self.collapsed_messages {
-                                        let m_id = i as u32;
-                                        self.pending_staggered_anims.push_back((m_id, true));
-                                    }
-                                    self.collapsed_messages.clear();
-
-                                    // Expand all thoughts in history
-                                    for &i in &self.collapsed_thoughts {
-                                        let t_id = (i as u32) | 0x4000_0000;
-                                        self.pending_staggered_anims.push_back((t_id, true));
-                                    }
-                                    self.collapsed_thoughts.clear();
-
-                                    // Expand action chips that were closed/collapsed
-                                    for chip in &mut self.tool_chips {
-                                        if !chip.expanded {
-                                            chip.expanded = true;
-                                            let c_id = (chip.id as u32) | 0x8000_0000;
-                                            self.pending_staggered_anims.push_back((c_id, true));
-                                        }
-                                    }
-
-                                    self.status_message = "Opened all sections (Ctrl+O)".to_string();
-                                }
-                                // Panel chrome only when input unfocused (mouse is primary open)
-                                KeyCode::Char('x') | KeyCode::Char('X')
-                                    if self.tool_panel.is_some()
-                                        && !self.input_focused
-                                        && !self.show_menu
-                                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    self.close_tool_panel();
-                                }
-                                // Runtime menu: +/- adjust ctx / repeat threshold
-                                KeyCode::Char('+')
-                                | KeyCode::Char('=')
-                                | KeyCode::Char('-')
-                                | KeyCode::Char('_')
-                                    if self.show_menu
-                                        && self.menu_section == 3
-                                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    let inc =
-                                        matches!(key.code, KeyCode::Char('+') | KeyCode::Char('='));
-                                    self.runtime_nudge_selected(if inc { 1 } else { -1 });
-                                }
-                                KeyCode::Char('-') | KeyCode::Char('_')
-                                    if self.tool_panel.is_some()
-                                        && !self.input_focused
-                                        && !self.show_menu
-                                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    self.toggle_minimize_tool_panel();
-                                }
-
-                                KeyCode::Backspace | KeyCode::Char('h')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                                        || key.modifiers.contains(KeyModifiers::ALT) =>
-                                {
-                                    // Ctrl+Backspace or Alt+Backspace: delete previous word
-                                    if self.input_focused && !self.show_menu {
-                                        self.delete_word_backward();
-                                    }
-                                }
-                                KeyCode::Tab if !self.show_menu && self.path_suggestion_active => {
-                                    self.accept_path_suggestion();
-                                }
-                                KeyCode::Char('v') | KeyCode::Char('V')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    // 1. Check if clipboard has raw image bytes
-                                    if let Some((img_bytes, ext)) = crate::clipboard::read_clipboard_image_bytes() {
-                                        self.attach_image_bytes(&img_bytes, ext);
-                                    } else if let Some(text) = crate::clipboard::read_clipboard_silent() {
-                                        let trimmed = text.trim();
-                                        // Check if pasted text is a local file path
-                                        let path = std::path::Path::new(trimmed);
-                                        if path.exists() && path.is_file() {
-                                            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-                                            let mtype = crate::media::MediaType::from_extension(ext);
-                                            if mtype != crate::media::MediaType::Other {
-                                                self.attach_file_path(path);
-                                                let tag = format!("[{} {}: {}]", mtype.label(), self.next_attachment_id - 1, path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
-                                                self.input_insert_text(&format!(" {tag} "));
-                                            } else {
-                                                self.input_insert_text(&text);
-                                            }
-                                        } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 9 && self.hf_token_editing {
-                                            self.hf_token_input.push_str(trimmed);
-                                        } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 8 && self.search_token_editing {
-                                            self.search_token_input.push_str(trimmed);
-                                        } else if self.input_focused && !self.show_menu {
-                                            self.input_insert_text(&text);
-                                            self.update_path_autocomplete();
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('z') | KeyCode::Char('Z')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                                        && !key.modifiers.contains(KeyModifiers::SHIFT) =>
-                                {
-                                    if self.input_focused && !self.show_menu {
-                                        self.input_undo_apply();
-                                    }
-                                }
-                                KeyCode::Char('y') | KeyCode::Char('Y')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                                        && self.delete_confirm_model.is_none() =>
-                                {
-                                    if self.input_focused && !self.show_menu {
-                                        self.input_redo_apply();
-                                    }
-                                }
-                                KeyCode::Char('z') | KeyCode::Char('Z')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
-                                {
-                                    if self.input_focused && !self.show_menu {
-                                        self.input_redo_apply();
-                                    }
-                                }
-                                KeyCode::Char('y') | KeyCode::Char('Y')
-                                    if self.delete_confirm_model.is_some() =>
-                                {
-                                    if let Some(target) = self.delete_confirm_model.take() {
-                                        if target.contains("Local GGUF:")
-                                            || target.contains(".gguf")
-                                        {
-                                            if let Err(e) = self.manager.delete_local_model(&target)
-                                            {
-                                                if let Ok(mut l) = self.activity_logs.lock() {
-                                                    l.push(format!("[DELETE ERROR] {}", e));
-                                                }
-                                            } else if let Ok(mut l) = self.activity_logs.lock() {
-                                                l.push(format!(
-                                            "[DELETE] Removed from models.toml and disk: {}",
-                                            target
-                                        ));
-                                            }
-                                        }
-                                        self.installed_models.retain(|m| m != &target);
-                                        self.status_message =
-                                            format!("Model '{}' deleted successfully.", target);
-                                        if let Ok(mut l) = self.activity_logs.lock() {
-                                            l.push(format!(
-                                                "[DELETE] User confirmed deletion of model '{}'",
-                                                target
-                                            ));
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('n') | KeyCode::Char('N')
-                                    if self.delete_confirm_model.is_some() =>
-                                {
-                                    self.delete_confirm_model = None;
-                                }
-                                // Ctrl+J = newline (classic terminal multiline)
-                                KeyCode::Char('j') | KeyCode::Char('J')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                                        && self.input_focused
-                                        && !self.show_menu =>
-                                {
-                                    self.input_insert_char('\n');
-                                }
-                                KeyCode::Char(c) => {
-                                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                                        && !key.modifiers.contains(KeyModifiers::ALT)
-                                    {
-                                        if self.show_menu && self.menu_section == 1 {
-                                            self.registry_search_query.push(c);
-                                            let query = self.registry_search_query.clone();
-                                            let manager = self.manager.clone();
-                                            let results = self.search_results.clone();
-                                            tokio::spawn(async move {
-                                                let matches =
-                                                    manager.search_all_models(&query).await;
-                                                *results.lock().unwrap() = Some(matches);
-                                            });
-                                        } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 8 && self.search_token_editing {
-                                            if c != '\n' && c != '\r' {
-                                                self.search_token_input.push(c);
-                                            }
-                                        } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 9 && self.hf_token_editing {
-                                            if c != '\n' && c != '\r' {
-                                                self.hf_token_input.push(c);
-                                            }
-                                        } else if self.input_focused && !self.show_menu {
-                                            // Paste / typed text may include newlines
-                                            if c == '\n' || c == '\r' {
-                                                self.input_insert_char('\n');
-                                            } else {
-                                                self.input_insert_char(c);
-                                            }
-                                            self.update_path_autocomplete();
-                                        }
-                                    }
-                                }
-                                KeyCode::Backspace => {
-                                    if key.modifiers.contains(KeyModifiers::ALT)
-                                        || key.modifiers.contains(KeyModifiers::CONTROL)
-                                    {
-                                        // handled above for word-delete
-                                    } else if self.show_menu && self.menu_section == 1 {
-                                        self.registry_search_query.pop();
-                                        let query = self.registry_search_query.clone();
-                                        let manager = self.manager.clone();
-                                        let results = self.search_results.clone();
-                                        tokio::spawn(async move {
-                                            let matches = manager.search_all_models(&query).await;
-                                            *results.lock().unwrap() = Some(matches);
-                                        });
-                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 8 && self.search_token_editing {
-                                        self.search_token_input.pop();
-                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 9 && self.hf_token_editing {
-                                        self.hf_token_input.pop();
-                                    } else if self.input_focused && !self.show_menu {
-                                        if self.input_cursor_position > 0 && !self.input.is_empty()
-                                        {
-                                            self.push_input_undo();
-                                            let pos = self
-                                                .input_cursor_position
-                                                .min(self.input.chars().count());
-                                            let mut chars: Vec<char> = self.input.chars().collect();
-                                            chars.remove(pos - 1);
-                                            self.input = chars.into_iter().collect();
-                                            self.input_cursor_position -= 1;
-                                            self.update_path_autocomplete();
-                                        }
-                                    }
-                                }
-                                KeyCode::Delete => {
-                                    if self.show_menu && self.menu_section == 1 {
-                                        if let Some(idx) = self.installed_state.selected() {
-                                            if idx < self.installed_models.len() {
-                                                self.delete_confirm_model =
-                                                    Some(self.installed_models[idx].clone());
-                                            }
-                                        }
-                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 8 {
-                                        if self.search_token_editing {
-                                            self.search_token_input.clear();
-                                        } else {
-                                            let s = crate::settings::get_settings();
-                                            crate::settings::clear_search_token(s.web_search_provider);
-                                            self.status_message = format!("Cleared key for provider {}", s.web_search_provider.label());
-                                        }
-                                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 9 {
-                                        if self.hf_token_editing {
-                                            self.hf_token_input.clear();
-                                        } else {
-                                            crate::settings::clear_hf_token();
-                                            self.status_message = "HuggingFace token removed.".to_string();
-                                        }
-                                    } else if self.input_focused && !self.show_menu {
-                                        let len = self.input.chars().count();
-                                        if self.input_cursor_position < len {
-                                            self.push_input_undo();
-                                            let mut chars: Vec<char> = self.input.chars().collect();
-                                            chars.remove(self.input_cursor_position);
-                                            self.input = chars.into_iter().collect();
-                                        }
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    // Multiline: Shift+Enter / Alt+Enter → newline
-                                    // Plain Enter → send · Ctrl+Enter → force send / interrupt
-                                    // Ctrl+J also inserts newline (handled separately)
-                                    let want_newline = self.input_focused
-                                        && !self.show_menu
-                                        && (key.modifiers.contains(KeyModifiers::SHIFT)
-                                            || key.modifiers.contains(KeyModifiers::ALT));
-
-                                    if want_newline {
-                                        self.input_insert_char('\n');
-                                    } else if !self.show_menu && self.path_suggestion_active {
-                                        self.accept_path_suggestion();
-                                    } else if self.show_menu {
-                                        if self.menu_section == 0 {
-                                            // Help tab: Enter closes menu
-                                            self.menu_closing = true;
-                                        } else if self.menu_section == 1 {
-                                            // Registry tab: download selected model
-                                            let filtered_models = self.filtered_registry_models();
-                                            if let Some(i) = self.registry_state.selected() {
-                                                if i < filtered_models.len() {
-                                                    let item_str = filtered_models[i].clone();
-                                                    if item_str.starts_with("Ollama:")
-                                                        || item_str.starts_with("Ollama Local:")
-                                                    {
-                                                        let ollama_name = item_str
-                                                            .replace("Ollama:", "")
-                                                            .replace("Ollama Local:", "")
-                                                            .split('(')
-                                                            .next()
-                                                            .unwrap_or(&item_str)
-                                                            .split('[')
-                                                            .next()
-                                                            .unwrap_or(&item_str)
-                                                            .trim()
-                                                            .to_string();
-
-                                                        self.status_message = format!(
-                                                            "Pulling Ollama Model {}",
-                                                            ollama_name
-                                                        );
-                                                        self.messages.push(format!(
-                                                            "System: Pulling Ollama Model: {}",
-                                                            ollama_name
-                                                        ));
-                                                        if let Ok(mut l) = self.activity_logs.lock()
-                                                        {
-                                                            l.push(format!("[OLLAMA] Initiated pull stream for model: {}", ollama_name));
-                                                        }
-
-                                                        *self.download_progress.lock().unwrap() = Some(0.0);
-                                                        let progress_clone =
-                                                            self.download_progress.clone();
-                                                        let complete_clone =
-                                                            self.download_complete.clone();
-                                                        let logs_clone = self.activity_logs.clone();
-                                                        let manager_clone = self.manager.clone();
-
-                                                        tokio::spawn(async move {
-                                                            let res = manager_clone
-                                                                .download_ollama_model(
-                                                                    &ollama_name,
-                                                                    progress_clone,
-                                                                    logs_clone,
-                                                                )
-                                                                .await;
-                                                            if res.is_ok() {
-                                                                *complete_clone.lock().unwrap() =
-                                                                    true;
-                                                            } else {
-                                                                *complete_clone.lock().unwrap() =
-                                                                    false;
-                                                            }
-                                                        });
-                                                    } else {
-                                                        let repo_id = {
-                                                            let s = item_str
-                                                                .replace("HuggingFace:", "")
-                                                                .trim()
-                                                                .to_string();
-                                                            let s = s
-                                                                .split('[')
-                                                                .next()
-                                                                .unwrap_or(&s)
-                                                                .trim();
-                                                            s.split_whitespace()
-                                                                .next()
-                                                                .unwrap_or(s)
-                                                                .to_string()
-                                                        };
-
-                                                        self.status_message = format!(
-                                                            "Resolving weights for {}",
-                                                            repo_id
-                                                        );
-                                                        self.messages.push(format!("System: Resolving model weights and initiating download for: {}", repo_id));
-                                                        if let Ok(mut l) = self.activity_logs.lock()
-                                                        {
-                                                            l.push(format!("[USER] Initiated download for HuggingFace model: {}", repo_id));
-                                                        }
-
-                                                        *self.download_progress.lock().unwrap() = Some(0.0);
-                                                        let progress_clone =
-                                                            self.download_progress.clone();
-                                                        let complete_clone =
-                                                            self.download_complete.clone();
-                                                        let logs_clone = self.activity_logs.clone();
-                                                        let manager_clone = self.manager.clone();
-
-                                                        tokio::spawn(async move {
-                                                            let resolved = manager_clone
-                                                                .resolve_gguf_file(&repo_id)
-                                                                .await;
-                                                            match resolved {
-                                                                Ok((
-                                                                    dl_repo,
-                                                                    weight_filename,
-                                                                    shard_files,
-                                                                )) => {
-                                                                    let progress_for_dl =
-                                                                        progress_clone.clone();
-                                                                    let res = manager_clone
-                                                                        .download_hf_model(
-                                                                            &dl_repo,
-                                                                            &weight_filename,
-                                                                            &shard_files,
-                                                                            progress_for_dl,
-                                                                            logs_clone.clone(),
-                                                                        )
-                                                                        .await;
-                                                                    match res {
-                                                                        Ok(path) => {
-                                                                            if let Ok(mut l) =
-                                                                                logs_clone.lock()
-                                                                            {
-                                                                                l.push(format!(
-                                                                            "[SUCCESS] Installed GGUF at {}",
-                                                                            path.display()
-                                                                        ));
-                                                                            }
-                                                                            *complete_clone
-                                                                                .lock()
-                                                                                .unwrap() = true;
-                                                                        }
-                                                                        Err(e) => {
-                                                                            if let Ok(mut l) =
-                                                                                logs_clone.lock()
-                                                                            {
-                                                                                l.push(format!(
-                                                                                    "[ERROR] {}",
-                                                                                    e
-                                                                                ));
-                                                                            }
-                                                                            *complete_clone
-                                                                                .lock()
-                                                                                .unwrap() = false;
-                                                                            *progress_clone
-                                                                                .lock()
-                                                                                .unwrap() = None;
-                                                                        }
-                                                                    }
-                                                                }
-                                                                Err(e) => {
-                                                                    if let Ok(mut l) =
-                                                                        logs_clone.lock()
-                                                                    {
-                                                                        l.push(format!(
-                                                                            "[RESOLVE ERROR] {}",
-                                                                            e
-                                                                        ));
-                                                                    }
-                                                                    *complete_clone
-                                                                        .lock()
-                                                                        .unwrap() = false;
-                                                                    *progress_clone
-                                                                        .lock()
-                                                                        .unwrap() = None;
-                                                                }
-                                                            }
-                                                        });
-                                                    }
-                                                    self.menu_closing = true;
-                                                }
-                                            }
-                                        } else if self.menu_section == 2 {
-                                            // Modal (Installed models) tab: activate model
-                                            if let Some(i) = self.installed_state.selected() {
-                                                if i < self.installed_models.len() {
-                                                    let selected_model =
-                                                        self.installed_models[i].clone();
-                                                    if selected_model.contains("Ollama") {
-                                                        let model_name = selected_model
-                                                            .replace("Local Installed:", "")
-                                                            .replace("Ollama:", "")
-                                                            .replace("Ollama Local:", "")
-                                                            .split('(')
-                                                            .next()
-                                                            .unwrap_or("llama3.2")
-                                                            .trim()
-                                                            .to_string();
-                                                        self.backend = AgentBackend::Ollama(
-                                                            OllamaBackend::new(model_name.clone()),
-                                                        );
-                                                        self.status_message = format!(
-                                                            "Active Engine: Ollama ({})",
-                                                            model_name
-                                                        );
-                                                    } else if selected_model.contains("Local GGUF:")
-                                                        || selected_model
-                                                            .to_lowercase()
-                                                            .contains(".gguf")
-                                                        || selected_model.contains("GGUF")
-                                                    {
-                                                        let path =
-                                                            selected_model
-                                                                .rfind('[')
-                                                                .and_then(|i| {
-                                                                    let rest =
-                                                                        &selected_model[i + 1..];
-                                                                    rest.strip_suffix(']')
-                                                                        .map(|s| s.to_string())
-                                                                })
-                                                                .map(std::path::PathBuf::from)
-                                                                .filter(|p| p.exists())
-                                                                .or_else(|| {
-                                                                    self.manager
-                                                            .list_installed_entries()
-                                                            .into_iter()
-                                                            .find(|e| {
-                                                                selected_model.contains(&e.name)
-                                                                    || selected_model
-                                                                        .contains(&e.path)
-                                                            })
-                                                            .map(|e| {
-                                                                std::path::PathBuf::from(e.path)
-                                                            })
-                                                            .filter(|p| p.exists())
-                                                                });
-
-                                                        if let Some(path) = path {
-                                                            self.backend = AgentBackend::LlamaCppLib(
-                                                                LlamaCppLibBackend::gguf(path.clone()),
-                                                            );
-                                                            self.manager.set_active_gguf_path(path.display().to_string());
-                                                            if let AgentBackend::LlamaCppLib(ref b) = self.backend {
-                                                                if let Some(limit) = b.actual_context_limit() {
-                                                                    self.model_context_limit = Some(limit);
-                                                                }
-                                                            }
-                                                            self.status_message = format!(
-                                                                "Active Engine: llama.cpp lib ({})",
-                                                                path.display()
-                                                            );
-                                                        }
-                                                    } else if let Some(path) =
-                                                        self.manager.latest_gguf_path()
-                                                    {
-                                                        self.backend = AgentBackend::LlamaCppLib(
-                                                            LlamaCppLibBackend::gguf(path.clone()),
-                                                        );
-                                                        self.manager.set_active_gguf_path(path.display().to_string());
-                                                        if let AgentBackend::LlamaCppLib(ref b) = self.backend {
-                                                            if let Some(limit) = b.actual_context_limit() {
-                                                                self.model_context_limit = Some(limit);
-                                                            }
-                                                        }
-                                                        self.status_message = format!(
-                                                            "Active Engine: llama.cpp lib ({})",
-                                                            path.display()
-                                                        );
-                                                    }
-                                                    self.messages.push(format!("System: Switched active engine model to '{}'", selected_model));
-                                                    self.initialized = false;
-                                                    self.init_triggered = false;
-                                                    self.menu_closing = true;
-                                                }
-                                            }
-                                        } else if self.menu_section == 3 {
-                                            // Settings tab (2-column)
-                                            if self.settings_tab == 8 {
-                                                let s = crate::settings::get_settings();
-                                                let provider_needs_token = matches!(
-                                                    s.web_search_provider,
-                                                    crate::settings::WebSearchProvider::Google
-                                                        | crate::settings::WebSearchProvider::Brave
-                                                        | crate::settings::WebSearchProvider::Tavily
-                                                        | crate::settings::WebSearchProvider::Searxng
-                                                );
-                                                if self.search_token_editing {
-                                                    // Save search token
-                                                    let tok = self.search_token_input.trim().to_string();
-                                                    crate::settings::set_search_token(s.web_search_provider, tok.clone());
-                                                    self.search_token_editing = false;
-                                                    self.search_token_input.clear();
-                                                    self.status_message = format!("Saved token for provider {}", s.web_search_provider.label());
-                                                } else if provider_needs_token {
-                                                    // Enter starts editing if token required
-                                                    self.search_token_input = crate::settings::get_search_token(s.web_search_provider).unwrap_or_default();
-                                                    self.search_token_editing = true;
-                                                    self.status_message = format!("Type or paste key/URL for {}...", s.web_search_provider.label());
-                                                } else if self.settings_col == 0 {
-                                                    self.settings_col = 1;
-                                                } else {
-                                                    self.adjust_setting_value(1);
-                                                }
-                                            } else if self.settings_tab == 9 {
-                                                if self.hf_token_editing {
-                                                    // Save token
-                                                    let tok = self.hf_token_input.trim().to_string();
-                                                    if tok.is_empty() {
-                                                        crate::settings::clear_hf_token();
-                                                        self.status_message = "HuggingFace token cleared.".to_string();
-                                                    } else {
-                                                        crate::settings::set_hf_token(tok);
-                                                        self.status_message = "HuggingFace token saved successfully.".to_string();
-                                                    }
-                                                    self.hf_token_editing = false;
-                                                    self.hf_token_input.clear();
-                                                } else if self.settings_col == 0 {
-                                                    self.settings_col = 1;
-                                                } else {
-                                                    // Enter editing mode
-                                                    self.hf_token_input = crate::settings::get_hf_token().unwrap_or_default();
-                                                    self.hf_token_editing = true;
-                                                    self.status_message = "Type or paste HuggingFace token...".to_string();
-                                                }
-                                            } else if self.settings_col == 0 {
-                                                self.settings_col = 1; // shift focus to Column 2
-                                            } else {
-                                                self.adjust_setting_value(1); // cycle / modify
-                                            }
-                                        } else if self.menu_section == 4 {
-                                            if let Some(i) = self.perms_state.selected() {
-                                                match i {
-                                                    0 => {
-                                                        set_permission_mode(PermissionMode::Ask);
-                                                        self.status_message =
-                                                    "Permissions: Ask user to allow (writes/cmd blocked until /allow)"
-                                                        .to_string();
-                                                    }
-                                                    1 => {
-                                                        set_permission_mode(
-                                                            PermissionMode::AlwaysAllow,
-                                                        );
-                                                        self.status_message =
-                                                    "Permissions: Always allow tool writes & commands"
-                                                        .to_string();
-                                                    }
-                                                    2 => {
-                                                        set_folder_scope(FolderScope::CurrentDir);
-                                                        self.status_message =
-                                                            "Safefolder: current directory only"
-                                                                .to_string();
-                                                    }
-                                                    _ => {
-                                                        set_folder_scope(FolderScope::AllDirs);
-                                                        self.status_message =
-                                                            "Safefolder: all directories allowed"
-                                                                .to_string();
-                                                    }
-                                                }
-                                                let p = get_tool_permissions();
-                                                self.messages.push(format!(
-                                                    "System: Permissions → {} | {}",
-                                                    p.mode_label(),
-                                                    p.scope_label()
-                                                ));
-                                                if let Ok(mut l) = self.activity_logs.lock() {
-                                                    l.push(format!(
-                                                        "[PERMS] mode={} scope={}",
-                                                        p.mode_label(),
-                                                        p.scope_label()
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    } else if self.input_focused && !self.input.trim().is_empty() {
-                                        let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                        if *self.is_generating.lock().unwrap() {
-                                            if is_ctrl {
-                                                // CTRL + Enter forces prompt submission and interrupts ongoing generation
-                                                *self.is_generating.lock().unwrap() = false;
-                                                if let Some(last) = self.messages.last_mut() {
-                                                    if last.starts_with("Agent: ") {
-                                                        last.push_str("\n[Interrupted by User]");
-                                                    }
-                                                }
-                                            } else {
-                                                self.status_message = "Generating... Shift+Enter=newline · CTRL+Enter=interrupt & send".to_string();
-                                                return Ok(true);
-                                            }
-                                        }
-
-                                        let prompt = self.input.clone();
-                                        self.input.clear();
-                                        self.input_cursor_position = 0;
-                                        self.typewriter_len = 0;
-                                        self.auto_scroll_enabled = true;
-                                        self.auto_tool_turns = 0;
-                                        self.recent_tool_calls.clear();
-                                        self.tool_result_context.clear();
-
-                                        let backend = self.backend.name();
-                                        if let Ok(mut l) = self.activity_logs.lock() {
-                                            l.push(format!(
-                                                "[PROMPT] Processing: \"{}\" via {}",
-                                                prompt, backend
-                                            ));
-                                        }
-
-                                        if prompt.starts_with('/') {
-                                            self.messages.push(format!("You: {}", prompt));
-                                            let parts: Vec<&str> =
-                                                prompt.split_whitespace().collect();
-                                            match parts[0] {
-                                                "/help" => {
-                                                    self.messages.push(
-                                                        "System: Press F1 for shortcut overlay.\n\
-/allow   — grant write/cmd for this session (Ask mode)\n\
-/swarm   — initialize swarm orchestrator mode and spawn sub-agents\n\
-/compact — compress chat → memory, forget old turns\n\
-/cancel-download — clear stuck HF download lock so you can install another model\n\
-/download-status — show active download lock\n\
-/copy /theme /save /load — utilities"
-                                                            .to_string(),
-                                                    );
-                                                }
-                                                "/allow" => {
-                                                    allow_session_tools();
-                                                    self.messages.push(
-                                                "System: Session tool permission granted (write/cmd allowed until restart)."
-                                                    .to_string(),
-                                            );
-                                                }
-                                                "/swarm" => {
-                                                    let instruction = if parts.len() > 1 {
-                                                        prompt[7..].trim()
-                                                    } else {
-                                                        "accomplish this task"
-                                                    };
-                                                    let models = self.available_swarm_models();
-                                                    let models_str = if models.is_empty() {
-                                                        "Default active model".to_string()
-                                                    } else {
-                                                        models.join(", ")
-                                                    };
-                                                    let backend_type = match &self.backend {
-                                                        AgentBackend::Ollama(_) => "Ollama repository",
-                                                        AgentBackend::LlamaCppLib(_) => "llama.cpp / local GGUF repository",
-                                                        #[cfg(feature = "gpu")]
-                                                        AgentBackend::BurnWgpu(_) => "WGPU repository",
-                                                    };
-                                                    self.status_message = "Swarm Orchestrator active — delegating to sub-agents...".to_string();
-                                                    self.messages.push(
-                                                        format!("System: [Swarm Orchestrator initialized] Available models: [{models_str}]")
-                                                    );
-                                                    // Trigger agent generation with the swarm orchestration prompt in memory context
-                                                    self.tool_result_context.push(format!(
-                                                        "[System Orchestration]\nYou are the Swarm Orchestrator (H0). You can spawn specialized sub-agents with custom models using `<agent action=\"spawn\" role=\"ROLE\" model=\"MODEL\">task description</agent>`.\nAvailable models for your current {backend_type}: [{models_str}]\nTask: {}\nDo not write full code directly. Delegate tasks to specialized sub-agents.",
-                                                        instruction
-                                                    ));
-                                                    self.trigger_generation_from_context();
-                                                }
-                                                "/compact" | "/compact!" | "/gc" => {
-                                                    let before =
-                                                        self.estimate_full_session_tokens();
-                                                    let msgs = self.messages.len();
-                                                    self.compact_context_to_memory(true);
-                                                    self.messages.push(format!(
-                                                "System: [OK] /compact done — was ~{} tokens / {} messages → \
-                                                 ~{} tokens now. Summary in memory. Type a new question.",
-                                                before,
-                                                msgs,
-                                                self.context_tokens_est
-                                            ));
-                                                }
-                                                "/tasks" => {
-                                                    let list = self.task_manager.list();
-                                                    if list.is_empty() {
-                                                        self.messages.push(
-                                                    "System: Task manager empty — no background jobs."
-                                                        .into(),
-                                                );
-                                                    } else {
-                                                        let mut lines = vec![
-                                                            "System: Task manager:".to_string(),
-                                                        ];
-                                                        for t in list {
-                                                            let age = t.started.elapsed().as_secs();
-                                                            lines.push(format!(
-                                                                "  #{} [{:?}] {age}s  `{}`",
-                                                                t.id, t.status, t.cmd
-                                                            ));
-                                                        }
-                                                        lines.push(
-                                                            "  Ctrl+C kills all running tasks."
-                                                                .into(),
-                                                        );
-                                                        self.messages.push(lines.join("\n"));
-                                                    }
-                                                }
-                                                "/cancel-download" | "/cancel_download"
-                                                | "/cdl" => {
-                                                    let msg = self.manager.cancel_download();
-                                                    self.messages.push(format!("System: {msg}"));
-                                                    self.status_message = msg;
-                                                    if let Ok(mut l) = self.activity_logs.lock() {
-                                                        l.push("[DOWNLOAD] cancel-download".into());
-                                                    }
-                                                    // Clear stuck progress UI
-                                                    *self.download_progress.lock().unwrap() = None;
-                                                    *self.download_complete.lock().unwrap() = false;
-                                                }
-                                                "/download-status" | "/dlstatus" => {
-                                                    let s = self.manager.download_status();
-                                                    self.messages.push(format!("System: {s}"));
-                                                    self.status_message = s;
-                                                }
-                                                "/copy" => {
-                                                    let full_chat = self.messages.join("\n\n");
-                                                    let ok = crate::clipboard::copy_text_silent(
-                                                        &full_chat,
-                                                    );
-                                                    let _ = std::fs::write(
-                                                        "/tmp/hercules_chat_export.txt",
-                                                        &full_chat,
-                                                    );
-                                                    self.messages.push(format!(
-                                                "System: Chat exported to /tmp/hercules_chat_export.txt{}",
-                                                if ok { " (+ clipboard)" } else { "" }
-                                            ));
-                                                }
-                                                "/theme" => {
-                                                    if parts.len() > 1 {
-                                                        match parts[1] {
-                                                            "blue" => {
-                                                                self.theme_color =
-                                                                    Color::Rgb(0, 150, 255)
-                                                            }
-                                                            "red" => {
-                                                                self.theme_color =
-                                                                    Color::Rgb(255, 50, 50)
-                                                            }
-                                                            "green" | _ => {
-                                                                self.theme_color =
-                                                                    Color::Rgb(0, 255, 128)
-                                                            }
-                                                        }
-                                                        self.messages.push(format!(
-                                                            "System: Theme changed to {}",
-                                                            parts[1]
-                                                        ));
-                                                    }
-                                                }
-                                                "/save" => {
-                                                    if parts.len() > 1 {
-                                                        let _ = std::fs::write(
-                                                            parts[1],
-                                                            self.messages.join("\n"),
-                                                        );
-                                                        self.messages.push(format!(
-                                                            "System: Session saved to {}",
-                                                            parts[1]
-                                                        ));
-                                                    }
-                                                }
-                                                "/load" => {
-                                                    if parts.len() > 1 {
-                                                        if let Ok(data) =
-                                                            std::fs::read_to_string(parts[1])
-                                                        {
-                                                            self.messages = data
-                                                                .split('\n')
-                                                                .map(|s| s.to_string())
-                                                                .collect();
-                                                            self.messages.push(format!(
-                                                                "System: Session loaded from {}",
-                                                                parts[1]
-                                                            ));
-                                                        } else {
-                                                            self.messages.push(
-                                                                "System: Failed to load session"
-                                                                    .to_string(),
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                _ => self.messages.push(format!(
-                                                    "System: Unknown command '{}'",
-                                                    parts[0]
-                                                )),
-                                            }
-                                        } else {
-                                            self.messages.push(format!("You: {}", prompt));
-                                            self.trigger_generation_from_context();
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        } // end if !pending_consumed
-                    } // end if !skip_key
+                    }
                 }
                 _ => {}
             }
@@ -5788,7 +4773,9 @@ impl App {
         let is_gen = *self.is_generating.lock().unwrap();
         let is_thinking = if is_gen {
             let s = self.streaming_response.lock().unwrap();
-            let thinking_now = (s.contains("<think>") || s.contains(" thinking")) && !s.contains("</think>") && !s.contains(" response");
+            let thinking_now = (s.contains("<think>") || s.contains(" thinking"))
+                && !s.contains("</think>")
+                && !s.contains(" response");
             if thinking_now && self.thought_start_time.is_none() {
                 self.thought_start_time = Some(Instant::now());
             } else if !thinking_now {
@@ -5820,7 +4807,11 @@ impl App {
 
         let input_box_h = (self.input_anim_height.round() as u16).clamp(1, 7);
 
-        let top_header_h = if self.header_anim_progress > 0.5 { 2 } else { 1 };
+        let top_header_h = if self.header_anim_progress > 0.5 {
+            2
+        } else {
+            1
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(
@@ -5852,7 +4843,8 @@ impl App {
 
         let progress_val = *self.download_progress.lock().unwrap();
         let active_download_lock = if progress_val.is_some() {
-            crate::manager::DownloadLock::load().filter(|l| l.status == crate::manager::DownloadStatus::InProgress)
+            crate::manager::DownloadLock::load()
+                .filter(|l| l.status == crate::manager::DownloadStatus::InProgress)
         } else {
             None
         };
@@ -5863,7 +4855,8 @@ impl App {
             if let Some(total) = lock.bytes_total {
                 if total > 0 {
                     let total_str = crate::manager::format_byte_size(total);
-                    let pct = ((lock.bytes_downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0);
+                    let pct =
+                        ((lock.bytes_downloaded as f64 / total as f64) * 100.0).clamp(0.0, 100.0);
                     format!("{}/{} ({:.0}%)", downloaded_str, total_str, pct)
                 } else {
                     downloaded_str
@@ -5874,16 +4867,19 @@ impl App {
             } else {
                 downloaded_str
             }
-} else {
-                let ctx_label = crate::settings::format_context_tokens(ctx_limit);
-                let ctx_str = format!("CTX {:.0}% {}", ctx_pct, ctx_label);
-                if self.model_context_limit.is_some() && self.model_context_limit.unwrap() != requested_ctx {
-                    let actual_label = crate::settings::format_context_tokens(self.model_context_limit.unwrap());
-                    format!("{} (model: {})", ctx_str, actual_label)
-                } else {
-                    ctx_str
-                }
-            };
+        } else {
+            let ctx_label = crate::settings::format_context_tokens(ctx_limit);
+            let ctx_str = format!("CTX {:.0}% {}", ctx_pct, ctx_label);
+            if self.model_context_limit.is_some()
+                && self.model_context_limit.unwrap() != requested_ctx
+            {
+                let actual_label =
+                    crate::settings::format_context_tokens(self.model_context_limit.unwrap());
+                format!("{} (model: {})", ctx_str, actual_label)
+            } else {
+                ctx_str
+            }
+        };
         let right_trans = "🭧🭓";
         let right_len = 2 + right_ctx_str.chars().count() + 2; // 🭧🭓 + " " + text + " "
 
@@ -5950,16 +4946,24 @@ impl App {
 
         let mut top_spans: Vec<Span> = Vec::new();
         let mut cur_top_col = 0;
-        let esc_hold_p = self.esc_hold_start.map(|s| (s.elapsed().as_secs_f32() / 1.0).clamp(0.0, 1.0));
+        let esc_hold_p = self
+            .esc_hold_start
+            .map(|s| (s.elapsed().as_secs_f32() / 1.0).clamp(0.0, 1.0));
 
         // 1. Left brand badge (colors matching the bar at col 0)
         let brand_bg = get_bar_color(0, full_top_w);
         let brand_fg = get_contrast_text_color(brand_bg);
         top_spans.push(Span::styled(
             brand_text.clone(),
-            Style::default().fg(brand_fg).bg(brand_bg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(brand_fg)
+                .bg(brand_bg)
+                .add_modifier(Modifier::BOLD),
         ));
-        top_spans.push(Span::styled(left_trans, Style::default().fg(brand_bg).bg(NORDIC_BG)));
+        top_spans.push(Span::styled(
+            left_trans,
+            Style::default().fg(brand_bg).bg(NORDIC_BG),
+        ));
         cur_top_col += left_brand_w;
 
         // 2. Middle bar: 🬂
@@ -5972,24 +4976,37 @@ impl App {
                     let r = (240.0 * (1.0 - norm) + 200.0 * norm) as u8;
                     let g = (60.0 * (1.0 - norm) + 40.0 * norm) as u8;
                     let b = (60.0 * (1.0 - norm) + 80.0 * norm) as u8;
-                    top_spans.push(Span::styled("🬂", Style::default().fg(Color::Rgb(r, g, b)).bg(NORDIC_BG)));
+                    top_spans.push(Span::styled(
+                        "🬂",
+                        Style::default().fg(Color::Rgb(r, g, b)).bg(NORDIC_BG),
+                    ));
                 } else {
-                    top_spans.push(Span::styled("🬂", Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG)));
+                    top_spans.push(Span::styled(
+                        "🬂",
+                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG),
+                    ));
                 }
                 cur_top_col += 1;
             }
         } else if let Some(dl_ratio) = progress_val {
             // While downloading model: base color gray (76, 86, 106) and fill cyan-to-blue left to right
-            let filled_count = ((dl_ratio.clamp(0.0, 1.0) * mid_bar_w as f64).round() as usize).min(mid_bar_w);
+            let filled_count =
+                ((dl_ratio.clamp(0.0, 1.0) * mid_bar_w as f64).round() as usize).min(mid_bar_w);
             for i in 0..mid_bar_w {
                 if i < filled_count {
                     let norm = i as f32 / mid_bar_w.max(1) as f32;
                     let r = (0.0 * (1.0 - norm) + 60.0 * norm) as u8;
                     let g = (220.0 * (1.0 - norm) + 140.0 * norm) as u8;
                     let b = (255.0 * (1.0 - norm) + 255.0 * norm) as u8;
-                    top_spans.push(Span::styled("🬂", Style::default().fg(Color::Rgb(r, g, b)).bg(NORDIC_BG)));
+                    top_spans.push(Span::styled(
+                        "🬂",
+                        Style::default().fg(Color::Rgb(r, g, b)).bg(NORDIC_BG),
+                    ));
                 } else {
-                    top_spans.push(Span::styled("🬂", Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG)));
+                    top_spans.push(Span::styled(
+                        "🬂",
+                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG),
+                    ));
                 }
                 cur_top_col += 1;
             }
@@ -6005,10 +5022,16 @@ impl App {
         // 3. Right CTX meter
         let ctx_bg = get_bar_color(cur_top_col, full_top_w);
         let ctx_fg = get_contrast_text_color(ctx_bg);
-        top_spans.push(Span::styled(right_trans, Style::default().fg(ctx_bg).bg(NORDIC_BG)));
+        top_spans.push(Span::styled(
+            right_trans,
+            Style::default().fg(ctx_bg).bg(NORDIC_BG),
+        ));
         top_spans.push(Span::styled(
             format!(" {} ", right_ctx_str),
-            Style::default().fg(ctx_fg).bg(ctx_bg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(ctx_fg)
+                .bg(ctx_bg)
+                .add_modifier(Modifier::BOLD),
         ));
 
         // When dropdown is open / sliding:
@@ -6025,6 +5048,8 @@ impl App {
                 (1, " Registry "),
                 (2, " Modal "),
                 (3, " Settings "),
+                (4, " Session "),
+                (5, " Code Graph "),
             ];
 
             menu_spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
@@ -6044,7 +5069,10 @@ impl App {
 
                 menu_spans.push(Span::styled(
                     label,
-                    Style::default().fg(tab_fg).bg(tab_bg).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(tab_fg)
+                        .bg(tab_bg)
+                        .add_modifier(Modifier::BOLD),
                 ));
                 col_ptr += label_len;
 
@@ -6067,7 +5095,11 @@ impl App {
         };
 
         // Render header bar at header_y
-        self.header_bar_hit = Some((header_y, top_area.x, top_area.x + top_area.width.saturating_sub(1)));
+        self.header_bar_hit = Some((
+            header_y,
+            top_area.x,
+            top_area.x + top_area.width.saturating_sub(1),
+        ));
         frame.render_widget(
             Paragraph::new(Line::from(top_spans)).style(Style::default().bg(NORDIC_BG)),
             Rect {
@@ -6110,7 +5142,8 @@ impl App {
         let mut section_headers: Vec<(usize, String, Color)> = Vec::new();
         let mut all_toggle_buttons: Vec<(usize, usize, u16, u16, u16, u16)> = Vec::new();
         let mut all_copy_buttons: Vec<(usize, usize, u16, u16, String)> = Vec::new();
-        let mut all_scroll_buttons: Vec<(usize, usize, u16, u16, u16, u16, u16, u16, usize)> = Vec::new();
+        let mut all_scroll_buttons: Vec<(usize, usize, u16, u16, u16, u16, u16, u16, usize)> =
+            Vec::new();
         let content_bg = Color::Rgb(34, 39, 48); // Shaded dark background for process output
 
         macro_rules! push_full_shaded {
@@ -6119,56 +5152,61 @@ impl App {
                 let cur_w = $cur_w;
                 let max_w = $max_w;
                 if cur_w < max_w {
-                    spans.push(Span::styled(" ".repeat(max_w.saturating_sub(cur_w)), Style::default().bg($bg)));
+                    spans.push(Span::styled(
+                        " ".repeat(max_w.saturating_sub(cur_w)),
+                        Style::default().bg($bg),
+                    ));
                 }
                 $lines.push(Line::from(spans));
             }};
         }
 
         // Buffer for consecutive collapsed section labels to line up horizontally
-        let mut collapsed_row_buf: Vec<(Span<'static>, usize, SectionKind, Color, String)> = Vec::new();
+        let mut collapsed_row_buf: Vec<(Span<'static>, usize, SectionKind, Color, String)> =
+            Vec::new();
 
-        let flush_collapsed_row = |lines: &mut Vec<Line>,
-                                   btn_list: &mut Vec<(usize, u16, u16, SectionKind)>,
-                                   headers: &mut Vec<(usize, String, Color)>,
-                                   buf: &mut Vec<(Span<'static>, usize, SectionKind, Color, String)>,
-                                   max_w: usize| {
-            if buf.is_empty() {
-                return;
-            }
-            let mut cur_line_spans: Vec<Span<'static>> = Vec::new();
-            let mut cur_line_w: usize = 0;
-            let mut cur_line_idx = lines.len();
+        let flush_collapsed_row =
+            |lines: &mut Vec<Line>,
+             btn_list: &mut Vec<(usize, u16, u16, SectionKind)>,
+             headers: &mut Vec<(usize, String, Color)>,
+             buf: &mut Vec<(Span<'static>, usize, SectionKind, Color, String)>,
+             max_w: usize| {
+                if buf.is_empty() {
+                    return;
+                }
+                let mut cur_line_spans: Vec<Span<'static>> = Vec::new();
+                let mut cur_line_w: usize = 0;
+                let mut cur_line_idx = lines.len();
 
-            for (span, badge_w, kind, color, label_str) in buf.drain(..) {
-                let needed_w = if cur_line_w > 0 { badge_w + 1 } else { badge_w };
-                if cur_line_w + needed_w > max_w && cur_line_w > 0 {
-                    // Flush current line
-                    push_full_shaded!(lines, cur_line_spans, cur_line_w, max_w, NORDIC_BG);
-                    cur_line_spans = Vec::new();
-                    cur_line_w = 0;
-                    cur_line_idx = lines.len();
+                for (span, badge_w, kind, color, label_str) in buf.drain(..) {
+                    let needed_w = if cur_line_w > 0 { badge_w + 1 } else { badge_w };
+                    if cur_line_w + needed_w > max_w && cur_line_w > 0 {
+                        // Flush current line
+                        push_full_shaded!(lines, cur_line_spans, cur_line_w, max_w, NORDIC_BG);
+                        cur_line_spans = Vec::new();
+                        cur_line_w = 0;
+                        cur_line_idx = lines.len();
+                    }
+
+                    if cur_line_w > 0 {
+                        cur_line_spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
+                        cur_line_w += 1;
+                    }
+
+                    let x_start = cur_line_w as u16;
+                    let x_end = (cur_line_w + badge_w) as u16;
+                    btn_list.push((cur_line_idx, x_start, x_end, kind));
+                    headers.push((cur_line_idx, label_str, color));
+
+                    cur_line_spans.push(span);
+                    cur_line_w += badge_w;
                 }
 
                 if cur_line_w > 0 {
-                    cur_line_spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
-                    cur_line_w += 1;
+                    push_full_shaded!(lines, cur_line_spans, cur_line_w, max_w, NORDIC_BG);
                 }
-
-                let x_start = cur_line_w as u16;
-                let x_end = (cur_line_w + badge_w) as u16;
-                btn_list.push((cur_line_idx, x_start, x_end, kind));
-                headers.push((cur_line_idx, label_str, color));
-
-                cur_line_spans.push(span);
-                cur_line_w += badge_w;
-            }
-
-            if cur_line_w > 0 {
-                push_full_shaded!(lines, cur_line_spans, cur_line_w, max_w, NORDIC_BG);
-            }
-            lines.push(Line::from(""));
-        };
+                lines.push(Line::from(""));
+            };
 
         let mut all_section_hits_unmapped: Vec<(usize, u16, u16, SectionKind)> = Vec::new();
 
@@ -6179,12 +5217,20 @@ impl App {
                 let user_bg = Color::Rgb(163, 190, 140); // Sage Green
                 let user_text = m.strip_prefix("You:").unwrap_or(&m[4..]).trim();
                 let is_collapsed = self.collapsed_messages.contains(&m_idx);
-                let badge_span = Span::styled(" You ", Style::default().fg(NORDIC_BG).bg(user_bg).add_modifier(Modifier::BOLD));
+                let badge_span = Span::styled(
+                    " You ",
+                    Style::default()
+                        .fg(NORDIC_BG)
+                        .bg(user_bg)
+                        .add_modifier(Modifier::BOLD),
+                );
                 let anim_id = m_idx as u32;
                 let is_anim = self.krama.is_animating("collapse", anim_id);
 
                 let raw_u = if is_anim {
-                    1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
+                    1.0 - self
+                        .krama
+                        .from_range_generic("collapse", anim_id, 0.0..=1.0)
                 } else if is_collapsed {
                     0.0
                 } else {
@@ -6202,16 +5248,34 @@ impl App {
 
                 if (is_collapsed && !is_anim) || (is_collapsed && visible_u_lines == 0) {
                     // Fully collapsed: buffer for horizontal row line up
-                    collapsed_row_buf.push((badge_span, 5, SectionKind::You(m_idx), user_bg, "You".to_string()));
+                    collapsed_row_buf.push((
+                        badge_span,
+                        5,
+                        SectionKind::You(m_idx),
+                        user_bg,
+                        "You".to_string(),
+                    ));
                 } else {
                     // Flushing any previously buffered collapsed row
-                    flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+                    flush_collapsed_row(
+                        &mut chat_lines,
+                        &mut all_section_hits_unmapped,
+                        &mut section_headers,
+                        &mut collapsed_row_buf,
+                        available_width,
+                    );
 
                     let title_line_idx = chat_lines.len();
                     all_section_hits_unmapped.push((title_line_idx, 0, 5, SectionKind::You(m_idx)));
                     section_headers.push((title_line_idx, "You".to_string(), user_bg));
                     let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
-                    push_full_shaded!(&mut chat_lines, vec![badge_span], 5, available_width, row_bg);
+                    push_full_shaded!(
+                        &mut chat_lines,
+                        vec![badge_span],
+                        5,
+                        available_width,
+                        row_bg
+                    );
 
                     if visible_u_lines > 0 {
                         let mut rendered_u = 0;
@@ -6234,10 +5298,16 @@ impl App {
                                     style = style.add_modifier(Modifier::CROSSED_OUT);
                                 }
                                 if ispan.code {
-                                    style = style.fg(Color::Rgb(255, 190, 100)).bg(content_bg).add_modifier(Modifier::BOLD);
+                                    style = style
+                                        .fg(Color::Rgb(255, 190, 100))
+                                        .bg(content_bg)
+                                        .add_modifier(Modifier::BOLD);
                                 }
                                 if ispan.link_url.is_some() {
-                                    style = style.fg(Color::Rgb(0, 200, 255)).bg(content_bg).add_modifier(Modifier::UNDERLINED);
+                                    style = style
+                                        .fg(Color::Rgb(0, 200, 255))
+                                        .bg(content_bg)
+                                        .add_modifier(Modifier::UNDERLINED);
                                 }
                                 raw_spans.push(Span::styled(ispan.text, style));
                             }
@@ -6253,9 +5323,18 @@ impl App {
                                 for word in text.split_inclusive(' ') {
                                     let wl = word.chars().count();
                                     if cur_w + wl > available_width && cur_w > 2 {
-                                        push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                        push_full_shaded!(
+                                            &mut chat_lines,
+                                            cur_spans,
+                                            cur_w,
+                                            available_width,
+                                            content_bg
+                                        );
                                         cur_spans = vec![
-                                            Span::styled("▎", Style::default().fg(user_bg).bg(content_bg)),
+                                            Span::styled(
+                                                "▎",
+                                                Style::default().fg(user_bg).bg(content_bg),
+                                            ),
                                             Span::styled(" ", Style::default().bg(content_bg)),
                                         ];
                                         cur_w = 2;
@@ -6265,7 +5344,13 @@ impl App {
                                 }
                             }
                             if cur_w > 2 {
-                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                push_full_shaded!(
+                                    &mut chat_lines,
+                                    cur_spans,
+                                    cur_w,
+                                    available_width,
+                                    content_bg
+                                );
                             }
                         }
                     }
@@ -6296,7 +5381,11 @@ impl App {
                             (
                                 Some(think.to_string()),
                                 before,
-                                if is_generating_val { "Thinking" } else { "Thought" },
+                                if is_generating_val {
+                                    "Thinking"
+                                } else {
+                                    "Thought"
+                                },
                             )
                         }
                     } else {
@@ -6312,44 +5401,87 @@ impl App {
                         || (is_generating_val && content.contains("<think>"))
                     {
                         let think_bg = Color::Rgb(180, 100, 240); // Soft Purple
-                        let live_think_dur = if is_generating_val && is_last_message && think_label == "Thinking" {
-                            self.thought_start_time.map(|s| s.elapsed().as_secs().max(1))
-                        } else {
-                            None
-                        };
-                        let think_dur = self.thought_durations.get(&m_idx).copied().or(live_think_dur);
+                        let live_think_dur =
+                            if is_generating_val && is_last_message && think_label == "Thinking" {
+                                self.thought_start_time
+                                    .map(|s| s.elapsed().as_secs().max(1))
+                            } else {
+                                None
+                            };
+                        let think_dur = self
+                            .thought_durations
+                            .get(&m_idx)
+                            .copied()
+                            .or(live_think_dur);
                         let think_tag = if let Some(dur) = think_dur {
                             format!(" {think_label} {}s ", dur)
                         } else {
                             format!(" {think_label} ")
                         };
                         let think_len = think_tag.chars().count();
-                        let badge_span = Span::styled(think_tag.clone(), Style::default().fg(Color::Rgb(245, 248, 255)).bg(think_bg).add_modifier(Modifier::BOLD));
+                        let badge_span = Span::styled(
+                            think_tag.clone(),
+                            Style::default()
+                                .fg(Color::Rgb(245, 248, 255))
+                                .bg(think_bg)
+                                .add_modifier(Modifier::BOLD),
+                        );
                         let is_collapsed = self.collapsed_thoughts.contains(&m_idx);
                         let anim_id = (m_idx as u32) | 0x4000_0000;
                         let is_anim = self.krama.is_animating("collapse", anim_id);
 
                         let raw_think = if is_anim {
-                            1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
+                            1.0 - self
+                                .krama
+                                .from_range_generic("collapse", anim_id, 0.0..=1.0)
                         } else if is_collapsed {
                             0.0
                         } else {
                             1.0
                         };
                         let total_think_lines = clean_think.lines().count().max(1);
-                        let visible_think_lines = ((total_think_lines as f32) * raw_think).round() as usize;
+                        let visible_think_lines =
+                            ((total_think_lines as f32) * raw_think).round() as usize;
 
-                        if (is_collapsed && !is_anim) || (is_collapsed && visible_think_lines == 0) {
+                        if (is_collapsed && !is_anim) || (is_collapsed && visible_think_lines == 0)
+                        {
                             // Fully collapsed: buffer for horizontal row line up with other collapsed sections
-                            collapsed_row_buf.push((badge_span, think_len, SectionKind::Thought(m_idx), think_bg, think_tag.trim().to_string()));
+                            collapsed_row_buf.push((
+                                badge_span,
+                                think_len,
+                                SectionKind::Thought(m_idx),
+                                think_bg,
+                                think_tag.trim().to_string(),
+                            ));
                         } else {
-                            flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+                            flush_collapsed_row(
+                                &mut chat_lines,
+                                &mut all_section_hits_unmapped,
+                                &mut section_headers,
+                                &mut collapsed_row_buf,
+                                available_width,
+                            );
 
                             let title_line_idx = chat_lines.len();
-                            all_section_hits_unmapped.push((title_line_idx, 0, think_len as u16, SectionKind::Thought(m_idx)));
-                            section_headers.push((title_line_idx, think_tag.trim().to_string(), think_bg));
+                            all_section_hits_unmapped.push((
+                                title_line_idx,
+                                0,
+                                think_len as u16,
+                                SectionKind::Thought(m_idx),
+                            ));
+                            section_headers.push((
+                                title_line_idx,
+                                think_tag.trim().to_string(),
+                                think_bg,
+                            ));
                             let header_row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
-                            push_full_shaded!(&mut chat_lines, vec![badge_span], think_len, available_width, header_row_bg);
+                            push_full_shaded!(
+                                &mut chat_lines,
+                                vec![badge_span],
+                                think_len,
+                                available_width,
+                                header_row_bg
+                            );
 
                             if visible_think_lines > 0 {
                                 let visible_think = reveal_limit.min(clean_think.chars().count());
@@ -6361,16 +5493,29 @@ impl App {
                                     let reason_str = " Reasoning… █";
                                     let r_len = reason_str.chars().count();
                                     let mut cur_spans = vec![
-                                        Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
+                                        Span::styled(
+                                            "▎",
+                                            Style::default().fg(think_bg).bg(content_bg),
+                                        ),
                                         Span::styled(
                                             reason_str,
                                             Style::default()
-                                                .fg(Color::Rgb(b_val, b_val.saturating_add(20), 255))
+                                                .fg(Color::Rgb(
+                                                    b_val,
+                                                    b_val.saturating_add(20),
+                                                    255,
+                                                ))
                                                 .bg(content_bg)
                                                 .add_modifier(Modifier::ITALIC),
                                         ),
                                     ];
-                                    push_full_shaded!(&mut chat_lines, cur_spans, 1 + r_len, available_width, content_bg);
+                                    push_full_shaded!(
+                                        &mut chat_lines,
+                                        cur_spans,
+                                        1 + r_len,
+                                        available_width,
+                                        content_bg
+                                    );
                                 } else {
                                     for line in clean_think.lines().take(visible_think_lines) {
                                         if global_think_ch >= visible_think {
@@ -6378,7 +5523,10 @@ impl App {
                                         }
 
                                         let mut cur_spans = vec![
-                                            Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
+                                            Span::styled(
+                                                "▎",
+                                                Style::default().fg(think_bg).bg(content_bg),
+                                            ),
                                             Span::styled(" ", Style::default().bg(content_bg)),
                                         ];
                                         let mut cur_w = 2;
@@ -6389,29 +5537,52 @@ impl App {
                                                 break;
                                             }
 
-                                            let take_chars = (visible_think - global_think_ch).min(word_len);
-                                            let partial_word: String = word.chars().take(take_chars).collect();
+                                            let take_chars =
+                                                (visible_think - global_think_ch).min(word_len);
+                                            let partial_word: String =
+                                                word.chars().take(take_chars).collect();
                                             global_think_ch += take_chars;
 
-                                            let is_cursor = global_think_ch == visible_think && is_generating_val;
+                                            let is_cursor = global_think_ch == visible_think
+                                                && is_generating_val;
                                             let style = Style::default()
                                                 .fg(Color::Rgb(190, 195, 215))
                                                 .bg(content_bg)
                                                 .add_modifier(Modifier::ITALIC);
 
-                                            let mut word_spans = vec![Span::styled(partial_word.clone(), style)];
+                                            let mut word_spans =
+                                                vec![Span::styled(partial_word.clone(), style)];
                                             let mut word_w = partial_word.chars().count();
 
                                             if is_cursor {
-                                                word_spans.push(Span::styled("█", Style::default().fg(Color::Rgb(200, 120, 255)).bg(content_bg)));
+                                                word_spans.push(Span::styled(
+                                                    "█",
+                                                    Style::default()
+                                                        .fg(Color::Rgb(200, 120, 255))
+                                                        .bg(content_bg),
+                                                ));
                                                 word_w += 1;
                                             }
 
                                             if cur_w + word_w > available_width && cur_w > 2 {
-                                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                                push_full_shaded!(
+                                                    &mut chat_lines,
+                                                    cur_spans,
+                                                    cur_w,
+                                                    available_width,
+                                                    content_bg
+                                                );
                                                 cur_spans = vec![
-                                                    Span::styled("▎", Style::default().fg(think_bg).bg(content_bg)),
-                                                    Span::styled(" ", Style::default().bg(content_bg)),
+                                                    Span::styled(
+                                                        "▎",
+                                                        Style::default()
+                                                            .fg(think_bg)
+                                                            .bg(content_bg),
+                                                    ),
+                                                    Span::styled(
+                                                        " ",
+                                                        Style::default().bg(content_bg),
+                                                    ),
                                                 ];
                                                 cur_w = 2;
                                             }
@@ -6421,7 +5592,13 @@ impl App {
                                         }
 
                                         if cur_w > 2 {
-                                            push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                            push_full_shaded!(
+                                                &mut chat_lines,
+                                                cur_spans,
+                                                cur_w,
+                                                available_width,
+                                                content_bg
+                                            );
                                         }
                                     }
                                 }
@@ -6433,19 +5610,30 @@ impl App {
 
                 let clean_output = tool_panel::redact_tools_for_chat(&output_part);
                 if !clean_output.trim().is_empty()
-                    || (think_part.is_none() && is_generating_val && !crate::agent::AgentEngine::response_has_tool_tags(content))
+                    || (think_part.is_none()
+                        && is_generating_val
+                        && !crate::agent::AgentEngine::response_has_tool_tags(content))
                 {
-                    let raw_text = if clean_output.is_empty() && think_part.is_none() && !crate::agent::AgentEngine::response_has_tool_tags(content) {
+                    let raw_text = if clean_output.is_empty()
+                        && think_part.is_none()
+                        && !crate::agent::AgentEngine::response_has_tool_tags(content)
+                    {
                         content
                     } else {
                         clean_output.as_str()
                     };
-                    let text_to_render = raw_text.trim_start_matches(|c| c == '\n' || c == '\r').to_string();
+                    let text_to_render = raw_text
+                        .trim_start_matches(|c| c == '\n' || c == '\r')
+                        .to_string();
                     let think_len = think_part.as_ref().map(|t| t.chars().count()).unwrap_or(0);
                     let available_output = reveal_limit.saturating_sub(think_len);
 
-                    let active_write_chip = self.tool_chips.iter().any(|c| c.kind == tool_panel::ToolPanelKind::Write && !c.tag_closed);
-                    let should_show_agent = !text_to_render.trim().is_empty() || (is_generating_val && !active_write_chip && think_part.is_none());
+                    let active_write_chip = self
+                        .tool_chips
+                        .iter()
+                        .any(|c| c.kind == tool_panel::ToolPanelKind::Write && !c.tag_closed);
+                    let should_show_agent = !text_to_render.trim().is_empty()
+                        || (is_generating_val && !active_write_chip && think_part.is_none());
 
                     if should_show_agent {
                         let agent_bg = Color::Rgb(136, 192, 208);
@@ -6476,23 +5664,58 @@ impl App {
                         };
                         let is_collapsed = self.collapsed_messages.contains(&m_idx);
                         let agent_len = agent_label.chars().count();
-                        let badge_span = Span::styled(agent_label.clone(), Style::default().fg(NORDIC_BG).bg(agent_bg).add_modifier(Modifier::BOLD));
+                        let badge_span = Span::styled(
+                            agent_label.clone(),
+                            Style::default()
+                                .fg(NORDIC_BG)
+                                .bg(agent_bg)
+                                .add_modifier(Modifier::BOLD),
+                        );
                         let anim_id = m_idx as u32;
                         let is_anim = self.krama.is_animating("collapse", anim_id);
 
                         if is_collapsed && !is_anim {
-                            collapsed_row_buf.push((badge_span, agent_len, SectionKind::Agent(m_idx), agent_bg, agent_label.trim().to_string()));
+                            collapsed_row_buf.push((
+                                badge_span,
+                                agent_len,
+                                SectionKind::Agent(m_idx),
+                                agent_bg,
+                                agent_label.trim().to_string(),
+                            ));
                         } else {
-                            flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+                            flush_collapsed_row(
+                                &mut chat_lines,
+                                &mut all_section_hits_unmapped,
+                                &mut section_headers,
+                                &mut collapsed_row_buf,
+                                available_width,
+                            );
                             let title_line_idx = chat_lines.len();
-                            all_section_hits_unmapped.push((title_line_idx, 0, agent_len as u16, SectionKind::Agent(m_idx)));
-                            section_headers.push((title_line_idx, agent_label.trim().to_string(), agent_bg));
+                            all_section_hits_unmapped.push((
+                                title_line_idx,
+                                0,
+                                agent_len as u16,
+                                SectionKind::Agent(m_idx),
+                            ));
+                            section_headers.push((
+                                title_line_idx,
+                                agent_label.trim().to_string(),
+                                agent_bg,
+                            ));
                             let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
-                            push_full_shaded!(&mut chat_lines, vec![badge_span], agent_len, available_width, row_bg);
+                            push_full_shaded!(
+                                &mut chat_lines,
+                                vec![badge_span],
+                                agent_len,
+                                available_width,
+                                row_bg
+                            );
 
                             let total_agent_lines = text_to_render.lines().count().max(1);
                             let raw_agent = if is_anim {
-                                1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
+                                1.0 - self
+                                    .krama
+                                    .from_range_generic("collapse", anim_id, 0.0..=1.0)
                             } else if is_collapsed {
                                 0.0
                             } else {
@@ -6505,7 +5728,8 @@ impl App {
                             } else {
                                 raw_agent
                             };
-                            let visible_agent_lines = ((total_agent_lines as f32) * agent_col_progress).round() as usize;
+                            let visible_agent_lines =
+                                ((total_agent_lines as f32) * agent_col_progress).round() as usize;
 
                             let show_agent_body = visible_agent_lines > 0;
                             if show_agent_body {
@@ -6514,7 +5738,7 @@ impl App {
                                 let mut local_toggles = Vec::new();
                                 let mut local_copies = Vec::new();
                                 let mut local_scrolls = Vec::new();
-                                
+
                                 let md_lines = crate::markdown::render_markdown_to_lines(
                                     &text_to_render,
                                     available_output,
@@ -6533,21 +5757,51 @@ impl App {
                                     Some(&self.code_block_scrolls),
                                 );
                                 for (local_idx, b_idx, n_s, n_e, p_s, p_e) in local_toggles {
-                                    all_toggle_buttons.push((start_line_idx + local_idx, b_idx, n_s + 2, n_e + 2, p_s + 2, p_e + 2));
+                                    all_toggle_buttons.push((
+                                        start_line_idx + local_idx,
+                                        b_idx,
+                                        n_s + 2,
+                                        n_e + 2,
+                                        p_s + 2,
+                                        p_e + 2,
+                                    ));
                                 }
                                 for (local_idx, b_idx, c_s, c_e, body) in local_copies {
-                                    all_copy_buttons.push((start_line_idx + local_idx, b_idx, c_s + 2, c_e + 2, body));
+                                    all_copy_buttons.push((
+                                        start_line_idx + local_idx,
+                                        b_idx,
+                                        c_s + 2,
+                                        c_e + 2,
+                                        body,
+                                    ));
                                 }
-                                for (local_idx, b_idx, l_s, l_e, t_s, t_e, r_s, r_e, max_sc) in local_scrolls {
-                                    all_scroll_buttons.push((start_line_idx + local_idx, b_idx, l_s + 2, l_e + 2, t_s + 2, t_e + 2, r_s + 2, r_e + 2, max_sc));
+                                for (local_idx, b_idx, l_s, l_e, t_s, t_e, r_s, r_e, max_sc) in
+                                    local_scrolls
+                                {
+                                    all_scroll_buttons.push((
+                                        start_line_idx + local_idx,
+                                        b_idx,
+                                        l_s + 2,
+                                        l_e + 2,
+                                        t_s + 2,
+                                        t_e + 2,
+                                        r_s + 2,
+                                        r_e + 2,
+                                        max_sc,
+                                    ));
                                 }
                                 for md_l in md_lines.into_iter().take(visible_agent_lines) {
-                                    let spans_with_bg: Vec<Span> = md_l.spans.into_iter().map(|s| {
-                                        Span::styled(s.content, s.style.bg(content_bg))
-                                    }).collect();
+                                    let spans_with_bg: Vec<Span> = md_l
+                                        .spans
+                                        .into_iter()
+                                        .map(|s| Span::styled(s.content, s.style.bg(content_bg)))
+                                        .collect();
 
                                     let is_code_or_table = spans_with_bg.iter().any(|s| {
-                                        s.content.contains('│') || s.content.contains('┌') || s.content.contains('└') || s.content.contains('─')
+                                        s.content.contains('│')
+                                            || s.content.contains('┌')
+                                            || s.content.contains('└')
+                                            || s.content.contains('─')
                                     });
 
                                     if is_code_or_table {
@@ -6556,14 +5810,26 @@ impl App {
                                             cur_w += s.content.chars().count();
                                         }
                                         let mut spans = vec![
-                                            Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
+                                            Span::styled(
+                                                "▎",
+                                                Style::default().fg(agent_bg).bg(content_bg),
+                                            ),
                                             Span::styled(" ", Style::default().bg(content_bg)),
                                         ];
                                         spans.extend(spans_with_bg);
-                                        push_full_shaded!(&mut chat_lines, spans, cur_w, available_width, content_bg);
+                                        push_full_shaded!(
+                                            &mut chat_lines,
+                                            spans,
+                                            cur_w,
+                                            available_width,
+                                            content_bg
+                                        );
                                     } else {
                                         let mut cur_spans = vec![
-                                            Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
+                                            Span::styled(
+                                                "▎",
+                                                Style::default().fg(agent_bg).bg(content_bg),
+                                            ),
                                             Span::styled(" ", Style::default().bg(content_bg)),
                                         ];
                                         let mut cur_w = 2;
@@ -6573,19 +5839,40 @@ impl App {
                                             for word in text.split_inclusive(' ') {
                                                 let wl = word.chars().count();
                                                 if cur_w + wl > available_width && cur_w > 2 {
-                                                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                                    push_full_shaded!(
+                                                        &mut chat_lines,
+                                                        cur_spans,
+                                                        cur_w,
+                                                        available_width,
+                                                        content_bg
+                                                    );
                                                     cur_spans = vec![
-                                                        Span::styled("▎", Style::default().fg(agent_bg).bg(content_bg)),
-                                                        Span::styled(" ", Style::default().bg(content_bg)),
+                                                        Span::styled(
+                                                            "▎",
+                                                            Style::default()
+                                                                .fg(agent_bg)
+                                                                .bg(content_bg),
+                                                        ),
+                                                        Span::styled(
+                                                            " ",
+                                                            Style::default().bg(content_bg),
+                                                        ),
                                                     ];
                                                     cur_w = 2;
                                                 }
-                                                cur_spans.push(Span::styled(word.to_string(), style));
+                                                cur_spans
+                                                    .push(Span::styled(word.to_string(), style));
                                                 cur_w += wl;
                                             }
                                         }
                                         if cur_w > 2 {
-                                            push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                            push_full_shaded!(
+                                                &mut chat_lines,
+                                                cur_spans,
+                                                cur_w,
+                                                available_width,
+                                                content_bg
+                                            );
                                         }
                                     }
                                 }
@@ -6604,7 +5891,10 @@ impl App {
                     .collect();
 
                 for chip in matching_chips {
-                    let live_dur = self.action_start_times.get(&chip.id).map(|s| s.elapsed().as_secs().max(1));
+                    let live_dur = self
+                        .action_start_times
+                        .get(&chip.id)
+                        .map(|s| s.elapsed().as_secs().max(1));
                     let chip_dur = self.action_durations.get(&chip.id).copied().or(live_dur);
                     let action_tag = if let Some(dur) = chip_dur {
                         format!(" Action {}s ", dur)
@@ -6617,11 +5907,16 @@ impl App {
                     let is_anim = self.krama.is_animating("collapse", anim_id);
                     let badge_span = Span::styled(
                         action_tag.clone(),
-                        Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(NORDIC_BG)
+                            .bg(action_bg)
+                            .add_modifier(Modifier::BOLD),
                     );
 
                     let raw_action = if is_anim {
-                        1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
+                        1.0 - self
+                            .krama
+                            .from_range_generic("collapse", anim_id, 0.0..=1.0)
                     } else if is_open {
                         1.0
                     } else {
@@ -6630,31 +5925,78 @@ impl App {
 
                     if (!is_open && !is_anim) || (!is_open && raw_action == 0.0) {
                         // Fully collapsed: buffer for horizontal row line up
-collapsed_row_buf.push((badge_span, 8, SectionKind::Action(chip.id), action_bg, format!("Action: {}", chip.label_text_with_duration(action_duration.as_deref()))));
+                        collapsed_row_buf.push((
+                            badge_span,
+                            8,
+                            SectionKind::Action(chip.id),
+                            action_bg,
+                            format!(
+                                "Action: {}",
+                                chip.label_text_with_duration(action_duration.as_deref())
+                            ),
+                        ));
                     } else {
-                        flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+                        flush_collapsed_row(
+                            &mut chat_lines,
+                            &mut all_section_hits_unmapped,
+                            &mut section_headers,
+                            &mut collapsed_row_buf,
+                            available_width,
+                        );
 
                         let chip_start = chat_lines.len();
                         chip_line_starts.push((chip.id, chip_start));
 
                         let action_row_bg = if is_open { content_bg } else { NORDIC_BG };
-section_headers.push((chip_start, format!("Action: {}", chip.label_text_with_duration(action_duration.as_deref())), action_bg));
-                        all_section_hits_unmapped.push((chip_start, 0, 8, SectionKind::Action(chip.id)));
-                        push_full_shaded!(&mut chat_lines, vec![badge_span], 8, available_width, action_row_bg);
+                        section_headers.push((
+                            chip_start,
+                            format!(
+                                "Action: {}",
+                                chip.label_text_with_duration(action_duration.as_deref())
+                            ),
+                            action_bg,
+                        ));
+                        all_section_hits_unmapped.push((
+                            chip_start,
+                            0,
+                            8,
+                            SectionKind::Action(chip.id),
+                        ));
+                        push_full_shaded!(
+                            &mut chat_lines,
+                            vec![badge_span],
+                            8,
+                            available_width,
+                            action_row_bg
+                        );
 
-let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
+                        let chip_summary =
+                            chip.label_text_with_duration(action_duration.as_deref());
                         let cur_spans = vec![
                             Span::styled("▎", Style::default().fg(action_bg).bg(action_row_bg)),
                             Span::styled(" ", Style::default().bg(action_row_bg)),
                             Span::styled(
                                 chip_summary.clone(),
-                                Style::default().fg(chip.kind.accent()).bg(action_row_bg).add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .fg(chip.kind.accent())
+                                    .bg(action_row_bg)
+                                    .add_modifier(Modifier::BOLD),
                             ),
                         ];
                         let cur_w = 2 + chip_summary.chars().count();
-                        push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, action_row_bg);
+                        push_full_shaded!(
+                            &mut chat_lines,
+                            cur_spans,
+                            cur_w,
+                            available_width,
+                            action_row_bg
+                        );
 
-                        let max_body_lines = chip.body.trim_start_matches(|c| c == '\n' || c == '\r').lines().count();
+                        let max_body_lines = chip
+                            .body
+                            .trim_start_matches(|c| c == '\n' || c == '\r')
+                            .lines()
+                            .count();
                         let visible_lines = if !chip.tag_closed {
                             max_body_lines
                         } else {
@@ -6662,7 +6004,8 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                         };
 
                         if visible_lines > 0 && !chip.body.trim().is_empty() {
-                            let body_trimmed = chip.body.trim_start_matches(|c| c == '\n' || c == '\r');
+                            let body_trimmed =
+                                chip.body.trim_start_matches(|c| c == '\n' || c == '\r');
                             let max_body_lines_adj = body_trimmed.lines().count();
                             let visible_lines_adj = visible_lines.min(max_body_lines_adj);
 
@@ -6670,17 +6013,29 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             let rule_spans = vec![
                                 Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
                                 Span::styled(" ", Style::default().bg(content_bg)),
-                                Span::styled("─".repeat(rule_w), Style::default().fg(Color::Rgb(60, 68, 82)).bg(content_bg)),
+                                Span::styled(
+                                    "─".repeat(rule_w),
+                                    Style::default().fg(Color::Rgb(60, 68, 82)).bg(content_bg),
+                                ),
                             ];
                             let cur_w = 2 + rule_w;
-                            push_full_shaded!(&mut chat_lines, rule_spans, cur_w, available_width, content_bg);
+                            push_full_shaded!(
+                                &mut chat_lines,
+                                rule_spans,
+                                cur_w,
+                                available_width,
+                                content_bg
+                            );
 
-                            let num_digits = (max_body_lines_adj.max(1).ilog10() as usize + 1).max(2);
+                            let num_digits =
+                                (max_body_lines_adj.max(1).ilog10() as usize + 1).max(2);
 
-                            for (line_idx, b_line) in body_trimmed.lines().take(visible_lines_adj).enumerate() {
+                            for (line_idx, b_line) in
+                                body_trimmed.lines().take(visible_lines_adj).enumerate()
+                            {
                                 let is_del = b_line.starts_with("- ") || b_line.starts_with('-');
                                 let is_add = b_line.starts_with("+ ") || b_line.starts_with('+');
-                                
+
                                 let (line_fg, sign_color) = if is_del {
                                     (Color::Rgb(255, 130, 140), Color::Rgb(255, 90, 100))
                                 } else if is_add {
@@ -6689,8 +6044,10 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                     (NORDIC_TEXT, Color::Rgb(100, 110, 130))
                                 };
 
-                                let line_num_str = format!(" {:>width$} │ ", line_idx + 1, width = num_digits);
-                                let cont_num_str = format!(" {:>width$} │ ", "·", width = num_digits);
+                                let line_num_str =
+                                    format!(" {:>width$} │ ", line_idx + 1, width = num_digits);
+                                let cont_num_str =
+                                    format!(" {:>width$} │ ", "·", width = num_digits);
                                 let gutter_w = 2 + line_num_str.chars().count();
                                 let max_chunk_w = available_width.saturating_sub(gutter_w).max(20);
 
@@ -6702,17 +6059,41 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                 };
 
                                 for (chunk_i, chunk) in chunks.into_iter().enumerate() {
-                                    let g_str = if chunk_i == 0 { &line_num_str } else { &cont_num_str };
-                                    let s_color = if chunk_i == 0 { sign_color } else { Color::Rgb(76, 86, 106) };
+                                    let g_str = if chunk_i == 0 {
+                                        &line_num_str
+                                    } else {
+                                        &cont_num_str
+                                    };
+                                    let s_color = if chunk_i == 0 {
+                                        sign_color
+                                    } else {
+                                        Color::Rgb(76, 86, 106)
+                                    };
                                     let chunk_str: String = chunk.into_iter().collect();
                                     let cur_spans = vec![
-                                        Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
+                                        Span::styled(
+                                            "▎",
+                                            Style::default().fg(action_bg).bg(content_bg),
+                                        ),
                                         Span::styled(" ", Style::default().bg(content_bg)),
-                                        Span::styled(g_str.clone(), Style::default().fg(s_color).bg(content_bg)),
-                                        Span::styled(chunk_str.clone(), Style::default().fg(line_fg).bg(content_bg)),
+                                        Span::styled(
+                                            g_str.clone(),
+                                            Style::default().fg(s_color).bg(content_bg),
+                                        ),
+                                        Span::styled(
+                                            chunk_str.clone(),
+                                            Style::default().fg(line_fg).bg(content_bg),
+                                        ),
                                     ];
-                                    let cur_w = 2 + g_str.chars().count() + chunk_str.chars().count();
-                                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                    let cur_w =
+                                        2 + g_str.chars().count() + chunk_str.chars().count();
+                                    push_full_shaded!(
+                                        &mut chat_lines,
+                                        cur_spans,
+                                        cur_w,
+                                        available_width,
+                                        content_bg
+                                    );
                                 }
                             }
                         }
@@ -6723,13 +6104,21 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 let sys_bg = Color::Rgb(94, 129, 172); // Nordic Slate Blue
                 let sys_body = m.strip_prefix("System:").unwrap_or(&m[7..]).trim();
                 let is_collapsed = self.collapsed_messages.contains(&m_idx);
-                let badge_span = Span::styled(" System ", Style::default().fg(Color::Rgb(245, 248, 255)).bg(sys_bg).add_modifier(Modifier::BOLD));
+                let badge_span = Span::styled(
+                    " System ",
+                    Style::default()
+                        .fg(Color::Rgb(245, 248, 255))
+                        .bg(sys_bg)
+                        .add_modifier(Modifier::BOLD),
+                );
 
                 let anim_id = m_idx as u32;
                 let is_anim = self.krama.is_animating("collapse", anim_id);
                 let total_sys_lines = sys_body.lines().count().max(1);
                 let raw_sys = if is_anim {
-                    1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
+                    1.0 - self
+                        .krama
+                        .from_range_generic("collapse", anim_id, 0.0..=1.0)
                 } else if is_collapsed {
                     0.0
                 } else {
@@ -6739,15 +6128,38 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
 
                 if (is_collapsed && !is_anim) || (is_collapsed && visible_sys_lines == 0) {
                     // Fully collapsed: buffer for horizontal row line up
-                    collapsed_row_buf.push((badge_span, 8, SectionKind::System(m_idx), sys_bg, "System".to_string()));
+                    collapsed_row_buf.push((
+                        badge_span,
+                        8,
+                        SectionKind::System(m_idx),
+                        sys_bg,
+                        "System".to_string(),
+                    ));
                 } else {
-                    flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+                    flush_collapsed_row(
+                        &mut chat_lines,
+                        &mut all_section_hits_unmapped,
+                        &mut section_headers,
+                        &mut collapsed_row_buf,
+                        available_width,
+                    );
 
                     let title_line_idx = chat_lines.len();
-                    all_section_hits_unmapped.push((title_line_idx, 0, 8, SectionKind::System(m_idx)));
+                    all_section_hits_unmapped.push((
+                        title_line_idx,
+                        0,
+                        8,
+                        SectionKind::System(m_idx),
+                    ));
                     section_headers.push((title_line_idx, "System".to_string(), sys_bg));
                     let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
-                    push_full_shaded!(&mut chat_lines, vec![badge_span], 8, available_width, row_bg);
+                    push_full_shaded!(
+                        &mut chat_lines,
+                        vec![badge_span],
+                        8,
+                        available_width,
+                        row_bg
+                    );
 
                     if visible_sys_lines > 0 {
                         let mut rendered_sys = 0;
@@ -6764,25 +6176,49 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             for word in line.split_inclusive(' ') {
                                 let wl = word.chars().count();
                                 if cur_w + wl > available_width && cur_w > 2 {
-                                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                    push_full_shaded!(
+                                        &mut chat_lines,
+                                        cur_spans,
+                                        cur_w,
+                                        available_width,
+                                        content_bg
+                                    );
                                     cur_spans = vec![
-                                        Span::styled("▎", Style::default().fg(sys_bg).bg(content_bg)),
+                                        Span::styled(
+                                            "▎",
+                                            Style::default().fg(sys_bg).bg(content_bg),
+                                        ),
                                         Span::styled(" ", Style::default().bg(content_bg)),
                                     ];
                                     cur_w = 2;
                                 }
-                                cur_spans.push(Span::styled(word.to_string(), Style::default().fg(NORDIC_TEXT).bg(content_bg)));
+                                cur_spans.push(Span::styled(
+                                    word.to_string(),
+                                    Style::default().fg(NORDIC_TEXT).bg(content_bg),
+                                ));
                                 cur_w += wl;
                             }
                             if cur_w > 2 {
-                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                push_full_shaded!(
+                                    &mut chat_lines,
+                                    cur_spans,
+                                    cur_w,
+                                    available_width,
+                                    content_bg
+                                );
                             }
                         }
                     }
                     chat_lines.push(Line::from(""));
                 }
             } else {
-                flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+                flush_collapsed_row(
+                    &mut chat_lines,
+                    &mut all_section_hits_unmapped,
+                    &mut section_headers,
+                    &mut collapsed_row_buf,
+                    available_width,
+                );
                 chat_lines.push(Line::from(Span::styled(
                     m.clone(),
                     Style::default().fg(NORDIC_MUTED),
@@ -6794,7 +6230,11 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
         let unanchored_chips: Vec<&ToolChip> = self
             .tool_chips
             .iter()
-            .filter(|c| c.anchor_msg.map(|idx| idx >= self.messages.len()).unwrap_or(true))
+            .filter(|c| {
+                c.anchor_msg
+                    .map(|idx| idx >= self.messages.len())
+                    .unwrap_or(true)
+            })
             .collect();
 
         if !unanchored_chips.is_empty() {
@@ -6806,11 +6246,16 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 let is_anim = self.krama.is_animating("collapse", anim_id);
                 let badge_span = Span::styled(
                     action_tag,
-                    Style::default().fg(NORDIC_BG).bg(action_bg).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(NORDIC_BG)
+                        .bg(action_bg)
+                        .add_modifier(Modifier::BOLD),
                 );
 
                 let raw_action2 = if is_anim {
-                    1.0 - self.krama.from_range_generic("collapse", anim_id, 0.0..=1.0)
+                    1.0 - self
+                        .krama
+                        .from_range_generic("collapse", anim_id, 0.0..=1.0)
                 } else if is_open {
                     1.0
                 } else {
@@ -6828,17 +6273,50 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 });
 
                 if (!is_open && !is_anim) || (!is_open && anim_progress2 == 0.0) {
-                    collapsed_row_buf.push((badge_span, 8, SectionKind::Action(chip.id), action_bg, format!("Action: {}", chip.label_text_with_duration(action_duration.as_deref()))));
+                    collapsed_row_buf.push((
+                        badge_span,
+                        8,
+                        SectionKind::Action(chip.id),
+                        action_bg,
+                        format!(
+                            "Action: {}",
+                            chip.label_text_with_duration(action_duration.as_deref())
+                        ),
+                    ));
                 } else {
-                    flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+                    flush_collapsed_row(
+                        &mut chat_lines,
+                        &mut all_section_hits_unmapped,
+                        &mut section_headers,
+                        &mut collapsed_row_buf,
+                        available_width,
+                    );
 
                     let chip_start = chat_lines.len();
                     chip_line_starts.push((chip.id, chip_start));
 
                     let action_row_bg = if is_open { content_bg } else { NORDIC_BG };
-                    section_headers.push((chip_start, format!("Action: {}", chip.label_text_with_duration(action_duration.as_deref())), action_bg));
-                    all_section_hits_unmapped.push((chip_start, 0, 8, SectionKind::Action(chip.id)));
-                    push_full_shaded!(&mut chat_lines, vec![badge_span], 8, available_width, action_row_bg);
+                    section_headers.push((
+                        chip_start,
+                        format!(
+                            "Action: {}",
+                            chip.label_text_with_duration(action_duration.as_deref())
+                        ),
+                        action_bg,
+                    ));
+                    all_section_hits_unmapped.push((
+                        chip_start,
+                        0,
+                        8,
+                        SectionKind::Action(chip.id),
+                    ));
+                    push_full_shaded!(
+                        &mut chat_lines,
+                        vec![badge_span],
+                        8,
+                        available_width,
+                        action_row_bg
+                    );
 
                     let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                     let cur_spans = vec![
@@ -6846,13 +6324,26 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                         Span::styled(" ", Style::default().bg(action_row_bg)),
                         Span::styled(
                             chip_summary.clone(),
-                            Style::default().fg(chip.kind.accent()).bg(action_row_bg).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(chip.kind.accent())
+                                .bg(action_row_bg)
+                                .add_modifier(Modifier::BOLD),
                         ),
                     ];
                     let cur_w = 2 + chip_summary.chars().count();
-                    push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, action_row_bg);
+                    push_full_shaded!(
+                        &mut chat_lines,
+                        cur_spans,
+                        cur_w,
+                        available_width,
+                        action_row_bg
+                    );
 
-                    let max_body_lines = chip.body.trim_start_matches(|c| c == '\n' || c == '\r').lines().count();
+                    let max_body_lines = chip
+                        .body
+                        .trim_start_matches(|c| c == '\n' || c == '\r')
+                        .lines()
+                        .count();
                     let visible_lines = if !chip.tag_closed {
                         max_body_lines
                     } else {
@@ -6868,17 +6359,28 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                         let rule_spans = vec![
                             Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
                             Span::styled(" ", Style::default().bg(content_bg)),
-                            Span::styled("─".repeat(rule_w), Style::default().fg(Color::Rgb(60, 68, 82)).bg(content_bg)),
+                            Span::styled(
+                                "─".repeat(rule_w),
+                                Style::default().fg(Color::Rgb(60, 68, 82)).bg(content_bg),
+                            ),
                         ];
                         let cur_w = 2 + rule_w;
-                        push_full_shaded!(&mut chat_lines, rule_spans, cur_w, available_width, content_bg);
+                        push_full_shaded!(
+                            &mut chat_lines,
+                            rule_spans,
+                            cur_w,
+                            available_width,
+                            content_bg
+                        );
 
                         let num_digits = (max_body_lines_adj.max(1).ilog10() as usize + 1).max(2);
 
-                        for (line_idx, b_line) in body_trimmed.lines().take(visible_lines_adj).enumerate() {
+                        for (line_idx, b_line) in
+                            body_trimmed.lines().take(visible_lines_adj).enumerate()
+                        {
                             let is_del = b_line.starts_with("- ") || b_line.starts_with('-');
                             let is_add = b_line.starts_with("+ ") || b_line.starts_with('+');
-                            
+
                             let (line_fg, sign_color) = if is_del {
                                 (Color::Rgb(255, 130, 140), Color::Rgb(255, 90, 100))
                             } else if is_add {
@@ -6887,7 +6389,8 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                 (NORDIC_TEXT, Color::Rgb(100, 110, 130))
                             };
 
-                            let line_num_str = format!(" {:>width$} │ ", line_idx + 1, width = num_digits);
+                            let line_num_str =
+                                format!(" {:>width$} │ ", line_idx + 1, width = num_digits);
                             let cont_num_str = format!(" {:>width$} │ ", "·", width = num_digits);
                             let gutter_w = 2 + line_num_str.chars().count();
                             let max_chunk_w = available_width.saturating_sub(gutter_w).max(20);
@@ -6900,17 +6403,40 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             };
 
                             for (chunk_i, chunk) in chunks.into_iter().enumerate() {
-                                let g_str = if chunk_i == 0 { &line_num_str } else { &cont_num_str };
-                                let s_color = if chunk_i == 0 { sign_color } else { Color::Rgb(76, 86, 106) };
+                                let g_str = if chunk_i == 0 {
+                                    &line_num_str
+                                } else {
+                                    &cont_num_str
+                                };
+                                let s_color = if chunk_i == 0 {
+                                    sign_color
+                                } else {
+                                    Color::Rgb(76, 86, 106)
+                                };
                                 let chunk_str: String = chunk.into_iter().collect();
                                 let cur_spans = vec![
-                                    Span::styled("▎", Style::default().fg(action_bg).bg(content_bg)),
+                                    Span::styled(
+                                        "▎",
+                                        Style::default().fg(action_bg).bg(content_bg),
+                                    ),
                                     Span::styled(" ", Style::default().bg(content_bg)),
-                                    Span::styled(g_str.clone(), Style::default().fg(s_color).bg(content_bg)),
-                                    Span::styled(chunk_str.clone(), Style::default().fg(line_fg).bg(content_bg)),
+                                    Span::styled(
+                                        g_str.clone(),
+                                        Style::default().fg(s_color).bg(content_bg),
+                                    ),
+                                    Span::styled(
+                                        chunk_str.clone(),
+                                        Style::default().fg(line_fg).bg(content_bg),
+                                    ),
                                 ];
                                 let cur_w = 2 + g_str.chars().count() + chunk_str.chars().count();
-                                push_full_shaded!(&mut chat_lines, cur_spans, cur_w, available_width, content_bg);
+                                push_full_shaded!(
+                                    &mut chat_lines,
+                                    cur_spans,
+                                    cur_w,
+                                    available_width,
+                                    content_bg
+                                );
                             }
                         }
                     }
@@ -6920,7 +6446,13 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
         }
 
         // Flush any remaining trailing collapsed labels
-        flush_collapsed_row(&mut chat_lines, &mut all_section_hits_unmapped, &mut section_headers, &mut collapsed_row_buf, available_width);
+        flush_collapsed_row(
+            &mut chat_lines,
+            &mut all_section_hits_unmapped,
+            &mut section_headers,
+            &mut collapsed_row_buf,
+            available_width,
+        );
 
         let mut total_visual_lines: u16 = 0;
         let mut visual_at: Vec<u16> = Vec::with_capacity(chat_lines.len() + 1);
@@ -7052,10 +6584,7 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
             .style(Style::default().bg(NORDIC_BG))
             .scroll((self.scroll_offset, 0))
             .wrap(ratatui::widgets::Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::NONE)
-            );
+            .block(Block::default().borders(Borders::NONE));
         frame.render_widget(chat_box, chat_area);
 
         // Sticky process title on top of chat area (like code review sticky header)
@@ -7073,7 +6602,8 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
 
             if let Some((label, bg_col)) = active_header {
                 let sticky_label = format!(" {label} ");
-                let sticky_w = (sticky_label.chars().count() as u16).min(chat_area.width.saturating_sub(4));
+                let sticky_w =
+                    (sticky_label.chars().count() as u16).min(chat_area.width.saturating_sub(4));
                 let sticky_area = Rect {
                     x: chat_area.x, // Sticky to left side matching actual section label direction
                     y: chat_area.y,
@@ -7082,7 +6612,10 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 };
                 let sticky_span = Span::styled(
                     sticky_label,
-                    Style::default().fg(NORDIC_BG).bg(bg_col).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(NORDIC_BG)
+                        .bg(bg_col)
+                        .add_modifier(Modifier::BOLD),
                 );
                 frame.render_widget(Paragraph::new(Line::from(sticky_span)), sticky_area);
             }
@@ -7161,7 +6694,9 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
         let left_main_total = main_badge_len + main_trans_len;
 
         let total_right_badge_w = right_trans_len + badge_len;
-        let _mid_bar_w = bar_w.saturating_sub(left_main_total + total_right_badge_w).max(1);
+        let _mid_bar_w = bar_w
+            .saturating_sub(left_main_total + total_right_badge_w)
+            .max(1);
 
         let white_c = Color::Rgb(236, 239, 244); // #ECEFF4 Snow White
 
@@ -7202,14 +6737,23 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
         let main_fg = get_contrast_text_color(main_bg);
         bar_spans.push(Span::styled(
             main_badge_text,
-            Style::default().fg(main_fg).bg(main_bg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(main_fg)
+                .bg(main_bg)
+                .add_modifier(Modifier::BOLD),
         ));
-        bar_spans.push(Span::styled(main_trans, Style::default().fg(main_bg).bg(NORDIC_BG)));
+        bar_spans.push(Span::styled(
+            main_trans,
+            Style::default().fg(main_bg).bg(NORDIC_BG),
+        ));
         cur_col_idx += left_main_total;
 
         // Render sub-agent tabs if any tasks exist (e.g. " H1 ", " H2 ")
         let tasks = self.task_manager.list();
-        let agent_tasks: Vec<_> = tasks.iter().filter(|t| t.cmd.starts_with("agent ")).collect();
+        let agent_tasks: Vec<_> = tasks
+            .iter()
+            .filter(|t| t.cmd.starts_with("agent "))
+            .collect();
         for t in &agent_tasks {
             let tag = format!(" H{} ", t.id);
             let tag_len = tag.chars().count();
@@ -7223,7 +6767,10 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 let fg_c = get_contrast_text_color(bg_c);
                 bar_spans.push(Span::styled(
                     tag,
-                    Style::default().fg(fg_c).bg(bg_c).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(fg_c)
+                        .bg(bg_c)
+                        .add_modifier(Modifier::BOLD),
                 ));
                 bar_spans.push(Span::styled("🭍🭑", Style::default().fg(bg_c).bg(NORDIC_BG)));
                 cur_col_idx += tag_len + 2;
@@ -7231,7 +6778,9 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
         }
 
         let total_right_badge_w = right_trans_len + badge_len;
-        let mid_bar_w = bar_w.saturating_sub(cur_col_idx + total_right_badge_w).max(1);
+        let mid_bar_w = bar_w
+            .saturating_sub(cur_col_idx + total_right_badge_w)
+            .max(1);
 
         // Fill middle with gradient (no duration here — shown on chip labels)
         for _ in 0..mid_bar_w {
@@ -7244,13 +6793,19 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
         let c_badge_bg = get_bar_color(cur_col_idx, bar_w);
         let c_badge_fg = get_contrast_text_color(c_badge_bg);
 
-        bar_spans.push(Span::styled(right_trans, Style::default().fg(c_badge_bg).bg(NORDIC_BG)));
+        bar_spans.push(Span::styled(
+            right_trans,
+            Style::default().fg(c_badge_bg).bg(NORDIC_BG),
+        ));
         cur_col_idx += right_trans_len;
 
         let badge_start_col = input_area.x + cur_col_idx as u16;
         bar_spans.push(Span::styled(
             badge_text,
-            Style::default().fg(c_badge_fg).bg(c_badge_bg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(c_badge_fg)
+                .bg(c_badge_bg)
+                .add_modifier(Modifier::BOLD),
         ));
         cur_col_idx += badge_len;
         let badge_end_col = input_area.x + cur_col_idx as u16;
@@ -7266,7 +6821,8 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
             let (_cursor_col, cursor_row) = self.input_cursor_col_row(inner_w);
 
             let total_prompt_lines = wrapped_prompt_lines.len().max(1);
-            let max_possible_scroll = total_prompt_lines.saturating_sub(available_content_rows as usize) as u16;
+            let max_possible_scroll =
+                total_prompt_lines.saturating_sub(available_content_rows as usize) as u16;
 
             // Auto-scroll input vertically so cursor is always visible
             let cur_row_u16 = cursor_row as u16;
@@ -7279,20 +6835,28 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
 
             if self.term_is_interactive() {
                 input_ui_lines.push(Line::from(vec![
-                    Span::styled(" $ ", Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG)),
+                    Span::styled(
+                        " $ ",
+                        Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG),
+                    ),
                     Span::styled(
                         if self.term_input.is_empty() {
                             "type shell command…".to_string()
                         } else {
                             self.term_input.clone()
                         },
-                        Style::default().fg(if self.term_input.is_empty() {
-                            NORDIC_MUTED
-                        } else {
-                            Color::Rgb(163, 190, 140)
-                        }).bg(NORDIC_BG),
+                        Style::default()
+                            .fg(if self.term_input.is_empty() {
+                                NORDIC_MUTED
+                            } else {
+                                Color::Rgb(163, 190, 140)
+                            })
+                            .bg(NORDIC_BG),
                     ),
-                    Span::styled("█", Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG)),
+                    Span::styled(
+                        "█",
+                        Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG),
+                    ),
                 ]));
             } else if self.input.is_empty() {
                 input_ui_lines.push(Line::from(Span::styled(
@@ -7308,9 +6872,14 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                     inner_w
                 };
                 let max_scroll = total_lines.saturating_sub(available_content_rows as usize);
-                let thumb_height = (((available_content_rows as f32 / total_lines as f32) * available_content_rows as f32).round() as usize).max(1);
+                let thumb_height = (((available_content_rows as f32 / total_lines as f32)
+                    * available_content_rows as f32)
+                    .round() as usize)
+                    .max(1);
                 let thumb_start = if max_scroll > 0 {
-                    ((self.input_scroll_y as f32 / max_scroll as f32) * (available_content_rows as usize - thumb_height) as f32).round() as usize 
+                    ((self.input_scroll_y as f32 / max_scroll as f32)
+                        * (available_content_rows as usize - thumb_height) as f32)
+                        .round() as usize
                 } else {
                     0
                 };
@@ -7356,7 +6925,10 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
 
                                 row_spans.push(Span::styled(
                                     format!(" {} ", badge_body),
-                                    Style::default().fg(Color::White).bg(bg_color).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(bg_color)
+                                        .add_modifier(Modifier::BOLD),
                                 ));
 
                                 cur_pos = actual_close + 1;
@@ -7377,12 +6949,22 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                         let line_len = line_str.chars().count();
                         let pad_spaces = text_w.saturating_sub(line_len);
                         if pad_spaces > 0 {
-                            row_spans.push(Span::styled(" ".repeat(pad_spaces), Style::default().bg(NORDIC_BG)));
+                            row_spans.push(Span::styled(
+                                " ".repeat(pad_spaces),
+                                Style::default().bg(NORDIC_BG),
+                            ));
                         }
                         let is_thumb = r >= thumb_start && r < thumb_start + thumb_height;
                         let sb_char = if is_thumb { "┃" } else { "│" };
-                        let sb_color = if is_thumb { Color::Rgb(143, 218, 255) } else { Color::Rgb(76, 86, 106) };
-                        row_spans.push(Span::styled(sb_char, Style::default().fg(sb_color).bg(NORDIC_BG)));
+                        let sb_color = if is_thumb {
+                            Color::Rgb(143, 218, 255)
+                        } else {
+                            Color::Rgb(76, 86, 106)
+                        };
+                        row_spans.push(Span::styled(
+                            sb_char,
+                            Style::default().fg(sb_color).bg(NORDIC_BG),
+                        ));
                     }
 
                     input_ui_lines.push(Line::from(row_spans));
@@ -7390,8 +6972,7 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
             }
         }
 
-        let input_box = Paragraph::new(input_ui_lines)
-            .style(Style::default().bg(NORDIC_BG));
+        let input_box = Paragraph::new(input_ui_lines).style(Style::default().bg(NORDIC_BG));
         frame.render_widget(input_box, input_area);
 
         // Path Autocomplete Popup floating above input
@@ -7412,11 +6993,18 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
             for (idx, sug) in self.path_suggestions.iter().take(num_items).enumerate() {
                 let is_sel = idx == self.path_suggestion_index;
                 let style = if is_sel {
-                    Style::default().fg(Color::Black).bg(Color::Rgb(143, 218, 255)).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(143, 218, 255))
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White).bg(Color::Rgb(46, 52, 64))
                 };
-                let tag = if sug.ends_with('/') { "[DIR] " } else { "[FILE] " };
+                let tag = if sug.ends_with('/') {
+                    "[DIR] "
+                } else {
+                    "[FILE] "
+                };
                 list_items.push(ListItem::new(Span::styled(format!(" {tag}{sug} "), style)));
             }
 
@@ -7436,7 +7024,10 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
             let visible_rel_row = (row as u16).saturating_sub(self.input_scroll_y);
             if visible_rel_row < available_content_rows {
                 let cursor_x = input_area.x.saturating_add(1).saturating_add(col as u16);
-                let cursor_y = input_area.y.saturating_add(1).saturating_add(visible_rel_row);
+                let cursor_y = input_area
+                    .y
+                    .saturating_add(1)
+                    .saturating_add(visible_rel_row);
                 let max_x = input_area.x + input_area.width.saturating_sub(1);
                 let max_y = input_area.y + input_box_h.saturating_sub(1);
                 frame.set_cursor_position((cursor_x.min(max_x), cursor_y.min(max_y)));
@@ -7446,7 +7037,9 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
         // --- Custom Framed Container Modal Widget ---
         if self.show_menu {
             let anim_p = self.menu_anim_progress.clamp(0.0, 1.0);
-            if anim_p > 0.01 {
+            // Menu visibility must never depend on animation progress: render
+            // immediately on open (anim_p only scales the intro size/fade).
+            if self.show_menu {
                 let full_w = area.width;
                 let full_h = area.height;
 
@@ -7467,13 +7060,18 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
 
                 // Clear container background with exact screen background
                 frame.render_widget(Clear, container_rect);
-                frame.render_widget(Block::default().style(Style::default().bg(NORDIC_BG)), container_rect);
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(NORDIC_BG)),
+                    container_rect,
+                );
 
                 let menu_title_str = match self.menu_section {
                     0 => " Help ",
                     1 => " Registry ",
                     2 => " Modal ",
                     3 => " Settings ",
+                    4 => " Session Info ",
+                    5 => " Code Graph ",
                     _ => " Session Info ",
                 };
 
@@ -7497,86 +7095,138 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 // --- Row 0 (Top line) ---
                 let mut row0_spans: Vec<Span> = Vec::new();
                 // 🭈🭆🭂
-                row0_spans.push(Span::styled("🭈🭆🭂", Style::default().fg(border_color).bg(NORDIC_BG)));
+                row0_spans.push(Span::styled(
+                    "🭈🭆🭂",
+                    Style::default().fg(border_color).bg(NORDIC_BG),
+                ));
                 // { menu } with white background and base text
                 row0_spans.push(Span::styled(
                     menu_title_str,
-                    Style::default().fg(NORDIC_BG).bg(border_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(NORDIC_BG)
+                        .bg(border_color)
+                        .add_modifier(Modifier::BOLD),
                 ));
                 // 🭞🭜
-                row0_spans.push(Span::styled("🭞🭜", Style::default().fg(border_color).bg(NORDIC_BG)));
+                row0_spans.push(Span::styled(
+                    "🭞🭜",
+                    Style::default().fg(border_color).bg(NORDIC_BG),
+                ));
                 // Top border fill 🬂
                 for _ in 0..top_bar_fill_w {
-                    row0_spans.push(Span::styled("🬂", Style::default().fg(border_color).bg(NORDIC_BG)));
+                    row0_spans.push(Span::styled(
+                        "🬂",
+                        Style::default().fg(border_color).bg(NORDIC_BG),
+                    ));
                 }
                 // 🭧🭓
-                row0_spans.push(Span::styled("🭧🭓", Style::default().fg(border_color).bg(NORDIC_BG)));
+                row0_spans.push(Span::styled(
+                    "🭧🭓",
+                    Style::default().fg(border_color).bg(NORDIC_BG),
+                ));
                 // " x " close button
                 row0_spans.push(Span::styled(
                     close_btn_str,
-                    Style::default().fg(NORDIC_BG).bg(border_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(NORDIC_BG)
+                        .bg(border_color)
+                        .add_modifier(Modifier::BOLD),
                 ));
                 // 🭍🭑🬽
-                row0_spans.push(Span::styled("🭍🭑🬽", Style::default().fg(border_color).bg(NORDIC_BG)));
-                frame.render_widget(Paragraph::new(Line::from(row0_spans)).style(Style::default().bg(NORDIC_BG)), Rect {
-                    x: modal_x,
-                    y: modal_y,
-                    width: modal_w,
-                    height: 1,
-                });
+                row0_spans.push(Span::styled(
+                    "🭍🭑🬽",
+                    Style::default().fg(border_color).bg(NORDIC_BG),
+                ));
+                frame.render_widget(
+                    Paragraph::new(Line::from(row0_spans)).style(Style::default().bg(NORDIC_BG)),
+                    Rect {
+                        x: modal_x,
+                        y: modal_y,
+                        width: modal_w,
+                        height: 1,
+                    },
+                );
 
                 // --- Row 1 (Top sub-corners) ---
                 // Left: 🭝🭜🭘  Right: 🭣🭧🭒
                 if modal_h >= 4 {
                     let mut row1_spans: Vec<Span> = Vec::new();
-                    row1_spans.push(Span::styled("🭝🭜🭘", Style::default().fg(border_color).bg(NORDIC_BG)));
+                    row1_spans.push(Span::styled(
+                        "🭝🭜🭘",
+                        Style::default().fg(border_color).bg(NORDIC_BG),
+                    ));
                     let middle_spaces = modal_w.saturating_sub(6) as usize;
                     if middle_spaces > 0 {
                         row1_spans.push(Span::raw(" ".repeat(middle_spaces)));
                     }
-                    row1_spans.push(Span::styled("🭣🭧🭒", Style::default().fg(border_color).bg(NORDIC_BG)));
-                    frame.render_widget(Paragraph::new(Line::from(row1_spans)).style(Style::default().bg(NORDIC_BG)), Rect {
-                        x: modal_x,
-                        y: modal_y + 1,
-                        width: modal_w,
-                        height: 1,
-                    });
+                    row1_spans.push(Span::styled(
+                        "🭣🭧🭒",
+                        Style::default().fg(border_color).bg(NORDIC_BG),
+                    ));
+                    frame.render_widget(
+                        Paragraph::new(Line::from(row1_spans))
+                            .style(Style::default().bg(NORDIC_BG)),
+                        Rect {
+                            x: modal_x,
+                            y: modal_y + 1,
+                            width: modal_w,
+                            height: 1,
+                        },
+                    );
                 }
 
                 // --- Middle Rows (Left ▌ and Right ▐) ---
                 for r in 2..modal_h.saturating_sub(2) {
-                    let left_span = Span::styled("▌", Style::default().fg(border_color).bg(NORDIC_BG));
-                    frame.render_widget(Paragraph::new(Line::from(left_span)), Rect {
-                        x: modal_x,
-                        y: modal_y + r,
-                        width: 1,
-                        height: 1,
-                    });
-                    let right_span = Span::styled("▐", Style::default().fg(border_color).bg(NORDIC_BG));
-                    frame.render_widget(Paragraph::new(Line::from(right_span)), Rect {
-                        x: modal_x + modal_w.saturating_sub(1),
-                        y: modal_y + r,
-                        width: 1,
-                        height: 1,
-                    });
+                    let left_span =
+                        Span::styled("▌", Style::default().fg(border_color).bg(NORDIC_BG));
+                    frame.render_widget(
+                        Paragraph::new(Line::from(left_span)),
+                        Rect {
+                            x: modal_x,
+                            y: modal_y + r,
+                            width: 1,
+                            height: 1,
+                        },
+                    );
+                    let right_span =
+                        Span::styled("▐", Style::default().fg(border_color).bg(NORDIC_BG));
+                    frame.render_widget(
+                        Paragraph::new(Line::from(right_span)),
+                        Rect {
+                            x: modal_x + modal_w.saturating_sub(1),
+                            y: modal_y + r,
+                            width: 1,
+                            height: 1,
+                        },
+                    );
                 }
 
                 // --- Row H-2 (Bottom sub-corners) ---
                 // Left: 🭌🭑🬽  Right: 🭈🭆🭁
                 if modal_h >= 4 {
                     let mut row_sub_b_spans: Vec<Span> = Vec::new();
-                    row_sub_b_spans.push(Span::styled("🭌🭑🬽", Style::default().fg(border_color).bg(NORDIC_BG)));
+                    row_sub_b_spans.push(Span::styled(
+                        "🭌🭑🬽",
+                        Style::default().fg(border_color).bg(NORDIC_BG),
+                    ));
                     let middle_spaces = modal_w.saturating_sub(6) as usize;
                     if middle_spaces > 0 {
                         row_sub_b_spans.push(Span::raw(" ".repeat(middle_spaces)));
                     }
-                    row_sub_b_spans.push(Span::styled("🭈🭆🭁", Style::default().fg(border_color).bg(NORDIC_BG)));
-                    frame.render_widget(Paragraph::new(Line::from(row_sub_b_spans)).style(Style::default().bg(NORDIC_BG)), Rect {
-                        x: modal_x,
-                        y: modal_y + modal_h.saturating_sub(2),
-                        width: modal_w,
-                        height: 1,
-                    });
+                    row_sub_b_spans.push(Span::styled(
+                        "🭈🭆🭁",
+                        Style::default().fg(border_color).bg(NORDIC_BG),
+                    ));
+                    frame.render_widget(
+                        Paragraph::new(Line::from(row_sub_b_spans))
+                            .style(Style::default().bg(NORDIC_BG)),
+                        Rect {
+                            x: modal_x,
+                            y: modal_y + modal_h.saturating_sub(2),
+                            width: modal_w,
+                            height: 1,
+                        },
+                    );
                 }
 
                 // --- Row H-1 (Bottom line) ---
@@ -7585,17 +7235,29 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 let br_w = 5u16; // "🭆🭂🭞🭜🭘"
                 let bot_fill_w = modal_w.saturating_sub(bl_w + br_w) as usize;
                 let mut row_bot_spans: Vec<Span> = Vec::new();
-                row_bot_spans.push(Span::styled("🭣🭧🭓🭍🭑", Style::default().fg(border_color).bg(NORDIC_BG)));
+                row_bot_spans.push(Span::styled(
+                    "🭣🭧🭓🭍🭑",
+                    Style::default().fg(border_color).bg(NORDIC_BG),
+                ));
                 for _ in 0..bot_fill_w {
-                    row_bot_spans.push(Span::styled("🬭", Style::default().fg(border_color).bg(NORDIC_BG)));
+                    row_bot_spans.push(Span::styled(
+                        "🬭",
+                        Style::default().fg(border_color).bg(NORDIC_BG),
+                    ));
                 }
-                row_bot_spans.push(Span::styled("🭆🭂🭞🭜🭘", Style::default().fg(border_color).bg(NORDIC_BG)));
-                frame.render_widget(Paragraph::new(Line::from(row_bot_spans)).style(Style::default().bg(NORDIC_BG)), Rect {
-                    x: modal_x,
-                    y: modal_y + modal_h.saturating_sub(1),
-                    width: modal_w,
-                    height: 1,
-                });
+                row_bot_spans.push(Span::styled(
+                    "🭆🭂🭞🭜🭘",
+                    Style::default().fg(border_color).bg(NORDIC_BG),
+                ));
+                frame.render_widget(
+                    Paragraph::new(Line::from(row_bot_spans)).style(Style::default().bg(NORDIC_BG)),
+                    Rect {
+                        x: modal_x,
+                        y: modal_y + modal_h.saturating_sub(1),
+                        width: modal_w,
+                        height: 1,
+                    },
+                );
 
                 // --- Inner Container Content Area ---
                 let content_inner = Rect {
@@ -7631,6 +7293,10 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                 Span::styled(" F5 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
                                 Span::styled("          Session Info (Context budget, hardware load, power, chips)", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
                             ]),
+                            Line::from(vec![
+                                Span::styled(" F6 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
+                                Span::styled("          Code Graph (Tree-sitter + LSP: nodes, edges, call hierarchy)", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                            ]),
                             Line::from(Span::styled("", Style::default().bg(NORDIC_BG))),
                             Line::from(vec![
                                 Span::styled(" Esc ", Style::default().fg(Color::Rgb(255, 180, 180)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
@@ -7661,22 +7327,38 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                 Span::styled(" Scroll conversation history", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
                             ]),
                         ];
-                        frame.render_widget(Paragraph::new(help_lines).style(Style::default().bg(NORDIC_BG)), content_inner);
+                        frame.render_widget(
+                            Paragraph::new(help_lines).style(Style::default().bg(NORDIC_BG)),
+                            content_inner,
+                        );
                     }
                     1 => {
                         // === Registry Section (Tab Bar + Search Bar + Filtered Model List) ===
                         let chunks = Layout::default()
                             .direction(Direction::Vertical)
-                            .constraints([Constraint::Length(2), Constraint::Length(2), Constraint::Min(1)].as_ref())
+                            .constraints(
+                                [
+                                    Constraint::Length(2),
+                                    Constraint::Length(2),
+                                    Constraint::Min(1),
+                                ]
+                                .as_ref(),
+                            )
                             .split(content_inner);
 
                         let hf_style = if self.registry_tab == 0 {
-                            Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)
+                            Style::default()
+                                .fg(NORDIC_BG)
+                                .bg(Color::White)
+                                .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG)
                         };
                         let ol_style = if self.registry_tab == 1 {
-                            Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)
+                            Style::default()
+                                .fg(NORDIC_BG)
+                                .bg(Color::White)
+                                .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG)
                         };
@@ -7685,30 +7367,51 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             Span::styled(" [ HuggingFace Models ] ", hf_style),
                             Span::styled("  ", Style::default().bg(NORDIC_BG)),
                             Span::styled(" [ Ollama Models ] ", ol_style),
-                            Span::styled("   (Left/Right to switch tab | Enter to download)", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG)),
-                        ])).style(Style::default().bg(NORDIC_BG));
+                            Span::styled(
+                                "   (Left/Right to switch tab | Enter to download)",
+                                Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                            ),
+                        ]))
+                        .style(Style::default().bg(NORDIC_BG));
                         frame.render_widget(tab_bar, chunks[0]);
 
                         // Search Bar
                         let search_text = if self.registry_search_query.is_empty() {
-                            Span::styled(" Search models (type to filter query)...", Style::default().fg(Color::Rgb(100, 120, 140)).bg(NORDIC_BG))
+                            Span::styled(
+                                " Search models (type to filter query)...",
+                                Style::default().fg(Color::Rgb(100, 120, 140)).bg(NORDIC_BG),
+                            )
                         } else {
-                            Span::styled(format!(" Search: {}", self.registry_search_query), Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD))
+                            Span::styled(
+                                format!(" Search: {}", self.registry_search_query),
+                                Style::default()
+                                    .fg(Color::White)
+                                    .bg(NORDIC_BG)
+                                    .add_modifier(Modifier::BOLD),
+                            )
                         };
-                        frame.render_widget(Paragraph::new(Line::from(vec![search_text])).style(Style::default().bg(NORDIC_BG)), chunks[1]);
+                        frame.render_widget(
+                            Paragraph::new(Line::from(vec![search_text]))
+                                .style(Style::default().bg(NORDIC_BG)),
+                            chunks[1],
+                        );
 
                         let q_raw = self.registry_search_query.trim();
                         let total_w = chunks[2].width as usize;
 
                         // Helper closure to build highlighted spans with bold matching chars
-                        let build_highlighted_spans = |text: &str, query: &str, base_style: Style, match_style: Style| -> Vec<Span> {
+                        let build_highlighted_spans = |text: &str,
+                                                       query: &str,
+                                                       base_style: Style,
+                                                       match_style: Style|
+                         -> Vec<Span> {
                             if query.is_empty() {
                                 return vec![Span::styled(text.to_string(), base_style)];
                             }
                             let text_lower = text.to_lowercase();
                             let mut spans = Vec::new();
                             let mut last_idx = 0;
-                            
+
                             // Check if query is in text as substring or match sub-tokens
                             let search_term = if let Some(slash_idx) = query.rfind('/') {
                                 &query[slash_idx + 1..]
@@ -7720,17 +7423,26 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             if !needle.is_empty() && text_lower.contains(&needle) {
                                 for (match_start, _) in text_lower.match_indices(&needle) {
                                     if match_start > last_idx {
-                                        spans.push(Span::styled(text[last_idx..match_start].to_string(), base_style));
+                                        spans.push(Span::styled(
+                                            text[last_idx..match_start].to_string(),
+                                            base_style,
+                                        ));
                                     }
                                     let match_end = match_start + needle.len();
-                                    spans.push(Span::styled(text[match_start..match_end].to_string(), match_style));
+                                    spans.push(Span::styled(
+                                        text[match_start..match_end].to_string(),
+                                        match_style,
+                                    ));
                                     last_idx = match_end;
                                 }
                                 if last_idx < text.len() {
-                                    spans.push(Span::styled(text[last_idx..].to_string(), base_style));
+                                    spans.push(Span::styled(
+                                        text[last_idx..].to_string(),
+                                        base_style,
+                                    ));
                                 }
                             } else {
-                        spans.push(Span::styled(text.to_string(), base_style));
+                                spans.push(Span::styled(text.to_string(), base_style));
                             }
                             spans
                         };
@@ -7752,93 +7464,263 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                         let selected_idx = self.registry_state.selected();
 
                         let items: Vec<ListItem> = if self.registry_tab == 0 {
-                            filtered_models.iter()
+                            filtered_models
+                                .iter()
                                 .enumerate()
                                 .map(|(row_idx, m)| {
                                     let is_selected = selected_idx == Some(row_idx);
-                                    let row_bg = if is_selected { Color::Rgb(59, 66, 82) } else { NORDIC_BG };
+                                    let row_bg = if is_selected {
+                                        Color::Rgb(59, 66, 82)
+                                    } else {
+                                        NORDIC_BG
+                                    };
 
                                     // Split org/repo [size] into columns: Org │ Model │ Size
-                                    let (repo_part, size_part) = if let Some(bracket_idx) = m.find('[') {
-                                        (m[..bracket_idx].trim(), m[bracket_idx..].trim())
-                                    } else {
-                                        (m.trim(), "")
-                                    };
-                                    let (org, model_name) = if let Some(slash_idx) = repo_part.find('/') {
-                                        (&repo_part[..slash_idx], &repo_part[slash_idx + 1..])
-                                    } else {
-                                        ("-", repo_part)
-                                    };
+                                    let (repo_part, size_part) =
+                                        if let Some(bracket_idx) = m.find('[') {
+                                            (m[..bracket_idx].trim(), m[bracket_idx..].trim())
+                                        } else {
+                                            (m.trim(), "")
+                                        };
+                                    let (org, model_name) =
+                                        if let Some(slash_idx) = repo_part.find('/') {
+                                            (&repo_part[..slash_idx], &repo_part[slash_idx + 1..])
+                                        } else {
+                                            ("-", repo_part)
+                                        };
 
-                                    let org_col = format!("{:<14}", if org.len() > 14 { &org[..14] } else { org });
-                                    let size_clean = size_part.trim_matches(|c| c == '[' || c == ']').replace("Q4 est.", "est").replace("GGUF", "").trim().to_string();
-                                    let size_col = format!("{:>12}", if size_clean.len() > 12 { &size_clean[..12] } else { &size_clean });
-                                    
+                                    let org_col = format!(
+                                        "{:<14}",
+                                        if org.len() > 14 { &org[..14] } else { org }
+                                    );
+                                    let size_clean = size_part
+                                        .trim_matches(|c| c == '[' || c == ']')
+                                        .replace("Q4 est.", "est")
+                                        .replace("GGUF", "")
+                                        .trim()
+                                        .to_string();
+                                    let size_col = format!(
+                                        "{:>12}",
+                                        if size_clean.len() > 12 {
+                                            &size_clean[..12]
+                                        } else {
+                                            &size_clean
+                                        }
+                                    );
+
                                     let used_w = 14 + 3 + 12 + 3; // org + " │ " + size + " │ "
                                     let model_max_w = total_w.saturating_sub(used_w).max(10);
-                                    let model_col = format!("{:<width$}", if model_name.len() > model_max_w { &model_name[..model_max_w] } else { model_name }, width = model_max_w);
+                                    let model_col = format!(
+                                        "{:<width$}",
+                                        if model_name.len() > model_max_w {
+                                            &model_name[..model_max_w]
+                                        } else {
+                                            model_name
+                                        },
+                                        width = model_max_w
+                                    );
 
-                                    let org_base_style = Style::default().fg(if is_selected { Color::Rgb(143, 218, 255) } else { Color::Rgb(136, 192, 208) }).bg(row_bg);
-                                    let org_match_style = Style::default().fg(Color::White).bg(Color::Rgb(94, 129, 172)).add_modifier(Modifier::BOLD);
-                                    let org_spans = build_highlighted_spans(&org_col, q_raw, org_base_style, org_match_style);
+                                    let org_base_style = Style::default()
+                                        .fg(if is_selected {
+                                            Color::Rgb(143, 218, 255)
+                                        } else {
+                                            Color::Rgb(136, 192, 208)
+                                        })
+                                        .bg(row_bg);
+                                    let org_match_style = Style::default()
+                                        .fg(Color::White)
+                                        .bg(Color::Rgb(94, 129, 172))
+                                        .add_modifier(Modifier::BOLD);
+                                    let org_spans = build_highlighted_spans(
+                                        &org_col,
+                                        q_raw,
+                                        org_base_style,
+                                        org_match_style,
+                                    );
 
-                                    let model_base_style = Style::default().fg(if is_selected { Color::White } else { Color::Rgb(220, 230, 242) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() });
-                                    let model_match_style = Style::default().fg(Color::Rgb(235, 203, 139)).bg(Color::Rgb(67, 76, 94)).add_modifier(Modifier::BOLD);
-                                    let model_spans = build_highlighted_spans(&model_col, q_raw, model_base_style, model_match_style);
+                                    let model_base_style = Style::default()
+                                        .fg(if is_selected {
+                                            Color::White
+                                        } else {
+                                            Color::Rgb(220, 230, 242)
+                                        })
+                                        .bg(row_bg)
+                                        .add_modifier(if is_selected {
+                                            Modifier::BOLD
+                                        } else {
+                                            Modifier::empty()
+                                        });
+                                    let model_match_style = Style::default()
+                                        .fg(Color::Rgb(235, 203, 139))
+                                        .bg(Color::Rgb(67, 76, 94))
+                                        .add_modifier(Modifier::BOLD);
+                                    let model_spans = build_highlighted_spans(
+                                        &model_col,
+                                        q_raw,
+                                        model_base_style,
+                                        model_match_style,
+                                    );
 
                                     let mut line_spans = Vec::new();
                                     line_spans.extend(org_spans);
-                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)));
+                                    line_spans.push(Span::styled(
+                                        " │ ",
+                                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
+                                    ));
                                     line_spans.extend(model_spans);
-                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)));
-                                    line_spans.push(Span::styled(size_col, Style::default().fg(if is_selected { Color::Rgb(180, 240, 160) } else { Color::Rgb(163, 190, 140) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })));
+                                    line_spans.push(Span::styled(
+                                        " │ ",
+                                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
+                                    ));
+                                    line_spans.push(Span::styled(
+                                        size_col,
+                                        Style::default()
+                                            .fg(if is_selected {
+                                                Color::Rgb(180, 240, 160)
+                                            } else {
+                                                Color::Rgb(163, 190, 140)
+                                            })
+                                            .bg(row_bg)
+                                            .add_modifier(if is_selected {
+                                                Modifier::BOLD
+                                            } else {
+                                                Modifier::empty()
+                                            }),
+                                    ));
 
-                                    ListItem::new(Line::from(line_spans)).style(Style::default().bg(row_bg))
-                                }).collect()
+                                    ListItem::new(Line::from(line_spans))
+                                        .style(Style::default().bg(row_bg))
+                                })
+                                .collect()
                         } else {
-                            filtered_models.iter()
+                            filtered_models
+                                .iter()
                                 .enumerate()
                                 .map(|(row_idx, m)| {
                                     let is_selected = selected_idx == Some(row_idx);
-                                    let row_bg = if is_selected { Color::Rgb(59, 66, 82) } else { NORDIC_BG };
+                                    let row_bg = if is_selected {
+                                        Color::Rgb(59, 66, 82)
+                                    } else {
+                                        NORDIC_BG
+                                    };
 
                                     let (name_part, size_part) = if let Some(idx) = m.find('(') {
-                                        (m[..idx].trim(), m[idx..].trim_matches(|c| c == '(' || c == ')').trim())
+                                        (
+                                            m[..idx].trim(),
+                                            m[idx..].trim_matches(|c| c == '(' || c == ')').trim(),
+                                        )
                                     } else if let Some(idx) = m.find('[') {
-                                        (m[..idx].trim(), m[idx..].trim_matches(|c| c == '[' || c == ']').trim())
+                                        (
+                                            m[..idx].trim(),
+                                            m[idx..].trim_matches(|c| c == '[' || c == ']').trim(),
+                                        )
                                     } else {
                                         (m.trim(), "")
                                     };
 
-                                    let (org, model_name) = if let Some(slash_idx) = name_part.find('/') {
-                                        (&name_part[..slash_idx], &name_part[slash_idx + 1..])
-                                    } else {
-                                        ("ollama", name_part)
-                                    };
+                                    let (org, model_name) =
+                                        if let Some(slash_idx) = name_part.find('/') {
+                                            (&name_part[..slash_idx], &name_part[slash_idx + 1..])
+                                        } else {
+                                            ("ollama", name_part)
+                                        };
 
-                                    let org_col = format!("{:<14}", if org.len() > 14 { &org[..14] } else { org });
-                                    let size_col = format!("{:>12}", if size_part.len() > 12 { &size_part[..12] } else { size_part });
+                                    let org_col = format!(
+                                        "{:<14}",
+                                        if org.len() > 14 { &org[..14] } else { org }
+                                    );
+                                    let size_col = format!(
+                                        "{:>12}",
+                                        if size_part.len() > 12 {
+                                            &size_part[..12]
+                                        } else {
+                                            size_part
+                                        }
+                                    );
                                     let used_w = 14 + 3 + 12 + 3;
                                     let model_max_w = total_w.saturating_sub(used_w).max(10);
-                                    let model_col = format!("{:<width$}", if model_name.len() > model_max_w { &model_name[..model_max_w] } else { model_name }, width = model_max_w);
+                                    let model_col = format!(
+                                        "{:<width$}",
+                                        if model_name.len() > model_max_w {
+                                            &model_name[..model_max_w]
+                                        } else {
+                                            model_name
+                                        },
+                                        width = model_max_w
+                                    );
 
-                                    let org_base_style = Style::default().fg(if is_selected { Color::Rgb(143, 218, 255) } else { Color::Rgb(136, 192, 208) }).bg(row_bg);
-                                    let org_match_style = Style::default().fg(Color::White).bg(Color::Rgb(94, 129, 172)).add_modifier(Modifier::BOLD);
-                                    let org_spans = build_highlighted_spans(&org_col, q_raw, org_base_style, org_match_style);
+                                    let org_base_style = Style::default()
+                                        .fg(if is_selected {
+                                            Color::Rgb(143, 218, 255)
+                                        } else {
+                                            Color::Rgb(136, 192, 208)
+                                        })
+                                        .bg(row_bg);
+                                    let org_match_style = Style::default()
+                                        .fg(Color::White)
+                                        .bg(Color::Rgb(94, 129, 172))
+                                        .add_modifier(Modifier::BOLD);
+                                    let org_spans = build_highlighted_spans(
+                                        &org_col,
+                                        q_raw,
+                                        org_base_style,
+                                        org_match_style,
+                                    );
 
-                                    let model_base_style = Style::default().fg(if is_selected { Color::White } else { Color::Rgb(220, 230, 242) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() });
-                                    let model_match_style = Style::default().fg(Color::Rgb(235, 203, 139)).bg(Color::Rgb(67, 76, 94)).add_modifier(Modifier::BOLD);
-                                    let model_spans = build_highlighted_spans(&model_col, q_raw, model_base_style, model_match_style);
+                                    let model_base_style = Style::default()
+                                        .fg(if is_selected {
+                                            Color::White
+                                        } else {
+                                            Color::Rgb(220, 230, 242)
+                                        })
+                                        .bg(row_bg)
+                                        .add_modifier(if is_selected {
+                                            Modifier::BOLD
+                                        } else {
+                                            Modifier::empty()
+                                        });
+                                    let model_match_style = Style::default()
+                                        .fg(Color::Rgb(235, 203, 139))
+                                        .bg(Color::Rgb(67, 76, 94))
+                                        .add_modifier(Modifier::BOLD);
+                                    let model_spans = build_highlighted_spans(
+                                        &model_col,
+                                        q_raw,
+                                        model_base_style,
+                                        model_match_style,
+                                    );
 
                                     let mut line_spans = Vec::new();
                                     line_spans.extend(org_spans);
-                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)));
+                                    line_spans.push(Span::styled(
+                                        " │ ",
+                                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
+                                    ));
                                     line_spans.extend(model_spans);
-                                    line_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)));
-                                    line_spans.push(Span::styled(size_col, Style::default().fg(if is_selected { Color::Rgb(180, 240, 160) } else { Color::Rgb(163, 190, 140) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })));
+                                    line_spans.push(Span::styled(
+                                        " │ ",
+                                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
+                                    ));
+                                    line_spans.push(Span::styled(
+                                        size_col,
+                                        Style::default()
+                                            .fg(if is_selected {
+                                                Color::Rgb(180, 240, 160)
+                                            } else {
+                                                Color::Rgb(163, 190, 140)
+                                            })
+                                            .bg(row_bg)
+                                            .add_modifier(if is_selected {
+                                                Modifier::BOLD
+                                            } else {
+                                                Modifier::empty()
+                                            }),
+                                    ));
 
-                                    ListItem::new(Line::from(line_spans)).style(Style::default().bg(row_bg))
-                                }).collect()
+                                    ListItem::new(Line::from(line_spans))
+                                        .style(Style::default().bg(row_bg))
+                                })
+                                .collect()
                         };
 
                         if items.is_empty() {
@@ -7847,13 +7729,14 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             } else {
                                 "No models found matching query. Press Backspace or search another author/model."
                             };
-                            let p = Paragraph::new(Line::from(vec![
-                                Span::styled(format!("  {}", empty_msg), Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG))
-                            ])).style(Style::default().bg(NORDIC_BG));
+                            let p = Paragraph::new(Line::from(vec![Span::styled(
+                                format!("  {}", empty_msg),
+                                Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG),
+                            )]))
+                            .style(Style::default().bg(NORDIC_BG));
                             frame.render_widget(p, chunks[2]);
                         } else {
-                            let list = List::new(items)
-                                .style(Style::default().bg(NORDIC_BG));
+                            let list = List::new(items).style(Style::default().bg(NORDIC_BG));
                             frame.render_stateful_widget(list, chunks[2], &mut self.registry_state);
                         }
                     }
@@ -7865,9 +7748,19 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             .split(content_inner);
 
                         let info = Paragraph::new(Line::from(vec![
-                            Span::styled(" Installed Models ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                            Span::styled(" (Up/Down or W/S to navigate | Enter to activate model)", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG)),
-                        ])).style(Style::default().bg(NORDIC_BG));
+                            Span::styled(
+                                " Installed Models ",
+                                Style::default()
+                                    .fg(Color::White)
+                                    .bg(NORDIC_BG)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                " (Up/Down or W/S to navigate | Enter to activate model)",
+                                Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                            ),
+                        ]))
+                        .style(Style::default().bg(NORDIC_BG));
                         frame.render_widget(info, chunks[0]);
 
                         if self.installed_models.is_empty() {
@@ -7875,74 +7768,164 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                         } else {
                             let cur_sel = self.installed_state.selected().unwrap_or(0);
                             if cur_sel >= self.installed_models.len() {
-                                self.installed_state.select(Some(self.installed_models.len() - 1));
+                                self.installed_state
+                                    .select(Some(self.installed_models.len() - 1));
                             } else if self.installed_state.selected().is_none() {
                                 self.installed_state.select(Some(0));
                             }
                         }
 
                         let selected_idx = self.installed_state.selected();
-                        let items: Vec<ListItem> = self.installed_models.iter().enumerate().map(|(row_idx, m)| {
-                            let is_selected = selected_idx == Some(row_idx);
-                            let is_being_deleted = self.delete_confirm_model.as_ref() == Some(m);
-                            let row_bg = if is_being_deleted {
-                                Color::Rgb(75, 45, 45)
-                            } else if is_selected {
-                                Color::Rgb(59, 66, 82)
-                            } else {
-                                NORDIC_BG
-                            };
+                        let items: Vec<ListItem> = self
+                            .installed_models
+                            .iter()
+                            .enumerate()
+                            .map(|(row_idx, m)| {
+                                let is_selected = selected_idx == Some(row_idx);
+                                let is_being_deleted =
+                                    self.delete_confirm_model.as_ref() == Some(m);
+                                let row_bg = if is_being_deleted {
+                                    Color::Rgb(75, 45, 45)
+                                } else if is_selected {
+                                    Color::Rgb(59, 66, 82)
+                                } else {
+                                    NORDIC_BG
+                                };
 
-                            let is_active = self.backend.name().contains(m) || m.contains(&self.backend.name());
-                            let (badge_txt, badge_fg, badge_bg) = if is_being_deleted {
-                                (" DELETE? ", Color::White, Color::Rgb(220, 60, 60))
-                            } else if is_active {
-                                (" ACTIVE ", NORDIC_BG, Color::Rgb(163, 190, 140))
-                            } else {
-                                (" READY  ", NORDIC_BG, Color::Rgb(76, 86, 106))
-                            };
+                                let is_active = self.backend.name().contains(m)
+                                    || m.contains(&self.backend.name());
+                                let (badge_txt, badge_fg, badge_bg) = if is_being_deleted {
+                                    (" DELETE? ", Color::White, Color::Rgb(220, 60, 60))
+                                } else if is_active {
+                                    (" ACTIVE ", NORDIC_BG, Color::Rgb(163, 190, 140))
+                                } else {
+                                    (" READY  ", NORDIC_BG, Color::Rgb(76, 86, 106))
+                                };
 
-                            let clean_name = m.replace("Local GGUF:", "").replace("Ollama Local:", "").trim().to_string();
-                            let (repo, model_label) = if let Some(idx) = clean_name.find('/') {
-                                (&clean_name[..idx], clean_name[idx+1..].trim())
-                            } else {
-                                ("local", clean_name.as_str())
-                            };
+                                let clean_name = m
+                                    .replace("Local GGUF:", "")
+                                    .replace("Ollama Local:", "")
+                                    .trim()
+                                    .to_string();
+                                let (repo, model_label) = if let Some(idx) = clean_name.find('/') {
+                                    (&clean_name[..idx], clean_name[idx + 1..].trim())
+                                } else {
+                                    ("local", clean_name.as_str())
+                                };
 
-                            let repo_col = format!("{:<14}", if repo.len() > 14 { &repo[..14] } else { repo });
-                            let total_w = chunks[1].width as usize;
+                                let repo_col = format!(
+                                    "{:<14}",
+                                    if repo.len() > 14 { &repo[..14] } else { repo }
+                                );
+                                let total_w = chunks[1].width as usize;
 
-                            if is_being_deleted {
-                                let prompt_str = " Confirm delete? [y/n] ";
-                                let used_w = 10 + 1 + 14 + 3 + prompt_str.chars().count();
-                                let name_max_w = total_w.saturating_sub(used_w).max(10);
-                                let name_col = format!("{:<width$}", if model_label.len() > name_max_w { &model_label[..name_max_w] } else { model_label }, width = name_max_w);
+                                if is_being_deleted {
+                                    let prompt_str = " Confirm delete? [y/n] ";
+                                    let used_w = 10 + 1 + 14 + 3 + prompt_str.chars().count();
+                                    let name_max_w = total_w.saturating_sub(used_w).max(10);
+                                    let name_col = format!(
+                                        "{:<width$}",
+                                        if model_label.len() > name_max_w {
+                                            &model_label[..name_max_w]
+                                        } else {
+                                            model_label
+                                        },
+                                        width = name_max_w
+                                    );
 
-                                ListItem::new(Line::from(vec![
-                                    Span::styled(badge_txt, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD)),
-                                    Span::styled(" ", Style::default().bg(row_bg)),
-                                    Span::styled(repo_col, Style::default().fg(Color::Rgb(255, 140, 140)).bg(row_bg)),
-                                    Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)),
-                                    Span::styled(name_col, Style::default().fg(Color::White).bg(row_bg).add_modifier(Modifier::BOLD)),
-                                    Span::styled(prompt_str, Style::default().fg(Color::Rgb(255, 200, 100)).bg(Color::Rgb(100, 30, 30)).add_modifier(Modifier::BOLD)),
-                                ])).style(Style::default().bg(row_bg))
-                            } else {
-                                let used_w = 9 + 1 + 14 + 3; // badge + space + repo + " │ "
-                                let name_max_w = total_w.saturating_sub(used_w).max(10);
-                                let name_col = format!("{:<width$}", if model_label.len() > name_max_w { &model_label[..name_max_w] } else { model_label }, width = name_max_w);
+                                    ListItem::new(Line::from(vec![
+                                        Span::styled(
+                                            badge_txt,
+                                            Style::default()
+                                                .fg(badge_fg)
+                                                .bg(badge_bg)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(" ", Style::default().bg(row_bg)),
+                                        Span::styled(
+                                            repo_col,
+                                            Style::default()
+                                                .fg(Color::Rgb(255, 140, 140))
+                                                .bg(row_bg),
+                                        ),
+                                        Span::styled(
+                                            " │ ",
+                                            Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
+                                        ),
+                                        Span::styled(
+                                            name_col,
+                                            Style::default()
+                                                .fg(Color::White)
+                                                .bg(row_bg)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            prompt_str,
+                                            Style::default()
+                                                .fg(Color::Rgb(255, 200, 100))
+                                                .bg(Color::Rgb(100, 30, 30))
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                    ]))
+                                    .style(Style::default().bg(row_bg))
+                                } else {
+                                    let used_w = 9 + 1 + 14 + 3; // badge + space + repo + " │ "
+                                    let name_max_w = total_w.saturating_sub(used_w).max(10);
+                                    let name_col = format!(
+                                        "{:<width$}",
+                                        if model_label.len() > name_max_w {
+                                            &model_label[..name_max_w]
+                                        } else {
+                                            model_label
+                                        },
+                                        width = name_max_w
+                                    );
 
-                                ListItem::new(Line::from(vec![
-                                    Span::styled(badge_txt, Style::default().fg(badge_fg).bg(badge_bg).add_modifier(Modifier::BOLD)),
-                                    Span::styled(" ", Style::default().bg(row_bg)),
-                                    Span::styled(repo_col, Style::default().fg(if is_selected { Color::Rgb(143, 218, 255) } else { Color::Rgb(136, 192, 208) }).bg(row_bg)),
-                                    Span::styled(" │ ", Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg)),
-                                    Span::styled(name_col, Style::default().fg(if is_selected { Color::White } else { Color::Rgb(220, 230, 242) }).bg(row_bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })),
-                                ])).style(Style::default().bg(row_bg))
-                            }
-                        }).collect();
+                                    ListItem::new(Line::from(vec![
+                                        Span::styled(
+                                            badge_txt,
+                                            Style::default()
+                                                .fg(badge_fg)
+                                                .bg(badge_bg)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(" ", Style::default().bg(row_bg)),
+                                        Span::styled(
+                                            repo_col,
+                                            Style::default()
+                                                .fg(if is_selected {
+                                                    Color::Rgb(143, 218, 255)
+                                                } else {
+                                                    Color::Rgb(136, 192, 208)
+                                                })
+                                                .bg(row_bg),
+                                        ),
+                                        Span::styled(
+                                            " │ ",
+                                            Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
+                                        ),
+                                        Span::styled(
+                                            name_col,
+                                            Style::default()
+                                                .fg(if is_selected {
+                                                    Color::White
+                                                } else {
+                                                    Color::Rgb(220, 230, 242)
+                                                })
+                                                .bg(row_bg)
+                                                .add_modifier(if is_selected {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
+                                    ]))
+                                    .style(Style::default().bg(row_bg))
+                                }
+                            })
+                            .collect();
 
-                        let list = List::new(items)
-                            .style(Style::default().bg(NORDIC_BG));
+                        let list = List::new(items).style(Style::default().bg(NORDIC_BG));
                         frame.render_stateful_widget(list, chunks[1], &mut self.installed_state);
                     }
                     3 => {
@@ -7954,7 +7937,14 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
 
                         let cols = Layout::default()
                             .direction(Direction::Horizontal)
-                            .constraints([Constraint::Length(22), Constraint::Length(2), Constraint::Min(1)].as_ref())
+                            .constraints(
+                                [
+                                    Constraint::Length(22),
+                                    Constraint::Length(2),
+                                    Constraint::Min(1),
+                                ]
+                                .as_ref(),
+                            )
                             .split(content_inner);
 
                         // Column 1: Tabs (w/Up to go up, s/Down to go down)
@@ -7972,8 +7962,18 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
 
                             let symbol = if is_selected { "● " } else { "  " };
                             tab_items.push(ListItem::new(Line::from(vec![
-                                Span::styled(symbol, Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD)),
-                                Span::styled(*name, Style::default().fg(fg).bg(bg).add_modifier(if is_selected { Modifier::BOLD } else { Modifier::empty() })),
+                                Span::styled(
+                                    symbol,
+                                    Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    *name,
+                                    Style::default().fg(fg).bg(bg).add_modifier(if is_selected {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                                ),
                             ])));
                         }
 
@@ -7981,31 +7981,101 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                         frame.render_widget(col1_list, cols[0]);
 
                         // Column separator
-                        let sep_lines: Vec<Line> = (0..cols[1].height).map(|_| Line::from(Span::styled("│", Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG)))).collect();
+                        let sep_lines: Vec<Line> = (0..cols[1].height)
+                            .map(|_| {
+                                Line::from(Span::styled(
+                                    "│",
+                                    Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG),
+                                ))
+                            })
+                            .collect();
                         frame.render_widget(Paragraph::new(sep_lines), cols[1]);
 
                         // Column 2: Value options
                         let col2_focus = self.settings_col == 1;
                         let focus_badge = if self.settings_tab == 8 {
                             if self.search_token_editing {
-                                Span::styled(" [EDITING: Type API Key / URL | Enter=Save | Esc=Cancel] ", Style::default().fg(NORDIC_BG).bg(Color::Rgb(163, 190, 140)).add_modifier(Modifier::BOLD))
+                                Span::styled(
+                                    " [EDITING: Type API Key / URL | Enter=Save | Esc=Cancel] ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::Rgb(163, 190, 140))
+                                        .add_modifier(Modifier::BOLD),
+                                )
                             } else if col2_focus {
                                 Span::styled(" [FOCUSED: A/D or Left/Right to Cycle | K=Edit Key | Del=Clear Key] ", Style::default().fg(NORDIC_BG).bg(Color::Rgb(143, 218, 255)).add_modifier(Modifier::BOLD))
                             } else {
-                                Span::styled(" [Press Enter to Configure Web Search] ", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))
+                                Span::styled(
+                                    " [Press Enter to Configure Web Search] ",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )
                             }
-                        } else if self.settings_tab == SETTINGS_TAB_NAMES.len() - 1 {
+                        } else if self.settings_tab == SETTINGS_HF_TOKEN {
                             if self.hf_token_editing {
-                                Span::styled(" [EDITING: Type token | Enter=Save | Esc=Cancel] ", Style::default().fg(NORDIC_BG).bg(Color::Rgb(163, 190, 140)).add_modifier(Modifier::BOLD))
+                                Span::styled(
+                                    " [EDITING: Type token | Enter=Save | Esc=Cancel] ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::Rgb(163, 190, 140))
+                                        .add_modifier(Modifier::BOLD),
+                                )
                             } else if col2_focus {
-                                Span::styled(" [FOCUSED: Enter=Edit/Add | D/Delete=Remove] ", Style::default().fg(NORDIC_BG).bg(Color::Rgb(143, 218, 255)).add_modifier(Modifier::BOLD))
+                                Span::styled(
+                                    " [FOCUSED: Enter=Edit/Add | D/Delete=Remove] ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::Rgb(143, 218, 255))
+                                        .add_modifier(Modifier::BOLD),
+                                )
                             } else {
-                                Span::styled(" [Press Enter to Configure Token] ", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))
+                                Span::styled(
+                                    " [Press Enter to Configure Token] ",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )
+                            }
+                        } else if self.settings_tab == SETTINGS_CODE_GRAPH {
+                            if col2_focus {
+                                Span::styled(
+                                    " [FOCUSED: Up/Down Select | A/Left OFF | D/Right ON | Enter Toggle] ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::Rgb(143, 218, 255))
+                                        .add_modifier(Modifier::BOLD),
+                                )
+                            } else {
+                                Span::styled(
+                                    " [Enter/Right: Open | Up/Down: Navigate | Esc: Back] ",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )
+                            }
+                        } else if self.settings_tab == SETTINGS_LSP_DIAGNOSTICS {
+                            if col2_focus {
+                                Span::styled(
+                                    " [FOCUSED: Up/Down Select | A/Left OFF | D/Right ON | Enter Toggle] ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::Rgb(143, 218, 255))
+                                        .add_modifier(Modifier::BOLD),
+                                )
+                            } else {
+                                Span::styled(
+                                    " [Enter/Right: Open | Up/Down: Navigate | Esc: Back] ",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )
                             }
                         } else if col2_focus {
-                            Span::styled(" [FOCUSED: A/D or Left/Right to change] ", Style::default().fg(NORDIC_BG).bg(Color::Rgb(143, 218, 255)).add_modifier(Modifier::BOLD))
+                            Span::styled(
+                                " [FOCUSED: A/D or Left/Right to change] ",
+                                Style::default()
+                                    .fg(NORDIC_BG)
+                                    .bg(Color::Rgb(143, 218, 255))
+                                    .add_modifier(Modifier::BOLD),
+                            )
                         } else {
-                            Span::styled(" [Press Enter to Edit Value] ", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))
+                            Span::styled(
+                                " [Press Enter to Edit Value] ",
+                                Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                            )
                         };
 
                         let mut val_lines: Vec<Line> = vec![
@@ -8017,36 +8087,100 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             0 => {
                                 // Power mode options
                                 let modes = [
-                                    (crate::settings::PowerMode::PowerSaver, "Power Saver (ease off when CPU is warm)"),
-                                    (crate::settings::PowerMode::Normal, "Normal (default - auto threads & GPU offload)"),
-                                    (crate::settings::PowerMode::Extreme, "Extreme (max GPU layers & full CPU threads)"),
+                                    (
+                                        crate::settings::PowerMode::PowerSaver,
+                                        "Power Saver (ease off when CPU is warm)",
+                                    ),
+                                    (
+                                        crate::settings::PowerMode::Normal,
+                                        "Normal (default - auto threads & GPU offload)",
+                                    ),
+                                    (
+                                        crate::settings::PowerMode::Extreme,
+                                        "Extreme (max GPU layers & full CPU threads)",
+                                    ),
                                 ];
                                 for (m, desc) in modes {
                                     let active = s.power_mode == m;
                                     let sym = if active { "● " } else { "○ " };
-                                    let color = if active { Color::Rgb(163, 190, 140) } else { Color::Rgb(160, 175, 195) };
+                                    let color = if active {
+                                        Color::Rgb(163, 190, 140)
+                                    } else {
+                                        Color::Rgb(160, 175, 195)
+                                    };
                                     val_lines.push(Line::from(vec![
-                                        Span::styled(sym, Style::default().fg(color).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                        Span::styled(desc, Style::default().fg(if active { Color::White } else { color }).bg(NORDIC_BG).add_modifier(if active { Modifier::BOLD } else { Modifier::empty() })),
+                                        Span::styled(
+                                            sym,
+                                            Style::default()
+                                                .fg(color)
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            desc,
+                                            Style::default()
+                                                .fg(if active { Color::White } else { color })
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(if active {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
                                     ]));
                                 }
                             }
                             1 => {
                                 // MTP / Speculative Decoding options
                                 let mtp_modes = [
-                                    (crate::settings::MtpMode::Disabled, "Disabled (Single-token generation)"),
-                                    (crate::settings::MtpMode::NativeMtp, "Native MTP (Model Multi-Token Prediction Layers)"),
-                                    (crate::settings::MtpMode::PromptLookup3, "Prompt Lookup Speculative (3-gram - Fastest, 0 RAM)"),
-                                    (crate::settings::MtpMode::PromptLookup4, "Prompt Lookup Speculative (4-gram - Code repetition)"),
-                                    (crate::settings::MtpMode::PromptLookup5, "Prompt Lookup Speculative (5-gram - Long match)"),
+                                    (
+                                        crate::settings::MtpMode::Disabled,
+                                        "Disabled (Single-token generation)",
+                                    ),
+                                    (
+                                        crate::settings::MtpMode::NativeMtp,
+                                        "Native MTP (Model Multi-Token Prediction Layers)",
+                                    ),
+                                    (
+                                        crate::settings::MtpMode::PromptLookup3,
+                                        "Prompt Lookup Speculative (3-gram - Fastest, 0 RAM)",
+                                    ),
+                                    (
+                                        crate::settings::MtpMode::PromptLookup4,
+                                        "Prompt Lookup Speculative (4-gram - Code repetition)",
+                                    ),
+                                    (
+                                        crate::settings::MtpMode::PromptLookup5,
+                                        "Prompt Lookup Speculative (5-gram - Long match)",
+                                    ),
                                 ];
                                 for (m, desc) in mtp_modes {
                                     let active = s.mtp_mode == m;
                                     let sym = if active { "● " } else { "○ " };
-                                    let color = if active { Color::Rgb(163, 190, 140) } else { Color::Rgb(160, 175, 195) };
+                                    let color = if active {
+                                        Color::Rgb(163, 190, 140)
+                                    } else {
+                                        Color::Rgb(160, 175, 195)
+                                    };
                                     val_lines.push(Line::from(vec![
-                                        Span::styled(sym, Style::default().fg(color).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                        Span::styled(desc, Style::default().fg(if active { Color::White } else { color }).bg(NORDIC_BG).add_modifier(if active { Modifier::BOLD } else { Modifier::empty() })),
+                                        Span::styled(
+                                            sym,
+                                            Style::default()
+                                                .fg(color)
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            desc,
+                                            Style::default()
+                                                .fg(if active { Color::White } else { color })
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(if active {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
                                     ]));
                                 }
                             }
@@ -8060,10 +8194,30 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                 for (val, desc) in options {
                                     let active = auto_col == val;
                                     let sym = if active { "● " } else { "○ " };
-                                    let color = if active { Color::Rgb(163, 190, 140) } else { Color::Rgb(160, 175, 195) };
+                                    let color = if active {
+                                        Color::Rgb(163, 190, 140)
+                                    } else {
+                                        Color::Rgb(160, 175, 195)
+                                    };
                                     val_lines.push(Line::from(vec![
-                                        Span::styled(sym, Style::default().fg(color).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                        Span::styled(desc, Style::default().fg(if active { Color::White } else { color }).bg(NORDIC_BG).add_modifier(if active { Modifier::BOLD } else { Modifier::empty() })),
+                                        Span::styled(
+                                            sym,
+                                            Style::default()
+                                                .fg(color)
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            desc,
+                                            Style::default()
+                                                .fg(if active { Color::White } else { color })
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(if active {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
                                     ]));
                                 }
                                 val_lines.push(Line::from(Span::styled("When enabled, previous turn's you/system/agent/action chips smoothly collapse into badge bars.", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
@@ -8080,10 +8234,30 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                 for (val, desc) in fps_options {
                                     let active = s.target_fps == val;
                                     let sym = if active { "● " } else { "○ " };
-                                    let color = if active { Color::Rgb(163, 190, 140) } else { Color::Rgb(160, 175, 195) };
+                                    let color = if active {
+                                        Color::Rgb(163, 190, 140)
+                                    } else {
+                                        Color::Rgb(160, 175, 195)
+                                    };
                                     val_lines.push(Line::from(vec![
-                                        Span::styled(sym, Style::default().fg(color).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                        Span::styled(desc, Style::default().fg(if active { Color::White } else { color }).bg(NORDIC_BG).add_modifier(if active { Modifier::BOLD } else { Modifier::empty() })),
+                                        Span::styled(
+                                            sym,
+                                            Style::default()
+                                                .fg(color)
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            desc,
+                                            Style::default()
+                                                .fg(if active { Color::White } else { color })
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(if active {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
                                     ]));
                                 }
                                 val_lines.push(Line::from(Span::styled("Controls the live UI frame polling rate and metrics refresh rate.", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
@@ -8091,35 +8265,101 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             4 => {
                                 // Stall watchdog options
                                 val_lines.push(Line::from(vec![
-                                    Span::styled("Watchdog Timeout: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                    Span::styled(crate::settings::format_stall_timeout(s.stall_timeout_secs), Style::default().fg(Color::Rgb(235, 203, 139)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(
+                                        "Watchdog Timeout: ",
+                                        Style::default()
+                                            .fg(Color::White)
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
+                                    Span::styled(
+                                        crate::settings::format_stall_timeout(s.stall_timeout_secs),
+                                        Style::default()
+                                            .fg(Color::Rgb(235, 203, 139))
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
                                 ]));
-                                val_lines.push(Line::from(Span::styled("Cycles: 5 min → 10 min → 20 min → Unlimited", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Cycles: 5 min → 10 min → 20 min → Unlimited",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
                             }
                             5 => {
                                 // Repeat detector
                                 val_lines.push(Line::from(vec![
-                                    Span::styled("Repeat Threshold: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                    Span::styled(format!("{} consecutive outputs", s.repeat_threshold), Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(
+                                        "Repeat Threshold: ",
+                                        Style::default()
+                                            .fg(Color::White)
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
+                                    Span::styled(
+                                        format!("{} consecutive outputs", s.repeat_threshold),
+                                        Style::default()
+                                            .fg(Color::Rgb(143, 218, 255))
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
                                 ]));
                                 val_lines.push(Line::from(vec![
-                                    Span::styled("Detect on Thinking: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                    Span::styled(if s.repeat_detect_thinking { "ENABLED" } else { "DISABLED" }, Style::default().fg(if s.repeat_detect_thinking { Color::Rgb(163, 190, 140) } else { Color::Rgb(255, 120, 120) }).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(
+                                        "Detect on Thinking: ",
+                                        Style::default()
+                                            .fg(Color::White)
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
+                                    Span::styled(
+                                        if s.repeat_detect_thinking {
+                                            "ENABLED"
+                                        } else {
+                                            "DISABLED"
+                                        },
+                                        Style::default()
+                                            .fg(if s.repeat_detect_thinking {
+                                                Color::Rgb(163, 190, 140)
+                                            } else {
+                                                Color::Rgb(255, 120, 120)
+                                            })
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
                                 ]));
                             }
                             6 => {
                                 // Context window
                                 val_lines.push(Line::from(vec![
-                                    Span::styled("Context Window Limit: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                    Span::styled(format!("{} ({} tokens)", ctx_label, ctx_n), Style::default().fg(Color::Rgb(180, 160, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(
+                                        "Context Window Limit: ",
+                                        Style::default()
+                                            .fg(Color::White)
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
+                                    Span::styled(
+                                        format!("{} ({} tokens)", ctx_label, ctx_n),
+                                        Style::default()
+                                            .fg(Color::Rgb(180, 160, 255))
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
                                 ]));
-                                val_lines.push(Line::from(Span::styled("Cycles: 4K → 8K → 16K → 32K → 64K → 128K → 250K → 1M", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Cycles: 4K → 8K → 16K → 32K → 64K → 128K → 250K → 1M",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
                             }
                             7 => {
                                 // Permissions Mode
-                                val_lines.push(Line::from(vec![
-                                    Span::styled("Action Permission Mode:", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                ]));
+                                val_lines.push(Line::from(vec![Span::styled(
+                                    "Action Permission Mode:",
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
+                                )]));
                                 let perms_modes = [
                                     (PermissionMode::Ask, "Ask user (Approval prompt before file write or command execution)"),
                                     (PermissionMode::AlwaysAllow, "Always Allow (Execute tool actions autonomously without asking)"),
@@ -8127,60 +8367,172 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                 for (m, desc) in perms_modes {
                                     let active = p.mode == m;
                                     let sym = if active { "  ● " } else { "  ○ " };
-                                    let color = if active { Color::Rgb(163, 190, 140) } else { Color::Rgb(160, 175, 195) };
+                                    let color = if active {
+                                        Color::Rgb(163, 190, 140)
+                                    } else {
+                                        Color::Rgb(160, 175, 195)
+                                    };
                                     val_lines.push(Line::from(vec![
-                                        Span::styled(sym, Style::default().fg(color).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                        Span::styled(desc, Style::default().fg(if active { Color::White } else { color }).bg(NORDIC_BG).add_modifier(if active { Modifier::BOLD } else { Modifier::empty() })),
+                                        Span::styled(
+                                            sym,
+                                            Style::default()
+                                                .fg(color)
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            desc,
+                                            Style::default()
+                                                .fg(if active { Color::White } else { color })
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(if active {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
                                     ]));
                                 }
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
-                                val_lines.push(Line::from(vec![
-                                    Span::styled("Directory Access Scope:", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                ]));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
+                                val_lines.push(Line::from(vec![Span::styled(
+                                    "Directory Access Scope:",
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
+                                )]));
                                 let scopes = [
-                                    (FolderScope::CurrentDir, "Current Project Directory ($CURRENT root only)"),
-                                    (FolderScope::AllDirs, "All Directories (Unrestricted filesystem access)"),
+                                    (
+                                        FolderScope::CurrentDir,
+                                        "Current Project Directory ($CURRENT root only)",
+                                    ),
+                                    (
+                                        FolderScope::AllDirs,
+                                        "All Directories (Unrestricted filesystem access)",
+                                    ),
                                 ];
                                 for (sc, desc) in scopes {
                                     let active = p.folder_scope == sc;
                                     let sym = if active { "  ● " } else { "  ○ " };
-                                    let color = if active { Color::Rgb(163, 190, 140) } else { Color::Rgb(160, 175, 195) };
+                                    let color = if active {
+                                        Color::Rgb(163, 190, 140)
+                                    } else {
+                                        Color::Rgb(160, 175, 195)
+                                    };
                                     val_lines.push(Line::from(vec![
-                                        Span::styled(sym, Style::default().fg(color).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                        Span::styled(desc, Style::default().fg(if active { Color::White } else { color }).bg(NORDIC_BG).add_modifier(if active { Modifier::BOLD } else { Modifier::empty() })),
+                                        Span::styled(
+                                            sym,
+                                            Style::default()
+                                                .fg(color)
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            desc,
+                                            Style::default()
+                                                .fg(if active { Color::White } else { color })
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(if active {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
                                     ]));
                                 }
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
                                 val_lines.push(Line::from(Span::styled("Press Enter or Left/Right to toggle Mode | Press S/D to toggle Directory Scope.", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
                             }
                             8 => {
                                 // Web Search Provider
                                 let search_providers = [
-                                    (crate::settings::WebSearchProvider::DuckDuckGo, "DuckDuckGo (Default, Zero Config)"),
-                                    (crate::settings::WebSearchProvider::Google, "Google Search (Requires GOOGLE_API_KEY & GOOGLE_CX)"),
-                                    (crate::settings::WebSearchProvider::Brave, "Brave Search (Requires BRAVE_API_KEY)"),
-                                    (crate::settings::WebSearchProvider::Tavily, "Tavily AI (Requires TAVILY_API_KEY)"),
-                                    (crate::settings::WebSearchProvider::Searxng, "SearXNG (Local/Self-Hosted Instance URL)"),
-                                    (crate::settings::WebSearchProvider::Arxiv, "ArXiv Research Papers (Zero Config)"),
+                                    (
+                                        crate::settings::WebSearchProvider::DuckDuckGo,
+                                        "DuckDuckGo (Default, Zero Config)",
+                                    ),
+                                    (
+                                        crate::settings::WebSearchProvider::Google,
+                                        "Google Search (Requires GOOGLE_API_KEY & GOOGLE_CX)",
+                                    ),
+                                    (
+                                        crate::settings::WebSearchProvider::Brave,
+                                        "Brave Search (Requires BRAVE_API_KEY)",
+                                    ),
+                                    (
+                                        crate::settings::WebSearchProvider::Tavily,
+                                        "Tavily AI (Requires TAVILY_API_KEY)",
+                                    ),
+                                    (
+                                        crate::settings::WebSearchProvider::Searxng,
+                                        "SearXNG (Local/Self-Hosted Instance URL)",
+                                    ),
+                                    (
+                                        crate::settings::WebSearchProvider::Arxiv,
+                                        "ArXiv Research Papers (Zero Config)",
+                                    ),
                                 ];
                                 for (sp, desc) in search_providers {
                                     let active = s.web_search_provider == sp;
                                     let sym = if active { "● " } else { "○ " };
-                                    let color = if active { Color::Rgb(163, 190, 140) } else { Color::Rgb(160, 175, 195) };
+                                    let color = if active {
+                                        Color::Rgb(163, 190, 140)
+                                    } else {
+                                        Color::Rgb(160, 175, 195)
+                                    };
                                     val_lines.push(Line::from(vec![
-                                        Span::styled(sym, Style::default().fg(color).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                        Span::styled(desc, Style::default().fg(if active { Color::White } else { color }).bg(NORDIC_BG).add_modifier(if active { Modifier::BOLD } else { Modifier::empty() })),
+                                        Span::styled(
+                                            sym,
+                                            Style::default()
+                                                .fg(color)
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            desc,
+                                            Style::default()
+                                                .fg(if active { Color::White } else { color })
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(if active {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
                                     ]));
                                 }
 
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
-                                let current_token_opt = crate::settings::get_search_token(s.web_search_provider);
-                                let provider_needs_token = matches!(s.web_search_provider, crate::settings::WebSearchProvider::Google | crate::settings::WebSearchProvider::Brave | crate::settings::WebSearchProvider::Tavily | crate::settings::WebSearchProvider::Searxng);
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
+                                let current_token_opt =
+                                    crate::settings::get_search_token(s.web_search_provider);
+                                let provider_needs_token = matches!(
+                                    s.web_search_provider,
+                                    crate::settings::WebSearchProvider::Google
+                                        | crate::settings::WebSearchProvider::Brave
+                                        | crate::settings::WebSearchProvider::Tavily
+                                        | crate::settings::WebSearchProvider::Searxng
+                                );
 
                                 if provider_needs_token {
-                                    let key_label = if s.web_search_provider == crate::settings::WebSearchProvider::Searxng { "Instance URL: " } else { "API Key / Token: " };
+                                    let key_label = if s.web_search_provider
+                                        == crate::settings::WebSearchProvider::Searxng
+                                    {
+                                        "Instance URL: "
+                                    } else {
+                                        "API Key / Token: "
+                                    };
                                     let masked_key = if let Some(ref tok) = current_token_opt {
-                                        if s.web_search_provider == crate::settings::WebSearchProvider::Searxng {
+                                        if s.web_search_provider
+                                            == crate::settings::WebSearchProvider::Searxng
+                                        {
                                             tok.clone()
                                         } else if tok.len() > 8 {
                                             format!("{}...{}", &tok[..4], &tok[tok.len() - 4..])
@@ -8188,36 +8540,96 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                             "********".to_string()
                                         }
                                     } else {
-                                        "None (Using environment fallback or unconfigured)".to_string()
+                                        "None (Using environment fallback or unconfigured)"
+                                            .to_string()
                                     };
 
                                     val_lines.push(Line::from(vec![
-                                        Span::styled(key_label, Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                        Span::styled(
+                                            key_label,
+                                            Style::default()
+                                                .fg(Color::White)
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
                                         Span::styled(
                                             masked_key,
-                                            Style::default().fg(if current_token_opt.is_some() { Color::Rgb(163, 190, 140) } else { Color::Rgb(235, 203, 139) }).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                            Style::default()
+                                                .fg(if current_token_opt.is_some() {
+                                                    Color::Rgb(163, 190, 140)
+                                                } else {
+                                                    Color::Rgb(235, 203, 139)
+                                                })
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
                                         ),
                                     ]));
 
                                     if self.search_token_editing {
                                         val_lines.push(Line::from(vec![
-                                            Span::styled("New Key/URL: ", Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                            Span::styled(&self.search_token_input, Style::default().fg(Color::White).bg(Color::Rgb(46, 52, 64))),
-                                            Span::styled("▍", Style::default().fg(Color::Rgb(143, 218, 255)).bg(Color::Rgb(46, 52, 64))),
+                                            Span::styled(
+                                                "New Key/URL: ",
+                                                Style::default()
+                                                    .fg(Color::Rgb(143, 218, 255))
+                                                    .bg(NORDIC_BG)
+                                                    .add_modifier(Modifier::BOLD),
+                                            ),
+                                            Span::styled(
+                                                &self.search_token_input,
+                                                Style::default()
+                                                    .fg(Color::White)
+                                                    .bg(Color::Rgb(46, 52, 64)),
+                                            ),
+                                            Span::styled(
+                                                "▍",
+                                                Style::default()
+                                                    .fg(Color::Rgb(143, 218, 255))
+                                                    .bg(Color::Rgb(46, 52, 64)),
+                                            ),
                                         ]));
                                         val_lines.push(Line::from(Span::styled("Type or paste key, then press Enter to save. Esc to cancel.", Style::default().fg(Color::Rgb(160, 175, 195)).bg(NORDIC_BG))));
                                     } else {
                                         val_lines.push(Line::from(vec![
-                                            Span::styled("[ K ] ", Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                            Span::styled(if current_token_opt.is_some() { "Change / Overwrite Key" } else { "Set Custom Key" }, Style::default().fg(Color::White).bg(NORDIC_BG)),
-                                            Span::styled("   [ D / Del ] ", Style::default().fg(Color::Rgb(255, 120, 120)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                            Span::styled("Clear Key", Style::default().fg(Color::White).bg(NORDIC_BG)),
+                                            Span::styled(
+                                                "[ K ] ",
+                                                Style::default()
+                                                    .fg(Color::Rgb(143, 218, 255))
+                                                    .bg(NORDIC_BG)
+                                                    .add_modifier(Modifier::BOLD),
+                                            ),
+                                            Span::styled(
+                                                if current_token_opt.is_some() {
+                                                    "Change / Overwrite Key"
+                                                } else {
+                                                    "Set Custom Key"
+                                                },
+                                                Style::default().fg(Color::White).bg(NORDIC_BG),
+                                            ),
+                                            Span::styled(
+                                                "   [ D / Del ] ",
+                                                Style::default()
+                                                    .fg(Color::Rgb(255, 120, 120))
+                                                    .bg(NORDIC_BG)
+                                                    .add_modifier(Modifier::BOLD),
+                                            ),
+                                            Span::styled(
+                                                "Clear Key",
+                                                Style::default().fg(Color::White).bg(NORDIC_BG),
+                                            ),
                                         ]));
                                     }
                                 } else {
-                                    val_lines.push(Line::from(Span::styled("No API key required for this search provider.", Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG))));
+                                    val_lines.push(Line::from(Span::styled(
+                                        "No API key required for this search provider.",
+                                        Style::default()
+                                            .fg(Color::Rgb(163, 190, 140))
+                                            .bg(NORDIC_BG),
+                                    )));
                                 }
-                                val_lines.push(Line::from(Span::styled("Left/Right/A/D: Cycle Provider | Enter: Edit | Esc: Back", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Left/Right/A/D: Cycle Provider | Enter: Edit | Esc: Back",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
                             }
                             9 => {
                                 // HuggingFace Token
@@ -8234,23 +8646,55 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                 };
 
                                 val_lines.push(Line::from(vec![
-                                    Span::styled("Current Token: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(
+                                        "Current Token: ",
+                                        Style::default()
+                                            .fg(Color::White)
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
                                     Span::styled(
                                         masked_token,
-                                        Style::default().fg(if has_token { Color::Rgb(163, 190, 140) } else { Color::Rgb(235, 203, 139) }).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                        Style::default()
+                                            .fg(if has_token {
+                                                Color::Rgb(163, 190, 140)
+                                            } else {
+                                                Color::Rgb(235, 203, 139)
+                                            })
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
                                     ),
                                 ]));
                                 val_lines.push(Line::from(Span::styled(
                                     "Used for Hugging Face model registry searches and GGUF downloads.",
                                     Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
                                 )));
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
 
                                 if self.hf_token_editing {
                                     val_lines.push(Line::from(vec![
-                                        Span::styled("New Token: ", Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                        Span::styled(&self.hf_token_input, Style::default().fg(Color::White).bg(Color::Rgb(46, 52, 64))),
-                                        Span::styled("▍", Style::default().fg(Color::Rgb(143, 218, 255)).bg(Color::Rgb(46, 52, 64))),
+                                        Span::styled(
+                                            "New Token: ",
+                                            Style::default()
+                                                .fg(Color::Rgb(143, 218, 255))
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            &self.hf_token_input,
+                                            Style::default()
+                                                .fg(Color::White)
+                                                .bg(Color::Rgb(46, 52, 64)),
+                                        ),
+                                        Span::styled(
+                                            "▍",
+                                            Style::default()
+                                                .fg(Color::Rgb(143, 218, 255))
+                                                .bg(Color::Rgb(46, 52, 64)),
+                                        ),
                                     ]));
                                     val_lines.push(Line::from(Span::styled(
                                         "Paste or type token (starts with 'hf_...'), then press Enter to save.",
@@ -8258,13 +8702,35 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                     )));
                                 } else {
                                     val_lines.push(Line::from(vec![
-                                        Span::styled("[ Enter ] ", Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                        Span::styled(if has_token { "Change / Overwrite Token" } else { "Add HF Token" }, Style::default().fg(Color::White).bg(NORDIC_BG)),
+                                        Span::styled(
+                                            "[ Enter ] ",
+                                            Style::default()
+                                                .fg(Color::Rgb(143, 218, 255))
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            if has_token {
+                                                "Change / Overwrite Token"
+                                            } else {
+                                                "Add HF Token"
+                                            },
+                                            Style::default().fg(Color::White).bg(NORDIC_BG),
+                                        ),
                                     ]));
                                     if has_token {
                                         val_lines.push(Line::from(vec![
-                                            Span::styled("[ D / Del ] ", Style::default().fg(Color::Rgb(255, 120, 120)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                            Span::styled("Remove / Clear Saved Token", Style::default().fg(Color::White).bg(NORDIC_BG)),
+                                            Span::styled(
+                                                "[ D / Del ] ",
+                                                Style::default()
+                                                    .fg(Color::Rgb(255, 120, 120))
+                                                    .bg(NORDIC_BG)
+                                                    .add_modifier(Modifier::BOLD),
+                                            ),
+                                            Span::styled(
+                                                "Remove / Clear Saved Token",
+                                                Style::default().fg(Color::White).bg(NORDIC_BG),
+                                            ),
                                         ]));
                                     }
                                 }
@@ -8273,93 +8739,304 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                                 // OCR Engine
                                 let ocr_mode = crate::settings::get_ocr_engine_mode();
                                 val_lines.push(Line::from(vec![
-                                    Span::styled("Active OCR Backend: ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
+                                    Span::styled(
+                                        "Active OCR Backend: ",
+                                        Style::default()
+                                            .fg(Color::White)
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
                                     Span::styled(
                                         ocr_mode.label(),
-                                        Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                        Style::default()
+                                            .fg(Color::Rgb(163, 190, 140))
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
                                     ),
                                 ]));
                                 val_lines.push(Line::from(Span::styled(
                                     "Used for extracting text from pasted images, PDFs, screenshots, and video keyframes.",
                                     Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
                                 )));
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
 
                                 let modes = [
-                                    (crate::ocr::OcrEngineMode::Auto, "Auto (Tesseract CLI / pdftotext / Native fallbacks)"),
-                                    (crate::ocr::OcrEngineMode::Tesseract, "Tesseract CLI (Uses system tesseract with 100+ languages)"),
-                                    (crate::ocr::OcrEngineMode::Native, "Native (In-memory neural net / fallback parser)"),
-                                    (crate::ocr::OcrEngineMode::Pdftotext, "pdftotext (Fast vector document parser)"),
+                                    (
+                                        crate::ocr::OcrEngineMode::Auto,
+                                        "Auto (Tesseract CLI / pdftotext / Native fallbacks)",
+                                    ),
+                                    (
+                                        crate::ocr::OcrEngineMode::Tesseract,
+                                        "Tesseract CLI (Uses system tesseract with 100+ languages)",
+                                    ),
+                                    (
+                                        crate::ocr::OcrEngineMode::Native,
+                                        "Native (In-memory neural net / fallback parser)",
+                                    ),
+                                    (
+                                        crate::ocr::OcrEngineMode::Pdftotext,
+                                        "pdftotext (Fast vector document parser)",
+                                    ),
                                 ];
 
                                 for (m, desc) in modes {
                                     let active = ocr_mode == m;
                                     let sym = if active { "  ● " } else { "  ○ " };
-                                    let color = if active { Color::Rgb(163, 190, 140) } else { Color::Rgb(160, 175, 195) };
+                                    let color = if active {
+                                        Color::Rgb(163, 190, 140)
+                                    } else {
+                                        Color::Rgb(160, 175, 195)
+                                    };
                                     val_lines.push(Line::from(vec![
-                                        Span::styled(sym, Style::default().fg(color).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                        Span::styled(desc, Style::default().fg(if active { Color::White } else { color }).bg(NORDIC_BG).add_modifier(if active { Modifier::BOLD } else { Modifier::empty() })),
+                                        Span::styled(
+                                            sym,
+                                            Style::default()
+                                                .fg(color)
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            desc,
+                                            Style::default()
+                                                .fg(if active { Color::White } else { color })
+                                                .bg(NORDIC_BG)
+                                                .add_modifier(if active {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
                                     ]));
                                 }
 
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Left/Right/A/D or Enter: Cycle OCR Engine | Esc: Back",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
+                            }
+                            11 => {
+                                // Code Graph
+                                let cg_enabled = s.code_graph_enabled;
+                                let include_comments = s.code_graph_include_comments;
+                                let bounce = s.code_graph_bounce_response_write;
+                                let opt = self.settings_option;
+
+                                val_lines.push(Line::from(Span::styled(
+                                    "Code Graph",
+                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                )));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Master toggle for the F6 Code Graph panel.",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
                                 val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
-                                val_lines.push(Line::from(Span::styled("Left/Right/A/D or Enter: Cycle OCR Engine | Esc: Back", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
+
+                                val_lines.push(crate::app::render_toggle("Code Graph Panel", cg_enabled, self.settings_col == 1 && opt == 0));
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+
+                                val_lines.push(Line::from(Span::styled(
+                                    "Include Comments",
+                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                )));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Include comments/docstrings in code graph nodes.",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
+                                val_lines.push(crate::app::render_toggle("Include Comments", include_comments, self.settings_col == 1 && opt == 1));
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+
+                                val_lines.push(Line::from(Span::styled(
+                                    "Bounce Response Write",
+                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                )));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Enable focused/bounce graph for AI write responses.",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
+                                val_lines.push(crate::app::render_toggle("Bounce Response Write", bounce, self.settings_col == 1 && opt == 2));
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                            }
+                            12 => {
+                                // LSP Diagnostics
+                                let diag_enabled = crate::settings::get_lsp_diagnostics_enabled();
+                                let show_errors = crate::settings::get_lsp_show_errors();
+                                let show_warnings = crate::settings::get_lsp_show_warnings();
+                                let show_info = crate::settings::get_lsp_show_info();
+                                let opt = self.settings_option;
+
+                                // Get cached LSP configuration info
+                                let lsp_config_info = self.lsp_config_info.clone();
+
+                                val_lines.push(Line::from(Span::styled(
+                                    "LSP Diagnostics",
+                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                )));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Master switch for showing LSP diagnostics in code graph.",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+
+                                // LSP Configuration Source
+                                val_lines.push(Line::from(Span::styled(
+                                    "LSP Configuration",
+                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                )));
+                                if let Some((name, command, source, status)) = lsp_config_info {
+                                    let source_str = match source {
+                                        crate::lsp::LspConfigSource::Project => "Project",
+                                        crate::lsp::LspConfigSource::User => "User",
+                                        crate::lsp::LspConfigSource::Hercules => "Hercules",
+                                        crate::lsp::LspConfigSource::Builtin => "Builtin",
+                                    };
+                                    let status_color = if status == "Connected" { Color::Rgb(163, 190, 140) } else { Color::Rgb(255, 120, 120) };
+                                    val_lines.push(Line::from(Span::styled(
+                                        format!("  Source: {}", source_str),
+                                        Style::default().fg(Color::Rgb(220, 230, 242)).bg(NORDIC_BG),
+                                    )));
+                                    val_lines.push(Line::from(Span::styled(
+                                        format!("  Server: {} ({})", name, command),
+                                        Style::default().fg(Color::Rgb(220, 230, 242)).bg(NORDIC_BG),
+                                    )));
+                                    val_lines.push(Line::from(Span::styled(
+                                        format!("  Status: {} ●", status),
+                                        Style::default().fg(status_color).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                    )));
+                                } else {
+                                    val_lines.push(Line::from(Span::styled(
+                                        "  No editor LSP configuration found.",
+                                        Style::default().fg(Color::Rgb(255, 120, 120)).bg(NORDIC_BG),
+                                    )));
+                                    val_lines.push(Line::from(Span::styled(
+                                        "  Checked: Helix, Neovim, VS Code, VSCodium, Zed",
+                                        Style::default().fg(Color::Rgb(160, 175, 195)).bg(NORDIC_BG),
+                                    )));
+                                }
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+
+                                val_lines.push(crate::app::render_toggle("Diagnostics", diag_enabled, self.settings_col == 1 && opt == 0));
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+
+                                val_lines.push(Line::from(Span::styled(
+                                    "Show Errors",
+                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                )));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Display LSP error diagnostics (red).",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
+                                val_lines.push(crate::app::render_toggle("Show Errors", show_errors, self.settings_col == 1 && opt == 1));
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+
+                                val_lines.push(Line::from(Span::styled(
+                                    "Show Warnings",
+                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                )));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Display LSP warning diagnostics (yellow).",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
+                                val_lines.push(crate::app::render_toggle("Show Warnings", show_warnings, self.settings_col == 1 && opt == 2));
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+
+                                val_lines.push(Line::from(Span::styled(
+                                    "Show Info/Hints",
+                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                )));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Display LSP info/hint diagnostics (blue).",
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                )));
+                                val_lines.push(crate::app::render_toggle("Show Info/Hints", show_info, self.settings_col == 1 && opt == 3));
+                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
                             }
                             _ => {}
                         }
 
-                        frame.render_widget(Paragraph::new(val_lines).style(Style::default().bg(NORDIC_BG)), cols[2]);
+                        frame.render_widget(
+                            Paragraph::new(val_lines).style(Style::default().bg(NORDIC_BG)),
+                            cols[2],
+                        );
                     }
                     4 => {
                         // === Session Info Section (Table Cards Layout) ===
                         let chunks = Layout::default()
                             .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Length(2), // Title
-                                Constraint::Min(1),    // Cards table grid
-                            ].as_ref())
+                            .constraints(
+                                [
+                                    Constraint::Length(2), // Title
+                                    Constraint::Min(1),    // Cards table grid
+                                ]
+                                .as_ref(),
+                            )
                             .split(content_inner);
 
                         let title_bar = Paragraph::new(Line::from(vec![
-                            Span::styled(" Session Information ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                            Span::styled(" (Live diagnostics, hardware metrics, context budget & power)", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG)),
-                        ])).style(Style::default().bg(NORDIC_BG));
+                            Span::styled(
+                                " Session Information ",
+                                Style::default()
+                                    .fg(Color::White)
+                                    .bg(NORDIC_BG)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                " (Live diagnostics, hardware metrics, context budget & power)",
+                                Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                            ),
+                        ]))
+                        .style(Style::default().bg(NORDIC_BG));
                         frame.render_widget(title_bar, chunks[0]);
 
                         // 2 Columns layout with 2-character middle gutter: Left | Gap | Right
                         let grid_cols = Layout::default()
                             .direction(Direction::Horizontal)
-                            .constraints([
-                                Constraint::Ratio(1, 2),
-                                Constraint::Length(2), // Middle gap space
-                                Constraint::Ratio(1, 2),
-                            ].as_ref())
+                            .constraints(
+                                [
+                                    Constraint::Ratio(1, 2),
+                                    Constraint::Length(2), // Middle gap space
+                                    Constraint::Ratio(1, 2),
+                                ]
+                                .as_ref(),
+                            )
                             .split(chunks[1]);
 
                         // Left Column Cards
                         let left_rows = Layout::default()
                             .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Length(5), // LLM Inference & Throughput Card
-                                Constraint::Length(1), // Gap
-                                Constraint::Length(4), // Context Budget Card
-                                Constraint::Length(1), // Gap
-                                Constraint::Length(4), // AI Engine & Agents Card
-                                Constraint::Length(1), // Gap
-                                Constraint::Length(4), // Session State Card
-                            ].as_ref())
+                            .constraints(
+                                [
+                                    Constraint::Length(5), // LLM Inference & Throughput Card
+                                    Constraint::Length(1), // Gap
+                                    Constraint::Length(4), // Context Budget Card
+                                    Constraint::Length(1), // Gap
+                                    Constraint::Length(4), // AI Engine & Agents Card
+                                    Constraint::Length(1), // Gap
+                                    Constraint::Length(4), // Session State Card
+                                ]
+                                .as_ref(),
+                            )
                             .split(grid_cols[0]);
 
                         // Right Column Cards
                         let right_rows = Layout::default()
                             .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Length(5), // Hardware & Memory Card
-                                Constraint::Length(1), // Gap
-                                Constraint::Length(4), // Session Energy & Cost Card
-                                Constraint::Length(1), // Gap
-                                Constraint::Length(4), // Action & Tool Chips Card
-                            ].as_ref())
+                            .constraints(
+                                [
+                                    Constraint::Length(5), // Hardware & Memory Card
+                                    Constraint::Length(1), // Gap
+                                    Constraint::Length(4), // Session Energy & Cost Card
+                                    Constraint::Length(1), // Gap
+                                    Constraint::Length(4), // Action & Tool Chips Card
+                                ]
+                                .as_ref(),
+                            )
                             .split(grid_cols[2]);
 
                         // Helper to render exact table design:
@@ -8367,66 +9044,100 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                         // │ field ┃ Value        │
                         // │ field ┃ Value        │
                         // └───────┸──────────────┘
-                        let render_info_table = |frame: &mut ratatui::Frame, area: Rect, title: &str, color: Color, col1_w: usize, rows: Vec<(&str, &str, Color)>| {
-                            if area.height < 3 || area.width < 14 {
-                                return;
-                            }
+                        let render_info_table =
+                            |frame: &mut ratatui::Frame,
+                             area: Rect,
+                             title: &str,
+                             color: Color,
+                             col1_w: usize,
+                             rows: Vec<(&str, &str, Color)>| {
+                                if area.height < 3 || area.width < 14 {
+                                    return;
+                                }
 
-                            let full_w = area.width as usize;
-                            let title_chars = title.chars().count();
-                            let col1_width = col1_w.min(full_w.saturating_sub(10));
-                            // Row width breakdown: "│ " (2) + col1_width + " ┃ " (3) + col2_width + " │" (2) = full_w
-                            let col2_width = full_w.saturating_sub(col1_width + 7);
+                                let full_w = area.width as usize;
+                                let title_chars = title.chars().count();
+                                let col1_width = col1_w.min(full_w.saturating_sub(10));
+                                // Row width breakdown: "│ " (2) + col1_width + " ┃ " (3) + col2_width + " │" (2) = full_w
+                                let col2_width = full_w.saturating_sub(col1_width + 7);
 
-                            let mut lines = Vec::new();
+                                let mut lines = Vec::new();
 
-                            // Line 0: █Title ██████████████████
-                            // Header width breakdown: "█" (1) + title_chars + " " (1) + bar_repeat = full_w
-                            let bar_repeat = full_w.saturating_sub(title_chars + 2);
-                            let header_spans = vec![
-                                Span::styled("█", Style::default().fg(color)),
-                                Span::styled(title, Style::default().fg(NORDIC_BG).bg(color).add_modifier(Modifier::BOLD)),
-                                Span::styled(" ", Style::default().fg(NORDIC_BG).bg(color)),
-                                Span::styled("█".repeat(bar_repeat), Style::default().fg(color)),
-                            ];
-                            lines.push(Line::from(header_spans));
-
-                            // Table body rows: │ field ┃ Value        │
-                            for (field, value, val_color) in rows {
-                                let f_trunc = crate::app::trunc_chars(field, col1_width);
-                                let f_padded = format!("{:width$}", f_trunc, width = col1_width);
-                                let v_trunc = crate::app::trunc_chars(value, col2_width);
-                                let v_padded = format!("{:width$}", v_trunc, width = col2_width);
-                                let row_spans = vec![
-                                    Span::styled("│ ", Style::default().fg(color)),
-                                    Span::styled(f_padded, Style::default().fg(Color::Rgb(180, 200, 220))),
-                                    Span::styled(" ┃ ", Style::default().fg(color)),
-                                    Span::styled(v_padded, Style::default().fg(val_color).add_modifier(Modifier::BOLD)),
-                                    Span::styled(" │", Style::default().fg(color)),
+                                // Line 0: █Title ██████████████████
+                                // Header width breakdown: "█" (1) + title_chars + " " (1) + bar_repeat = full_w
+                                let bar_repeat = full_w.saturating_sub(title_chars + 2);
+                                let header_spans = vec![
+                                    Span::styled("█", Style::default().fg(color)),
+                                    Span::styled(
+                                        title,
+                                        Style::default()
+                                            .fg(NORDIC_BG)
+                                            .bg(color)
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
+                                    Span::styled(" ", Style::default().fg(NORDIC_BG).bg(color)),
+                                    Span::styled(
+                                        "█".repeat(bar_repeat),
+                                        Style::default().fg(color),
+                                    ),
                                 ];
-                                lines.push(Line::from(row_spans));
-                            }
+                                lines.push(Line::from(header_spans));
 
-                            // Bottom border: └───────┸──────────────┘
-                            let b1 = "─".repeat(col1_width + 2);
-                            let b2 = "─".repeat(col2_width + 2);
-                            let bottom_spans = vec![
-                                Span::styled("└", Style::default().fg(color)),
-                                Span::styled(b1, Style::default().fg(color)),
-                                Span::styled("┸", Style::default().fg(color)),
-                                Span::styled(b2, Style::default().fg(color)),
-                                Span::styled("┘", Style::default().fg(color)),
-                            ];
-                            lines.push(Line::from(bottom_spans));
+                                // Table body rows: │ field ┃ Value        │
+                                for (field, value, val_color) in rows {
+                                    let f_trunc = crate::app::trunc_chars(field, col1_width);
+                                    let f_padded =
+                                        format!("{:width$}", f_trunc, width = col1_width);
+                                    let v_trunc = crate::app::trunc_chars(value, col2_width);
+                                    let v_padded =
+                                        format!("{:width$}", v_trunc, width = col2_width);
+                                    let row_spans = vec![
+                                        Span::styled("│ ", Style::default().fg(color)),
+                                        Span::styled(
+                                            f_padded,
+                                            Style::default().fg(Color::Rgb(180, 200, 220)),
+                                        ),
+                                        Span::styled(" ┃ ", Style::default().fg(color)),
+                                        Span::styled(
+                                            v_padded,
+                                            Style::default()
+                                                .fg(val_color)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(" │", Style::default().fg(color)),
+                                    ];
+                                    lines.push(Line::from(row_spans));
+                                }
 
-                            frame.render_widget(Paragraph::new(lines).style(Style::default().bg(NORDIC_BG)), area);
-                        };
+                                // Bottom border: └───────┸──────────────┘
+                                let b1 = "─".repeat(col1_width + 2);
+                                let b2 = "─".repeat(col2_width + 2);
+                                let bottom_spans = vec![
+                                    Span::styled("└", Style::default().fg(color)),
+                                    Span::styled(b1, Style::default().fg(color)),
+                                    Span::styled("┸", Style::default().fg(color)),
+                                    Span::styled(b2, Style::default().fg(color)),
+                                    Span::styled("┘", Style::default().fg(color)),
+                                ];
+                                lines.push(Line::from(bottom_spans));
+
+                                frame.render_widget(
+                                    Paragraph::new(lines).style(Style::default().bg(NORDIC_BG)),
+                                    area,
+                                );
+                            };
 
                         // 1. LLM Inference & Throughput Diagnostics Table
                         let telem = crate::llama::libinfer::get_inference_telemetry();
                         let infer_color = Color::Rgb(120, 220, 255);
-                        let tok_str = format!("{} in / {} out", telem.prompt_tokens, telem.generated_tokens);
-                        let speed_str = format!("{:.1} p / {:.1} d tok/s", telem.prefill_tok_per_sec, telem.decode_tok_per_sec);
+                        let tok_str = format!(
+                            "{} in / {} out",
+                            telem.prompt_tokens, telem.generated_tokens
+                        );
+                        let speed_str = format!(
+                            "{:.1} p / {:.1} d tok/s",
+                            telem.prefill_tok_per_sec, telem.decode_tok_per_sec
+                        );
                         let ttft_str = if telem.ttft_secs > 0.0 {
                             format!("{:.2}s", telem.ttft_secs)
                         } else {
@@ -8437,41 +9148,88 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             ("Throughput", speed_str.as_str(), Color::Rgb(180, 255, 160)),
                             ("TTFT", ttft_str.as_str(), Color::Rgb(255, 220, 120)),
                         ];
-                        render_info_table(frame, left_rows[0], "Inference Diagnostics", infer_color, 12, infer_rows);
+                        render_info_table(
+                            frame,
+                            left_rows[0],
+                            "Inference Diagnostics",
+                            infer_color,
+                            12,
+                            infer_rows,
+                        );
 
                         // 2. Context Budget Table
                         let req_limit = crate::settings::context_token_limit();
                         let capacity = self.model_context_limit.unwrap_or(req_limit);
-                        let ctx_pct = (self.context_tokens_est as f64 / capacity.max(1) as f64 * 100.0).clamp(0.0, 100.0);
+                        let ctx_pct = (self.context_tokens_est as f64 / capacity.max(1) as f64
+                            * 100.0)
+                            .clamp(0.0, 100.0);
                         let ctx_color = Color::Rgb(143, 218, 255);
-                        let cap_str = format!("{} / {}", crate::settings::format_context_tokens(req_limit), crate::settings::format_context_tokens(capacity));
-                        let used_str = format!("{} ({:.1}%)", crate::settings::format_context_tokens(self.context_tokens_est), ctx_pct);
+                        let cap_str = format!(
+                            "{} / {}",
+                            crate::settings::format_context_tokens(req_limit),
+                            crate::settings::format_context_tokens(capacity)
+                        );
+                        let used_str = format!(
+                            "{} ({:.1}%)",
+                            crate::settings::format_context_tokens(self.context_tokens_est),
+                            ctx_pct
+                        );
                         let ctx_rows = vec![
                             ("Req / Cap", cap_str.as_str(), Color::White),
                             ("Used", used_str.as_str(), Color::Rgb(180, 240, 160)),
                         ];
-                        render_info_table(frame, left_rows[2], "Context Budget", ctx_color, 12, ctx_rows);
+                        render_info_table(
+                            frame,
+                            left_rows[2],
+                            "Context Budget",
+                            ctx_color,
+                            12,
+                            ctx_rows,
+                        );
 
                         // 3. AI Engine & Agents Table
                         let agent_color = Color::Rgb(180, 100, 240);
-                        let sub_agents_count = self.task_manager.list().iter().filter(|t| t.cmd.starts_with("agent ")).count();
+                        let sub_agents_count = self
+                            .task_manager
+                            .list()
+                            .iter()
+                            .filter(|t| t.cmd.starts_with("agent "))
+                            .count();
                         let sub_str = format!("{} active / spawned", sub_agents_count);
                         let engine_str = self.backend.name();
                         let agent_rows = vec![
                             ("Main Engine", engine_str.as_str(), Color::White),
                             ("Sub-Agents", sub_str.as_str(), Color::White),
                         ];
-                        render_info_table(frame, left_rows[4], "AI Engine & Agents", agent_color, 12, agent_rows);
+                        render_info_table(
+                            frame,
+                            left_rows[4],
+                            "AI Engine & Agents",
+                            agent_color,
+                            12,
+                            agent_rows,
+                        );
 
                         // 4. Session State Table
                         let session_color = Color::Rgb(255, 120, 120);
                         let sess_id = self.session_id.as_deref().unwrap_or("N/A");
-                        let stats_str = format!("{} msgs | {} compacts", self.messages.len(), self.context_compact_count);
+                        let stats_str = format!(
+                            "{} msgs | {} compacts",
+                            self.messages.len(),
+                            self.context_compact_count
+                        );
                         let session_rows = vec![
                             ("Session ID", sess_id, Color::White),
                             ("Activity", stats_str.as_str(), Color::White),
                         ];
-                        render_info_table(frame, left_rows[6], "Session State", session_color, 12, session_rows);
+                        render_info_table(
+                            frame,
+                            left_rows[6],
+                            "Session State",
+                            session_color,
+                            12,
+                            session_rows,
+                        );
 
                         // 5. Hardware & Memory Table
                         let hw_color = Color::Rgb(163, 190, 140);
@@ -8484,9 +9242,17 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                         } else {
                             app_pct as f64
                         };
-                        let app_mem_mb = self.sys.process(pid).map(|p| p.memory() / 1_000_000).unwrap_or(0);
-                        let cpu_ram_str = format!("{:.0}% (avg {:.1}%) | {}MB", app_pct, avg_cpu_pct, app_mem_mb);
-                        let gpu_str = format!("{} ({:.1}W)", self.detected_gpu_name, self.live_gpu_power_w);
+                        let app_mem_mb = self
+                            .sys
+                            .process(pid)
+                            .map(|p| p.memory() / 1_000_000)
+                            .unwrap_or(0);
+                        let cpu_ram_str = format!(
+                            "{:.0}% (avg {:.1}%) | {}MB",
+                            app_pct, avg_cpu_pct, app_mem_mb
+                        );
+                        let gpu_str =
+                            format!("{} ({:.1}W)", self.detected_gpu_name, self.live_gpu_power_w);
                         let num_threads = crate::settings::get_settings().power_mode.threads();
                         let thread_str = format!("{} active threads", num_threads);
                         let hw_rows = vec![
@@ -8494,11 +9260,19 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             ("GPU Power", gpu_str.as_str(), Color::White),
                             ("Compute", thread_str.as_str(), Color::Rgb(200, 220, 240)),
                         ];
-                        render_info_table(frame, right_rows[0], "Hardware & Memory", hw_color, 12, hw_rows);
+                        render_info_table(
+                            frame,
+                            right_rows[0],
+                            "Hardware & Memory",
+                            hw_color,
+                            12,
+                            hw_rows,
+                        );
 
                         // 6. Session Energy & Compute Cost Table
                         let power_color = Color::Rgb(235, 203, 139);
-                        let total_joules = self.session_cpu_energy_joules + self.session_gpu_energy_joules;
+                        let total_joules =
+                            self.session_cpu_energy_joules + self.session_gpu_energy_joules;
                         let total_wh = total_joules / 3600.0;
                         let active_secs = self.total_active_compute_secs.round() as u64;
                         let active_str = crate::settings::format_duration_adaptive(active_secs);
@@ -8510,24 +9284,69 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                             format!("{} (Active)", active_str)
                         };
                         let power_rows = vec![
-                            ("Total Power", energy_str.as_str(), Color::Rgb(235, 203, 139)),
+                            (
+                                "Total Power",
+                                energy_str.as_str(),
+                                Color::Rgb(235, 203, 139),
+                            ),
                             ("Energy/Tok", energy_per_tok_str.as_str(), Color::White),
                         ];
-                        render_info_table(frame, right_rows[2], "Session Energy", power_color, 12, power_rows);
+                        render_info_table(
+                            frame,
+                            right_rows[2],
+                            "Session Energy",
+                            power_color,
+                            12,
+                            power_rows,
+                        );
 
                         // 7. Action & Tool Chips Table
                         let chip_color = Color::Rgb(255, 200, 80);
-                        let write_count = self.tool_chips.iter().filter(|c| c.kind == tool_panel::ToolPanelKind::Write).count();
-                        let cmd_count = self.tool_chips.iter().filter(|c| c.kind == tool_panel::ToolPanelKind::Cmd).count();
-                        let read_count = self.tool_chips.iter().filter(|c| c.kind == tool_panel::ToolPanelKind::Read).count();
-                        let other_count = self.tool_chips.iter().filter(|c| c.kind != tool_panel::ToolPanelKind::Write && c.kind != tool_panel::ToolPanelKind::Cmd && c.kind != tool_panel::ToolPanelKind::Read).count();
+                        let write_count = self
+                            .tool_chips
+                            .iter()
+                            .filter(|c| c.kind == tool_panel::ToolPanelKind::Write)
+                            .count();
+                        let cmd_count = self
+                            .tool_chips
+                            .iter()
+                            .filter(|c| c.kind == tool_panel::ToolPanelKind::Cmd)
+                            .count();
+                        let read_count = self
+                            .tool_chips
+                            .iter()
+                            .filter(|c| c.kind == tool_panel::ToolPanelKind::Read)
+                            .count();
+                        let other_count = self
+                            .tool_chips
+                            .iter()
+                            .filter(|c| {
+                                c.kind != tool_panel::ToolPanelKind::Write
+                                    && c.kind != tool_panel::ToolPanelKind::Cmd
+                                    && c.kind != tool_panel::ToolPanelKind::Read
+                            })
+                            .count();
                         let total_chips_str = format!("{} total", self.tool_chips.len());
-                        let break_str = format!("W:{} C:{} R:{} O:{}", write_count, cmd_count, read_count, other_count);
+                        let break_str = format!(
+                            "W:{} C:{} R:{} O:{}",
+                            write_count, cmd_count, read_count, other_count
+                        );
                         let chip_rows = vec![
                             ("Total Chips", total_chips_str.as_str(), Color::White),
                             ("Breakdown", break_str.as_str(), Color::White),
                         ];
-                        render_info_table(frame, right_rows[4], "Action & Tool Chips", chip_color, 12, chip_rows);
+                        render_info_table(
+                            frame,
+                            right_rows[4],
+                            "Action & Tool Chips",
+                            chip_color,
+                            12,
+                            chip_rows,
+                        );
+                    }
+                    5 => {
+                        // === Code Graph Section (Three-pane: Nodes | Graph | Details) ===
+                        self.render_code_graph(frame, content_inner);
                     }
                     _ => {}
                 }
@@ -8535,11 +9354,929 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
         }
     }
 
-    /// Render Ask Mode overlay
-    pub fn render_ask_mode(&mut self, frame: &mut ratatui::Frame, area: Rect) {
-        use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+    /// Kick off code graph construction in a background thread.
+    /// The TUI keeps rendering the loading state; the finished graph is picked
+    /// up by poll_code_graph_job() on subsequent event-loop iterations.
+    /// (A dedicated thread + private runtime is required because LspManager is
+    /// not Send and blocking the UI thread's runtime would freeze the TUI.)
+    fn build_code_graph_async(&mut self) {
+        self.code_graph_loading = true;
+        self.code_graph_error = None;
+
+        let job_slot = self.code_graph_job.clone();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let result = match rt {
+                Ok(rt) => rt.block_on(Self::build_code_graph_task()),
+                Err(e) => Err(format!("Failed to create runtime: {}", e)),
+            };
+            if let Ok(mut slot) = job_slot.lock() {
+                *slot = Some(result);
+            }
+        });
+    }
+
+    async fn build_code_graph_task() -> Result<(crate::code_graph::CodeGraph, usize, usize), String>
+    {
+        let mut lsp_manager = crate::lsp::LspManager::new(
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        );
+        if lsp_manager.start().await.is_err() {
+            // LSP failed, but we can still use Tree-sitter
+        }
+
+        let config = crate::code_graph::config_from_settings();
+        let mut builder = match crate::code_graph::CodeGraphBuilder::with_lsp(config, lsp_manager) {
+            Ok(b) => b,
+            Err(e) => return Err(format!("Failed to create builder: {}", e)),
+        };
+
+        let mut merged_graph = crate::code_graph::CodeGraph::new();
+        let mut total_files = 0usize;
+        let mut failed_files = 0usize;
+
+        for file_path in Self::collect_rust_files(
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        ) {
+            total_files += 1;
+            // Collect failures instead of silently discarding them so a
+            // partial graph is reported as such rather than as clean success.
+            match std::fs::read_to_string(&file_path) {
+                Ok(source) => match builder.add_file_async(&source, file_path.clone()).await {
+                    Ok(graph) => {
+                        merged_graph = builder.merge(vec![merged_graph, graph]);
+                    }
+                    Err(_) => failed_files += 1,
+                },
+                Err(_) => failed_files += 1,
+            }
+        }
+
+        Ok((merged_graph, total_files, failed_files))
+    }
+
+    /// Install a finished background code-graph build, if one completed.
+    fn poll_code_graph_job(&mut self) {
+        let finished = self
+            .code_graph_job
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(result) = finished {
+            self.code_graph_loading = false;
+            match result {
+                Ok((graph, total_files, failed_files)) => {
+                    self.code_graph = Some(graph);
+                    self.code_graph_error = None;
+                    self.code_graph_selected = 0;
+                    self.code_graph_scroll = 0;
+                    self.code_graph_detail_scroll = 0;
+                    self.code_graph_pane = CodeGraphPane::Graph;
+                    self.build_code_graph_adjacency();
+
+                    // Capture LSP configuration info for settings display (blocking)
+                    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let configs: Vec<crate::lsp::DiscoveredLspConfig> = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(
+                            crate::lsp::discover_lsp_configs(&workspace_root)
+                        )
+                    });
+                    if let Some(best) = configs.into_iter().max_by_key(|c| match c.source {
+                        crate::lsp::LspConfigSource::Project => 3,
+                        crate::lsp::LspConfigSource::User => 2,
+                        crate::lsp::LspConfigSource::Hercules => 1,
+                        crate::lsp::LspConfigSource::Builtin => 0,
+                    }) {
+                        let status = "Connected".to_string(); // We know it worked since graph was built
+                        self.lsp_config_info = Some((
+                            best.server.name,
+                            best.server.command,
+                            best.source,
+                            status,
+                        ));
+                    }
+
+                    if failed_files > 0 {
+                        self.status_message = format!(
+                            "Code Graph: {} of {} files indexed, {} failed",
+                            total_files - failed_files,
+                            total_files,
+                            failed_files
+                        );
+                    }
+                }
+                Err(e) => {
+                    self.code_graph_error = Some(e);
+                }
+            }
+        }
+    }
+
+    /// Build outgoing/incoming adjacency maps once on graph load so per-frame
+    /// lookups (dimming, details counts) never scan all edges per node.
+    fn build_code_graph_adjacency(&mut self) {
+        self.code_graph_outgoing.clear();
+        self.code_graph_incoming.clear();
+        if let Some(graph) = &self.code_graph {
+            for (idx, edge) in graph.edges.iter().enumerate() {
+                self.code_graph_outgoing
+                    .entry(edge.from.clone())
+                    .or_default()
+                    .push(idx);
+                self.code_graph_incoming
+                    .entry(edge.to.clone())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+    }
+
+    /// Related node ids for the selected node (itself + direct neighbors via adjacency maps)
+    fn code_graph_related_set(
+        &self,
+        selected: &crate::code_graph::NodeId,
+    ) -> std::collections::HashSet<crate::code_graph::NodeId> {
+        let mut related = std::collections::HashSet::new();
+        related.insert(selected.clone());
+        if let Some(graph) = &self.code_graph {
+            if let Some(idxs) = self.code_graph_outgoing.get(selected) {
+                for &i in idxs {
+                    related.insert(graph.edges[i].to.clone());
+                }
+            }
+            if let Some(idxs) = self.code_graph_incoming.get(selected) {
+                for &i in idxs {
+                    related.insert(graph.edges[i].from.clone());
+                }
+            }
+        }
+        related
+    }
+
+    /// Collect all Rust files in the workspace
+    fn collect_rust_files(workspace_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        Self::collect_source_files_recursive(workspace_root, &mut files);
+        files
+    }
+
+    fn collect_source_files_recursive(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Skip target, .git, node_modules directories
+                    if let Some(name) = path.file_name() {
+                        let name_str = name.to_string_lossy();
+                        if name_str != "target" && name_str != ".git" && name_str != "node_modules"
+                        {
+                            Self::collect_source_files_recursive(&path, files);
+                        }
+                    }
+                } else if path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .and_then(crate::code_graph::GraphLanguage::from_extension)
+                    .is_some()
+                {
+                    files.push(path);
+                }
+            }
+        }
+    }
+
+    /// Render Code Graph three-pane layout: Nodes | Graph | Details
+    /// Render Code Graph three-pane layout: Nodes | Graph | Details
+    fn render_code_graph(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Paragraph};
+
+        if self.code_graph_loading {
+            let loading = Paragraph::new(Line::from(Span::styled(
+                " Loading project graph… Running Tree-sitter + LSP ",
+                Style::default()
+                    .fg(Color::Rgb(143, 218, 255))
+                    .bg(NORDIC_BG)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Code Graph ")
+                    .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
+                    .style(Style::default().bg(NORDIC_BG)),
+            );
+            frame.render_widget(loading, area);
+            return;
+        }
+
+        if let Some(err) = &self.code_graph_error {
+            let error = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " Error: ",
+                    Style::default()
+                        .fg(Color::Rgb(255, 120, 120))
+                        .bg(NORDIC_BG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    err.as_str(),
+                    Style::default().fg(Color::Rgb(255, 120, 120)).bg(NORDIC_BG),
+                ),
+                Span::styled(
+                    "  [R] Retry   [Esc] Close",
+                    Style::default().fg(Color::Rgb(200, 200, 210)).bg(NORDIC_BG),
+                ),
+            ]))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Code Graph ")
+                    .border_style(Style::default().fg(Color::Rgb(255, 120, 120)))
+                    .style(Style::default().bg(NORDIC_BG)),
+            );
+            frame.render_widget(error, area);
+            return;
+        }
+
+        let Some(graph) = &self.code_graph else {
+            let empty = Paragraph::new(vec![Line::from(Span::styled(
+                " No code graph data available. Press R to rebuild. ",
+                Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+            ))])
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Code Graph ")
+                    .border_style(Style::default().fg(Color::Rgb(120, 140, 160)))
+                    .style(Style::default().bg(NORDIC_BG)),
+            );
+            frame.render_widget(empty, area);
+            return;
+        };
+
+        // Clone the graph to avoid borrow issues with &mut self in render methods
+        let graph = graph.clone();
+
+        // Three-pane layout: Nodes (left, 28 cols) | Graph (center) | Details (right, 42 cols)
+        let chunks = ratatui::layout::Layout::default()
+            .direction(ratatui::layout::Direction::Horizontal)
+            .constraints(
+                [
+                    ratatui::layout::Constraint::Length(28),
+                    ratatui::layout::Constraint::Min(10),
+                    ratatui::layout::Constraint::Length(42),
+                ]
+                .as_ref(),
+            )
+            .split(area);
+
+        self.render_nodes_list(frame, &graph, chunks[0]);
+        self.render_code_graph_visualization(frame, &graph, chunks[1]);
+        self.render_code_graph_details(frame, &graph, chunks[2]);
+    }
+
+    /// Left pane: node list with kind prefixes; selection highlighted by background only
+    fn render_nodes_list(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        graph: &crate::code_graph::CodeGraph,
+        area: ratatui::layout::Rect,
+    ) {
+        use ratatui::style::Style;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+
+        let nodes = self.get_visible_nodes(graph);
+
+        let items: Vec<ListItem> = nodes
+            .iter()
+            .enumerate()
+            .map(|(idx, node)| {
+                let label = format!("{} {}", Self::node_kind_prefix(node.kind), node.name);
+                let style =
+                    Self::code_graph_node_style(node.kind, idx == self.code_graph_selected, false);
+                ListItem::new(Line::from(Span::styled(label, style)))
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Nodes ")
+                    .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
+                    .style(Style::default().bg(NORDIC_BG)),
+            )
+            .style(Style::default().bg(NORDIC_BG));
+
+        let mut list_state = ListState::default();
+        list_state.select(Some(
+            self.code_graph_selected.min(nodes.len().saturating_sub(1)),
+        ));
+        frame.render_stateful_widget(list, area, &mut list_state);
+    }
+
+    /// Center pane: deterministic 2D graph layout — borderless colored rectangle nodes
+    /// connected by EdgeKind-distinct connectors; unrelated nodes/edges dimmed.
+    fn render_code_graph_visualization(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        graph: &crate::code_graph::CodeGraph,
+        area: ratatui::layout::Rect,
+    ) {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::widgets::{Block, Borders};
+
+        // Viewport handling: the deterministic grid never wraps, so when the
+        // whole workspace graph exceeds the grid capacity we render only the
+        // selected node's 1-hop neighborhood (truncated deterministically if
+        // even that overflows). Nothing is ever drawn on top of another node.
+        let capacity = Self::code_graph_capacity(area);
+        let full_nodes = self.get_visible_nodes(graph);
+        let shown_total = full_nodes.len();
+        let selected_full_idx = self
+            .code_graph_selected
+            .min(full_nodes.len().saturating_sub(1));
+        let selected_id = full_nodes.get(selected_full_idx).map(|n| n.id.clone());
+
+        let mut nodes: Vec<_> = full_nodes;
+        if nodes.len() > capacity {
+            if let Some(sel_id) = &selected_id {
+                let sub = graph.subgraph_around(std::slice::from_ref(sel_id), 1);
+                let ids: std::collections::HashSet<_> =
+                    sub.nodes.iter().map(|n| n.id.clone()).collect();
+                nodes.retain(|n| ids.contains(&n.id));
+            }
+            if nodes.len() > capacity {
+                nodes.truncate(capacity);
+            }
+        }
+        // Selection index within the (possibly reduced) displayed set
+        let selected_idx = selected_id
+            .as_ref()
+            .and_then(|id| nodes.iter().position(|n| n.id == *id))
+            .unwrap_or(0);
+        let rects = Self::compute_code_graph_layout(nodes.len(), area);
+
+        // Selected node + related set for dimming (adjacency maps, no edge scan per frame)
+        let selected = nodes.get(selected_idx).map(|n| n.id.clone());
+        let related = selected.as_ref().map(|id| self.code_graph_related_set(id));
+
+        // Cell buffer: (char, style); rendered after edges/nodes are painted
+        let w = area.width.saturating_sub(2) as usize;
+        let h = area.height.saturating_sub(2) as usize;
+        let base = Style::default().bg(NORDIC_BG);
+        let mut grid = vec![vec![(char::from(' '), base); w.max(1)]; h.max(1)];
+        let inner = ratatui::layout::Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+
+        let mut put =
+            |gx: i64, gy: i64, ch: char, style: Style, grid: &mut Vec<Vec<(char, Style)>>| {
+                if gx >= 0 && gy >= 0 && (gx as usize) < grid[0].len() && (gy as usize) < grid.len()
+                {
+                    grid[gy as usize][gx as usize] = (ch, style);
+                }
+            };
+
+        let dim_style = Style::default().fg(Color::Rgb(90, 100, 115)).bg(NORDIC_BG);
+
+        // NodeId → displayed index, built once per frame (O(n)) so the edge
+        // pass never scans the node list per endpoint (O(edges × nodes)).
+        let visible_index: std::collections::HashMap<&crate::code_graph::NodeId, usize> =
+            nodes.iter().enumerate().map(|(i, n)| (&n.id, i)).collect();
+
+        // --- Edges first (nodes overwrite overlap) ---
+        for edge in &graph.edges {
+            let (Some(fi), Some(ti)) = (
+                visible_index.get(&edge.from).copied(),
+                visible_index.get(&edge.to).copied(),
+            ) else {
+                continue;
+            };
+            if fi >= rects.len() || ti >= rects.len() {
+                continue;
+            }
+            let (ra, rb) = (rects[fi], rects[ti]);
+            let (h_ch, v_ch, color) = Self::code_graph_edge_connector(edge.kind);
+            let style = match &related {
+                Some(rel) if rel.contains(&edge.from) && rel.contains(&edge.to) => {
+                    Style::default().fg(color).bg(NORDIC_BG)
+                }
+                Some(_) => dim_style,
+                None => Style::default().fg(color).bg(NORDIC_BG),
+            };
+            let label = Self::code_graph_edge_label(edge.kind);
+
+            let ax = (ra.x + ra.width / 2) as i64 - inner.x as i64;
+            let ay = (ra.y + ra.height / 2) as i64 - inner.y as i64;
+            let bx = (rb.x + rb.width / 2) as i64 - inner.x as i64;
+            let by = (rb.y + rb.height / 2) as i64 - inner.y as i64;
+
+            if ay == by {
+                // horizontal run: a → b
+                let (start, end) = if ax < bx {
+                    (ax + 1, bx - 1)
+                } else {
+                    (bx + 1, ax - 1)
+                };
+                let mut gx = start;
+                while gx <= end {
+                    put(gx, ay, h_ch, style, &mut grid);
+                    gx += 1;
+                }
+                if end - start >= 3 {
+                    put(start + (end - start) / 2, ay, label, style, &mut grid);
+                }
+            } else {
+                // elbow: vertical at a's center column, then horizontal into b
+                let corner = if by > ay { '└' } else { '┌' };
+                let (y0, y1) = if by > ay { (ay + 1, by) } else { (by, ay - 1) };
+                let mut gy = y0;
+                while gy <= y1 {
+                    put(ax, gy, v_ch, style, &mut grid);
+                    gy += 1;
+                }
+                put(ax, if by > ay { y1 } else { y0 }, corner, style, &mut grid);
+                let (start, end) = if ax < bx {
+                    (ax + 1, bx - 1)
+                } else {
+                    (bx + 1, ax - 1)
+                };
+                let mut gx = start;
+                while gx <= end {
+                    put(gx, by, h_ch, style, &mut grid);
+                    gx += 1;
+                }
+                if end - start >= 3 {
+                    put(start + (end - start) / 2, by, label, style, &mut grid);
+                }
+            }
+        }
+
+        // --- Nodes: borderless colored rectangles, label inside ---
+        for (idx, node) in nodes.iter().enumerate() {
+            if idx >= rects.len() {
+                break;
+            }
+            let r = rects[idx];
+            let is_selected = idx == selected_idx;
+            let is_dimmed =
+                matches!(&related, Some(rel) if !rel.contains(&node.id) && !is_selected);
+            let fill_style = Self::code_graph_node_fill(node.kind, is_selected, is_dimmed);
+            let text_style = Self::code_graph_node_text(node.kind, is_selected, is_dimmed);
+            let label = format!("{} {}", Self::node_kind_prefix(node.kind), node.name);
+            let mut label = label.chars();
+            for ry in 0..r.height {
+                for rx in 0..r.width {
+                    let ch = if ry == r.height / 2 && rx >= 1 {
+                        label.next().unwrap_or(' ')
+                    } else if ry == r.height / 2 {
+                        ' '
+                    } else {
+                        ' '
+                    };
+                    put(
+                        (r.x + rx) as i64 - inner.x as i64,
+                        (r.y + ry) as i64 - inner.y as i64,
+                        ch,
+                        if ry == r.height / 2 && rx >= 1 {
+                            text_style
+                        } else {
+                            fill_style
+                        },
+                        &mut grid,
+                    );
+                }
+            }
+        }
+
+        // --- Render grid ---
+        let lines: Vec<ratatui::text::Line> = grid
+            .into_iter()
+            .map(|row| {
+                let mut spans = Vec::with_capacity(row.len());
+                let mut cur = String::new();
+                let mut cur_style = row[0].1;
+                for (ch, st) in row {
+                    if st == cur_style {
+                        cur.push(ch);
+                    } else {
+                        spans.push(Span::styled(std::mem::take(&mut cur), cur_style));
+                        cur_style = st;
+                        cur.push(ch);
+                    }
+                }
+                if !cur.is_empty() {
+                    spans.push(Span::styled(cur, cur_style));
+                }
+                ratatui::text::Line::from(spans)
+            })
+            .collect();
+
+        let title_style = Style::default()
+            .fg(Color::Rgb(143, 218, 255))
+            .add_modifier(Modifier::BOLD);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                format!(
+                    " Graph ({}/{} nodes, {} edges) ",
+                    nodes.len(),
+                    shown_total,
+                    graph.edges.len()
+                ),
+                title_style,
+            ))
+            .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
+            .style(Style::default().bg(NORDIC_BG));
+        frame.render_widget(block, area);
+        let lines_area = ratatui::layout::Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: inner.height,
+        };
+        let para = ratatui::widgets::Paragraph::new(lines).style(Style::default().bg(NORDIC_BG));
+        frame.render_widget(para, lines_area);
+    }
+
+    /// Right pane: node details — name, kind, file, range, parent, doc, relationship counts
+    /// (counts from adjacency maps built at graph load)
+    fn render_code_graph_details(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        graph: &crate::code_graph::CodeGraph,
+        area: ratatui::layout::Rect,
+    ) {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+
+        use crate::code_graph::EdgeKind;
+        use crate::code_graph::NodeKind as NK;
+
+        let visible_nodes = self.get_visible_nodes(graph);
+        let selected_node = visible_nodes.get(self.code_graph_selected);
+
+        let mut lines: Vec<Line> = Vec::new();
+        let label_style = Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG);
+        let value_style = Style::default().fg(Color::White).bg(NORDIC_BG);
+
+        if let Some(node) = selected_node {
+            let out = self
+                .code_graph_outgoing
+                .get(&node.id)
+                .cloned()
+                .unwrap_or_default();
+            let inc = self
+                .code_graph_incoming
+                .get(&node.id)
+                .cloned()
+                .unwrap_or_default();
+            let count_out = |k: EdgeKind| out.iter().filter(|&&i| graph.edges[i].kind == k).count();
+            let count_in = |k: EdgeKind| inc.iter().filter(|&&i| graph.edges[i].kind == k).count();
+
+            lines.push(Line::from(Span::styled(
+                format!(" {} {}", Self::node_kind_prefix(node.kind), node.name),
+                Style::default()
+                    .fg(Self::node_kind_color(node.kind))
+                    .bg(NORDIC_BG)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+
+            lines.push(Line::from(vec![
+                Span::styled("Kind: ", label_style),
+                Span::styled(
+                    format!("{:?}", node.kind),
+                    value_style.add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("File: ", label_style),
+                Span::styled(node.file_path.to_string_lossy().to_string(), value_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Range: ", label_style),
+                Span::styled(
+                    format!(
+                        "{}:{}–{}:{}",
+                        node.range.start_line,
+                        node.range.start_col,
+                        node.range.end_line,
+                        node.range.end_col
+                    ),
+                    value_style,
+                ),
+            ]));
+
+            if let Some(parent) = &node.parent {
+                if let Some(parent_node) = graph.get_node(parent) {
+                    lines.push(Line::from(vec![
+                        Span::styled("Parent: ", label_style),
+                        Span::styled(
+                            parent_node.name.as_str(),
+                            value_style.add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+            }
+
+            if let Some(doc) = &node.documentation {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Documentation:",
+                    label_style.add_modifier(Modifier::BOLD),
+                )));
+                for doc_line in doc.lines() {
+                    lines.push(Line::from(Span::styled(doc_line, value_style)));
+                }
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Relationships:",
+                label_style.add_modifier(Modifier::BOLD),
+            )));
+            let push_count = |lines: &mut Vec<Line>, name: &str, n: usize| {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {}: ", name), label_style),
+                    Span::styled(n.to_string(), value_style),
+                ]));
+            };
+            push_count(&mut lines, "Calls (out)", count_out(EdgeKind::Calls));
+            push_count(&mut lines, "Called by", count_in(EdgeKind::Calls));
+            push_count(&mut lines, "Implements", count_out(EdgeKind::Implements));
+            push_count(&mut lines, "Contains", count_out(EdgeKind::Contains));
+            push_count(
+                &mut lines,
+                "References (out)",
+                count_out(EdgeKind::References),
+            );
+            push_count(&mut lines, "Referenced by", count_in(EdgeKind::References));
+            push_count(
+                &mut lines,
+                "Imports",
+                count_out(EdgeKind::Imports) + count_in(EdgeKind::Imports),
+            );
+            push_count(&mut lines, "Defines", count_out(EdgeKind::Defines));
+            push_count(&mut lines, "Total out", out.len());
+            push_count(&mut lines, "Total in", inc.len());
+
+            // hint for kind semantics (no emoji dependence)
+            let _ = NK::Function;
+        } else {
+            lines.push(Line::from(Span::styled(
+                " No node selected ",
+                Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG),
+            )));
+        }
+
+        // clamp detail scroll to content length
+        let max_scroll = lines.len().saturating_sub(1);
+        let scroll = self.code_graph_detail_scroll.min(max_scroll);
+
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Details ")
+                    .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
+                    .style(Style::default().bg(NORDIC_BG)),
+            )
+            .wrap(Wrap { trim: true })
+            .scroll((scroll as u16, 0))
+            .style(Style::default().bg(NORDIC_BG));
+
+        frame.render_widget(paragraph, area);
+    }
+
+    /// Get visible (non-Module) nodes sorted by file then line
+    fn get_visible_nodes<'a>(
+        &self,
+        graph: &'a crate::code_graph::CodeGraph,
+    ) -> Vec<&'a crate::code_graph::CodeNode> {
+        let mut nodes: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|n| n.kind != crate::code_graph::NodeKind::Module)
+            .collect();
+        nodes.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then_with(|| a.range.start_line.cmp(&b.range.start_line))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        nodes
+    }
+
+    /// Get prefix for node kind (plain ASCII tags, no emoji/unicode-script dependence)
+    pub fn node_kind_prefix(kind: crate::code_graph::NodeKind) -> &'static str {
+        use crate::code_graph::NodeKind::*;
+        match kind {
+            Function => "[F]",
+            Method => "[M]",
+            Struct => "[S]",
+            Enum => "[E]",
+            Trait => "[T]",
+            Impl => "[I]",
+            Constant => "[C]",
+            Static => "[G]",
+            TypeAlias => "[Y]",
+            Field => "[D]",
+            Parameter => "[P]",
+            Variable => "[V]",
+            Macro => "[X]",
+            Use => "[U]",
+            Module => "[O]",
+        }
+    }
+
+    /// Get semantic color for node kind
+    fn node_kind_color(kind: crate::code_graph::NodeKind) -> Color {
+        use ratatui::style::Color;
+        match kind {
+            crate::code_graph::NodeKind::Function => Color::Rgb(143, 218, 255), // Frost cyan
+            crate::code_graph::NodeKind::Method => Color::Rgb(163, 190, 140),   // Frost green
+            crate::code_graph::NodeKind::Struct => Color::Rgb(235, 203, 139),   // Frost yellow
+            crate::code_graph::NodeKind::Enum => Color::Rgb(255, 180, 120),     // Frost orange
+            crate::code_graph::NodeKind::Trait => Color::Rgb(180, 160, 255),    // Frost purple
+            crate::code_graph::NodeKind::Impl => Color::Rgb(255, 120, 180),     // Frost pink
+            crate::code_graph::NodeKind::Constant => Color::Rgb(143, 218, 255),
+            crate::code_graph::NodeKind::Static => Color::Rgb(163, 190, 140),
+            crate::code_graph::NodeKind::TypeAlias => Color::Rgb(235, 203, 139),
+            crate::code_graph::NodeKind::Field => Color::Rgb(180, 160, 255),
+            crate::code_graph::NodeKind::Parameter => Color::Rgb(255, 180, 120),
+            crate::code_graph::NodeKind::Variable => Color::Rgb(255, 120, 180),
+            crate::code_graph::NodeKind::Macro => Color::Rgb(143, 218, 255),
+            crate::code_graph::NodeKind::Use => Color::Rgb(163, 190, 140),
+            crate::code_graph::NodeKind::Module => Color::Rgb(120, 140, 160),
+        }
+    }
+
+    /// Centralized node list style: semantic fg color per kind; selected nodes are
+    /// highlighted via background only (no border modifiers).
+    pub fn code_graph_node_style(
+        kind: crate::code_graph::NodeKind,
+        selected: bool,
+        dimmed: bool,
+    ) -> ratatui::style::Style {
+        use ratatui::style::{Color, Modifier, Style};
+        if selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(94, 129, 172))
+                .add_modifier(Modifier::BOLD)
+        } else if dimmed {
+            Style::default().fg(Color::Rgb(90, 100, 115)).bg(NORDIC_BG)
+        } else {
+            Style::default()
+                .fg(Self::node_kind_color(kind))
+                .bg(NORDIC_BG)
+        }
+    }
+
+    /// Fill (background) style for graph rectangle nodes — borderless solid fill
+    fn code_graph_node_fill(
+        kind: crate::code_graph::NodeKind,
+        selected: bool,
+        dimmed: bool,
+    ) -> ratatui::style::Style {
+        use ratatui::style::{Color, Style};
+        if selected {
+            Style::default().bg(Color::Rgb(129, 161, 193)) // bright frost blue for selection
+        } else if dimmed {
+            Style::default().bg(Color::Rgb(59, 66, 82))
+        } else {
+            Style::default().bg(Self::node_kind_color(kind))
+        }
+    }
+
+    /// Text style inside graph rectangle nodes (dark text on colored fill)
+    fn code_graph_node_text(
+        kind: crate::code_graph::NodeKind,
+        selected: bool,
+        dimmed: bool,
+    ) -> ratatui::style::Style {
+        use ratatui::style::{Color, Modifier, Style};
+        if dimmed {
+            Style::default()
+                .fg(Color::Rgb(120, 130, 145))
+                .bg(Color::Rgb(59, 66, 82))
+        } else {
+            let _ = kind;
+            Style::default()
+                .fg(NORDIC_BG)
+                .bg(if selected {
+                    Color::Rgb(129, 161, 193)
+                } else {
+                    Self::node_kind_color(kind)
+                })
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Visually distinct connector (horizontal char, vertical char, color) per EdgeKind
+    fn code_graph_edge_connector(kind: crate::code_graph::EdgeKind) -> (char, char, Color) {
+        use crate::code_graph::EdgeKind::*;
+        use ratatui::style::Color;
+        match kind {
+            Calls => ('─', '│', Color::Rgb(143, 218, 255)), // solid, frost cyan
+            Implements => ('═', '║', Color::Rgb(180, 160, 255)), // double, purple
+            Contains => ('·', '·', Color::Rgb(235, 203, 139)), // dotted, yellow
+            References => ('╌', '╎', Color::Rgb(163, 190, 140)), // dashed, green
+            Imports => ('╌', '╎', Color::Rgb(255, 180, 120)), // dashed, orange
+            Defines => ('┄', '┊', Color::Rgb(216, 222, 233)), // light dashed, near-white
+        }
+    }
+
+    /// Single-glyph edge label drawn mid-connector
+    fn code_graph_edge_label(kind: crate::code_graph::EdgeKind) -> char {
+        use crate::code_graph::EdgeKind::*;
+        match kind {
+            Calls => '▸',
+            Implements => '⇒',
+            Contains => '⊃',
+            References => '↔',
+            Imports => '↥',
+            Defines => '≡',
+        }
+    }
+
+    /// Deterministic 2D graph layout: fixed-size grid cells filled row-major in
+    /// the visible-node order (file → line → name). Same input + area ⇒ same layout.
+    pub fn compute_code_graph_layout(
+        count: usize,
+        area: ratatui::layout::Rect,
+    ) -> Vec<ratatui::layout::Rect> {
+        const NODE_W: u16 = 16;
+        const NODE_H: u16 = 3;
+        const GAP_X: u16 = 4; // room for horizontal connectors
+        const GAP_Y: u16 = 2; // room for vertical connectors
+
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if inner_w == 0 || inner_h == 0 || count == 0 {
+            return vec![ratatui::layout::Rect::default(); count];
+        }
+
+        let cell_w = NODE_W + GAP_X;
+        let cell_h = NODE_H + GAP_Y;
+        let cols = ((inner_w / cell_w).max(1) as usize).min(count);
+        let rows = ((inner_h / cell_h).max(1) as usize);
+
+        let mut rects: Vec<ratatui::layout::Rect> = Vec::with_capacity(count);
+        // Grid capacity: nodes beyond it are simply not laid out (viewport);
+        // the modulo-wrap overlap bug is structurally impossible now.
+        let capacity = cols * rows.max(1);
+        for i in 0..count.min(capacity) {
+            let row = i / cols;
+            let col = i % cols;
+            let x = area.x + 1 + (col as u16) * cell_w;
+            let y = area.y + 1 + (row as u16) * cell_h;
+            let rw = NODE_W.min(area.right().saturating_sub(x));
+            let rh = NODE_H.min(area.bottom().saturating_sub(y));
+            rects.push(ratatui::layout::Rect {
+                x,
+                y,
+                width: rw,
+                height: rh,
+            });
+        }
+        rects
+    }
+
+    /// Maximum node count the deterministic grid can display without overlap.
+    /// Callers must keep the displayed set within this capacity (viewport).
+    pub fn code_graph_capacity(area: ratatui::layout::Rect) -> usize {
+        const NODE_W: u16 = 16;
+        const NODE_H: u16 = 3;
+        const GAP_X: u16 = 4;
+        const GAP_Y: u16 = 2;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if inner_w == 0 || inner_h == 0 {
+            return 0;
+        }
+        let cols = (inner_w / (NODE_W + GAP_X)).max(1) as usize;
+        let rows = (inner_h / (NODE_H + GAP_Y)).max(1) as usize;
+        cols * rows
+    }
+
+    /// Render Ask Mode overlay
+    pub fn render_ask_mode(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
         // Centered overlay
         let overlay_w = (area.width as f32 * 0.8).round() as u16;
@@ -8566,11 +10303,14 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
         // Layout: Question at top, elements in middle, hints at bottom
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(4),  // Question header
-                Constraint::Min(5),     // Elements list
-                Constraint::Length(3),  // Hints
-            ].as_ref())
+            .constraints(
+                [
+                    Constraint::Length(4), // Question header
+                    Constraint::Min(5),    // Elements list
+                    Constraint::Length(3), // Hints
+                ]
+                .as_ref(),
+            )
             .margin(1)
             .split(overlay_rect);
 
@@ -8595,7 +10335,10 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 let checked = if elem.selected() { "☑" } else { "☐" };
                 let prefix = format!(" {} ", checked);
                 let s = if is_focused {
-                    Style::default().fg(Color::Rgb(143, 218, 255)).bg(Color::Rgb(50, 60, 75)).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Rgb(143, 218, 255))
+                        .bg(Color::Rgb(50, 60, 75))
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White).bg(Color::Rgb(30, 35, 45))
                 };
@@ -8604,7 +10347,10 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 let checked = if elem.selected() { "●" } else { "○" };
                 let prefix = format!(" {} ", checked);
                 let s = if is_focused {
-                    Style::default().fg(Color::Rgb(163, 190, 140)).bg(Color::Rgb(50, 60, 75)).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Rgb(163, 190, 140))
+                        .bg(Color::Rgb(50, 60, 75))
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White).bg(Color::Rgb(30, 35, 45))
                 };
@@ -8612,9 +10358,15 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
             } else if elem.is_input() {
                 let prefix = if is_editing { " ▏ " } else { " ▎ " };
                 let s = if is_focused && is_editing {
-                    Style::default().fg(Color::Black).bg(Color::Rgb(143, 218, 255)).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Rgb(143, 218, 255))
+                        .add_modifier(Modifier::BOLD)
                 } else if is_focused {
-                    Style::default().fg(Color::Rgb(143, 218, 255)).bg(Color::Rgb(50, 60, 75)).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Rgb(143, 218, 255))
+                        .bg(Color::Rgb(50, 60, 75))
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White).bg(Color::Rgb(30, 35, 45))
                 };
@@ -8627,18 +10379,29 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
             } else if elem.is_question() {
                 let prefix = " ❓ ";
                 let s = if is_focused {
-                    Style::default().fg(Color::Rgb(235, 203, 139)).bg(Color::Rgb(50, 60, 75)).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Rgb(235, 203, 139))
+                        .bg(Color::Rgb(50, 60, 75))
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Rgb(235, 203, 139)).bg(Color::Rgb(30, 35, 45))
+                    Style::default()
+                        .fg(Color::Rgb(235, 203, 139))
+                        .bg(Color::Rgb(30, 35, 45))
                 };
-                (prefix.to_string(), s, format!("{} ({})", elem.label(), elem.action()))
+                (
+                    prefix.to_string(),
+                    s,
+                    format!("{} ({})", elem.label(), elem.action()),
+                )
             } else {
-                ("".to_string(), Style::default().fg(Color::White).bg(Color::Rgb(30, 35, 45)), String::new())
+                (
+                    "".to_string(),
+                    Style::default().fg(Color::White).bg(Color::Rgb(30, 35, 45)),
+                    String::new(),
+                )
             };
 
-            let mut spans = vec![
-                Span::styled(prefix, style),
-            ];
+            let mut spans = vec![Span::styled(prefix, style)];
             if is_editing {
                 spans.push(Span::styled(content, style));
                 // Show cursor position
@@ -8647,7 +10410,9 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                 spans.push(Span::styled(content, style));
             }
 
-            items.push(ListItem::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(30, 35, 45))));
+            items.push(
+                ListItem::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(30, 35, 45))),
+            );
         }
 
         let list = List::new(items)
@@ -8659,7 +10424,11 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                     .style(Style::default().bg(Color::Rgb(30, 35, 45))),
             )
             .style(Style::default().bg(Color::Rgb(30, 35, 45)))
-            .highlight_style(Style::default().bg(Color::Rgb(50, 60, 75)).add_modifier(Modifier::BOLD));
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(50, 60, 75))
+                    .add_modifier(Modifier::BOLD),
+            );
 
         let mut list_state = ListState::default();
         list_state.select(Some(state.focused_index));
@@ -8672,7 +10441,11 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
             "↑/↓ or j/k: navigate | Space/Enter: toggle | s: submit | q: cancel"
         };
         let hints_para = Paragraph::new(hints)
-            .style(Style::default().fg(Color::Rgb(120, 140, 160)).bg(Color::Rgb(30, 35, 45)))
+            .style(
+                Style::default()
+                    .fg(Color::Rgb(120, 140, 160))
+                    .bg(Color::Rgb(30, 35, 45)),
+            )
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -8680,6 +10453,1792 @@ let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
                     .style(Style::default().bg(Color::Rgb(30, 35, 45))),
             );
         frame.render_widget(hints_para, chunks[2]);
+    }
+    /// Handle a single key event. Returns Some(should_return_true_from_handle_events) when the event loop must return Ok(b).
+    pub async fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Option<bool> {
+        // F-keys toggle their menu section: an auto-repeat event (key held a
+        // moment too long) must not fire "open then instantly close".
+        if key.kind == crossterm::event::KeyEventKind::Repeat
+            && matches!(
+                key.code,
+                crossterm::event::KeyCode::F(1)
+                    | crossterm::event::KeyCode::F(2)
+                    | crossterm::event::KeyCode::F(3)
+                    | crossterm::event::KeyCode::F(4)
+                    | crossterm::event::KeyCode::F(5)
+                    | crossterm::event::KeyCode::F(6)
+            )
+        {
+            return None;
+        }
+        if self.term_is_interactive()
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.pending_actions.is_empty()
+            && !self.show_menu
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    self.exit_term_interactive();
+                }
+                KeyCode::Enter => {
+                    let line = std::mem::take(&mut self.term_input);
+                    self.term_run_line(&line);
+                }
+                KeyCode::Backspace => {
+                    self.term_input.pop();
+                }
+                KeyCode::PageUp => {
+                    if let Some(ref mut p) = self.tool_panel {
+                        p.scroll_by(-8);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(ref mut p) = self.tool_panel {
+                        p.scroll_by(8);
+                    }
+                }
+                KeyCode::Up => {
+                    if let Some(ref mut p) = self.tool_panel {
+                        p.scroll_by(-1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(ref mut p) = self.tool_panel {
+                        p.scroll_by(1);
+                    }
+                }
+                KeyCode::Char(c) => {
+                    self.term_input.push(c);
+                }
+                _ => {}
+            }
+            // skip rest of key handling (TERM owns keyboard)
+        } else if self.tool_panel.is_some()
+            && !self.input_focused
+            && !self.show_menu
+            && matches!(
+                key.code,
+                KeyCode::PageUp | KeyCode::PageDown | KeyCode::Up | KeyCode::Down
+            )
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            // Scroll WRITE/TERM panel without entering interactive
+            if let Some(ref mut p) = self.tool_panel {
+                match key.code {
+                    KeyCode::PageUp => p.scroll_by(-8),
+                    KeyCode::PageDown => p.scroll_by(8),
+                    KeyCode::Up => p.scroll_by(-1),
+                    KeyCode::Down => p.scroll_by(1),
+                    _ => {}
+                }
+            }
+        } else if !self.pending_actions.is_empty() && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.accept_pending_actions();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.reject_pending_actions();
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    set_permission_mode(PermissionMode::AlwaysAllow);
+                    allow_session_tools();
+                    self.accept_pending_actions();
+                    self.status_message =
+                        "Always allow + accepted. Writes/cmds auto-run this session.".to_string();
+                }
+                _ => {}
+            }
+            // Don't also type Y into input / other handlers for these keys
+            if matches!(
+                key.code,
+                KeyCode::Char('y')
+                    | KeyCode::Char('Y')
+                    | KeyCode::Char('n')
+                    | KeyCode::Char('N')
+                    | KeyCode::Char('a')
+                    | KeyCode::Char('A')
+                    | KeyCode::Enter
+            ) {
+                // fall through only for non-accept keys below — skip rest
+            } else {
+                // other keys while pending still work
+            }
+        }
+
+        let pending_consumed = !self.pending_actions.is_empty()
+            && matches!(
+                key.code,
+                KeyCode::Char('y')
+                    | KeyCode::Char('Y')
+                    | KeyCode::Char('n')
+                    | KeyCode::Char('N')
+                    | KeyCode::Char('a')
+                    | KeyCode::Char('A')
+                    | KeyCode::Enter
+            )
+            && !key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // Pressing anything else while not Esc cancels hold
+        if key.code != KeyCode::Esc {
+            self.esc_hold_start = None;
+        }
+
+        // Ask Mode key handling (takes priority when active)
+        if let Some(ref mut state) = self.ask_mode_state {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.move_focus_prev();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.move_focus_next();
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    state.toggle_focused();
+                }
+                KeyCode::Char('s') => {
+                    // Submit
+                    let response = state.submit();
+                    self.ask_mode_state = None;
+                    self.handle_ask_mode_response(response);
+                    self.status_message = "Ask Mode: submitted, resuming…".to_string();
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    // Cancel
+                    state.cancel();
+                    self.ask_mode_state = None;
+                    self.status_message = "Ask Mode: cancelled".to_string();
+                }
+                KeyCode::Backspace => {
+                    state.handle_input_backspace();
+                }
+                KeyCode::Char(c) => {
+                    state.handle_input_char(c);
+                }
+                _ => {}
+            }
+        } else if pending_consumed {
+            // already handled accept/reject
+        } else {
+            match key.code {
+                KeyCode::Esc => {
+                    // Ctrl+Esc → exit immediately (no hold)
+                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        self.esc_hold_start = None;
+                        if let Ok(mut g) = self.is_generating.lock() {
+                            *g = false;
+                        }
+                        crate::llama::libinfer::shutdown_warm_lib_engine();
+                        self.should_quit = true;
+                        self.status_message = "Exiting…".to_string();
+                    } else if self.delete_confirm_model.is_some() {
+                        self.delete_confirm_model = None;
+                        self.esc_hold_start = None;
+                    } else if self.show_menu {
+                        if self.search_token_editing {
+                            self.search_token_editing = false;
+                            self.search_token_input.clear();
+                            self.status_message = "Search token editing cancelled.".to_string();
+                        } else if self.hf_token_editing {
+                            self.hf_token_editing = false;
+                            self.hf_token_input.clear();
+                            self.status_message = "Token editing cancelled.".to_string();
+                        } else if self.settings_col == 1 {
+                            // Exit second column back to tab column
+                            self.settings_col = 0;
+                        } else {
+                            self.menu_closing = true;
+                        }
+                        self.esc_hold_start = None;
+                    } else if self.header_dropdown_open {
+                        self.header_dropdown_open = false;
+                        self.esc_hold_start = None;
+                    } else {
+                        // Start / continue hold-to-exit (1s)
+                        if self.esc_hold_start.is_none() {
+                            self.esc_hold_start = Some(std::time::Instant::now());
+                            self.status_message =
+                                "Hold Esc to exit… (release to cancel) | Ctrl+Esc = quit now"
+                                    .to_string();
+                        }
+                    }
+                }
+                KeyCode::F(1) => {
+                    if self.show_menu && self.menu_section == 0 && !self.menu_closing {
+                        self.menu_closing = true;
+                    } else {
+                        self.menu_section = 0; // Help
+                        self.show_menu = true;
+                        self.menu_closing = false;
+                        self.header_dropdown_open = false;
+                        self.krama.restart_progress("menu_fade", 0);
+                    }
+                }
+                KeyCode::F(2) => {
+                    if self.show_menu && self.menu_section == 1 && !self.menu_closing {
+                        self.menu_closing = true;
+                    } else {
+                        self.menu_section = 1; // Registry
+                        self.show_menu = true;
+                        self.menu_closing = false;
+                        self.header_dropdown_open = false;
+                        self.krama.restart_progress("menu_fade", 0);
+                        self.krama.restart_progress("list_fade", 0);
+                        let q = self.registry_search_query.clone();
+                        let manager_clone = self.manager.clone();
+                        let search_results_clone = self.search_results.clone();
+                        tokio::spawn(async move {
+                            let query_str = if q.trim().is_empty() { "gguf" } else { &q };
+                            let results = manager_clone.search_all_models(query_str).await;
+                            *search_results_clone.lock().unwrap() = Some(results);
+                        });
+                    }
+                }
+                KeyCode::F(3) => {
+                    if self.show_menu && self.menu_section == 2 && !self.menu_closing {
+                        self.menu_closing = true;
+                    } else {
+                        self.menu_section = 2; // Modal (Installed models)
+                        self.show_menu = true;
+                        self.menu_closing = false;
+                        self.header_dropdown_open = false;
+                        self.krama.restart_progress("menu_fade", 0);
+                        self.installed_models = self.manager.list_installed_local();
+                    }
+                }
+                KeyCode::F(4) => {
+                    if self.show_menu && self.menu_section == 3 && !self.menu_closing {
+                        self.menu_closing = true;
+                    } else {
+                        self.menu_section = 3; // Settings
+                        self.settings_col = 0;
+                        self.show_menu = true;
+                        self.menu_closing = false;
+                        self.header_dropdown_open = false;
+                        self.krama.restart_progress("menu_fade", 0);
+                    }
+                }
+                KeyCode::F(5) => {
+                    if self.show_menu && self.menu_section == 4 && !self.menu_closing {
+                        self.menu_closing = true;
+                    } else {
+                        self.menu_section = 4; // Session Info
+                        self.show_menu = true;
+                        self.menu_closing = false;
+                        self.header_dropdown_open = false;
+                        self.krama.restart_progress("menu_fade", 0);
+                    }
+                }
+                KeyCode::F(6) => {
+                    if !crate::settings::get_code_graph_enabled() {
+                        self.status_message = "Code Graph Panel is disabled in Settings.".to_string();
+                        return None;
+                    }
+                    if self.show_menu && self.menu_section == 5 && !self.menu_closing {
+                        self.menu_closing = true;
+                    } else {
+                        self.menu_section = 5; // Code Graph
+                        self.show_menu = true;
+                        self.menu_closing = false;
+                        self.header_dropdown_open = false;
+                        self.krama.restart_progress("menu_fade", 0);
+                        if self.code_graph.is_none() && !self.code_graph_loading {
+                            self.build_code_graph_async();
+                        }
+                    }
+                }
+                KeyCode::Char('f') | KeyCode::Char('F')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.input_focused = !self.input_focused;
+                    if self.input_focused {
+                        self.krama.restart_progress("input_slide", 0);
+                    } else {
+                        self.krama.reverse_animate("input_slide", 0);
+                    }
+                }
+                KeyCode::Char('m') | KeyCode::Char('M')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.header_dropdown_open = !self.header_dropdown_open;
+                }
+                KeyCode::Left if self.show_menu => {
+                    if self.menu_section == 1 {
+                        // Registry tab: toggle HF / Ollama
+                        self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
+                        self.registry_state.select(Some(0));
+                    } else if self.menu_section == 3 {
+                        if !self.hf_token_editing && !self.search_token_editing {
+                            if self.settings_col == 1 {
+                                // Left in value column: for Code Graph/LSP set OFF, else adjust
+                                match self.settings_tab {
+                                    SETTINGS_CODE_GRAPH => {
+                                        // Set OFF for Code Graph
+                                        match self.settings_option {
+                                            0 => {
+                                                crate::settings::set_code_graph_enabled(false);
+                                                self.status_message = "Code Graph Panel: OFF".to_string();
+                                            }
+                                            1 => {
+                                                crate::settings::set_code_graph_include_comments(false);
+                                                self.status_message = "Include Comments: OFF".to_string();
+                                            }
+                                            2 => {
+                                                crate::settings::set_code_graph_bounce_response_write(false);
+                                                self.status_message = "Bounce Response Write: OFF".to_string();
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    SETTINGS_LSP_DIAGNOSTICS => {
+                                        // Set OFF for LSP Diagnostics
+                                        match self.settings_option {
+                                            0 => {
+                                                crate::settings::set_lsp_diagnostics_enabled(false);
+                                                self.status_message = "LSP Diagnostics: OFF".to_string();
+                                            }
+                                            1 => {
+                                                crate::settings::set_lsp_show_errors(false);
+                                                self.status_message = "Show Errors: OFF".to_string();
+                                            }
+                                            2 => {
+                                                crate::settings::set_lsp_show_warnings(false);
+                                                self.status_message = "Show Warnings: OFF".to_string();
+                                            }
+                                            3 => {
+                                                crate::settings::set_lsp_show_info(false);
+                                                self.status_message = "Show Info/Hints: OFF".to_string();
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {
+                                        self.adjust_setting_value(-1);
+                                    }
+                                }
+                            } else {
+                                let num_tabs = SETTINGS_TAB_NAMES.len();
+                                self.settings_tab = if self.settings_tab == 0 {
+                                    num_tabs - 1
+                                } else {
+                                    self.settings_tab - 1
+                                };
+                                self.settings_option = 0;
+                            }
+                        }
+                    } else if self.menu_section == 5 {
+                        // Code Graph: switch panes left (Nodes ← Graph ← Details)
+                        self.code_graph_pane = match self.code_graph_pane {
+                            CodeGraphPane::Graph => CodeGraphPane::Nodes,
+                            CodeGraphPane::Details => CodeGraphPane::Graph,
+                            CodeGraphPane::Nodes => CodeGraphPane::Nodes,
+                        };
+                    }
+                }
+                KeyCode::Char('a') if self.show_menu && self.menu_section == 3 => {
+                    if !self.hf_token_editing && !self.search_token_editing {
+                        if self.settings_col == 1 {
+                            self.adjust_setting_value(-1);
+                        } else {
+                            let num_tabs = SETTINGS_TAB_NAMES.len();
+                            self.settings_tab = if self.settings_tab == 0 {
+                                num_tabs - 1
+                            } else {
+                                self.settings_tab - 1
+                            };
+                        }
+                    } else if self.search_token_editing {
+                        self.search_token_input.push('a');
+                    } else if self.hf_token_editing {
+                        self.hf_token_input.push('a');
+                    }
+                }
+                KeyCode::Right if self.show_menu => {
+                    if self.menu_section == 1 {
+                        // Registry tab: toggle HF / Ollama
+                        self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
+                        self.registry_state.select(Some(0));
+                    } else if self.menu_section == 3 {
+                        if !self.hf_token_editing && !self.search_token_editing {
+                            if self.settings_col == 1 {
+                                // Right in value column: for Code Graph/LSP set ON, else adjust
+                                match self.settings_tab {
+                                    SETTINGS_CODE_GRAPH => {
+                                        match self.settings_option {
+                                            0 => crate::settings::set_code_graph_enabled(true),
+                                            1 => crate::settings::set_code_graph_include_comments(true),
+                                            2 => crate::settings::set_code_graph_bounce_response_write(true),
+                                            _ => {}
+                                        }
+                                    }
+                                    SETTINGS_LSP_DIAGNOSTICS => {
+                                        match self.settings_option {
+                                            0 => crate::settings::set_lsp_diagnostics_enabled(true),
+                                            1 => crate::settings::set_lsp_show_errors(true),
+                                            2 => crate::settings::set_lsp_show_warnings(true),
+                                            3 => crate::settings::set_lsp_show_info(true),
+                                            _ => {}
+                                        }
+                                    }
+                                    _ => {
+                                        self.adjust_setting_value(1);
+                                    }
+                                }
+                            } else {
+                                self.settings_tab =
+                                    (self.settings_tab + 1) % SETTINGS_TAB_NAMES.len();
+                                self.settings_option = 0;
+                            }
+                        }
+                    } else if self.menu_section == 5 {
+                        // Code Graph: switch panes right (Nodes → Graph → Details)
+                        self.code_graph_pane = match self.code_graph_pane {
+                            CodeGraphPane::Nodes => CodeGraphPane::Graph,
+                            CodeGraphPane::Graph => CodeGraphPane::Details,
+                            CodeGraphPane::Details => CodeGraphPane::Details,
+                        };
+                    }
+                }
+                KeyCode::Char('k') if self.show_menu && self.menu_section == 3 => {
+                    if self.settings_tab == 8 && !self.search_token_editing {
+                        let s = crate::settings::get_settings();
+                        self.search_token_input =
+                            crate::settings::get_search_token(s.web_search_provider)
+                                .unwrap_or_default();
+                        self.search_token_editing = true;
+                        self.status_message = format!(
+                            "Type or paste key/URL for {}...",
+                            s.web_search_provider.label()
+                        );
+                    } else if self.settings_tab == 8 && self.search_token_editing {
+                        self.search_token_input.push('k');
+                    } else if self.settings_tab == 9 && self.hf_token_editing {
+                        self.hf_token_input.push('k');
+                    }
+                }
+                KeyCode::Char('d') if self.show_menu && self.menu_section == 3 => {
+                    if !self.hf_token_editing && !self.search_token_editing {
+                        if self.settings_col == 1 {
+                            if self.settings_tab == 8 {
+                                let s = crate::settings::get_settings();
+                                crate::settings::clear_search_token(s.web_search_provider);
+                                self.status_message = format!(
+                                    "Cleared key for provider {}",
+                                    s.web_search_provider.label()
+                                );
+                            } else if self.settings_tab == 9 {
+                                crate::settings::clear_hf_token();
+                                self.status_message = "HuggingFace token removed.".to_string();
+                            } else {
+                                self.adjust_setting_value(1);
+                            }
+                        } else {
+                            self.settings_tab = (self.settings_tab + 1) % SETTINGS_TAB_NAMES.len();
+                        }
+                    } else if self.search_token_editing {
+                        self.search_token_input.push('d');
+                    } else if self.hf_token_editing {
+                        self.hf_token_input.push('d');
+                    }
+                }
+                KeyCode::Char('l') if self.show_menu && self.menu_section == 3 => {
+                    if self.search_token_editing {
+                        self.search_token_input.push('l');
+                    } else if self.hf_token_editing {
+                        self.hf_token_input.push('l');
+                    }
+                }
+                KeyCode::Char('c') if self.show_menu && self.menu_section == 3 && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if !self.hf_token_editing && !self.search_token_editing {
+                        if self.settings_col == 1 && self.settings_tab == 11 {
+                            // Code Graph: Toggle Include Comments
+                            let s = crate::settings::get_settings();
+                            let new_val = !s.code_graph_include_comments;
+                            crate::settings::set_code_graph_include_comments(new_val);
+                            self.status_message = format!("Code Graph Include Comments: {}", if new_val { "ENABLED" } else { "DISABLED" });
+                        }
+                    } else if self.search_token_editing {
+                        self.search_token_input.push('c');
+                    } else if self.hf_token_editing {
+                        self.hf_token_input.push('c');
+                    }
+                }
+                KeyCode::Char('b') if self.show_menu && self.menu_section == 3 => {
+                    if !self.hf_token_editing && !self.search_token_editing {
+                        if self.settings_col == 1 && self.settings_tab == 11 {
+                            // Code Graph: Toggle Bounce Response Write
+                            let s = crate::settings::get_settings();
+                            let new_val = !s.code_graph_bounce_response_write;
+                            crate::settings::set_code_graph_bounce_response_write(new_val);
+                            self.status_message = format!("Code Graph Bounce Response Write: {}", if new_val { "ENABLED" } else { "DISABLED" });
+                        }
+                    } else if self.search_token_editing {
+                        self.search_token_input.push('b');
+                    } else if self.hf_token_editing {
+                        self.hf_token_input.push('b');
+                    }
+                }
+                KeyCode::Left => {
+                    if self.input_focused {
+                        if key.modifiers.contains(KeyModifiers::ALT) {
+                            self.input_cursor_position = self.cursor_word_left();
+                        } else {
+                            self.input_cursor_position =
+                                self.input_cursor_position.saturating_sub(1);
+                        }
+                    } else {
+                        self.table_scroll_x = self.table_scroll_x.saturating_sub(4);
+                    }
+                }
+                KeyCode::Right => {
+                    if self.input_focused {
+                        if key.modifiers.contains(KeyModifiers::ALT) {
+                            self.input_cursor_position = self.cursor_word_right();
+                        } else {
+                            self.input_cursor_position =
+                                (self.input_cursor_position + 1).min(self.input.chars().count());
+                        }
+                    } else {
+                        self.table_scroll_x = self.table_scroll_x.saturating_add(4);
+                    }
+                }
+                KeyCode::Home => {
+                    if self.input_focused && !self.show_menu {
+                        self.input_cursor_position = 0;
+                    } else if self.show_menu && self.menu_section == 5 {
+                        // Code Graph: jump to first node
+                        self.code_graph_selected = 0;
+                    }
+                }
+                KeyCode::End => {
+                    if self.input_focused && !self.show_menu {
+                        self.input_cursor_position = self.input.chars().count();
+                    } else if self.show_menu && self.menu_section == 5 {
+                        // Code Graph: jump to last node
+                        if let Some(graph) = &self.code_graph {
+                            let nodes = self.get_visible_nodes(graph);
+                            if !nodes.is_empty() {
+                                self.code_graph_selected = nodes.len() - 1;
+                            }
+                        }
+                    }
+                }
+                KeyCode::Up if self.show_menu => {
+                    if self.menu_section == 1 {
+                        let total = self.filtered_registry_models().len();
+                        let i = match self.registry_state.selected() {
+                            Some(i) => {
+                                if total == 0 {
+                                    0
+                                } else if i == 0 {
+                                    total.saturating_sub(1)
+                                } else {
+                                    i - 1
+                                }
+                            }
+                            None => 0,
+                        };
+                        self.registry_state
+                            .select(if total == 0 { None } else { Some(i) });
+                    } else if self.menu_section == 2 {
+                        let i = match self.installed_state.selected() {
+                            Some(i) => {
+                                if i == 0 {
+                                    self.installed_models.len().saturating_sub(1)
+                                } else {
+                                    i - 1
+                                }
+                            }
+                            None => 0,
+                        };
+                        self.installed_state.select(Some(i));
+                    } else if self.menu_section == 3 {
+                        if !self.hf_token_editing && !self.search_token_editing {
+                            if self.settings_col == 0 {
+                                let num_tabs = SETTINGS_TAB_NAMES.len();
+                                self.settings_tab = if self.settings_tab == 0 {
+                                    num_tabs - 1
+                                } else {
+                                    self.settings_tab - 1
+                                };
+                                self.settings_option = 0;
+                            } else {
+                                // Up in value column: navigate options for Code Graph / LSP, else adjust
+                                match self.settings_tab {
+                                    SETTINGS_CODE_GRAPH => {
+                                        // 3 options
+                                        self.settings_option = if self.settings_option == 0 { 2 } else { self.settings_option - 1 };
+                                    }
+                                    SETTINGS_LSP_DIAGNOSTICS => {
+                                        // 4 options
+                                        self.settings_option = if self.settings_option == 0 { 3 } else { self.settings_option - 1 };
+                                    }
+                                    _ => {
+                                        self.adjust_setting_value(-1);
+                                    }
+                                }
+                            }
+                        }
+                    } else if self.menu_section == 5 {
+                        // Code Graph: navigate nodes list (graph may still be loading)
+                        if self.code_graph_pane == CodeGraphPane::Nodes {
+                            if let Some(graph) = &self.code_graph {
+                                let nodes = self.get_visible_nodes(graph);
+                                if !nodes.is_empty() {
+                                    self.code_graph_selected =
+                                        self.code_graph_selected.saturating_sub(1);
+                                }
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('w') if self.show_menu && self.menu_section != 1 => {
+                    if self.menu_section == 2 {
+                        let i = match self.installed_state.selected() {
+                            Some(i) => {
+                                if i == 0 {
+                                    self.installed_models.len().saturating_sub(1)
+                                } else {
+                                    i - 1
+                                }
+                            }
+                            None => 0,
+                        };
+                        self.installed_state.select(Some(i));
+                    } else if self.menu_section == 3 {
+                        if !self.hf_token_editing && !self.search_token_editing {
+                            if self.settings_col == 0 {
+                                let num_tabs = SETTINGS_TAB_NAMES.len();
+                                self.settings_tab = if self.settings_tab == 0 {
+                                    num_tabs - 1
+                                } else {
+                                    self.settings_tab - 1
+                                };
+                            } else {
+                                match self.settings_tab {
+                                    SETTINGS_CODE_GRAPH => {
+                                        self.settings_option = if self.settings_option == 0 { 2 } else { self.settings_option - 1 };
+                                    }
+                                    SETTINGS_LSP_DIAGNOSTICS => {
+                                        self.settings_option = if self.settings_option == 0 { 3 } else { self.settings_option - 1 };
+                                    }
+                                    _ => {
+                                        self.adjust_setting_value(-1);
+                                    }
+                                }
+                            }
+                        } else if self.search_token_editing {
+                            self.search_token_input.push('w');
+                        } else {
+                            self.hf_token_input.push('w');
+                        }
+                    }
+                }
+                KeyCode::Down if self.show_menu => {
+                    if self.menu_section == 1 {
+                        let total = self.filtered_registry_models().len();
+                        let i = match self.registry_state.selected() {
+                            Some(i) => {
+                                if total == 0 {
+                                    0
+                                } else if i >= total.saturating_sub(1) {
+                                    0
+                                } else {
+                                    i + 1
+                                }
+                            }
+                            None => 0,
+                        };
+                        self.registry_state
+                            .select(if total == 0 { None } else { Some(i) });
+                    } else if self.menu_section == 2 {
+                        let i = match self.installed_state.selected() {
+                            Some(i) => {
+                                if i >= self.installed_models.len().saturating_sub(1) {
+                                    0
+                                } else {
+                                    i + 1
+                                }
+                            }
+                            None => 0,
+                        };
+                        self.installed_state.select(Some(i));
+                    } else if self.menu_section == 3 {
+                        if !self.hf_token_editing && !self.search_token_editing {
+                            if self.settings_col == 0 {
+                                self.settings_tab =
+                                    (self.settings_tab + 1) % SETTINGS_TAB_NAMES.len();
+                                self.settings_option = 0;
+                            } else {
+                                // Down in value column: navigate options for Code Graph / LSP, else adjust
+                                match self.settings_tab {
+                                    SETTINGS_CODE_GRAPH => {
+                                        self.settings_option = (self.settings_option + 1) % 3;
+                                    }
+                                    SETTINGS_LSP_DIAGNOSTICS => {
+                                        self.settings_option = (self.settings_option + 1) % 4;
+                                    }
+                                    _ => {
+                                        self.adjust_setting_value(1);
+                                    }
+                                }
+                            }
+                        }
+                    } else if self.menu_section == 5 {
+                        // Code Graph: navigate nodes list (graph may still be loading)
+                        if self.code_graph_pane == CodeGraphPane::Nodes {
+                            if let Some(graph) = &self.code_graph {
+                                let nodes = self.get_visible_nodes(graph);
+                                if !nodes.is_empty() {
+                                    self.code_graph_selected =
+                                        (self.code_graph_selected + 1).min(nodes.len() - 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('s') if self.show_menu && self.menu_section != 1 => {
+                    if self.menu_section == 2 {
+                        let i = match self.installed_state.selected() {
+                            Some(i) => {
+                                if i >= self.installed_models.len().saturating_sub(1) {
+                                    0
+                                } else {
+                                    i + 1
+                                }
+                            }
+                            None => 0,
+                        };
+                        self.installed_state.select(Some(i));
+                    } else if self.menu_section == 3 {
+                        if !self.hf_token_editing && !self.search_token_editing {
+                            if self.settings_col == 0 {
+                                self.settings_tab =
+                                    (self.settings_tab + 1) % SETTINGS_TAB_NAMES.len();
+                                self.settings_option = 0;
+                            } else {
+                                match self.settings_tab {
+                                    SETTINGS_CODE_GRAPH => {
+                                        self.settings_option = (self.settings_option + 1) % 3;
+                                    }
+                                    SETTINGS_LSP_DIAGNOSTICS => {
+                                        self.settings_option = (self.settings_option + 1) % 4;
+                                    }
+                                    _ => {
+                                        self.adjust_setting_value(1);
+                                    }
+                                }
+                            }
+                        } else if self.search_token_editing {
+                            self.search_token_input.push('s');
+                        } else {
+                            self.hf_token_input.push('s');
+                        }
+                    }
+                }
+                KeyCode::Up => {
+                    if !self.show_menu && self.path_suggestion_active {
+                        if self.path_suggestion_index == 0 {
+                            self.path_suggestion_index =
+                                self.path_suggestions.len().saturating_sub(1);
+                        } else {
+                            self.path_suggestion_index -= 1;
+                        }
+                    } else if self.input_focused {
+                        self.input_cursor_up(80);
+                    } else {
+                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                        self.auto_scroll_enabled = false;
+                    }
+                }
+                KeyCode::Down => {
+                    if !self.show_menu && self.path_suggestion_active {
+                        self.path_suggestion_index =
+                            (self.path_suggestion_index + 1) % self.path_suggestions.len().max(1);
+                    } else if self.input_focused {
+                        self.input_cursor_down(80);
+                    } else {
+                        self.scroll_offset = self.scroll_offset.saturating_add(1);
+                        self.auto_scroll_enabled = false;
+                    }
+                }
+                KeyCode::PageUp if self.show_menu && self.menu_section == 5 => {
+                    // Code Graph: scroll details pane up (must precede the generic arm)
+                    if self.code_graph_pane == CodeGraphPane::Details {
+                        self.code_graph_detail_scroll =
+                            self.code_graph_detail_scroll.saturating_sub(5);
+                    }
+                }
+                KeyCode::PageDown if self.show_menu && self.menu_section == 5 => {
+                    // Code Graph: scroll details pane down (must precede the generic arm)
+                    if self.code_graph_pane == CodeGraphPane::Details {
+                        self.code_graph_detail_scroll =
+                            self.code_graph_detail_scroll.saturating_add(5);
+                    }
+                }
+                KeyCode::PageUp if !self.input_focused => {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(5);
+                }
+                KeyCode::PageDown if !self.input_focused => {
+                    self.scroll_offset = self.scroll_offset.saturating_add(5);
+                }
+                KeyCode::Char('r') | KeyCode::Char('R')
+                    if self.show_menu && self.menu_section == 5 =>
+                {
+                    // Code Graph: rebuild
+                    if !self.code_graph_loading {
+                        self.build_code_graph_async();
+                    }
+                }
+                KeyCode::Char('+') | KeyCode::Char('=')
+                    if self.show_menu && self.menu_section == 5 =>
+                {
+                    // Code Graph: pane switch right (Nodes → Graph → Details)
+                    self.code_graph_pane = match self.code_graph_pane {
+                        CodeGraphPane::Nodes => CodeGraphPane::Graph,
+                        CodeGraphPane::Graph => CodeGraphPane::Details,
+                        CodeGraphPane::Details => CodeGraphPane::Details,
+                    };
+                }
+                KeyCode::Char('-') | KeyCode::Char('_')
+                    if self.show_menu && self.menu_section == 5 =>
+                {
+                    // Code Graph: pane switch left (Nodes ← Graph ← Details)
+                    self.code_graph_pane = match self.code_graph_pane {
+                        CodeGraphPane::Graph => CodeGraphPane::Nodes,
+                        CodeGraphPane::Details => CodeGraphPane::Graph,
+                        CodeGraphPane::Nodes => CodeGraphPane::Nodes,
+                    };
+                }
+                KeyCode::Enter if self.show_menu && self.menu_section == 5 => {
+                    // Code Graph: focus graph visualization on the selected node
+                    if self.code_graph_pane == CodeGraphPane::Nodes {
+                        self.code_graph_pane = CodeGraphPane::Graph;
+                    }
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Selection wins: Ctrl+C copies shaded text
+                    if self.selection_active() {
+                        if !self.copy_selection_to_clipboard() {
+                            self.status_message = "Nothing to copy".into();
+                        }
+                    } else {
+                        // Interrupt generation + kill background tasks
+                        let was_gen = *self.is_generating.lock().unwrap();
+                        let n_tasks = self.task_manager.running_count();
+                        if was_gen {
+                            // Signal cancel first; do not race process_response / re-prompt.
+                            self.user_cancelled_gen = true;
+                            self.auto_tool_turns = 0;
+                            *self.is_generating.lock().unwrap() = false;
+                            {
+                                let mut target = self.streaming_response.lock().unwrap();
+                                if !target.starts_with("__HERCULES") {
+                                    // Close an open thinking block so the
+                                    // "Thinking" chip resolves instead of
+                                    // staying stuck in its streaming state.
+                                    if target.contains(" thinking") && !target.contains(" response")
+                                    {
+                                        target.push_str(" response\n");
+                                    }
+                                    target.push_str("\n[Generation Interrupted by User (CTRL+C)]");
+                                }
+                            }
+                            self.gen_last_progress = None;
+                        }
+                        if n_tasks > 0 {
+                            self.task_manager.kill_all();
+                            self.messages.push(format!(
+                                "System: [CTRL+C] killed {n_tasks} background task(s)"
+                            ));
+                        }
+                        self.auto_tool_turns = 0;
+                        if was_gen || n_tasks > 0 {
+                            self.status_message = format!(
+                                "Interrupted (CTRL+C) — gen={} tasks_killed={}",
+                                was_gen, n_tasks
+                            );
+                            if let Ok(mut l) = self.activity_logs.lock() {
+                                l.push(format!("[CANCEL] CTRL+C gen={was_gen} tasks={n_tasks}"));
+                            }
+                        } else {
+                            self.input.clear();
+                            self.input_cursor_position = 0;
+                            self.status_message = "Input cleared.".to_string();
+                        }
+                    }
+                }
+                KeyCode::Char('t') | KeyCode::Char('T')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.pending_staggered_anims.clear();
+                    self.last_stagger_release = std::time::Instant::now()
+                        .checked_sub(Duration::from_millis(20))
+                        .unwrap_or_else(std::time::Instant::now);
+
+                    // Collapse only messages and thoughts that were NOT already collapsed
+                    for i in 0..self.messages.len() {
+                        let m_id = i as u32;
+                        if !self.collapsed_messages.contains(&i) {
+                            self.collapsed_messages.insert(i);
+                            self.pending_staggered_anims.push_back((m_id, false));
+                        }
+                        let t_id = (i as u32) | 0x4000_0000;
+                        if !self.collapsed_thoughts.contains(&i) {
+                            self.collapsed_thoughts.insert(i);
+                            self.pending_staggered_anims.push_back((t_id, false));
+                        }
+                    }
+
+                    // Collapse and close action chips that were open
+                    for chip in &mut self.tool_chips {
+                        if chip.expanded || !chip.tag_closed {
+                            chip.expanded = false;
+                            chip.tag_closed = true;
+                            let c_id = (chip.id as u32) | 0x8000_0000;
+                            self.pending_staggered_anims.push_back((c_id, false));
+                        }
+                    }
+
+                    self.status_message = "Collapsed all sections (Ctrl+T)".to_string();
+                }
+                KeyCode::Char('o') | KeyCode::Char('O')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.pending_staggered_anims.clear();
+                    self.last_stagger_release = std::time::Instant::now()
+                        .checked_sub(Duration::from_millis(20))
+                        .unwrap_or_else(std::time::Instant::now);
+
+                    // Expand all messages in history
+                    for &i in &self.collapsed_messages {
+                        let m_id = i as u32;
+                        self.pending_staggered_anims.push_back((m_id, true));
+                    }
+                    self.collapsed_messages.clear();
+
+                    // Expand all thoughts in history
+                    for &i in &self.collapsed_thoughts {
+                        let t_id = (i as u32) | 0x4000_0000;
+                        self.pending_staggered_anims.push_back((t_id, true));
+                    }
+                    self.collapsed_thoughts.clear();
+
+                    // Expand action chips that were closed/collapsed
+                    for chip in &mut self.tool_chips {
+                        if !chip.expanded {
+                            chip.expanded = true;
+                            let c_id = (chip.id as u32) | 0x8000_0000;
+                            self.pending_staggered_anims.push_back((c_id, true));
+                        }
+                    }
+
+                    self.status_message = "Opened all sections (Ctrl+O)".to_string();
+                }
+                // Panel chrome only when input unfocused (mouse is primary open)
+                KeyCode::Char('x') | KeyCode::Char('X')
+                    if self.tool_panel.is_some()
+                        && !self.input_focused
+                        && !self.show_menu
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.close_tool_panel();
+                }
+                // Runtime menu: +/- adjust ctx / repeat threshold
+                KeyCode::Char('+')
+                | KeyCode::Char('=')
+                | KeyCode::Char('-')
+                | KeyCode::Char('_')
+                    if self.show_menu
+                        && self.menu_section == 3
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    let inc = matches!(key.code, KeyCode::Char('+') | KeyCode::Char('='));
+                    self.runtime_nudge_selected(if inc { 1 } else { -1 });
+                }
+                KeyCode::Char('-') | KeyCode::Char('_')
+                    if self.tool_panel.is_some()
+                        && !self.input_focused
+                        && !self.show_menu
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.toggle_minimize_tool_panel();
+                }
+
+                KeyCode::Backspace | KeyCode::Char('h')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    // Ctrl+Backspace or Alt+Backspace: delete previous word
+                    if self.input_focused && !self.show_menu {
+                        self.delete_word_backward();
+                    }
+                }
+                KeyCode::Tab if !self.show_menu && self.path_suggestion_active => {
+                    self.accept_path_suggestion();
+                }
+                KeyCode::Char('v') | KeyCode::Char('V')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    // 1. Check if clipboard has raw image bytes
+                    if let Some((img_bytes, ext)) = crate::clipboard::read_clipboard_image_bytes() {
+                        self.attach_image_bytes(&img_bytes, ext);
+                    } else if let Some(text) = crate::clipboard::read_clipboard_silent() {
+                        let trimmed = text.trim();
+                        // Check if pasted text is a local file path
+                        let path = std::path::Path::new(trimmed);
+                        if path.exists() && path.is_file() {
+                            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+                            let mtype = crate::media::MediaType::from_extension(ext);
+                            if mtype != crate::media::MediaType::Other {
+                                self.attach_file_path(path);
+                                let tag = format!(
+                                    "[{} {}: {}]",
+                                    mtype.label(),
+                                    self.next_attachment_id - 1,
+                                    path.file_name().and_then(|s| s.to_str()).unwrap_or("file")
+                                );
+                                self.input_insert_text(&format!(" {tag} "));
+                            } else {
+                                self.input_insert_text(&text);
+                            }
+                        } else if self.show_menu
+                            && self.menu_section == 3
+                            && self.settings_tab == 9
+                            && self.hf_token_editing
+                        {
+                            self.hf_token_input.push_str(trimmed);
+                        } else if self.show_menu
+                            && self.menu_section == 3
+                            && self.settings_tab == 8
+                            && self.search_token_editing
+                        {
+                            self.search_token_input.push_str(trimmed);
+                        } else if self.input_focused && !self.show_menu {
+                            self.input_insert_text(&text);
+                            self.update_path_autocomplete();
+                        }
+                    }
+                }
+                KeyCode::Char('z') | KeyCode::Char('Z')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    if self.input_focused && !self.show_menu {
+                        self.input_undo_apply();
+                    }
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && self.delete_confirm_model.is_none() =>
+                {
+                    if self.input_focused && !self.show_menu {
+                        self.input_redo_apply();
+                    }
+                }
+                KeyCode::Char('z') | KeyCode::Char('Z')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    if self.input_focused && !self.show_menu {
+                        self.input_redo_apply();
+                    }
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') if self.delete_confirm_model.is_some() => {
+                    if let Some(target) = self.delete_confirm_model.take() {
+                        if target.contains("Local GGUF:") || target.contains(".gguf") {
+                            if let Err(e) = self.manager.delete_local_model(&target) {
+                                if let Ok(mut l) = self.activity_logs.lock() {
+                                    l.push(format!("[DELETE ERROR] {}", e));
+                                }
+                            } else if let Ok(mut l) = self.activity_logs.lock() {
+                                l.push(format!(
+                                    "[DELETE] Removed from models.toml and disk: {}",
+                                    target
+                                ));
+                            }
+                        }
+                        self.installed_models.retain(|m| m != &target);
+                        self.status_message = format!("Model '{}' deleted successfully.", target);
+                        if let Ok(mut l) = self.activity_logs.lock() {
+                            l.push(format!(
+                                "[DELETE] User confirmed deletion of model '{}'",
+                                target
+                            ));
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') if self.delete_confirm_model.is_some() => {
+                    self.delete_confirm_model = None;
+                }
+                // Ctrl+J = newline (classic terminal multiline)
+                KeyCode::Char('j') | KeyCode::Char('J')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && self.input_focused
+                        && !self.show_menu =>
+                {
+                    self.input_insert_char('\n');
+                }
+                KeyCode::Char(c) => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        if self.show_menu && self.menu_section == 1 {
+                            self.registry_search_query.push(c);
+                            let query = self.registry_search_query.clone();
+                            let manager = self.manager.clone();
+                            let results = self.search_results.clone();
+                            tokio::spawn(async move {
+                                let matches = manager.search_all_models(&query).await;
+                                *results.lock().unwrap() = Some(matches);
+                            });
+                        } else if self.show_menu
+                            && self.menu_section == 3
+                            && self.settings_tab == 8
+                            && self.search_token_editing
+                        {
+                            if c != '\n' && c != '\r' {
+                                self.search_token_input.push(c);
+                            }
+                        } else if self.show_menu
+                            && self.menu_section == 3
+                            && self.settings_tab == 9
+                            && self.hf_token_editing
+                        {
+                            if c != '\n' && c != '\r' {
+                                self.hf_token_input.push(c);
+                            }
+                        } else if self.input_focused && !self.show_menu {
+                            // Paste / typed text may include newlines
+                            if c == '\n' || c == '\r' {
+                                self.input_insert_char('\n');
+                            } else {
+                                self.input_insert_char(c);
+                            }
+                            self.update_path_autocomplete();
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        || key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        // handled above for word-delete
+                    } else if self.show_menu && self.menu_section == 1 {
+                        self.registry_search_query.pop();
+                        let query = self.registry_search_query.clone();
+                        let manager = self.manager.clone();
+                        let results = self.search_results.clone();
+                        tokio::spawn(async move {
+                            let matches = manager.search_all_models(&query).await;
+                            *results.lock().unwrap() = Some(matches);
+                        });
+                    } else if self.show_menu
+                        && self.menu_section == 3
+                        && self.settings_tab == 8
+                        && self.search_token_editing
+                    {
+                        self.search_token_input.pop();
+                    } else if self.show_menu
+                        && self.menu_section == 3
+                        && self.settings_tab == 9
+                        && self.hf_token_editing
+                    {
+                        self.hf_token_input.pop();
+                    } else if self.input_focused && !self.show_menu {
+                        if self.input_cursor_position > 0 && !self.input.is_empty() {
+                            self.push_input_undo();
+                            let pos = self.input_cursor_position.min(self.input.chars().count());
+                            let mut chars: Vec<char> = self.input.chars().collect();
+                            chars.remove(pos - 1);
+                            self.input = chars.into_iter().collect();
+                            self.input_cursor_position -= 1;
+                            self.update_path_autocomplete();
+                        }
+                    }
+                }
+                KeyCode::Delete => {
+                    if self.show_menu && self.menu_section == 1 {
+                        if let Some(idx) = self.installed_state.selected() {
+                            if idx < self.installed_models.len() {
+                                self.delete_confirm_model =
+                                    Some(self.installed_models[idx].clone());
+                            }
+                        }
+                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 8 {
+                        if self.search_token_editing {
+                            self.search_token_input.clear();
+                        } else {
+                            let s = crate::settings::get_settings();
+                            crate::settings::clear_search_token(s.web_search_provider);
+                            self.status_message = format!(
+                                "Cleared key for provider {}",
+                                s.web_search_provider.label()
+                            );
+                        }
+                    } else if self.show_menu && self.menu_section == 3 && self.settings_tab == 9 {
+                        if self.hf_token_editing {
+                            self.hf_token_input.clear();
+                        } else {
+                            crate::settings::clear_hf_token();
+                            self.status_message = "HuggingFace token removed.".to_string();
+                        }
+                    } else if self.input_focused && !self.show_menu {
+                        let len = self.input.chars().count();
+                        if self.input_cursor_position < len {
+                            self.push_input_undo();
+                            let mut chars: Vec<char> = self.input.chars().collect();
+                            chars.remove(self.input_cursor_position);
+                            self.input = chars.into_iter().collect();
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    // Multiline: Shift+Enter / Alt+Enter → newline
+                    // Plain Enter → send · Ctrl+Enter → force send / interrupt
+                    // Ctrl+J also inserts newline (handled separately)
+                    let want_newline = self.input_focused
+                        && !self.show_menu
+                        && (key.modifiers.contains(KeyModifiers::SHIFT)
+                            || key.modifiers.contains(KeyModifiers::ALT));
+
+                    if want_newline {
+                        self.input_insert_char('\n');
+                    } else if !self.show_menu && self.path_suggestion_active {
+                        self.accept_path_suggestion();
+                    } else if self.show_menu {
+                        if self.menu_section == 0 {
+                            // Help tab: Enter closes menu
+                            self.menu_closing = true;
+                        } else if self.menu_section == 1 {
+                            // Registry tab: download selected model
+                            let filtered_models = self.filtered_registry_models();
+                            if let Some(i) = self.registry_state.selected() {
+                                if i < filtered_models.len() {
+                                    let item_str = filtered_models[i].clone();
+                                    if item_str.starts_with("Ollama:")
+                                        || item_str.starts_with("Ollama Local:")
+                                    {
+                                        let ollama_name = item_str
+                                            .replace("Ollama:", "")
+                                            .replace("Ollama Local:", "")
+                                            .split('(')
+                                            .next()
+                                            .unwrap_or(&item_str)
+                                            .split('[')
+                                            .next()
+                                            .unwrap_or(&item_str)
+                                            .trim()
+                                            .to_string();
+
+                                        self.status_message =
+                                            format!("Pulling Ollama Model {}", ollama_name);
+                                        self.messages.push(format!(
+                                            "System: Pulling Ollama Model: {}",
+                                            ollama_name
+                                        ));
+                                        if let Ok(mut l) = self.activity_logs.lock() {
+                                            l.push(format!(
+                                                "[OLLAMA] Initiated pull stream for model: {}",
+                                                ollama_name
+                                            ));
+                                        }
+
+                                        *self.download_progress.lock().unwrap() = Some(0.0);
+                                        let progress_clone = self.download_progress.clone();
+                                        let complete_clone = self.download_complete.clone();
+                                        let logs_clone = self.activity_logs.clone();
+                                        let manager_clone = self.manager.clone();
+
+                                        tokio::spawn(async move {
+                                            let res = manager_clone
+                                                .download_ollama_model(
+                                                    &ollama_name,
+                                                    progress_clone,
+                                                    logs_clone,
+                                                )
+                                                .await;
+                                            if res.is_ok() {
+                                                *complete_clone.lock().unwrap() = true;
+                                            } else {
+                                                *complete_clone.lock().unwrap() = false;
+                                            }
+                                        });
+                                    } else {
+                                        let repo_id = {
+                                            let s = item_str
+                                                .replace("HuggingFace:", "")
+                                                .trim()
+                                                .to_string();
+                                            let s = s.split('[').next().unwrap_or(&s).trim();
+                                            s.split_whitespace().next().unwrap_or(s).to_string()
+                                        };
+
+                                        self.status_message =
+                                            format!("Resolving weights for {}", repo_id);
+                                        self.messages.push(format!("System: Resolving model weights and initiating download for: {}", repo_id));
+                                        if let Ok(mut l) = self.activity_logs.lock() {
+                                            l.push(format!("[USER] Initiated download for HuggingFace model: {}", repo_id));
+                                        }
+
+                                        *self.download_progress.lock().unwrap() = Some(0.0);
+                                        let progress_clone = self.download_progress.clone();
+                                        let complete_clone = self.download_complete.clone();
+                                        let logs_clone = self.activity_logs.clone();
+                                        let manager_clone = self.manager.clone();
+
+                                        tokio::spawn(async move {
+                                            let resolved =
+                                                manager_clone.resolve_gguf_file(&repo_id).await;
+                                            match resolved {
+                                                Ok((dl_repo, weight_filename, shard_files)) => {
+                                                    let progress_for_dl = progress_clone.clone();
+                                                    let res = manager_clone
+                                                        .download_hf_model(
+                                                            &dl_repo,
+                                                            &weight_filename,
+                                                            &shard_files,
+                                                            progress_for_dl,
+                                                            logs_clone.clone(),
+                                                        )
+                                                        .await;
+                                                    match res {
+                                                        Ok(path) => {
+                                                            if let Ok(mut l) = logs_clone.lock() {
+                                                                l.push(format!(
+                                                                    "[SUCCESS] Installed GGUF at {}",
+                                                                    path.display()
+                                                                ));
+                                                            }
+                                                            *complete_clone.lock().unwrap() = true;
+                                                        }
+                                                        Err(e) => {
+                                                            if let Ok(mut l) = logs_clone.lock() {
+                                                                l.push(format!("[ERROR] {}", e));
+                                                            }
+                                                            *complete_clone.lock().unwrap() = false;
+                                                            *progress_clone.lock().unwrap() = None;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    if let Ok(mut l) = logs_clone.lock() {
+                                                        l.push(format!("[RESOLVE ERROR] {}", e));
+                                                    }
+                                                    *complete_clone.lock().unwrap() = false;
+                                                    *progress_clone.lock().unwrap() = None;
+                                                }
+                                            }
+                                        });
+                                    }
+                                    self.menu_closing = true;
+                                }
+                            }
+                        } else if self.menu_section == 2 {
+                            // Modal (Installed models) tab: activate model
+                            if let Some(i) = self.installed_state.selected() {
+                                if i < self.installed_models.len() {
+                                    let selected_model = self.installed_models[i].clone();
+                                    if selected_model.contains("Ollama") {
+                                        let model_name = selected_model
+                                            .replace("Local Installed:", "")
+                                            .replace("Ollama:", "")
+                                            .replace("Ollama Local:", "")
+                                            .split('(')
+                                            .next()
+                                            .unwrap_or("llama3.2")
+                                            .trim()
+                                            .to_string();
+                                        self.backend = AgentBackend::Ollama(OllamaBackend::new(
+                                            model_name.clone(),
+                                        ));
+                                        self.status_message =
+                                            format!("Active Engine: Ollama ({})", model_name);
+                                    } else if selected_model.contains("Local GGUF:")
+                                        || selected_model.to_lowercase().contains(".gguf")
+                                        || selected_model.contains("GGUF")
+                                    {
+                                        let path = selected_model
+                                            .rfind('[')
+                                            .and_then(|i| {
+                                                let rest = &selected_model[i + 1..];
+                                                rest.strip_suffix(']').map(|s| s.to_string())
+                                            })
+                                            .map(std::path::PathBuf::from)
+                                            .filter(|p| p.exists())
+                                            .or_else(|| {
+                                                self.manager
+                                                    .list_installed_entries()
+                                                    .into_iter()
+                                                    .find(|e| {
+                                                        selected_model.contains(&e.name)
+                                                            || selected_model.contains(&e.path)
+                                                    })
+                                                    .map(|e| std::path::PathBuf::from(e.path))
+                                                    .filter(|p| p.exists())
+                                            });
+
+                                        if let Some(path) = path {
+                                            self.backend = AgentBackend::LlamaCppLib(
+                                                LlamaCppLibBackend::gguf(path.clone()),
+                                            );
+                                            self.manager
+                                                .set_active_gguf_path(path.display().to_string());
+                                            if let AgentBackend::LlamaCppLib(ref b) = self.backend {
+                                                if let Some(limit) = b.actual_context_limit() {
+                                                    self.model_context_limit = Some(limit);
+                                                }
+                                            }
+                                            self.status_message = format!(
+                                                "Active Engine: llama.cpp lib ({})",
+                                                path.display()
+                                            );
+                                        }
+                                    } else if let Some(path) = self.manager.latest_gguf_path() {
+                                        self.backend = AgentBackend::LlamaCppLib(
+                                            LlamaCppLibBackend::gguf(path.clone()),
+                                        );
+                                        self.manager
+                                            .set_active_gguf_path(path.display().to_string());
+                                        if let AgentBackend::LlamaCppLib(ref b) = self.backend {
+                                            if let Some(limit) = b.actual_context_limit() {
+                                                self.model_context_limit = Some(limit);
+                                            }
+                                        }
+                                        self.status_message = format!(
+                                            "Active Engine: llama.cpp lib ({})",
+                                            path.display()
+                                        );
+                                    }
+                                    self.messages.push(format!(
+                                        "System: Switched active engine model to '{}'",
+                                        selected_model
+                                    ));
+                                    self.initialized = false;
+                                    self.init_triggered = false;
+                                    self.menu_closing = true;
+                                }
+                            }
+                        } else if self.menu_section == 3 {
+                            // Settings tab (2-column)
+                            if self.settings_tab == 8 {
+                                let s = crate::settings::get_settings();
+                                let provider_needs_token = matches!(
+                                    s.web_search_provider,
+                                    crate::settings::WebSearchProvider::Google
+                                        | crate::settings::WebSearchProvider::Brave
+                                        | crate::settings::WebSearchProvider::Tavily
+                                        | crate::settings::WebSearchProvider::Searxng
+                                );
+                                if self.search_token_editing {
+                                    // Save search token
+                                    let tok = self.search_token_input.trim().to_string();
+                                    crate::settings::set_search_token(
+                                        s.web_search_provider,
+                                        tok.clone(),
+                                    );
+                                    self.search_token_editing = false;
+                                    self.search_token_input.clear();
+                                    self.status_message = format!(
+                                        "Saved token for provider {}",
+                                        s.web_search_provider.label()
+                                    );
+                                } else if provider_needs_token {
+                                    // Enter starts editing if token required
+                                    self.search_token_input =
+                                        crate::settings::get_search_token(s.web_search_provider)
+                                            .unwrap_or_default();
+                                    self.search_token_editing = true;
+                                    self.status_message = format!(
+                                        "Type or paste key/URL for {}...",
+                                        s.web_search_provider.label()
+                                    );
+                                } else if self.settings_col == 0 {
+                                    self.settings_col = 1;
+                                } else {
+                                    self.adjust_setting_value(1);
+                                }
+                            } else if self.settings_tab == 9 {
+                                if self.hf_token_editing {
+                                    // Save token
+                                    let tok = self.hf_token_input.trim().to_string();
+                                    if tok.is_empty() {
+                                        crate::settings::clear_hf_token();
+                                        self.status_message =
+                                            "HuggingFace token cleared.".to_string();
+                                    } else {
+                                        crate::settings::set_hf_token(tok);
+                                        self.status_message =
+                                            "HuggingFace token saved successfully.".to_string();
+                                    }
+                                    self.hf_token_editing = false;
+                                    self.hf_token_input.clear();
+                                } else if self.settings_col == 0 {
+                                    self.settings_col = 1;
+                                } else {
+                                    // Enter editing mode
+                                    self.hf_token_input =
+                                        crate::settings::get_hf_token().unwrap_or_default();
+                                    self.hf_token_editing = true;
+                                    self.status_message =
+                                        "Type or paste HuggingFace token...".to_string();
+                                }
+                            } else if self.settings_tab == SETTINGS_CODE_GRAPH {
+                                if self.settings_col == 1 {
+                                    self.adjust_setting_value(0); // toggle selected option
+                                } else {
+                                    self.settings_col = 1;
+                                }
+                            } else if self.settings_tab == SETTINGS_LSP_DIAGNOSTICS {
+                                if self.settings_col == 1 {
+                                    self.adjust_setting_value(0); // toggle selected option
+                                } else {
+                                    self.settings_col = 1;
+                                }
+                            } else if self.settings_col == 0 {
+                                self.settings_col = 1; // shift focus to Column 2
+                            } else {
+                                self.adjust_setting_value(1); // cycle / modify
+                            }
+                        } else if self.menu_section == 4 {
+                            if let Some(i) = self.perms_state.selected() {
+                                match i {
+                                    0 => {
+                                        set_permission_mode(PermissionMode::Ask);
+                                        self.status_message =
+                                            "Permissions: Ask user to allow (writes/cmd blocked until /allow)"
+                                                .to_string();
+                                    }
+                                    1 => {
+                                        set_permission_mode(PermissionMode::AlwaysAllow);
+                                        self.status_message =
+                                            "Permissions: Always allow tool writes & commands"
+                                                .to_string();
+                                    }
+                                    2 => {
+                                        set_folder_scope(FolderScope::CurrentDir);
+                                        self.status_message =
+                                            "Safefolder: current directory only".to_string();
+                                    }
+                                    _ => {
+                                        set_folder_scope(FolderScope::AllDirs);
+                                        self.status_message =
+                                            "Safefolder: all directories allowed".to_string();
+                                    }
+                                }
+                                let p = get_tool_permissions();
+                                self.messages.push(format!(
+                                    "System: Permissions → {} | {}",
+                                    p.mode_label(),
+                                    p.scope_label()
+                                ));
+                                if let Ok(mut l) = self.activity_logs.lock() {
+                                    l.push(format!(
+                                        "[PERMS] mode={} scope={}",
+                                        p.mode_label(),
+                                        p.scope_label()
+                                    ));
+                                }
+                            }
+                        }
+                    } else if self.input_focused && !self.input.trim().is_empty() {
+                        let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        if *self.is_generating.lock().unwrap() {
+                            if is_ctrl {
+                                // CTRL + Enter forces prompt submission and interrupts ongoing generation
+                                *self.is_generating.lock().unwrap() = false;
+                                if let Some(last) = self.messages.last_mut() {
+                                    if last.starts_with("Agent: ") {
+                                        last.push_str("\n[Interrupted by User]");
+                                    }
+                                }
+                            } else {
+                                self.status_message = "Generating... Shift+Enter=newline · CTRL+Enter=interrupt & send".to_string();
+                                return Some(true);
+                            }
+                        }
+
+                        let prompt = self.input.clone();
+                        self.input.clear();
+                        self.input_cursor_position = 0;
+                        self.typewriter_len = 0;
+                        self.auto_scroll_enabled = true;
+                        self.auto_tool_turns = 0;
+                        self.recent_tool_calls.clear();
+                        self.tool_result_context.clear();
+
+                        let backend = self.backend.name();
+                        if let Ok(mut l) = self.activity_logs.lock() {
+                            l.push(format!(
+                                "[PROMPT] Processing: \"{}\" via {}",
+                                prompt, backend
+                            ));
+                        }
+
+                        if prompt.starts_with('/') {
+                            self.messages.push(format!("You: {}", prompt));
+                            let parts: Vec<&str> = prompt.split_whitespace().collect();
+                            match parts[0] {
+                                "/help" => {
+                                    self.messages.push(
+                                        "System: Press F1 for shortcut overlay.\n\
+/allow   — grant write/cmd for this session (Ask mode)\n\
+/swarm   — initialize swarm orchestrator mode and spawn sub-agents\n\
+/compact — compress chat → memory, forget old turns\n\
+/cancel-download — clear stuck HF download lock so you can install another model\n\
+/download-status — show active download lock\n\
+/copy /theme /save /load — utilities"
+                                            .to_string(),
+                                    );
+                                }
+                                "/allow" => {
+                                    allow_session_tools();
+                                    self.messages.push(
+                                        "System: Session tool permission granted (write/cmd allowed until restart)."
+                                            .to_string(),
+                                    );
+                                }
+                                "/swarm" => {
+                                    let instruction = if parts.len() > 1 {
+                                        prompt[7..].trim()
+                                    } else {
+                                        "accomplish this task"
+                                    };
+                                    let models = self.available_swarm_models();
+                                    let models_str = if models.is_empty() {
+                                        "Default active model".to_string()
+                                    } else {
+                                        models.join(", ")
+                                    };
+                                    let backend_type = match &self.backend {
+                                        AgentBackend::Ollama(_) => "Ollama repository",
+                                        AgentBackend::LlamaCppLib(_) => {
+                                            "llama.cpp / local GGUF repository"
+                                        }
+                                        #[cfg(feature = "gpu")]
+                                        AgentBackend::BurnWgpu(_) => "WGPU repository",
+                                    };
+                                    self.status_message =
+                                        "Swarm Orchestrator active — delegating to sub-agents..."
+                                            .to_string();
+                                    self.messages.push(
+                                                format!("System: [Swarm Orchestrator initialized] Available models: [{models_str}]")
+                                            );
+                                    // Trigger agent generation with the swarm orchestration prompt in memory context
+                                    self.tool_result_context.push(format!(
+                                                "[System Orchestration]\nYou are the Swarm Orchestrator (H0). You can spawn specialized sub-agents with custom models using `<agent action=\"spawn\" role=\"ROLE\" model=\"MODEL\">task description</agent>`.\nAvailable models for your current {backend_type}: [{models_str}]\nTask: {}\nDo not write full code directly. Delegate tasks to specialized sub-agents.",
+                                                instruction
+                                            ));
+                                    self.trigger_generation_from_context();
+                                }
+                                "/compact" | "/compact!" | "/gc" => {
+                                    let before = self.estimate_full_session_tokens();
+                                    let msgs = self.messages.len();
+                                    self.compact_context_to_memory(true);
+                                    self.messages.push(format!(
+                                        "System: [OK] /compact done — was ~{} tokens / {} messages → \
+                                         ~{} tokens now. Summary in memory. Type a new question.",
+                                        before,
+                                        msgs,
+                                        self.context_tokens_est
+                                    ));
+                                }
+                                "/tasks" => {
+                                    let list = self.task_manager.list();
+                                    if list.is_empty() {
+                                        self.messages.push(
+                                            "System: Task manager empty — no background jobs."
+                                                .into(),
+                                        );
+                                    } else {
+                                        let mut lines = vec!["System: Task manager:".to_string()];
+                                        for t in list {
+                                            let age = t.started.elapsed().as_secs();
+                                            lines.push(format!(
+                                                "  #{} [{:?}] {age}s  `{}`",
+                                                t.id, t.status, t.cmd
+                                            ));
+                                        }
+                                        lines.push("  Ctrl+C kills all running tasks.".into());
+                                        self.messages.push(lines.join("\n"));
+                                    }
+                                }
+                                "/cancel-download" | "/cancel_download" | "/cdl" => {
+                                    let msg = self.manager.cancel_download();
+                                    self.messages.push(format!("System: {msg}"));
+                                    self.status_message = msg;
+                                    if let Ok(mut l) = self.activity_logs.lock() {
+                                        l.push("[DOWNLOAD] cancel-download".into());
+                                    }
+                                    // Clear stuck progress UI
+                                    *self.download_progress.lock().unwrap() = None;
+                                    *self.download_complete.lock().unwrap() = false;
+                                }
+                                "/download-status" | "/dlstatus" => {
+                                    let s = self.manager.download_status();
+                                    self.messages.push(format!("System: {s}"));
+                                    self.status_message = s;
+                                }
+                                "/copy" => {
+                                    let full_chat = self.messages.join("\n\n");
+                                    let ok = crate::clipboard::copy_text_silent(&full_chat);
+                                    let _ =
+                                        std::fs::write("/tmp/hercules_chat_export.txt", &full_chat);
+                                    self.messages.push(format!(
+                                        "System: Chat exported to /tmp/hercules_chat_export.txt{}",
+                                        if ok { " (+ clipboard)" } else { "" }
+                                    ));
+                                }
+                                "/theme" => {
+                                    if parts.len() > 1 {
+                                        match parts[1] {
+                                            "blue" => self.theme_color = Color::Rgb(0, 150, 255),
+                                            "red" => self.theme_color = Color::Rgb(255, 50, 50),
+                                            "green" | _ => {
+                                                self.theme_color = Color::Rgb(0, 255, 128)
+                                            }
+                                        }
+                                        self.messages
+                                            .push(format!("System: Theme changed to {}", parts[1]));
+                                    }
+                                }
+                                "/save" => {
+                                    if parts.len() > 1 {
+                                        let _ = std::fs::write(parts[1], self.messages.join("\n"));
+                                        self.messages
+                                            .push(format!("System: Session saved to {}", parts[1]));
+                                    }
+                                }
+                                "/load" => {
+                                    if parts.len() > 1 {
+                                        if let Ok(data) = std::fs::read_to_string(parts[1]) {
+                                            self.messages =
+                                                data.split('\n').map(|s| s.to_string()).collect();
+                                            self.messages.push(format!(
+                                                "System: Session loaded from {}",
+                                                parts[1]
+                                            ));
+                                        } else {
+                                            self.messages
+                                                .push("System: Failed to load session".to_string());
+                                        }
+                                    }
+                                }
+                                _ => self
+                                    .messages
+                                    .push(format!("System: Unknown command '{}'", parts[0])),
+                            }
+                        } else {
+                            self.messages.push(format!("You: {}", prompt));
+                            self.trigger_generation_from_context();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } // end if !pending_consumed
+        None
     }
 }
 
@@ -8838,7 +12397,8 @@ mod tests {
     async fn test_krama_multi_frame_ticks() {
         let mut app = App::new();
         let anim_id = 0u32;
-        app.krama.insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+        app.krama
+            .insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
         app.krama.restart_progress("collapse", anim_id);
 
         assert!(app.krama.is_any_animation_inprogress());
@@ -8853,7 +12413,10 @@ mod tests {
 
         let elapsed = start.elapsed();
         eprintln!("Completed in {} frames (elapsed {:?})", frames, elapsed);
-        assert!(!app.krama.is_any_animation_inprogress(), "Animation must complete");
+        assert!(
+            !app.krama.is_any_animation_inprogress(),
+            "Animation must complete"
+        );
         assert!(frames >= 1, "Should have run at least one frame");
     }
 }
@@ -8960,7 +12523,9 @@ pub fn query_active_gpu_power() -> f64 {
             if let Ok(s) = String::from_utf8(output.stdout) {
                 for line in s.lines() {
                     if line.contains("Average Graphics Package Power") || line.contains("Power:") {
-                        if let Some(val_str) = line.split_whitespace().find(|w| w.parse::<f64>().is_ok()) {
+                        if let Some(val_str) =
+                            line.split_whitespace().find(|w| w.parse::<f64>().is_ok())
+                        {
                             if let Ok(w) = val_str.parse::<f64>() {
                                 return w;
                             }

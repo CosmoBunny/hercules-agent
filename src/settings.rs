@@ -311,6 +311,21 @@ pub struct RuntimeSettings {
     /// Enable focused/bounce graph for AI write responses.
     #[serde(default = "default_true")]
     pub code_graph_bounce_response_write: bool,
+    /// Master switch for the F6 Code Graph panel (default: off).
+    #[serde(default)]
+    pub code_graph_enabled: bool,
+    /// Show LSP diagnostics (errors/warnings) in the code graph panel.
+    #[serde(default = "default_true")]
+    pub lsp_diagnostics_enabled: bool,
+    /// Show LSP errors in the code graph panel.
+    #[serde(default = "default_true")]
+    pub lsp_show_errors: bool,
+    /// Show LSP warnings in the code graph panel.
+    #[serde(default = "default_true")]
+    pub lsp_show_warnings: bool,
+    /// Show LSP info/hints in the code graph panel.
+    #[serde(default = "default_false")]
+    pub lsp_show_info: bool,
 }
 
 fn default_target_fps() -> u32 { 60 }
@@ -363,6 +378,11 @@ impl Default for RuntimeSettings {
             mcp_tools: Vec::new(),
             code_graph_include_comments: true,
             code_graph_bounce_response_write: true,
+            code_graph_enabled: false,
+            lsp_diagnostics_enabled: true,
+            lsp_show_errors: true,
+            lsp_show_warnings: true,
+            lsp_show_info: false,
         }
     }
 }
@@ -1349,6 +1369,108 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+pub fn get_code_graph_enabled() -> bool {
+    get_settings().code_graph_enabled
+}
+
+pub fn set_code_graph_enabled(val: bool) {
+    let mut s = get_settings();
+    if s.code_graph_enabled != val {
+        s.code_graph_enabled = val;
+        save_settings_to_disk(&s);
+    }
+}
+
+pub fn get_lsp_diagnostics_enabled() -> bool {
+    get_settings().lsp_diagnostics_enabled
+}
+
+pub fn set_lsp_diagnostics_enabled(val: bool) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.lsp_diagnostics_enabled = val;
+        save_settings_to_disk(&s);
+    }
+}
+
+pub fn get_lsp_show_errors() -> bool {
+    get_settings().lsp_show_errors
+}
+
+pub fn set_lsp_show_errors(val: bool) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.lsp_show_errors = val;
+        save_settings_to_disk(&s);
+    }
+}
+
+pub fn get_lsp_show_warnings() -> bool {
+    get_settings().lsp_show_warnings
+}
+
+pub fn set_lsp_show_warnings(val: bool) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.lsp_show_warnings = val;
+        save_settings_to_disk(&s);
+    }
+}
+
+pub fn get_lsp_show_info() -> bool {
+    get_settings().lsp_show_info
+}
+
+pub fn set_lsp_show_info(val: bool) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.lsp_show_info = val;
+        save_settings_to_disk(&s);
+    }
+}
+
+pub fn detect_project_languages() -> Vec<crate::code_graph::GraphLanguage> {
+    use std::collections::HashSet;
+    let mut languages = HashSet::new();
+    let project_root = std::env::current_dir().unwrap_or_default();
+    
+    fn scan_dir(dir: &std::path::Path, languages: &mut HashSet<crate::code_graph::GraphLanguage>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    // Skip common directories that shouldn't be scanned
+                    if !matches!(name, "target" | "node_modules" | ".git" | "dist" | "build" | ".cargo" | "vendor") {
+                        scan_dir(&path, languages);
+                    }
+                } else if path.is_file() {
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        if let Some(lang) = crate::code_graph::GraphLanguage::from_extension(ext) {
+                            languages.insert(lang);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    scan_dir(&project_root, &mut languages);
+    
+    // Always include Rust as default fallback
+    languages.insert(crate::code_graph::GraphLanguage::Rust);
+    
+    let mut result: Vec<_> = languages.into_iter().collect();
+    // Sort by preferred order: Rust, Python, JavaScript, TypeScript
+    result.sort_by_key(|l| match l {
+        crate::code_graph::GraphLanguage::Rust => 0,
+        crate::code_graph::GraphLanguage::Python => 1,
+        crate::code_graph::GraphLanguage::JavaScript => 2,
+        crate::code_graph::GraphLanguage::TypeScript => 3,
+    });
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1395,5 +1517,68 @@ mod tests {
             ..Default::default()
         };
         assert!(detect_repeat_loop(&hist, &s).is_none());
+    }
+
+    #[test]
+    fn test_settings_tab_constants() {
+        assert_eq!(crate::app::SETTINGS_POWER_MODE, 0);
+        assert_eq!(crate::app::SETTINGS_MTP, 1);
+        assert_eq!(crate::app::SETTINGS_AUTO_COLLAPSE, 2);
+        assert_eq!(crate::app::SETTINGS_TARGET_FPS, 3);
+        assert_eq!(crate::app::SETTINGS_STALL_TIME, 4);
+        assert_eq!(crate::app::SETTINGS_REPEAT_DETECTOR, 5);
+        assert_eq!(crate::app::SETTINGS_CONTEXT_WINDOW, 6);
+        assert_eq!(crate::app::SETTINGS_PERMISSIONS, 7);
+        assert_eq!(crate::app::SETTINGS_WEB_SEARCH, 8);
+        assert_eq!(crate::app::SETTINGS_HF_TOKEN, 9);
+        assert_eq!(crate::app::SETTINGS_OCR_ENGINE, 10);
+        assert_eq!(crate::app::SETTINGS_CODE_GRAPH, 11);
+        assert_eq!(crate::app::SETTINGS_LSP_DIAGNOSTICS, 12);
+        assert_eq!(crate::app::SETTINGS_TAB_NAMES.len(), 13);
+    }
+
+    #[test]
+    fn test_render_toggle_off() {
+        let line = crate::app::render_toggle("Test Setting", false, false);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("I"));
+        assert!(text.contains("O"));
+        assert!(text.contains("|"));
+        assert!(text.contains("Test Setting"));
+    }
+
+    #[test]
+    fn test_render_toggle_on() {
+        let line = crate::app::render_toggle("Test Setting", true, false);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("I"));
+        assert!(text.contains("O"));
+        assert!(text.contains("|"));
+        assert!(text.contains("Test Setting"));
+    }
+
+    #[test]
+    fn test_render_toggle_focused() {
+        let line = crate::app::render_toggle("Test Setting", false, true);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("►"));
+        assert!(text.contains("Test Setting"));
+    }
+
+    #[test]
+    fn test_lsp_config_source_priority() {
+        use crate::lsp::LspConfigSource;
+        let sources = vec![
+            LspConfigSource::Builtin,
+            LspConfigSource::User,
+            LspConfigSource::Project,
+        ];
+        let best = sources.into_iter().max_by_key(|s| match s {
+            LspConfigSource::Project => 3,
+            LspConfigSource::User => 2,
+            LspConfigSource::Hercules => 1,
+            LspConfigSource::Builtin => 0,
+        });
+        assert_eq!(best, Some(LspConfigSource::Project));
     }
 }
