@@ -31,6 +31,9 @@ pub struct Session {
     pub cpu_load_sum_pct: f64,
     #[serde(default)]
     pub cpu_sample_count: u64,
+    /// Persisted agent-run summaries (history, not live Instant state).
+    #[serde(default)]
+    pub run_history: Vec<crate::run_timeline::RunSummary>,
 }
 
 impl Session {
@@ -48,6 +51,7 @@ impl Session {
             total_active_compute_secs: 0.0,
             cpu_load_sum_pct: 0.0,
             cpu_sample_count: 0,
+            run_history: Vec::new(),
         }
     }
 }
@@ -57,7 +61,10 @@ pub fn sessions_dir() -> PathBuf {
     if let Some(data_dir) = dirs::data_local_dir() {
         data_dir.join("hercules").join("sessions")
     } else if let Some(home) = dirs::home_dir() {
-        home.join(".local").join("share").join("hercules").join("sessions")
+        home.join(".local")
+            .join("share")
+            .join("hercules")
+            .join("sessions")
     } else {
         PathBuf::from(".hercules_sessions")
     }
@@ -76,7 +83,13 @@ pub fn session_id_for_dir(dir: &Path) -> String {
 
     let clean_dir_name: String = dir_name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let clean_dir_name = if clean_dir_name.is_empty() {
         "workspace".to_string()
@@ -226,8 +239,13 @@ pub fn release_session_lock(session_id: &str) {
 /// Saves the given session to disk.
 pub fn save_session(session: &Session) -> Result<PathBuf, String> {
     let dir = sessions_dir();
-    fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create sessions directory {}: {}", dir.display(), e))?;
+    fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "Failed to create sessions directory {}: {}",
+            dir.display(),
+            e
+        )
+    })?;
 
     let path = session_file_path(&session.session_id);
     let json = serde_json::to_string_pretty(session)
@@ -342,7 +360,9 @@ pub fn clear_session_for_dir(dir: &Path) -> (usize, usize) {
                         } else {
                             let _ = fs::remove_file(&path);
                             let _ = fs::remove_file(lock_file_path(stem));
-                            if crate::settings::get_media_storage_delete_on_clear() == crate::settings::MediaStorageDeleteOnClear::AlwaysDelete {
+                            if crate::settings::get_media_storage_delete_on_clear()
+                                == crate::settings::MediaStorageDeleteOnClear::AlwaysDelete
+                            {
                                 crate::media::delete_session_media(stem);
                             }
                             cleared += 1;
@@ -373,7 +393,9 @@ pub fn clear_all_sessions() -> (usize, usize) {
                     } else {
                         let _ = fs::remove_file(&path);
                         let _ = fs::remove_file(lock_file_path(stem));
-                        if crate::settings::get_media_storage_delete_on_clear() == crate::settings::MediaStorageDeleteOnClear::AlwaysDelete {
+                        if crate::settings::get_media_storage_delete_on_clear()
+                            == crate::settings::MediaStorageDeleteOnClear::AlwaysDelete
+                        {
                             crate::media::delete_session_media(stem);
                         }
                         cleared += 1;
@@ -383,7 +405,10 @@ pub fn clear_all_sessions() -> (usize, usize) {
         }
     }
 
-    if crate::settings::get_media_storage_delete_on_clear() == crate::settings::MediaStorageDeleteOnClear::AlwaysDelete && skipped == 0 {
+    if crate::settings::get_media_storage_delete_on_clear()
+        == crate::settings::MediaStorageDeleteOnClear::AlwaysDelete
+        && skipped == 0
+    {
         crate::media::delete_all_sessions_media();
     }
 

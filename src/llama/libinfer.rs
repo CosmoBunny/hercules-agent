@@ -137,7 +137,11 @@ impl LlamaCppLib {
         let mut cparams = unsafe { (lib.context_default_params)() };
         let n_ctx_train = unsafe { (lib.n_ctx_train)(model) };
         let user_ctx = crate::settings::context_token_limit() as u32;
-        let train_max = if n_ctx_train > 0 { n_ctx_train as u32 } else { 4096 };
+        let train_max = if n_ctx_train > 0 {
+            n_ctx_train as u32
+        } else {
+            4096
+        };
         cparams.n_ctx = user_ctx.min(train_max).max(512);
         // Prefill is chunked to this size — never pass more tokens than n_batch to decode.
         cparams.n_batch = 512;
@@ -171,7 +175,9 @@ impl LlamaCppLib {
         let selected_vit = crate::settings::get_selected_vit_model();
 
         if !selected_vit.eq_ignore_ascii_case("disabled") {
-            if let (Some(init_mtmd), Some(def_params)) = (lib.mtmd_init_from_file, lib.mtmd_context_params_default) {
+            if let (Some(init_mtmd), Some(def_params)) =
+                (lib.mtmd_init_from_file, lib.mtmd_context_params_default)
+            {
                 let mut mmproj_path = None;
 
                 if !selected_vit.eq_ignore_ascii_case("auto") {
@@ -183,7 +189,10 @@ impl LlamaCppLib {
                         // Check inside models_dir and model_dir
                         let in_models = crate::manager::models_dir().join(&selected_vit);
                         let in_local = crate::manager::local_hercules_dir().join(&selected_vit);
-                        let in_model_dir = model_path.parent().unwrap_or(&model_path).join(&selected_vit);
+                        let in_model_dir = model_path
+                            .parent()
+                            .unwrap_or(&model_path)
+                            .join(&selected_vit);
                         if in_models.exists() {
                             mmproj_path = Some(in_models);
                         } else if in_local.exists() {
@@ -197,13 +206,25 @@ impl LlamaCppLib {
                 // Fallback to auto-detection if "auto" or if explicit path wasn't found
                 if mmproj_path.is_none() && selected_vit.eq_ignore_ascii_case("auto") {
                     let model_dir = model_path.parent().unwrap_or(&model_path);
-                    let search_dirs = vec![model_dir.to_path_buf(), crate::manager::models_dir(), crate::manager::local_hercules_dir()];
+                    let search_dirs = vec![
+                        model_dir.to_path_buf(),
+                        crate::manager::models_dir(),
+                        crate::manager::local_hercules_dir(),
+                    ];
                     for dir in search_dirs {
                         if let Ok(entries) = std::fs::read_dir(dir) {
                             for entry in entries.flatten() {
                                 let p = entry.path();
-                                let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-                                if (name.contains("mmproj") || name.contains("vit") || name.contains("clip")) && name.ends_with(".gguf") {
+                                let name = p
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_lowercase();
+                                if (name.contains("mmproj")
+                                    || name.contains("vit")
+                                    || name.contains("clip"))
+                                    && name.ends_with(".gguf")
+                                {
                                     mmproj_path = Some(p);
                                     break;
                                 }
@@ -291,7 +312,14 @@ impl LlamaCppLib {
         };
         let mut buf = vec![0u8; 64];
         let n = unsafe {
-            (lib.token_to_piece)(self.vocab, token, buf.as_mut_ptr() as *mut std::ffi::c_char, 64, 0, false)
+            (lib.token_to_piece)(
+                self.vocab,
+                token,
+                buf.as_mut_ptr() as *mut std::ffi::c_char,
+                64,
+                0,
+                false,
+            )
         };
         if n <= 0 {
             return String::new();
@@ -315,10 +343,7 @@ impl LlamaCppLib {
         let lib = get_lib()?;
 
         let system = crate::agent::AgentEngine::system_prompt_compact_for_cwd();
-        let sys_prefix = format!(
-            "<|im_start|>system\n{}<|im_end|>\n",
-            system
-        );
+        let sys_prefix = format!("<|im_start|>system\n{}<|im_end|>\n", system);
 
         // Parse conversational history into structured ChatML turns (<|im_start|>role...<|im_end|>)
         // so the model sees genuine separate turns instead of flattening prior assistant turns
@@ -359,7 +384,14 @@ impl LlamaCppLib {
         // -------------------------------------------------------------------
         let mut attached_images = Vec::new();
         if let Some(m_ctx) = self.mtmd_ctx {
-            if let (Some(bitmap_from_file), Some(eval_chunks), Some(chunks_init), Some(chunks_free), Some(bitmap_free), Some(tokenize_mtmd)) = (
+            if let (
+                Some(bitmap_from_file),
+                Some(eval_chunks),
+                Some(chunks_init),
+                Some(chunks_free),
+                Some(bitmap_free),
+                Some(tokenize_mtmd),
+            ) = (
                 lib.mtmd_helper_bitmap_init_from_file,
                 lib.mtmd_helper_eval_chunks,
                 lib.mtmd_input_chunks_init,
@@ -388,7 +420,8 @@ impl LlamaCppLib {
                     let mut wrappers = Vec::new();
                     for img_p in &attached_images {
                         if let Ok(c_path) = CString::new(img_p.to_string_lossy().as_bytes()) {
-                            let wrapper = unsafe { bitmap_from_file(m_ctx, c_path.as_ptr(), false) };
+                            let wrapper =
+                                unsafe { bitmap_from_file(m_ctx, c_path.as_ptr(), false) };
                             if !wrapper.bitmap.is_null() {
                                 bitmaps.push(wrapper.bitmap);
                                 wrappers.push(wrapper);
@@ -408,13 +441,18 @@ impl LlamaCppLib {
                         }
 
                         let default_marker = unsafe {
-                            lib.mtmd_default_marker.map(|m| {
-                                let c_str = m();
-                                std::ffi::CStr::from_ptr(c_str).to_string_lossy().into_owned()
-                            }).unwrap_or_else(|| "<__media__>".to_string())
+                            lib.mtmd_default_marker
+                                .map(|m| {
+                                    let c_str = m();
+                                    std::ffi::CStr::from_ptr(c_str)
+                                        .to_string_lossy()
+                                        .into_owned()
+                                })
+                                .unwrap_or_else(|| "<__media__>".to_string())
                         };
 
-                        let mut full_multimodal_text = format!("{}\n<|im_start|>user\n", sys_prefix);
+                        let mut full_multimodal_text =
+                            format!("{}\n<|im_start|>user\n", sys_prefix);
                         for _ in 0..bitmaps.len() {
                             full_multimodal_text.push_str(&default_marker);
                             full_multimodal_text.push('\n');
@@ -430,7 +468,13 @@ impl LlamaCppLib {
                             };
                             let chunks = unsafe { chunks_init() };
                             let tok_res = unsafe {
-                                tokenize_mtmd(m_ctx, chunks, &input_text, bitmaps.as_ptr(), bitmaps.len())
+                                tokenize_mtmd(
+                                    m_ctx,
+                                    chunks,
+                                    &input_text,
+                                    bitmaps.as_ptr(),
+                                    bitmaps.len(),
+                                )
                             };
                             if tok_res == 0 {
                                 let mut new_n_past: i32 = 0;
@@ -453,7 +497,8 @@ impl LlamaCppLib {
 
                                 if eval_res == 0 {
                                     total_prompt_tokens = new_n_past.max(1) as usize;
-                                    let prefill_dur = prefill_start_time.elapsed().as_secs_f64().max(0.0001);
+                                    let prefill_dur =
+                                        prefill_start_time.elapsed().as_secs_f64().max(0.0001);
                                     let prefill_toks_sec = total_prompt_tokens as f64 / prefill_dur;
                                     update_inference_telemetry(|t| {
                                         t.prompt_tokens = total_prompt_tokens;
@@ -462,17 +507,30 @@ impl LlamaCppLib {
                                         t.session_total_prompt_tokens += total_prompt_tokens;
                                     });
 
-                                    let chain_params = unsafe { (lib.sampler_chain_default_params)() };
+                                    let chain_params =
+                                        unsafe { (lib.sampler_chain_default_params)() };
                                     let chain = unsafe { (lib.sampler_chain_init)(chain_params) };
                                     if !chain.is_null() {
                                         let mtp_mode = crate::settings::get_mtp_mode();
                                         unsafe {
                                             if mtp_mode.ngram_size() >= 2 {
-                                                (lib.sampler_chain_add)(chain, (lib.sampler_init_greedy)());
+                                                (lib.sampler_chain_add)(
+                                                    chain,
+                                                    (lib.sampler_init_greedy)(),
+                                                );
                                             } else {
-                                                (lib.sampler_chain_add)(chain, (lib.sampler_init_top_p)(0.9, 1));
-                                                (lib.sampler_chain_add)(chain, (lib.sampler_init_temp)(0.7));
-                                                (lib.sampler_chain_add)(chain, (lib.sampler_init_dist)(0));
+                                                (lib.sampler_chain_add)(
+                                                    chain,
+                                                    (lib.sampler_init_top_p)(0.9, 1),
+                                                );
+                                                (lib.sampler_chain_add)(
+                                                    chain,
+                                                    (lib.sampler_init_temp)(0.7),
+                                                );
+                                                (lib.sampler_chain_add)(
+                                                    chain,
+                                                    (lib.sampler_init_dist)(0),
+                                                );
                                             }
                                         }
                                         let result = self.sample_loop(
@@ -511,9 +569,8 @@ impl LlamaCppLib {
             if let (Some(set_data), Some(get_size)) = (lib.state_set_data, lib.state_get_size) {
                 let needed = unsafe { get_size(self.ctx) };
                 if snap.data.len() == needed {
-                    let restored = unsafe {
-                        set_data(self.ctx, snap.data.as_ptr(), snap.data.len())
-                    };
+                    let restored =
+                        unsafe { set_data(self.ctx, snap.data.as_ptr(), snap.data.len()) };
                     if restored == snap.data.len() {
                         // State restored — now tokenize only the user-turn suffix and prefill it.
                         let mut user_tokens = self.tokenize(&user_suffix, false)?;
@@ -530,7 +587,9 @@ impl LlamaCppLib {
                         let total_user_tokens = user_tokens.len();
                         while i < total_user_tokens {
                             if let Ok(is_gen) = is_generating.lock() {
-                                if !*is_gen { return Ok(String::new()); }
+                                if !*is_gen {
+                                    return Ok(String::new());
+                                }
                             }
                             let end = (i + n_batch).min(total_user_tokens);
                             let is_last_chunk = end == total_user_tokens;
@@ -545,7 +604,12 @@ impl LlamaCppLib {
                                     *batch.pos.add(c_idx) = (sys_tokens + i + c_idx) as i32;
                                     *batch.n_seq_id.add(c_idx) = 1;
                                     *(*batch.seq_id.add(c_idx)).add(0) = 0;
-                                    *batch.logits.add(c_idx) = if is_last_chunk && c_idx == chunk_len - 1 { 1 } else { 0 };
+                                    *batch.logits.add(c_idx) =
+                                        if is_last_chunk && c_idx == chunk_len - 1 {
+                                            1
+                                        } else {
+                                            0
+                                        };
                                 }
                             }
 
@@ -558,7 +622,8 @@ impl LlamaCppLib {
                             i = end;
                         }
                         if user_prefill_ok {
-                            let prefill_dur = prefill_start_time.elapsed().as_secs_f64().max(0.0001);
+                            let prefill_dur =
+                                prefill_start_time.elapsed().as_secs_f64().max(0.0001);
                             let prefill_toks_sec = total_prompt_tokens as f64 / prefill_dur;
                             update_inference_telemetry(|t| {
                                 t.prompt_tokens = total_prompt_tokens;
@@ -576,14 +641,28 @@ impl LlamaCppLib {
                                     if mtp_mode.ngram_size() >= 2 {
                                         (lib.sampler_chain_add)(chain, (lib.sampler_init_greedy)());
                                     } else {
-                                        (lib.sampler_chain_add)(chain, (lib.sampler_init_top_p)(0.9, 1));
-                                        (lib.sampler_chain_add)(chain, (lib.sampler_init_temp)(0.7));
+                                        (lib.sampler_chain_add)(
+                                            chain,
+                                            (lib.sampler_init_top_p)(0.9, 1),
+                                        );
+                                        (lib.sampler_chain_add)(
+                                            chain,
+                                            (lib.sampler_init_temp)(0.7),
+                                        );
                                         (lib.sampler_chain_add)(chain, (lib.sampler_init_dist)(0));
                                     }
                                 }
                                 let mut all_tokens = snap.system_tokens.clone();
                                 all_tokens.extend_from_slice(&user_tokens);
-                                let result = self.sample_loop(chain, &lib, &stream_target, &is_generating, n_predict, all_tokens, gen_start_time);
+                                let result = self.sample_loop(
+                                    chain,
+                                    &lib,
+                                    &stream_target,
+                                    &is_generating,
+                                    n_predict,
+                                    all_tokens,
+                                    gen_start_time,
+                                );
                                 unsafe { (lib.sampler_free)(chain) };
                                 return result;
                             }
@@ -633,7 +712,9 @@ impl LlamaCppLib {
             let total_tokens = tokens.len();
             while offset < total_tokens {
                 if let Ok(is_gen) = is_generating.lock() {
-                    if !*is_gen { return Ok(String::new()); }
+                    if !*is_gen {
+                        return Ok(String::new());
+                    }
                 }
                 // If we have not yet reached n_sys, cap the chunk end strictly at n_sys
                 // so the KV snapshot contains ONLY the system tokens and no trailing user tokens.
@@ -655,7 +736,11 @@ impl LlamaCppLib {
                         *batch.pos.add(c_idx) = (offset + c_idx) as i32;
                         *batch.n_seq_id.add(c_idx) = 1;
                         *(*batch.seq_id.add(c_idx)).add(0) = 0;
-                        *batch.logits.add(c_idx) = if is_last_chunk && c_idx == chunk_len - 1 { 1 } else { 0 };
+                        *batch.logits.add(c_idx) = if is_last_chunk && c_idx == chunk_len - 1 {
+                            1
+                        } else {
+                            0
+                        };
                     }
                 }
 
@@ -668,10 +753,10 @@ impl LlamaCppLib {
                     ));
                 }
                 // Exactly after finishing system-prefix tokens, take the KV snapshot.
-                if offset + chunk.len() == n_sys
-                    && snap_guard.is_none()
-                {
-                    if let (Some(get_size), Some(get_data)) = (lib.state_get_size, lib.state_get_data) {
+                if offset + chunk.len() == n_sys && snap_guard.is_none() {
+                    if let (Some(get_size), Some(get_data)) =
+                        (lib.state_get_size, lib.state_get_data)
+                    {
                         let sz = unsafe { get_size(self.ctx) };
                         if sz > 0 && sz < 512 * 1024 * 1024 {
                             // Cap at 512 MB — guard against absurd values on old builds
@@ -719,7 +804,15 @@ impl LlamaCppLib {
                 (lib.sampler_chain_add)(chain, (lib.sampler_init_dist)(0));
             }
         }
-        let result = self.sample_loop(chain, &lib, &stream_target, &is_generating, n_predict, tokens, gen_start_time);
+        let result = self.sample_loop(
+            chain,
+            &lib,
+            &stream_target,
+            &is_generating,
+            n_predict,
+            tokens,
+            gen_start_time,
+        );
         unsafe { (lib.sampler_free)(chain) };
         result
     }
@@ -765,7 +858,9 @@ impl LlamaCppLib {
 
         loop {
             if let Ok(is_gen) = is_generating.lock() {
-                if !*is_gen { break; }
+                if !*is_gen {
+                    break;
+                }
             }
 
             let is_eog = unsafe { (lib.token_is_eog)(self.vocab, token) };
@@ -929,7 +1024,8 @@ impl LlamaCppLib {
                         }
 
                         // Sample prediction after this accepted draft token
-                        next_token = unsafe { (lib.sampler_sample)(chain, self.ctx, (i + 1) as i32) };
+                        next_token =
+                            unsafe { (lib.sampler_sample)(chain, self.ctx, (i + 1) as i32) };
                     } else {
                         // Diverged: `next_token` is the true sampled replacement from the model
                         break;
@@ -938,7 +1034,9 @@ impl LlamaCppLib {
 
                 // Rollback unaccepted draft positions in KV memory
                 if accepted_count < n_draft {
-                    if let (Some(m), Some(rm_fn), Some(pos_max_fn)) = (mem, lib.memory_seq_rm, lib.memory_seq_pos_max) {
+                    if let (Some(m), Some(rm_fn), Some(pos_max_fn)) =
+                        (mem, lib.memory_seq_rm, lib.memory_seq_pos_max)
+                    {
                         let cur_pos_max = unsafe { pos_max_fn(m, 0) };
                         let excess = (n_draft - accepted_count) as i32;
                         let keep_pos = cur_pos_max - excess + 1;
@@ -973,7 +1071,9 @@ impl LlamaCppLib {
 
                 let ret = unsafe { (lib.decode)(self.ctx, batch) };
                 unsafe { (lib.batch_free)(batch) };
-                if ret != 0 { break; }
+                if ret != 0 {
+                    break;
+                }
 
                 token = unsafe { (lib.sampler_sample)(chain, self.ctx, -1) };
             }
@@ -1155,6 +1255,12 @@ impl LlamaCppLibRuntime {
             let stream_target2 = stream_target.clone();
             let is_generating2 = is_generating.clone();
 
+            // Cancellation contract (two layers): the App wraps this future in
+            // `select!` against the run's child CancellationToken, so a
+            // cancelled run drops this await immediately; the blocking decode
+            // thread below ALSO polls `is_generating` per token and exits, so
+            // no detached inference keeps burning CPU after cancellation.
+            // Every cancel path sets the flag AND the token — keep both.
             let result = tokio::task::spawn_blocking(move || {
                 let engine = ensure_warm_lib_engine(&path)?;
                 engine.generate_stream(&user_prompt, stream_target2, is_generating2)
@@ -1188,8 +1294,6 @@ impl LlamaCppLibRuntime {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-
 
 /// Redirect stderr to /dev/null for the duration of llama.cpp calls so
 /// ggml_abort backtraces do not paint over the ratatui alternate screen.

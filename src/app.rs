@@ -1,21 +1,21 @@
 use crate::agent::{
-    allow_session_tools, get_tool_permissions, set_folder_scope, set_permission_mode, FolderScope,
-    PermissionMode, ProposedAction,
+    FolderScope, PermissionMode, ProposedAction, allow_session_tools, get_tool_permissions,
+    set_folder_scope, set_permission_mode,
 };
-use crate::ask_mode::{AskModeParser, AskModeResponse, AskModeState};
+use crate::ask_mode::{AskModeResponse, AskModeState};
 use crate::backend::{AgentBackend, LlamaCppLibBackend, OllamaBackend};
 use crate::manager::ModelManager;
-use crate::task_manager::{TaskEvent, TaskManager, QUICK_SECS};
+use crate::task_manager::{QUICK_SECS, TaskEvent, TaskManager};
 use crate::tool_panel::{self, PanelChromeHit, ToolChip, ToolPanel, ToolPanelKind};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use kramaframe::prelude::{KeyFrameFunction, KeyList};
-use kramaframe::{keylist::TRES16Bits, BTclasslist, BTframelist, KramaFrame};
+use kramaframe::{BTclasslist, BTframelist, KramaFrame, keylist::TRES16Bits};
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
-    Frame,
 };
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -73,8 +73,8 @@ pub const NORDIC_MUTED: Color = Color::Rgb(129, 161, 193); // #81A1C1 Frost Blue
 pub const NORDIC_ACCENT: Color = Color::Rgb(136, 192, 208); // #88C0D0 Frost Cyan
 
 /// Semantic colors for toggle states
-pub const TOGGLE_ON_GREEN: Color = Color::Rgb(163, 190, 140);  // #A3BE8C - Nord green
-pub const TOGGLE_OFF_RED: Color = Color::Rgb(191, 97, 106);    // #BF616A - Nord red
+pub const TOGGLE_ON_GREEN: Color = Color::Rgb(163, 190, 140); // #A3BE8C - Nord green
+pub const TOGGLE_OFF_RED: Color = Color::Rgb(191, 97, 106); // #BF616A - Nord red
 pub const TOGGLE_CONTAINER_GRAY: Color = Color::Rgb(76, 86, 106); // #4C566A - Nord gray
 pub const TOGGLE_INACTIVE_FG: Color = Color::Rgb(129, 161, 193); // #81A1C1 - Frost blue (muted)
 
@@ -84,14 +84,20 @@ pub const TOGGLE_INACTIVE_FG: Color = Color::Rgb(129, 161, 193); // #81A1C1 - Fr
 pub fn render_toggle<'a>(label: &'a str, enabled: bool, focused: bool) -> Line<'a> {
     let focus_prefix = if focused { "► " } else { "  " };
     let focus_style = if focused {
-        Style::default().fg(NORDIC_ACCENT).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(NORDIC_ACCENT)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(TOGGLE_INACTIVE_FG)
     };
 
     // Backgrounds for the three cells
     let (i_bg, pipe_bg, o_bg) = if enabled {
-        (TOGGLE_CONTAINER_GRAY, TOGGLE_CONTAINER_GRAY, TOGGLE_ON_GREEN)
+        (
+            TOGGLE_CONTAINER_GRAY,
+            TOGGLE_CONTAINER_GRAY,
+            TOGGLE_ON_GREEN,
+        )
     } else {
         (TOGGLE_OFF_RED, TOGGLE_CONTAINER_GRAY, TOGGLE_CONTAINER_GRAY)
     };
@@ -105,18 +111,65 @@ pub fn render_toggle<'a>(label: &'a str, enabled: bool, focused: bool) -> Line<'
     };
 
     Line::from(vec![
-        Span::styled(if focused { "► " } else { "  " }, 
-            Style::default().fg(if focused { NORDIC_ACCENT } else { TOGGLE_INACTIVE_FG }).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            if focused { "► " } else { "  " },
+            Style::default()
+                .fg(if focused {
+                    NORDIC_ACCENT
+                } else {
+                    TOGGLE_INACTIVE_FG
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(label, Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
         Span::styled(" ", Style::default().bg(NORDIC_BG)),
-        Span::styled("[", Style::default().fg(TOGGLE_CONTAINER_GRAY).bg(NORDIC_BG)),
+        Span::styled(
+            "[",
+            Style::default().fg(TOGGLE_CONTAINER_GRAY).bg(NORDIC_BG),
+        ),
         // I cell
-        Span::styled(" I ", Style::default().fg(if enabled { TOGGLE_INACTIVE_FG } else { Color::Rgb(36,41,51) }).bg(if enabled { TOGGLE_CONTAINER_GRAY } else { TOGGLE_OFF_RED }).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " I ",
+            Style::default()
+                .fg(if enabled {
+                    TOGGLE_INACTIVE_FG
+                } else {
+                    Color::Rgb(36, 41, 51)
+                })
+                .bg(if enabled {
+                    TOGGLE_CONTAINER_GRAY
+                } else {
+                    TOGGLE_OFF_RED
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
         // separator
-        Span::styled(" | ", Style::default().fg(TOGGLE_INACTIVE_FG).bg(TOGGLE_CONTAINER_GRAY)),
+        Span::styled(
+            " | ",
+            Style::default()
+                .fg(TOGGLE_INACTIVE_FG)
+                .bg(TOGGLE_CONTAINER_GRAY),
+        ),
         // O cell
-        Span::styled(" O ", Style::default().fg(if enabled { Color::Rgb(36,41,51) } else { TOGGLE_INACTIVE_FG }).bg(if enabled { TOGGLE_ON_GREEN } else { TOGGLE_CONTAINER_GRAY }).add_modifier(Modifier::BOLD)),
-        Span::styled("]", Style::default().fg(TOGGLE_CONTAINER_GRAY).bg(NORDIC_BG)),
+        Span::styled(
+            " O ",
+            Style::default()
+                .fg(if enabled {
+                    Color::Rgb(36, 41, 51)
+                } else {
+                    TOGGLE_INACTIVE_FG
+                })
+                .bg(if enabled {
+                    TOGGLE_ON_GREEN
+                } else {
+                    TOGGLE_CONTAINER_GRAY
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "]",
+            Style::default().fg(TOGGLE_CONTAINER_GRAY).bg(NORDIC_BG),
+        ),
     ])
 }
 
@@ -445,9 +498,45 @@ pub struct App {
     /// Targets already written mid-stream this turn (AlwaysAllow furious mode).
     /// Prevents double-execution when the post-gen path also sees the same tags.
     pub streamed_writes_done: Vec<String>,
+    /// Canonical exactly-once gate: every executable ToolCall must be
+    /// claimed here before execution/spawn, no matter which path parsed it
+    /// (streaming poll, completion dispatch, host recovery). Reset per turn.
+    pub dispatch_registry: crate::agent::ToolDispatchRegistry,
+    /// First-class agent run: one user prompt → steps → terminal state.
+    /// Steps are bound to canonical tool `call_id`s.
+    pub current_run: Option<crate::run_timeline::AgentRun>,
+    /// Completed/cancelled run summaries (persistable), newest last.
+    pub run_history: Vec<crate::run_timeline::RunSummary>,
+    /// Cooperative cancellation for the active run. Cancelled before a new
+    /// run starts and on Ctrl+C / Ctrl+Enter. A child token is handed to
+    /// each generation spawn; `select!` on it stops the actual async op
+    /// (the losing future is dropped), not just the `is_generating` flag.
+    pub run_cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Run id that owns the in-flight generation. Completion and task
+    /// events verify against it; stale events never mutate a newer run.
+    pub gen_run_id: Option<u64>,
+    /// Child token of the in-flight generation spawn. Cancelling it stops
+    /// only that generation future (stall/reject paths); the run token
+    /// stays alive so partial output still flows through the pipeline.
+    /// Parent cancellation (new run / Ctrl+C) cancels children automatically.
+    pub gen_cancel_token: Option<tokio_util::sync::CancellationToken>,
 
     /// Ask Mode interactive state
     pub ask_mode_state: Option<AskModeState>,
+}
+
+/// Map a canonical tool kind to its timeline step kind.
+fn step_kind_for_proposed(kind: crate::agent::ProposedKind) -> crate::run_timeline::StepKind {
+    match kind {
+        crate::agent::ProposedKind::Write => crate::run_timeline::StepKind::Write,
+        crate::agent::ProposedKind::Cmd => crate::run_timeline::StepKind::Run,
+        crate::agent::ProposedKind::Read => crate::run_timeline::StepKind::Read,
+        crate::agent::ProposedKind::Ls => crate::run_timeline::StepKind::List,
+        crate::agent::ProposedKind::WebSearch => crate::run_timeline::StepKind::Search,
+        crate::agent::ProposedKind::Mcp => crate::run_timeline::StepKind::Mcp,
+        crate::agent::ProposedKind::Skill => crate::run_timeline::StepKind::Skill,
+        crate::agent::ProposedKind::Agent => crate::run_timeline::StepKind::SubAgent,
+    }
 }
 
 impl App {
@@ -655,6 +744,12 @@ impl App {
             model_context_limit: None,
             term_input: String::new(),
             streamed_writes_done: Vec::new(),
+            dispatch_registry: crate::agent::ToolDispatchRegistry::new(),
+            current_run: None,
+            run_history: Vec::new(),
+            run_cancel_token: None,
+            gen_run_id: None,
+            gen_cancel_token: None,
             ask_mode_state: None,
             code_graph: None,
             code_graph_loading: false,
@@ -696,6 +791,9 @@ impl App {
         let sid = session.session_id.clone();
         if !session.messages.is_empty() {
             app.messages = session.messages;
+            // Restore persisted run history (summaries only — live Instant
+            // state is never serialized).
+            app.run_history = session.run_history;
             // Clean up transient messages (resumed lines, stall warnings)
             app.messages.retain(|m| {
                 !m.starts_with("System: Resumed session ")
@@ -826,6 +924,7 @@ impl App {
             session.total_active_compute_secs = self.total_active_compute_secs;
             session.cpu_load_sum_pct = self.cpu_load_sum_pct;
             session.cpu_sample_count = self.cpu_sample_count;
+            session.run_history = self.run_history.clone();
             let _ = crate::session::save_session(&session);
         }
     }
@@ -1001,31 +1100,11 @@ impl App {
         }
         self.dedupe_tool_chips();
 
-        let mut instant_cmds = Vec::new();
-        let perms = crate::agent::get_tool_permissions();
-        let can_instant_cmd =
-            perms.session_allow || perms.mode == crate::agent::PermissionMode::AlwaysAllow;
-
-        for chip in self.tool_chips.iter_mut() {
-            if chip.kind == tool_panel::ToolPanelKind::Cmd
-                && chip.tag_closed
-                && !chip.spawned
-                && can_instant_cmd
-            {
-                chip.spawned = true;
-                instant_cmds.push(crate::agent::ProposedAction {
-                    kind: crate::agent::ProposedKind::Cmd,
-                    target: chip.target.clone(),
-                    body: String::new(),
-                    line_attr: None,
-                    from_think: false,
-                    chip_id: Some(chip.id),
-                });
-            }
-        }
-        if !instant_cmds.is_empty() {
-            self.spawn_cmds_to_task_manager(instant_cmds);
-        }
+        // PREVIEW ONLY: chips reflect what the canonical parser accepted;
+        // they never execute. Execution happens exclusively in the canonical
+        // dispatch pipeline at completion (dispatch_tool_calls), which claims
+        // each call exactly once via ToolDispatchRegistry. A closed <cmd>
+        // chip therefore only *displays* until completion dispatches it.
 
         if let Some(id) = auto_open {
             if self.panel_closing {
@@ -1391,6 +1470,8 @@ impl App {
             let pkind = match a.kind {
                 crate::agent::ProposedKind::Cmd => tool_panel::ToolPanelKind::Cmd,
                 crate::agent::ProposedKind::Write => tool_panel::ToolPanelKind::Write,
+                crate::agent::ProposedKind::Read => tool_panel::ToolPanelKind::Read,
+                crate::agent::ProposedKind::Ls => tool_panel::ToolPanelKind::Read,
                 crate::agent::ProposedKind::Mcp => tool_panel::ToolPanelKind::Mcp,
                 crate::agent::ProposedKind::Skill => tool_panel::ToolPanelKind::Skill,
                 crate::agent::ProposedKind::WebSearch => tool_panel::ToolPanelKind::WebSearch,
@@ -1420,6 +1501,8 @@ impl App {
             let kind = match a.kind {
                 crate::agent::ProposedKind::Write => ToolPanelKind::Write,
                 crate::agent::ProposedKind::Cmd => ToolPanelKind::Cmd,
+                crate::agent::ProposedKind::Read => ToolPanelKind::Read,
+                crate::agent::ProposedKind::Ls => ToolPanelKind::Read,
                 crate::agent::ProposedKind::Mcp => ToolPanelKind::Mcp,
                 crate::agent::ProposedKind::Skill => ToolPanelKind::Skill,
                 crate::agent::ProposedKind::WebSearch => ToolPanelKind::WebSearch,
@@ -1482,8 +1565,10 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("; ");
+        // from_think is always false: extractors only see outside-think
+        // content, so no promotion path exists anymore.
         let think_note = if actions.iter().any(|a| a.from_think) {
-            " (recovered from <think> — model nested the tool wrongly)"
+            " (from model thinking — unexpected)"
         } else {
             ""
         };
@@ -1501,6 +1586,23 @@ impl App {
             self.status_message = format!("Pending {n} write(s) — Y to accept after AI finishes");
         }
         self.pending_actions = actions;
+        // Proposed-but-unapproved calls appear on the timeline as
+        // WaitingApproval; accept revives them to Running, reject fails them.
+        if let Some(run) = self.current_run.as_mut() {
+            for a in &self.pending_actions {
+                let summary = format!(
+                    "{} {}",
+                    a.kind.label(),
+                    a.target.chars().take(64).collect::<String>()
+                );
+                let id = run.start_step(step_kind_for_proposed(a.kind), summary, Some(a.call_id));
+                run.finish_step(
+                    id,
+                    crate::run_timeline::StepStatus::WaitingApproval,
+                    Some("waiting for user approval".to_string()),
+                );
+            }
+        }
         self.input_focused = false; // so Y/N aren't typed into the prompt
     }
 
@@ -1510,7 +1612,12 @@ impl App {
         }
         allow_session_tools();
         let now = Instant::now();
-        let actions = std::mem::take(&mut self.pending_actions);
+        let mut actions = std::mem::take(&mut self.pending_actions);
+        // User-confirmed calls re-enter the canonical pipeline with explicit
+        // provenance instead of bypassing the dispatcher.
+        for a in &mut actions {
+            a.source = crate::agent::ToolCallSource::UserAccept;
+        }
         for a in &actions {
             if let Some(chip_id) = a.chip_id {
                 self.action_start_times.insert(chip_id, now);
@@ -1525,6 +1632,8 @@ impl App {
             match a.kind {
                 crate::agent::ProposedKind::Write => writes.push(a),
                 crate::agent::ProposedKind::Cmd => cmds.push(a),
+                crate::agent::ProposedKind::Read => mcps.push(a),
+                crate::agent::ProposedKind::Ls => mcps.push(a),
                 crate::agent::ProposedKind::Mcp => mcps.push(a),
                 crate::agent::ProposedKind::Skill => mcps.push(a),
                 crate::agent::ProposedKind::WebSearch => mcps.push(a),
@@ -1535,6 +1644,9 @@ impl App {
         if !writes.is_empty() {
             let mut written = Vec::new();
             for a in &writes {
+                if !self.claim_tool_call(a) {
+                    continue;
+                }
                 let result = crate::agent::AgentEngine::execute_proposed(a);
 
                 if let Some(chip_id) = a.chip_id {
@@ -1576,6 +1688,9 @@ impl App {
         if !mcps.is_empty() {
             let mut agent_ids = Vec::new();
             for a in &mcps {
+                if !self.claim_tool_call(a) {
+                    continue;
+                }
                 if a.kind == crate::agent::ProposedKind::Agent {
                     let role = crate::agent::AgentEngine::extract_attribute(&a.target, "role")
                         .unwrap_or_default();
@@ -1585,13 +1700,18 @@ impl App {
                         .unwrap_or_default();
                     let sub_backend = self.backend.with_model(&model, &self.manager);
                     let instruction = a.body.clone();
-                    let agent_id = self.task_manager.spawn_agent(
+                    let run_id = self.current_run.as_ref().map(|r| r.id);
+                    let child = self.run_cancel_token.as_ref().map(|t| t.child_token());
+                    let agent_id = self.task_manager.spawn_agent_with_run(
                         sub_backend,
                         role.clone(),
                         to,
                         model.clone(),
                         instruction,
                         0, // spawned_by host/orchestrator
+                        Some(a.call_id),
+                        run_id,
+                        child,
                     );
                     agent_ids.push(agent_id);
                     let model_label = if model.is_empty() {
@@ -1603,7 +1723,9 @@ impl App {
                         if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
                             chip.pending = false;
                             chip.tag_closed = true;
-                            chip.body = format!("[Agent Task #{agent_id} ({role}{model_label}) spawning]\n(waiting for reply…)");
+                            chip.body = format!(
+                                "[Agent Task #{agent_id} ({role}{model_label}) spawning]\n(waiting for reply…)"
+                            );
                         }
                     }
                     continue;
@@ -1623,7 +1745,10 @@ impl App {
                             new_revision,
                             ..
                         } => {
-                            format!("[Smart System: Revision #{new_revision} Committed] Successfully wrote {lines_written} lines to {}", path.display())
+                            format!(
+                                "[Smart System: Revision #{new_revision} Committed] Successfully wrote {lines_written} lines to {}",
+                                path.display()
+                            )
                         }
                         crate::smart_system::SmartWriteResult::Conflict { message, .. } => {
                             format!("[CONFLICT REJECTED]\n{message}")
@@ -1651,7 +1776,13 @@ impl App {
         }
 
         if !cmds.is_empty() {
-            self.spawn_cmds_to_task_manager(cmds);
+            let cmds: Vec<_> = cmds
+                .into_iter()
+                .filter(|a| self.claim_tool_call(a))
+                .collect();
+            if !cmds.is_empty() {
+                self.spawn_cmds_to_task_manager(cmds);
+            }
             // Cmds still trigger re-prompt so the AI sees the shell output
         }
         // Record final action durations and clean up completed action start times
@@ -1669,11 +1800,191 @@ impl App {
         }
     }
 
+    /// Canonical dispatch gate — the ONLY doorway from a parsed ToolCall to    /// execution. Claims the call's fingerprint in `dispatch_registry` and
+    /// returns `false` when this exact call already ran (streaming poll vs.
+    /// completion re-dispatch vs. recovery re-fire within one turn).
+    /// Every site that executes or spawns a tool MUST call this first.
+    /// A successful claim also opens a Run step bound to the call id.
+    fn claim_tool_call(&mut self, action: &crate::agent::ProposedAction) -> bool {
+        if !self.dispatch_registry.try_claim(action) {
+            if let Ok(mut l) = self.activity_logs.lock() {
+                l.push(format!(
+                    "[DISPATCH] duplicate suppressed: {} -> {}",
+                    action.kind.label(),
+                    action.target.chars().take(80).collect::<String>(),
+                ));
+            }
+            return false;
+        }
+        if let Ok(mut l) = self.activity_logs.lock() {
+            l.push(format!(
+                "[DISPATCH #{}:{:?}] {} -> {}",
+                action.call_id,
+                action.source,
+                action.kind.label(),
+                action.target.chars().take(80).collect::<String>(),
+            ));
+        }
+        let kind = step_kind_for_proposed(action.kind);
+        let summary = format!(
+            "{} {}",
+            action.kind.label(),
+            action.target.chars().take(64).collect::<String>()
+        );
+        if let Some(run) = self.current_run.as_mut() {
+            run.start_step(kind, summary, Some(action.call_id));
+        }
+        true
+    }
+
+    /// Finish the Run step bound to a tool `call_id`, if any.
+    fn finish_run_call(
+        &mut self,
+        call_id: u64,
+        status: crate::run_timeline::StepStatus,
+        note: Option<String>,
+    ) {
+        if let Some(run) = self.current_run.as_mut() {
+            run.finish_call(call_id, status, note);
+        }
+    }
+
+    /// Start a run-level (non-tool) timeline step; returns the step id.
+    fn start_run_step(&mut self, kind: crate::run_timeline::StepKind, summary: String) -> u64 {
+        match self.current_run.as_mut() {
+            Some(run) => run.start_step(kind, summary, None),
+            None => 0,
+        }
+    }
+
+    /// Finish the latest still-running step of a kind (Think/Generate).
+    fn finish_open_run_step(
+        &mut self,
+        kind: crate::run_timeline::StepKind,
+        status: crate::run_timeline::StepStatus,
+        note: Option<String>,
+    ) {
+        use crate::run_timeline::StepStatus as S;
+        if let Some(run) = self.current_run.as_mut() {
+            if let Some(s) = run
+                .steps
+                .iter_mut()
+                .rev()
+                .find(|s| s.kind == kind && s.status == S::Running)
+            {
+                s.finish(status, note);
+            }
+        }
+    }
+
+    /// Terminal idle state: Ready + close the current agent run.
+    fn mark_ready(&mut self) {
+        self.status_message = "Ready.".to_string();
+        self.finish_current_run(crate::run_timeline::AgentRunState::Completed);
+    }
+
+    /// Mark the current run terminal, if one is open.
+    /// Cancellation cascades to active steps (none left `Running`).
+    fn finish_current_run(&mut self, state: crate::run_timeline::AgentRunState) {
+        if let Some(run) = self.current_run.as_mut() {
+            if state == crate::run_timeline::AgentRunState::Cancelled {
+                run.cancel();
+            } else {
+                run.finish_run(state);
+            }
+        }
+    }
+
+    /// Open a new run for a fresh prompt. The previous run is never
+    /// silently destroyed: its cancellation token is cancelled first, a
+    /// still-live run is cancelled + archived, then the new run gets a
+    /// fresh token. Archive happens exactly once per run (here only).
+    fn start_new_run(&mut self, prompt: String) {
+        if let Some(tok) = self.run_cancel_token.take() {
+            tok.cancel();
+        }
+        if let Some(run) = self.current_run.as_mut() {
+            if !run.is_terminal() {
+                run.cancel();
+            }
+            self.run_history.push(run.summarize());
+            if self.run_history.len() > 20 {
+                let n = self.run_history.len() - 20;
+                self.run_history.drain(0..n);
+            }
+        }
+        self.current_run = Some(crate::run_timeline::AgentRun::new(prompt));
+        self.run_cancel_token = Some(tokio_util::sync::CancellationToken::new());
+        self.gen_run_id = None;
+    }
+
+    /// Cancel only the in-flight generation future (stall/reject paths).
+    /// The run token — and the run itself — stay alive so partial output
+    /// still flows through finalize/dispatch. Full-run cancellation goes
+    /// through `cancel_active_run`, whose parent-token cancel also drops
+    /// this child. Idempotent.
+    fn cancel_generation(&mut self, reason: &str) {
+        if let Some(tok) = self.gen_cancel_token.as_ref() {
+            tok.cancel();
+        }
+        *self.is_generating.lock().unwrap() = false;
+        if let Ok(mut l) = self.activity_logs.lock() {
+            l.push(format!("[CANCEL-GEN] {reason}"));
+        }
+    }
+
+    /// Unified cooperative cancellation path for Ctrl+C and Ctrl+Enter.
+    /// Cancels the run token (in-flight `select!`s observe it and drop the
+    /// actual async operation), stops the generation flag, optionally kills
+    /// OS processes, and marks the run Cancelled with cascade.
+    /// Idempotent: repeated calls neither duplicate history nor revive work.
+    fn cancel_active_run(&mut self, reason: &str, kill_tasks: bool) {
+        if let Some(tok) = self.run_cancel_token.as_ref() {
+            tok.cancel();
+        }
+        self.user_cancelled_gen = true;
+        self.auto_tool_turns = 0;
+        *self.is_generating.lock().unwrap() = false;
+        if kill_tasks {
+            let n = self.task_manager.running_count();
+            if n > 0 {
+                self.task_manager.kill_all();
+                self.messages
+                    .push(format!("System: [CTRL+C] killed {n} background task(s)"));
+            }
+        }
+        self.finish_current_run(crate::run_timeline::AgentRunState::Cancelled);
+        if let Ok(mut l) = self.activity_logs.lock() {
+            l.push(format!("[CANCEL] {reason}"));
+        }
+    }
+
+    /// True when the just-finished generation still owns the current run.
+    /// Late/stale completions (cancelled run, newer run started) must not
+    /// dispatch tools, continue, or close the new run.
+    fn completion_owns_current_run(&self) -> bool {
+        match (self.gen_run_id, self.current_run.as_ref()) {
+            (Some(gid), Some(run)) => run.id == gid && !run.is_terminal(),
+            _ => false,
+        }
+    }
+
     /// Run shell cmds via task manager (non-blocking; park after 10s).
     fn spawn_cmds_to_task_manager(&mut self, cmds: Vec<ProposedAction>) {
         for a in cmds {
             let cmd = a.target.clone();
-            let id = self.task_manager.spawn_cmd(cmd.clone(), 0);
+            let run_id = self.current_run.as_ref().map(|r| r.id);
+            // Child token: cancelling the run kills this command's process
+            // in the worker wait-loop; cancelling the child alone is N/A
+            // here, but the parent/child split keeps generation independent.
+            let child = self.run_cancel_token.as_ref().map(|t| t.child_token());
+            let id = self.task_manager.spawn_cmd_with_run(
+                cmd.clone(),
+                0,
+                Some(a.call_id),
+                run_id,
+                child,
+            );
             // Update chip body with task id
             if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
                 c.kind == ToolPanelKind::Cmd
@@ -1728,13 +2039,16 @@ impl App {
                     output: _,
                     killed: _,
                     spawned_by,
+                    ..
                 } = &ev
                 {
                     if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
                         (c.kind == ToolPanelKind::Cmd || c.kind == ToolPanelKind::Agent)
                             && tool_panel::same_tool_target(c.kind, &c.target, cmd)
                     }) {
-                        chip.body = format!("[Task #{id} DONE (Agent {spawned_by}) — queued in inbox]\n(waiting for current response to finish)");
+                        chip.body = format!(
+                            "[Task #{id} DONE (Agent {spawned_by}) — queued in inbox]\n(waiting for current response to finish)"
+                        );
                     }
                 }
                 self.pending_agent_messages.push(ev);
@@ -1773,12 +2087,34 @@ impl App {
         }
     }
 
+    /// True when a task event still belongs to the current run.
+    /// Events without a run id (TERM input) always pass; events from a
+    /// superseded or terminal run are stale and must not mutate App state,
+    /// feed context, revive generation, or touch the timeline.
+    fn event_is_current(&self, ev_run_id: Option<u64>) -> bool {
+        match (ev_run_id, self.current_run.as_ref()) {
+            (None, _) => true,
+            (Some(rid), Some(run)) => run.id == rid && !run.is_terminal(),
+            (Some(_), None) => false,
+        }
+    }
+
     fn deliver_task_event(&mut self, ev: TaskEvent) {
+        let ev_run_id = match &ev {
+            TaskEvent::Parked { run_id, .. } | TaskEvent::Done { run_id, .. } => *run_id,
+        };
+        if !self.event_is_current(ev_run_id) {
+            if let Ok(mut l) = self.activity_logs.lock() {
+                l.push("[STALE] task event from superseded/finished run ignored".into());
+            }
+            return;
+        }
         match ev {
             TaskEvent::Parked {
                 id,
                 cmd,
                 spawned_by,
+                ..
             } => {
                 self.messages.push(format!(
                     "System: [Task #{id} (Agent {spawned_by})] still running after {QUICK_SECS}s — pushed to task manager. \
@@ -1818,6 +2154,8 @@ impl App {
                 output,
                 killed,
                 spawned_by,
+                call_id,
+                run_id: _,
             } => {
                 let label = if killed { "KILLED" } else { "DONE" };
                 let pretty = tool_panel::format_tool_output_for_chat(&output);
@@ -1836,6 +2174,18 @@ impl App {
                     "[Task #{id} {label} (Agent {spawned_by})]\ncmd: {cmd}\n\n{pretty}\n\n\
                      Use this output. Do not re-run the same command unless needed."
                 ));
+                let cmd_status = if killed {
+                    crate::run_timeline::StepStatus::Skipped
+                } else {
+                    crate::run_timeline::StepStatus::Succeeded
+                };
+                let note = format!("Task #{id} {label} ({} lines)", pretty.lines().count());
+                // ID-only completion: the task carries the exact call that
+                // spawned it. Tasks without a call (TERM input) have no
+                // timeline step and need none.
+                if let Some(cid) = call_id {
+                    self.finish_run_call(cid, cmd_status, Some(note));
+                }
                 if self.tool_result_context.len() > 8 {
                     let n = self.tool_result_context.len() - 8;
                     self.tool_result_context.drain(0..n);
@@ -1864,6 +2214,11 @@ impl App {
 
     /// Returns true when the latest tool tag was opened but never closed.
     fn has_incomplete_tool_tag(stream: &str) -> bool {
+        // Only executable parser state counts: an "incomplete" tag inside
+        // <think> is reasoning text, never a tool awaiting continuation.
+        // (strip_think_blocks also drops unclosed trailing think zones.)
+        let outside = crate::agent::AgentEngine::strip_think_blocks(stream);
+        let stream = outside.as_str();
         let last_write = stream.rfind("<write src=");
         let last_cmd = stream.rfind("<cmd>");
 
@@ -1904,8 +2259,10 @@ impl App {
 
         self.incomplete_tool_continuations += 1;
 
-        let last_write = partial.rfind("<write src=").unwrap_or(0);
-        let last_cmd = partial.rfind("<cmd>").unwrap_or(0);
+        // Kind must come from executable state too, not from thinking text.
+        let outside = crate::agent::AgentEngine::strip_think_blocks(partial);
+        let last_write = outside.rfind("<write src=").unwrap_or(0);
+        let last_cmd = outside.rfind("<cmd>").unwrap_or(0);
 
         let kind = if last_write > last_cmd {
             "write"
@@ -2026,7 +2383,10 @@ impl App {
             // limit_secs == 0 means Unlimited (watchdog disabled)
             return;
         }
-        *self.is_generating.lock().unwrap() = false;
+        // Stall stops the actual backend future via the generation child
+        // token — not just the flag — while the run stays alive to process
+        // the partial stream below.
+        self.cancel_generation(&format!("stall {limit_secs}s"));
         {
             let mut target = self.streaming_response.lock().unwrap();
             if !target.starts_with("__HERCULES") {
@@ -2101,14 +2461,25 @@ impl App {
             return;
         }
         let n = self.pending_actions.len();
+        // Rejected proposals fail their timeline steps (never executed).
+        if let Some(run) = self.current_run.as_mut() {
+            for a in &self.pending_actions {
+                run.finish_call(
+                    a.call_id,
+                    crate::run_timeline::StepStatus::Failed,
+                    Some("rejected by user".to_string()),
+                );
+            }
+        }
         self.pending_actions.clear();
-        // Reject = stop: interrupt any active generation so the model doesn't
-        // keep streaming after the user said no.
+        // Reject = stop: cancel the in-flight generation future via its
+        // child token (not just the flag) so the model stops streaming
+        // after the user said no. The run stays alive for the next prompt.
         let was_gen = *self.is_generating.lock().unwrap();
         if was_gen {
             self.user_cancelled_gen = true;
             self.auto_tool_turns = 0;
-            *self.is_generating.lock().unwrap() = false;
+            self.cancel_generation("rejected");
             let partial = self.streaming_response.lock().unwrap().clone();
             if !partial.is_empty() && !partial.starts_with("__HERCULES") {
                 self.finalize_incomplete_tools("rejected");
@@ -2199,7 +2570,10 @@ impl App {
                     let body = m.strip_prefix("Agent: ").unwrap_or(m);
                     if m.starts_with("Agent: ") {
                         let without_think = crate::agent::AgentEngine::strip_think_blocks(body);
-                        let clean = tool_panel::redact_tools_for_chat(&without_think);
+                        // Parsed Ask Mode blocks live in ask_mode_state / tool_result_context;
+                        // never feed raw <askmode> XML back to the model.
+                        let without_ask = crate::ask_mode::strip_ask_mode_blocks(&without_think);
+                        let clean = tool_panel::redact_tools_for_chat(without_ask.as_ref());
                         let low = clean.to_ascii_lowercase();
                         if clean.trim().is_empty() {
                             return None;
@@ -2661,6 +3035,28 @@ impl App {
     }
 
     pub fn trigger_generation_from_context(&mut self) {
+        // Each model generation is a real timeline step, not just a separate timer.
+        self.start_run_step(
+            crate::run_timeline::StepKind::Generate,
+            "Generate response".to_string(),
+        );
+        // This generation belongs to the current run; completion verifies
+        // ownership before dispatching anything.
+        let gen_run_id = self.current_run.as_ref().map(|r| r.id);
+        self.gen_run_id = gen_run_id;
+        // Child token: cancelling it stops this generation only, never the app.
+        let child_token = self
+            .run_cancel_token
+            .as_ref()
+            .map(|t| t.child_token())
+            .unwrap_or_default();
+        // Retained so stall/reject can cancel exactly this generation spawn
+        // while the run (and its partial output) stays alive. Fresh per
+        // generation: a stale previous token is cancelled first so it can
+        // never leak across and kill a newer generation.
+        if let Some(old) = self.gen_cancel_token.replace(child_token.clone()) {
+            old.cancel();
+        }
         // 80% of context budget → compress to memory, forget old turns
         self.maybe_compact_context();
         let context_prompt = self.build_context_prompt();
@@ -2712,14 +3108,24 @@ impl App {
                         .unwrap_or_else(|| context_prompt.clone())
                 };
                 let stream_target2 = stream_target.clone();
+                let cancel_child = child_token.clone();
                 tokio::spawn(async move {
-                    match backend_clone
-                        .generate_stream(&prompt, stream_target2.clone(), is_gen_task)
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            *gen_err.lock().unwrap() = Some(e);
+                    // Cooperative cancellation: the token reaches the actual
+                    // async op — select! drops the losing future, aborting
+                    // the in-flight stream (both futures are cancellation
+                    // safe: streaming IO + short std-mutex critical sections).
+                    tokio::select! {
+                        _ = cancel_child.cancelled() => {
+                            *gen_err.lock().unwrap() =
+                                Some("[Generation Cancelled by User]".to_string());
+                        }
+                        r = backend_clone.generate_stream(&prompt, stream_target2.clone(), is_gen_task) => {
+                            match r {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    *gen_err.lock().unwrap() = Some(e);
+                                }
+                            }
                         }
                     }
                     *is_gen.lock().unwrap() = false;
@@ -2728,14 +3134,20 @@ impl App {
             AgentBackend::Ollama(ollama_backend) => {
                 let backend_clone = ollama_backend.clone();
                 let is_gen_task = is_gen.clone();
+                let cancel_child = child_token.clone();
                 tokio::spawn(async move {
-                    match backend_clone
-                        .generate_stream(&context_prompt, vec![], stream_target, is_gen_task)
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => {
-                            *gen_err.lock().unwrap() = Some(e);
+                    tokio::select! {
+                        _ = cancel_child.cancelled() => {
+                            *gen_err.lock().unwrap() =
+                                Some("[Generation Cancelled by User]".to_string());
+                        }
+                        r = backend_clone.generate_stream(&context_prompt, vec![], stream_target, is_gen_task) => {
+                            match r {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    *gen_err.lock().unwrap() = Some(e);
+                                }
+                            }
                         }
                     }
                     *is_gen.lock().unwrap() = false;
@@ -2746,10 +3158,21 @@ impl App {
                 let backend_clone = self.backend.clone();
                 let stream_target_clone = stream_target.clone();
                 let is_gen_clone = is_gen.clone();
+                let cancel_child = child_token.clone();
                 tokio::spawn(async move {
-                    if let Ok(resp) = backend_clone.generate(&context_prompt).await {
-                        if let Ok(mut target) = stream_target_clone.lock() {
-                            *target = resp;
+                    // Same cooperative cancellation as the other backends:
+                    // a cancelled run drops the in-flight generate future.
+                    tokio::select! {
+                        _ = cancel_child.cancelled() => {
+                            *gen_err.lock().unwrap() =
+                                Some("[Generation Cancelled by User]".to_string());
+                        }
+                        r = backend_clone.generate(&context_prompt) => {
+                            if let Ok(resp) = r {
+                                if let Ok(mut target) = stream_target_clone.lock() {
+                                    *target = resp;
+                                }
+                            }
                         }
                     }
                     *is_gen_clone.lock().unwrap() = false;
@@ -2760,13 +3183,13 @@ impl App {
 
     pub fn adjust_setting_value(&mut self, dir: i32) {
         use crate::app::{
-            get_tool_permissions, set_folder_scope, set_permission_mode, FolderScope,
-            PermissionMode,
+            FolderScope, PermissionMode, get_tool_permissions, set_folder_scope,
+            set_permission_mode,
         };
         use crate::settings::{
-            cycle_repeat_threshold, cycle_stall_timeout, format_context_tokens,
+            PowerMode, cycle_repeat_threshold, cycle_stall_timeout, format_context_tokens,
             format_stall_timeout, get_settings, nudge_context_token_limit, set_power_mode,
-            toggle_repeat_thinking, PowerMode,
+            toggle_repeat_thinking,
         };
         match self.settings_tab {
             0 => {
@@ -2886,9 +3309,9 @@ impl App {
             11 => {
                 // Code Graph - 3 options: 0=Enabled, 1=Comments, 2=Bounce
                 use crate::settings::{
-                    get_code_graph_enabled, get_code_graph_include_comments, get_code_graph_bounce_response_write,
-                    set_code_graph_bounce_response_write, set_code_graph_enabled,
-                    set_code_graph_include_comments,
+                    get_code_graph_bounce_response_write, get_code_graph_enabled,
+                    get_code_graph_include_comments, set_code_graph_bounce_response_write,
+                    set_code_graph_enabled, set_code_graph_include_comments,
                 };
                 const NUM_OPTIONS: usize = 3;
                 let opt = self.settings_option.min(NUM_OPTIONS - 1);
@@ -2896,29 +3319,66 @@ impl App {
                 if dir > 0 {
                     // Right/D -> ON
                     match opt {
-                        0 => { set_code_graph_enabled(true); self.status_message = "Code Graph Panel: ON".to_string(); }
-                        1 => { set_code_graph_include_comments(true); self.status_message = "Include Comments: ON".to_string(); }
-                        2 => { set_code_graph_bounce_response_write(true); self.status_message = "Bounce Response Write: ON".to_string(); }
+                        0 => {
+                            set_code_graph_enabled(true);
+                            self.status_message = "Code Graph Panel: ON".to_string();
+                        }
+                        1 => {
+                            set_code_graph_include_comments(true);
+                            self.status_message = "Include Comments: ON".to_string();
+                        }
+                        2 => {
+                            set_code_graph_bounce_response_write(true);
+                            self.status_message = "Bounce Response Write: ON".to_string();
+                        }
                         _ => {}
                     }
                 } else if dir < 0 {
                     // Left/A -> OFF
                     match opt {
-                        0 => { set_code_graph_enabled(false); self.status_message = "Code Graph Panel: OFF".to_string(); }
-                        1 => { set_code_graph_include_comments(false); self.status_message = "Include Comments: OFF".to_string(); }
-                        2 => { set_code_graph_bounce_response_write(false); self.status_message = "Bounce Response Write: OFF".to_string(); }
+                        0 => {
+                            set_code_graph_enabled(false);
+                            self.status_message = "Code Graph Panel: OFF".to_string();
+                        }
+                        1 => {
+                            set_code_graph_include_comments(false);
+                            self.status_message = "Include Comments: OFF".to_string();
+                        }
+                        2 => {
+                            set_code_graph_bounce_response_write(false);
+                            self.status_message = "Bounce Response Write: OFF".to_string();
+                        }
                         _ => {}
                     }
                 } else {
                     // Enter -> toggle
                     match opt {
-                        0 => { let e = get_code_graph_enabled(); set_code_graph_enabled(!e); self.status_message = format!("Code Graph Panel: {}", if !e { "ON" } else { "OFF" }); }
-                        1 => { let e = get_code_graph_include_comments(); set_code_graph_include_comments(!e); self.status_message = format!("Include Comments: {}", if !e { "ON" } else { "OFF" }); }
-                        2 => { let e = get_code_graph_bounce_response_write(); set_code_graph_bounce_response_write(!e); self.status_message = format!("Bounce Response Write: {}", if !e { "ON" } else { "OFF" }); }
+                        0 => {
+                            let e = get_code_graph_enabled();
+                            set_code_graph_enabled(!e);
+                            self.status_message =
+                                format!("Code Graph Panel: {}", if !e { "ON" } else { "OFF" });
+                        }
+                        1 => {
+                            let e = get_code_graph_include_comments();
+                            set_code_graph_include_comments(!e);
+                            self.status_message =
+                                format!("Include Comments: {}", if !e { "ON" } else { "OFF" });
+                        }
+                        2 => {
+                            let e = get_code_graph_bounce_response_write();
+                            set_code_graph_bounce_response_write(!e);
+                            self.status_message =
+                                format!("Bounce Response Write: {}", if !e { "ON" } else { "OFF" });
+                        }
                         _ => {}
                     }
                 }
-                self.status_message = format!("Code Graph: {} → {}", labels[opt], self.status_message.split(": ").nth(1).unwrap_or(""));
+                self.status_message = format!(
+                    "Code Graph: {} → {}",
+                    labels[opt],
+                    self.status_message.split(": ").nth(1).unwrap_or("")
+                );
             }
             12 => {
                 // LSP Diagnostics - 4 options: 0=Diagnostics, 1=Errors, 2=Warnings, 3=Info/Hints
@@ -2933,32 +3393,80 @@ impl App {
                 if dir > 0 {
                     // Right/D -> ON
                     match opt {
-                        0 => { set_lsp_diagnostics_enabled(true); self.status_message = "LSP Diagnostics: ON".to_string(); }
-                        1 => { set_lsp_show_errors(true); self.status_message = "Show Errors: ON".to_string(); }
-                        2 => { set_lsp_show_warnings(true); self.status_message = "Show Warnings: ON".to_string(); }
-                        3 => { set_lsp_show_info(true); self.status_message = "Show Info/Hints: ON".to_string(); }
+                        0 => {
+                            set_lsp_diagnostics_enabled(true);
+                            self.status_message = "LSP Diagnostics: ON".to_string();
+                        }
+                        1 => {
+                            set_lsp_show_errors(true);
+                            self.status_message = "Show Errors: ON".to_string();
+                        }
+                        2 => {
+                            set_lsp_show_warnings(true);
+                            self.status_message = "Show Warnings: ON".to_string();
+                        }
+                        3 => {
+                            set_lsp_show_info(true);
+                            self.status_message = "Show Info/Hints: ON".to_string();
+                        }
                         _ => {}
                     }
                 } else if dir < 0 {
                     // Left/A -> OFF
                     match opt {
-                        0 => { set_lsp_diagnostics_enabled(false); self.status_message = "LSP Diagnostics: OFF".to_string(); }
-                        1 => { set_lsp_show_errors(false); self.status_message = "Show Errors: OFF".to_string(); }
-                        2 => { set_lsp_show_warnings(false); self.status_message = "Show Warnings: OFF".to_string(); }
-                        3 => { set_lsp_show_info(false); self.status_message = "Show Info/Hints: OFF".to_string(); }
+                        0 => {
+                            set_lsp_diagnostics_enabled(false);
+                            self.status_message = "LSP Diagnostics: OFF".to_string();
+                        }
+                        1 => {
+                            set_lsp_show_errors(false);
+                            self.status_message = "Show Errors: OFF".to_string();
+                        }
+                        2 => {
+                            set_lsp_show_warnings(false);
+                            self.status_message = "Show Warnings: OFF".to_string();
+                        }
+                        3 => {
+                            set_lsp_show_info(false);
+                            self.status_message = "Show Info/Hints: OFF".to_string();
+                        }
                         _ => {}
                     }
                 } else {
                     // Enter -> toggle
                     match opt {
-                        0 => { let e = get_lsp_diagnostics_enabled(); set_lsp_diagnostics_enabled(!e); self.status_message = format!("LSP Diagnostics: {}", if !e { "ON" } else { "OFF" }); }
-                        1 => { let e = get_lsp_show_errors(); set_lsp_show_errors(!e); self.status_message = format!("Show Errors: {}", if !e { "ON" } else { "OFF" }); }
-                        2 => { let e = get_lsp_show_warnings(); set_lsp_show_warnings(!e); self.status_message = format!("Show Warnings: {}", if !e { "ON" } else { "OFF" }); }
-                        3 => { let e = get_lsp_show_info(); set_lsp_show_info(!e); self.status_message = format!("Show Info/Hints: {}", if !e { "ON" } else { "OFF" }); }
+                        0 => {
+                            let e = get_lsp_diagnostics_enabled();
+                            set_lsp_diagnostics_enabled(!e);
+                            self.status_message =
+                                format!("LSP Diagnostics: {}", if !e { "ON" } else { "OFF" });
+                        }
+                        1 => {
+                            let e = get_lsp_show_errors();
+                            set_lsp_show_errors(!e);
+                            self.status_message =
+                                format!("Show Errors: {}", if !e { "ON" } else { "OFF" });
+                        }
+                        2 => {
+                            let e = get_lsp_show_warnings();
+                            set_lsp_show_warnings(!e);
+                            self.status_message =
+                                format!("Show Warnings: {}", if !e { "ON" } else { "OFF" });
+                        }
+                        3 => {
+                            let e = get_lsp_show_info();
+                            set_lsp_show_info(!e);
+                            self.status_message =
+                                format!("Show Info/Hints: {}", if !e { "ON" } else { "OFF" });
+                        }
                         _ => {}
                     }
                 }
-                self.status_message = format!("LSP: {} → {}", labels[opt], self.status_message.split(": ").nth(1).unwrap_or(""));
+                self.status_message = format!(
+                    "LSP: {} → {}",
+                    labels[opt],
+                    self.status_message.split(": ").nth(1).unwrap_or("")
+                );
             }
             _ => {}
         }
@@ -3292,6 +3800,39 @@ impl App {
         }
     }
 
+    /// Advance the menu open/close animation and enforce its terminal invariant:
+    /// open finished → progress exactly 1.0; close finished → progress exactly 0.0
+    /// and `show_menu == false`. Never requires a later key/mouse event to settle.
+    pub fn tick_menu_animation(&mut self) {
+        if self.show_menu {
+            if self.menu_closing {
+                if !self.krama.is_reversed("menu_fade", 0) {
+                    self.krama.reverse_animate("menu_fade", 0);
+                }
+                let t = self.krama.from_range_generic("menu_fade", 0, 0.0..=1.0);
+                self.menu_anim_progress = t;
+                if !self.krama.is_animating("menu_fade", 0) {
+                    self.show_menu = false;
+                    self.menu_closing = false;
+                    self.menu_anim_progress = 0.0;
+                    self.krama.restart_progress("menu_fade", 0);
+                }
+            } else {
+                if self.krama.is_reversed("menu_fade", 0) {
+                    self.krama.reverse_animate("menu_fade", 0);
+                }
+                let t = self.krama.from_range_generic("menu_fade", 0, 0.0..=1.0);
+                if self.krama.is_animating("menu_fade", 0) {
+                    self.menu_anim_progress = t;
+                } else {
+                    self.menu_anim_progress = 1.0;
+                }
+            }
+        } else {
+            self.menu_anim_progress = 0.0;
+        }
+    }
+
     pub fn tick_animations(&mut self) {
         let now = std::time::Instant::now();
         let delta = now.duration_since(self.last_frame_time);
@@ -3465,6 +4006,10 @@ impl App {
                     && self.thought_start_time.is_none()
                 {
                     self.thought_start_time = Some(Instant::now());
+                    self.start_run_step(
+                        crate::run_timeline::StepKind::Think,
+                        "Thinking…".to_string(),
+                    );
                 }
 
                 // Auto-collapse thinking section as soon as </think> closes (unless user manually expanded it)
@@ -3473,6 +4018,11 @@ impl App {
                     if let Some(start) = self.thought_start_time.take() {
                         let dur = start.elapsed().as_secs().max(1);
                         self.thought_durations.insert(m_idx, dur);
+                        self.finish_open_run_step(
+                            crate::run_timeline::StepKind::Think,
+                            crate::run_timeline::StepStatus::Succeeded,
+                            Some(format!("{dur}s")),
+                        );
                     }
                     if !self.manually_toggled_thoughts.contains(&m_idx)
                         && !self.collapsed_thoughts.contains(&m_idx)
@@ -3499,13 +4049,21 @@ impl App {
                 let auto_ok =
                     matches!(perms.mode, PermissionMode::AlwaysAllow) || perms.session_allow;
                 if auto_ok {
-                    let raw = crate::agent::AgentEngine::extract_proposed_actions(&current_stream);
+                    let raw = crate::agent::AgentEngine::parse_tool_calls(
+                        &current_stream,
+                        crate::agent::ToolCallSource::ModelStream,
+                    );
                     for action in raw {
                         if action.kind != crate::agent::ProposedKind::Write {
                             continue;
                         }
                         // Only act on targets we haven't already written this turn
                         if self.streamed_writes_done.contains(&action.target) {
+                            continue;
+                        }
+                        // Canonical exactly-once gate: completion re-dispatch
+                        // of this same call will be suppressed.
+                        if !self.claim_tool_call(&action) {
                             continue;
                         }
                         let write_result = crate::agent::AgentEngine::execute_proposed(&action);
@@ -3544,6 +4102,11 @@ impl App {
                             )
                         };
                         self.tool_result_context.push(context_entry);
+                        self.finish_run_call(
+                            action.call_id,
+                            crate::run_timeline::StepStatus::Succeeded,
+                            Some(format!("{file_name} +{added}/-{removed} (streamed)")),
+                        );
                         if self.tool_result_context.len() > 8 {
                             let n = self.tool_result_context.len() - 8;
                             self.tool_result_context.drain(0..n);
@@ -3581,6 +4144,10 @@ impl App {
             let settings = crate::settings::get_settings();
 
             if just_finished {
+                // Ownership check FIRST: a stale completion (cancelled run,
+                // newer run started) must not dispatch tools, continue,
+                // revive generation, or close the new run.
+                let run_live_at_finish = self.completion_owns_current_run();
                 let m_idx = self.messages.len().saturating_sub(1);
                 if let Some(start) = self.gen_start_time.take() {
                     let dur = start.elapsed().as_secs().max(1);
@@ -3589,352 +4156,499 @@ impl App {
                 if let Some(start) = self.thought_start_time.take() {
                     let dur = start.elapsed().as_secs().max(1);
                     self.thought_durations.insert(m_idx, dur);
+                    if run_live_at_finish {
+                        self.finish_open_run_step(
+                            crate::run_timeline::StepKind::Think,
+                            crate::run_timeline::StepStatus::Succeeded,
+                            Some(format!("{dur}s")),
+                        );
+                    }
                 }
                 if let Some(err) = err_opt {
                     self.streamed_writes_done.clear();
-                    let recovered =
-                        crate::agent::AgentEngine::extract_proposed_actions(&current_stream);
-                    if !recovered.is_empty() {
-                        let count = recovered.len();
-                        self.messages.push(format!(
-                            "System: Generation interrupted after {count} tool(s) were produced: {err}"
-                        ));
-                    } else if let Some(last) = self.messages.last_mut() {
-                        if last.starts_with("Agent: ") {
-                            *last = format!("Error: {}", err);
+                    if run_live_at_finish {
+                        self.finish_open_run_step(
+                            crate::run_timeline::StepKind::Generate,
+                            crate::run_timeline::StepStatus::Failed,
+                            Some(err.chars().take(80).collect()),
+                        );
+                        self.finish_current_run(crate::run_timeline::AgentRunState::Failed);
+                    } else if let Ok(mut l) = self.activity_logs.lock() {
+                        l.push("[STALE] superseded generation error discarded".into());
+                    }
+                    if run_live_at_finish {
+                        let recovered =
+                            crate::agent::AgentEngine::extract_proposed_actions(&current_stream);
+                        if !recovered.is_empty() {
+                            let count = recovered.len();
+                            self.messages.push(format!(
+                                "System: Generation interrupted after {count} tool(s) were produced: {err}"
+                            ));
+                        } else if let Some(last) = self.messages.last_mut() {
+                            if last.starts_with("Agent: ") {
+                                *last = format!("Error: {}", err);
+                            }
                         }
                     }
                 } else if !current_stream.is_empty() && !current_stream.starts_with("__HERCULES") {
-                    if let Some(last) = self.messages.last_mut() {
-                        if last.starts_with("Agent: ") {
-                            // Preserve raw stream including <think> and tool tags for session restore
-                            *last = format!("Agent: {}", current_stream);
-                            self.typewriter_len = 1000;
+                    if !run_live_at_finish {
+                        if let Ok(mut l) = self.activity_logs.lock() {
+                            l.push("[STALE] superseded generation output discarded — no dispatch, no revive".into());
                         }
-                    }
+                        self.streamed_writes_done.clear();
+                    } else {
+                        self.finish_open_run_step(
+                            crate::run_timeline::StepKind::Generate,
+                            crate::run_timeline::StepStatus::Succeeded,
+                            Some(format!("{} chars", current_stream.len())),
+                        );
+                        if let Some(last) = self.messages.last_mut() {
+                            if last.starts_with("Agent: ") {
+                                // Preserve raw stream including <think> and tool tags for session restore
+                                *last = format!("Agent: {}", current_stream);
+                                self.typewriter_len = 1000;
+                            }
+                        }
 
-                    self.sync_tool_chips(&current_stream);
-
-                    let incomplete = Self::has_incomplete_tool_tag(&current_stream);
-
-                    if self.user_cancelled_gen {
-                        self.user_cancelled_gen = false;
-                        self.incomplete_tool_continuations = 0;
-                        self.finalize_incomplete_tools("Ctrl+C");
-                    } else if incomplete {
-                        if self.continue_incomplete_tool(&current_stream) {
-                            // Do not process the incomplete action in this turn.
+                        // Classify output BEFORE any tool extraction/execution:
+                        // an AskMode event pauses generation and waits for the user;
+                        // it must never reach the tool pipeline.
+                        if let crate::agent::ModelOutput::AskMode(ask_mode) =
+                            crate::agent::AgentEngine::classify_output(&current_stream)
+                        {
+                            *self.streaming_response.lock().unwrap() = String::new();
+                            self.gen_last_progress = None;
+                            let state = AskModeState::new(ask_mode);
+                            self.ask_mode_state = Some(state);
+                            self.status_message = "Ask Mode: awaiting response".to_string();
+                            if let Ok(mut l) = self.activity_logs.lock() {
+                                l.push("[ASKMODE] classified before tool pipeline".into());
+                            }
+                            // Do not extract/execute tools — wait for user response.
+                            // Generation resumes from the Ask Mode submit path via
+                            // trigger_generation_from_context().
                             return Ok(true);
                         }
 
-                        self.finalize_incomplete_tools("continuation limit reached");
-                    } else {
-                        self.incomplete_tool_continuations = 0;
-                    }
+                        self.sync_tool_chips(&current_stream);
 
-                    let proposed_raw =
-                        crate::agent::AgentEngine::extract_proposed_actions(&current_stream);
+                        let incomplete = Self::has_incomplete_tool_tag(&current_stream);
 
-                    // Landing page / single HTML ask → one write, not file.txt + 3 html names
-                    let proposed = if let Some(user) = self.last_user_message() {
-                        crate::agent::AgentEngine::collapse_write_actions_for_user(
-                            &user,
-                            proposed_raw,
-                        )
-                    } else {
-                        proposed_raw
-                    };
-                    let perms = get_tool_permissions();
-                    let auto_ok =
-                        matches!(perms.mode, PermissionMode::AlwaysAllow) || perms.session_allow;
-                    let need_accept = !auto_ok
-                        && proposed
-                            .iter()
-                            .any(|a| a.kind == crate::agent::ProposedKind::Write);
+                        if self.user_cancelled_gen {
+                            self.user_cancelled_gen = false;
+                            self.incomplete_tool_continuations = 0;
+                            self.finalize_incomplete_tools("Ctrl+C");
+                        } else if incomplete {
+                            if self.continue_incomplete_tool(&current_stream) {
+                                // Do not process the incomplete action in this turn.
+                                return Ok(true);
+                            }
 
-                    // read/ls/memory/writes only — cmds never block here
-                    let mut effective_stream = current_stream.clone();
-                    let had_streamed_writes = !self.streamed_writes_done.is_empty();
-                    let num_writes = self.streamed_writes_done.len();
-                    let mut tool_output_opt =
-                        crate::agent::AgentEngine::process_response(&effective_stream);
-                    if tool_output_opt.is_none() && had_streamed_writes {
-                        let recent_writes: Vec<String> = self
-                            .tool_result_context
-                            .iter()
-                            .rev()
-                            .take(num_writes)
-                            .rev()
-                            .cloned()
-                            .collect();
-                        if !recent_writes.is_empty() {
-                            tool_output_opt = Some(recent_writes.join("\n\n"));
+                            self.finalize_incomplete_tools("continuation limit reached");
+                        } else {
+                            self.incomplete_tool_continuations = 0;
                         }
-                    }
 
-                    // Recover tools only on the *first* attempt. After we already have
-                    // tool results, recovery re-fires the same <read> and wipes the answer.
-                    let already_have_tools =
-                        !self.tool_result_context.is_empty() || self.auto_tool_turns > 0;
-                    if tool_output_opt.is_none() && !already_have_tools {
-                        if let Some(user) = self.last_user_message() {
-                            if let Some(tag) = crate::agent::AgentEngine::recover_tools_from_refusal(
+                        let proposed_raw =
+                            crate::agent::AgentEngine::extract_proposed_actions(&current_stream);
+
+                        // Landing page / single HTML ask → one write, not file.txt + 3 html names
+                        let proposed = if let Some(user) = self.last_user_message() {
+                            crate::agent::AgentEngine::collapse_write_actions_for_user(
                                 &user,
-                                &effective_stream,
-                            ) {
-                                if let Ok(mut l) = self.activity_logs.lock() {
-                                    l.push(format!(
-                                        "[HERCULES] tool recovery after model refusal → {tag}"
+                                proposed_raw,
+                            )
+                        } else {
+                            proposed_raw
+                        };
+                        let perms = get_tool_permissions();
+                        let auto_ok = matches!(perms.mode, PermissionMode::AlwaysAllow)
+                            || perms.session_allow;
+                        let need_accept = !auto_ok
+                            && proposed
+                                .iter()
+                                .any(|a| a.kind == crate::agent::ProposedKind::Write);
+
+                        // read/ls/memory/writes only — cmds never block here
+                        let mut effective_stream = current_stream.clone();
+                        let had_streamed_writes = !self.streamed_writes_done.is_empty();
+                        let num_writes = self.streamed_writes_done.len();
+                        // Writes already applied live during streaming must not run
+                        // again here (AlwaysAllow double-execution).
+                        let streamed_done: Vec<String> = self.streamed_writes_done.clone();
+                        let mut tool_output_opt = crate::agent::AgentEngine::process_response_with(
+                            &effective_stream,
+                            &streamed_done,
+                        );
+                        if tool_output_opt.is_none() && had_streamed_writes {
+                            let recent_writes: Vec<String> = self
+                                .tool_result_context
+                                .iter()
+                                .rev()
+                                .take(num_writes)
+                                .rev()
+                                .cloned()
+                                .collect();
+                            if !recent_writes.is_empty() {
+                                tool_output_opt = Some(recent_writes.join("\n\n"));
+                            }
+                        }
+
+                        // Recover tools only on the *first* attempt. After we already have
+                        // tool results, recovery re-fires the same <read> and wipes the answer.
+                        let already_have_tools =
+                            !self.tool_result_context.is_empty() || self.auto_tool_turns > 0;
+                        if tool_output_opt.is_none() && !already_have_tools {
+                            if let Some(user) = self.last_user_message() {
+                                if let Some(tag) =
+                                    crate::agent::AgentEngine::recover_tools_from_refusal(
+                                        &user,
+                                        &effective_stream,
+                                    )
+                                {
+                                    // Recovery produces the SAME canonical ToolCall
+                                    // type (source HostRecovery) and flows through
+                                    // the same parser → dispatch → execution path.
+                                    let recovered = crate::agent::AgentEngine::parse_tool_calls(
+                                        &tag,
+                                        crate::agent::ToolCallSource::HostRecovery,
+                                    );
+                                    if let Ok(mut l) = self.activity_logs.lock() {
+                                        l.push(format!(
+                                        "[HERCULES] tool recovery after model refusal → {tag} ({} canonical call(s))",
+                                        recovered.len(),
                                     ));
+                                    }
+                                    if let Some(last) = self.messages.last_mut() {
+                                        if last.starts_with("Agent: ") {
+                                            *last = format!(
+                                                "Agent: {tag}\n[Host recovered tool after model refused filesystem access]"
+                                            );
+                                        }
+                                    }
+                                    effective_stream = tag;
+                                    tool_output_opt = crate::agent::AgentEngine::process_response(
+                                        &effective_stream,
+                                    );
                                 }
-                                if let Some(last) = self.messages.last_mut() {
-                                    if last.starts_with("Agent: ") {
-                                        *last = format!(
-                                            "Agent: {tag}\n[Host recovered tool after model refused filesystem access]"
+                            }
+                        }
+
+                        *self.streaming_response.lock().unwrap() = String::new();
+                        self.gen_last_progress = None;
+
+                        // Automatically execute/spawn any non-write actions emitted by the agent
+                        let mut other_actions = Vec::new();
+                        for a in &proposed {
+                            match a.kind {
+                                crate::agent::ProposedKind::Cmd => {
+                                    if self.claim_tool_call(a) {
+                                        self.spawn_cmds_to_task_manager(vec![a.clone()]);
+                                    }
+                                }
+                                crate::agent::ProposedKind::Agent => {
+                                    let role = crate::agent::AgentEngine::extract_attribute(
+                                        &a.target, "role",
+                                    )
+                                    .unwrap_or_default();
+                                    let to = crate::agent::AgentEngine::extract_attribute(
+                                        &a.target, "to",
+                                    )
+                                    .unwrap_or_default();
+                                    let model = crate::agent::AgentEngine::extract_attribute(
+                                        &a.target, "model",
+                                    )
+                                    .unwrap_or_default();
+                                    let sub_backend =
+                                        self.backend.with_model(&model, &self.manager);
+                                    let instruction = a.body.clone();
+                                    let run_id = self.current_run.as_ref().map(|r| r.id);
+                                    let child =
+                                        self.run_cancel_token.as_ref().map(|t| t.child_token());
+                                    let agent_id = self.task_manager.spawn_agent_with_run(
+                                        sub_backend,
+                                        role.clone(),
+                                        to,
+                                        model.clone(),
+                                        instruction,
+                                        0,
+                                        Some(a.call_id),
+                                        run_id,
+                                        child,
+                                    );
+                                    let model_label = if model.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" [model={model}]")
+                                    };
+                                    if let Some(chip) = self.tool_chips.iter_mut().rev().find(|c| {
+                                        c.kind == ToolPanelKind::Cmd && c.target == a.target
+                                    }) {
+                                        chip.pending = false;
+                                        chip.tag_closed = true;
+                                        chip.body = format!(
+                                            "[Agent Task #{agent_id} ({role}{model_label}) spawning]\n(waiting for reply…)"
                                         );
                                     }
                                 }
-                                effective_stream = tag;
-                                tool_output_opt =
-                                    crate::agent::AgentEngine::process_response(&effective_stream);
+                                crate::agent::ProposedKind::Mcp
+                                | crate::agent::ProposedKind::Skill
+                                | crate::agent::ProposedKind::WebSearch
+                                | crate::agent::ProposedKind::Read
+                                | crate::agent::ProposedKind::Ls => {
+                                    if !self.claim_tool_call(a) {
+                                        continue;
+                                    }
+                                    let raw_result = crate::agent::AgentEngine::execute_proposed(a);
+                                    // Bind the result to the exact call id, not to
+                                    // "latest chip of this kind".
+                                    let tool_res = crate::agent::ToolResult::new(a, raw_result);
+                                    let shown = tool_res.output.clone();
+                                    if let Some(chip) = self
+                                        .tool_chips
+                                        .iter_mut()
+                                        .rev()
+                                        .find(|c| c.target == a.target)
+                                    {
+                                        chip.pending = false;
+                                        chip.tag_closed = true;
+                                        chip.body = shown.clone();
+                                    }
+                                    let entry = tool_res.context_entry(a.kind.label());
+                                    self.tool_result_context.push(entry.clone());
+                                    other_actions.push(entry);
+                                    // Keep the id binding in the log for audit.
+                                    if let Ok(mut l) = self.activity_logs.lock() {
+                                        l.push(format!(
+                                            "[RESULT #{}] {} -> {} chars",
+                                            tool_res.call_id,
+                                            a.kind.label(),
+                                            tool_res.output.len(),
+                                        ));
+                                    }
+                                    let step_status = if tool_res.output.starts_with("Error") {
+                                        crate::run_timeline::StepStatus::Failed
+                                    } else {
+                                        crate::run_timeline::StepStatus::Succeeded
+                                    };
+                                    let first_line = tool_res
+                                        .output
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("")
+                                        .chars()
+                                        .take(80)
+                                        .collect::<String>();
+                                    self.finish_run_call(
+                                        tool_res.call_id,
+                                        step_status,
+                                        Some(first_line),
+                                    );
+                                }
+                                crate::agent::ProposedKind::Write => {}
                             }
                         }
-                    }
+                        if !other_actions.is_empty() {
+                            let extra = other_actions.join("\n\n");
+                            tool_output_opt = Some(match tool_output_opt.take() {
+                                Some(prev) => format!("{prev}\n\n{extra}"),
+                                None => extra,
+                            });
+                        }
 
-                    *self.streaming_response.lock().unwrap() = String::new();
-                    self.gen_last_progress = None;
+                        // Identical tool tag twice in a row → stop (don't re-read forever)
+                        let same_as_prev = self
+                            .recent_tool_calls
+                            .last()
+                            .map(|prev| {
+                                crate::settings::normalize_for_repeat(prev)
+                                    == crate::settings::normalize_for_repeat(&effective_stream)
+                            })
+                            .unwrap_or(false);
 
-                    // Automatically execute/spawn any non-write actions emitted by the agent
-                    let mut other_actions = Vec::new();
-                    for a in &proposed {
-                        match a.kind {
-                            crate::agent::ProposedKind::Cmd => {
-                                self.spawn_cmds_to_task_manager(vec![a.clone()]);
-                            }
-                            crate::agent::ProposedKind::Agent => {
-                                let role =
-                                    crate::agent::AgentEngine::extract_attribute(&a.target, "role")
-                                        .unwrap_or_default();
-                                let to =
-                                    crate::agent::AgentEngine::extract_attribute(&a.target, "to")
-                                        .unwrap_or_default();
-                                let model = crate::agent::AgentEngine::extract_attribute(
-                                    &a.target, "model",
-                                )
-                                .unwrap_or_default();
-                                let sub_backend = self.backend.with_model(&model, &self.manager);
-                                let instruction = a.body.clone();
-                                let agent_id = self.task_manager.spawn_agent(
-                                    sub_backend,
-                                    role.clone(),
-                                    to,
-                                    model.clone(),
-                                    instruction,
-                                    0,
+                        // Ask Mode was already classified before the tool pipeline
+                        // (early return above); reaching here means normal output.
+                        {
+                            let prose = tool_panel::redact_tools_for_chat(&effective_stream);
+                            let only_repeated_tool = same_as_prev
+                                && crate::agent::AgentEngine::response_has_tool_tags(
+                                    &effective_stream,
                                 );
-                                let model_label = if model.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" [model={model}]")
-                                };
-                                if let Some(chip) =
-                                    self.tool_chips.iter_mut().rev().find(|c| {
-                                        c.kind == ToolPanelKind::Cmd && c.target == a.target
-                                    })
-                                {
-                                    chip.pending = false;
-                                    chip.tag_closed = true;
-                                    chip.body = format!("[Agent Task #{agent_id} ({role}{model_label}) spawning]\n(waiting for reply…)");
+                            let last_user = self.last_user_message().unwrap_or_default();
+                            let only_ls = effective_stream.contains("<ls")
+                                && !effective_stream.contains("<write")
+                                && !effective_stream.contains("<read src=");
+                            // After a useless ls loop on a create/plan task, re-prompt to plan/write
+                            // instead of "Done — tool already finished" (that felt like spam).
+                            let wants_plan =
+                                crate::agent::AgentEngine::wants_plan_first(&last_user);
+                            let wants_code = crate::agent::AgentEngine::wants_implement(&last_user)
+                                || last_user.to_ascii_lowercase().contains("start coding");
+                            let ls_spam_on_create = already_have_tools
+                                && only_ls
+                                && (wants_plan || wants_code || only_repeated_tool);
+
+                            let loop_hit = crate::settings::detect_repeat_loop(
+                                &self.recent_tool_calls,
+                                &settings,
+                            );
+
+                            if only_repeated_tool || ls_spam_on_create {
+                                self.messages.push(
+                                "System: [Host] Finished inspecting files. Ready for next prompt."
+                                    .to_string(),
+                            );
+                                self.recent_tool_calls.clear();
+                                self.repeat_count = 0;
+                                self.auto_tool_turns = 0;
+                                self.mark_ready();
+                                if let Ok(mut l) = self.activity_logs.lock() {
+                                    l.push(
+                                        "[REPEAT] identical tool tag — host summary instead".into(),
+                                    );
                                 }
-                            }
-                            crate::agent::ProposedKind::Mcp
-                            | crate::agent::ProposedKind::Skill
-                            | crate::agent::ProposedKind::WebSearch => {
-                                let result = crate::agent::AgentEngine::execute_proposed(a);
-                                if let Some(chip) = self
-                                    .tool_chips
-                                    .iter_mut()
-                                    .rev()
-                                    .find(|c| c.target == a.target)
-                                {
-                                    chip.pending = false;
-                                    chip.tag_closed = true;
-                                    chip.body = result.clone();
-                                }
-                                let entry = format!("[{} result]\n{}", a.kind.label(), result);
-                                self.tool_result_context.push(entry.clone());
-                                other_actions.push(entry);
-                            }
-                            crate::agent::ProposedKind::Write => {}
-                        }
-                    }
-                    if !other_actions.is_empty() && tool_output_opt.is_none() {
-                        tool_output_opt = Some(other_actions.join("\n\n"));
-                    }
-
-                    // Identical tool tag twice in a row → stop (don't re-read forever)
-                    let same_as_prev = self
-                        .recent_tool_calls
-                        .last()
-                        .map(|prev| {
-                            crate::settings::normalize_for_repeat(prev)
-                                == crate::settings::normalize_for_repeat(&effective_stream)
-                        })
-                        .unwrap_or(false);
-
-                    let prose = tool_panel::redact_tools_for_chat(&effective_stream);
-                    let only_repeated_tool = same_as_prev
-                        && crate::agent::AgentEngine::response_has_tool_tags(&effective_stream);
-                    let last_user = self.last_user_message().unwrap_or_default();
-                    let only_ls = effective_stream.contains("<ls")
-                        && !effective_stream.contains("<write")
-                        && !effective_stream.contains("<read src=");
-                    // After a useless ls loop on a create/plan task, re-prompt to plan/write
-                    // instead of "Done — tool already finished" (that felt like spam).
-                    let wants_plan = crate::agent::AgentEngine::wants_plan_first(&last_user);
-                    let wants_code = crate::agent::AgentEngine::wants_implement(&last_user)
-                        || last_user.to_ascii_lowercase().contains("start coding");
-                    let ls_spam_on_create = already_have_tools
-                        && only_ls
-                        && (wants_plan || wants_code || only_repeated_tool);
-
-                    let loop_hit =
-                        crate::settings::detect_repeat_loop(&self.recent_tool_calls, &settings);
-
-                    if only_repeated_tool || ls_spam_on_create {
-                        self.messages.push(
-                            "System: [Host] Finished inspecting files. Ready for next prompt."
-                                .to_string(),
-                        );
-                        self.recent_tool_calls.clear();
-                        self.repeat_count = 0;
-                        self.auto_tool_turns = 0;
-                        self.status_message = "Ready.".to_string();
-                        if let Ok(mut l) = self.activity_logs.lock() {
-                            l.push("[REPEAT] identical tool tag — host summary instead".into());
-                        }
-                    } else if let Some(reason) = loop_hit {
-                        self.repeat_count = settings.repeat_threshold;
-                        self.messages.push(format!(
+                            } else if let Some(reason) = loop_hit {
+                                self.repeat_count = settings.repeat_threshold;
+                                self.messages.push(format!(
                             "System: Repeat detector (threshold {}): {}. \
                              Stop looping — answer the user directly without re-running the same tool.",
                             settings.repeat_threshold, reason
                         ));
-                        self.auto_tool_turns = 999;
-                        self.status_message = "Repeat loop blocked.".to_string();
-                        if let Ok(mut l) = self.activity_logs.lock() {
-                            l.push(format!("[REPEAT DETECTOR] {}", reason));
-                        }
-                        self.recent_tool_calls.clear();
-                        self.repeat_count = 0;
-                    } else if need_accept {
-                        // "Ask" permission mode — auto-execute writes immediately for
-                        // continuous operation. Ctrl+C is the user's stop signal.
-                        let tool_out =
-                            crate::agent::AgentEngine::process_response(&effective_stream);
-                        for a in &proposed {
-                            if a.kind == crate::agent::ProposedKind::Write {
-                                let path = crate::agent::AgentEngine::expand_path(&a.target);
-                                if let Some(parent) = path.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
+                                self.auto_tool_turns = 999;
+                                self.status_message = "Repeat loop blocked.".to_string();
+                                if let Ok(mut l) = self.activity_logs.lock() {
+                                    l.push(format!("[REPEAT DETECTOR] {}", reason));
                                 }
-                                let _ = std::fs::write(&path, &a.body);
-                                let anchor = self.latest_agent_msg_idx();
-                                let kind = tool_panel::ToolPanelKind::Write;
-                                let target_str =
-                                    tool_panel::normalize_target(kind, &path.display().to_string());
-                                let chip_exists = self.tool_chips.iter().any(|c| {
-                                    c.kind == kind
-                                        && tool_panel::same_tool_target(
-                                            c.kind,
-                                            &c.target,
-                                            &target_str,
-                                        )
+                                self.recent_tool_calls.clear();
+                                self.repeat_count = 0;
+                            } else if need_accept {
+                                // "Ask" permission mode — auto-execute writes immediately for
+                                // continuous operation. Ctrl+C is the user's stop signal.
+                                // Reuse the result already computed above; re-running
+                                // process_response here would execute every tool twice.
+                                let tool_out = tool_output_opt.clone().or_else(|| {
+                                    crate::agent::AgentEngine::process_response_with(
+                                        &effective_stream,
+                                        &self.streamed_writes_done,
+                                    )
                                 });
-                                if !chip_exists {
-                                    let id = self.next_chip_id;
-                                    self.next_chip_id += 1;
-                                    self.tool_chips.push(tool_panel::ToolChip {
-                                        id,
-                                        kind,
-                                        target: target_str,
-                                        body: a.body.clone(),
-                                        tag_closed: true,
-                                        pending: false,
-                                        spawned: false,
-                                        rect: None,
-                                        anchor_msg: anchor,
-                                        expanded: false,
-                                        anim_start: None,
-                                    });
+                                for a in &proposed {
+                                    if a.kind == crate::agent::ProposedKind::Write {
+                                        if !self.claim_tool_call(a) {
+                                            continue;
+                                        }
+                                        let path =
+                                            crate::agent::AgentEngine::expand_path(&a.target);
+                                        if let Some(parent) = path.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        let _ = std::fs::write(&path, &a.body);
+                                        self.finish_run_call(
+                                            a.call_id,
+                                            crate::run_timeline::StepStatus::Succeeded,
+                                            Some(format!(
+                                                "wrote {} lines (ask-mode auto-execute)",
+                                                a.body.lines().count()
+                                            )),
+                                        );
+                                        let anchor = self.latest_agent_msg_idx();
+                                        let kind = tool_panel::ToolPanelKind::Write;
+                                        let target_str = tool_panel::normalize_target(
+                                            kind,
+                                            &path.display().to_string(),
+                                        );
+                                        let chip_exists = self.tool_chips.iter().any(|c| {
+                                            c.kind == kind
+                                                && tool_panel::same_tool_target(
+                                                    c.kind,
+                                                    &c.target,
+                                                    &target_str,
+                                                )
+                                        });
+                                        if !chip_exists {
+                                            let id = self.next_chip_id;
+                                            self.next_chip_id += 1;
+                                            self.tool_chips.push(tool_panel::ToolChip {
+                                                id,
+                                                kind,
+                                                target: target_str,
+                                                body: a.body.clone(),
+                                                tag_closed: true,
+                                                pending: false,
+                                                spawned: false,
+                                                rect: None,
+                                                anchor_msg: anchor,
+                                                expanded: false,
+                                                anim_start: None,
+                                            });
+                                        }
+                                    }
+                                }
+                                if let Some(out) = tool_out {
+                                    self.record_tool_result_ui("tool", &out);
+                                    self.auto_tool_turns += 1;
+                                    if self.auto_tool_turns == 20 {
+                                        self.messages.push(
+                                    "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
+                                        .to_string(),
+                                );
+                                    }
+                                    self.trigger_generation_from_context();
+                                } else {
+                                    self.auto_tool_turns = 0;
+                                    self.mark_ready();
+                                }
+                            } else if let Some(tool_output) = tool_output_opt {
+                                if !crate::agent::AgentEngine::response_has_tool_tags(
+                                    &effective_stream,
+                                ) {
+                                    self.auto_tool_turns = 0;
+                                    self.mark_ready();
+                                } else {
+                                    let tool_name = if effective_stream.contains("<websearch") {
+                                        "search"
+                                    } else if effective_stream.contains("<read") {
+                                        "read"
+                                    } else if effective_stream.contains("<ls") {
+                                        "ls"
+                                    } else if effective_stream.contains("<write") {
+                                        "write"
+                                    } else if effective_stream.contains("<mcp") {
+                                        "mcp"
+                                    } else if effective_stream.contains("<skill") {
+                                        "skill"
+                                    } else if effective_stream.contains("<agent") {
+                                        "agent"
+                                    } else {
+                                        "tool"
+                                    };
+                                    self.record_tool_result_ui(tool_name, &tool_output);
+                                    self.auto_tool_turns += 1;
+                                    if self.auto_tool_turns == 20 {
+                                        self.messages.push(
+                                    "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
+                                        .to_string(),
+                                );
+                                    }
+                                    self.trigger_generation_from_context();
+                                }
+                            } else {
+                                self.auto_tool_turns = 0;
+                                self.mark_ready();
+                            }
+                            self.streamed_writes_done.clear();
+
+                            if !prose.is_empty() {
+                                self.context_tokens_est = self.estimate_full_session_tokens();
+                                if let Ok(mut l) = self.activity_logs.lock() {
+                                    l.push(format!(
+                                        "[SESSION] tokens ≈ {}",
+                                        self.context_tokens_est
+                                    ));
                                 }
                             }
-                        }
-                        if let Some(out) = tool_out {
-                            self.record_tool_result_ui("tool", &out);
-                            self.auto_tool_turns += 1;
-                            if self.auto_tool_turns == 20 {
-                                self.messages.push(
-                                    "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
-                                        .to_string(),
-                                );
-                            }
-                            self.trigger_generation_from_context();
-                        } else {
-                            self.auto_tool_turns = 0;
-                            self.status_message = "Ready.".to_string();
-                        }
-                    } else if let Some(tool_output) = tool_output_opt {
-                        if !crate::agent::AgentEngine::response_has_tool_tags(&effective_stream) {
-                            self.auto_tool_turns = 0;
-                            self.status_message = "Ready.".to_string();
-                        } else {
-                            let tool_name = if effective_stream.contains("<websearch") {
-                                "search"
-                            } else if effective_stream.contains("<read") {
-                                "read"
-                            } else if effective_stream.contains("<ls") {
-                                "ls"
-                            } else if effective_stream.contains("<write") {
-                                "write"
-                            } else if effective_stream.contains("<mcp") {
-                                "mcp"
-                            } else if effective_stream.contains("<skill") {
-                                "skill"
-                            } else if effective_stream.contains("<agent") {
-                                "agent"
-                            } else {
-                                "tool"
-                            };
-                            self.record_tool_result_ui(tool_name, &tool_output);
-                            self.auto_tool_turns += 1;
-                            if self.auto_tool_turns == 20 {
-                                self.messages.push(
-                                    "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
-                                        .to_string(),
-                                );
-                            }
-                            self.trigger_generation_from_context();
-                        }
-                    } else {
-                        self.auto_tool_turns = 0;
-                        self.status_message = "Ready.".to_string();
+                        } // end run_live_at_finish — stale branch above discards
                     }
-                    self.streamed_writes_done.clear();
-
-                    // Check for Ask Mode in agent response
-                    if let Some(ask_mode) = AskModeParser::parse(&current_stream).ok().flatten() {
-                        let state = AskModeState::new(ask_mode);
-                        self.ask_mode_state = Some(state);
-                        self.status_message = "Ask Mode: awaiting response".to_string();
-                        // Don't trigger next generation - wait for user response
-                    } else if !prose.is_empty() {
-                        self.context_tokens_est = self.estimate_full_session_tokens();
-                        if let Ok(mut l) = self.activity_logs.lock() {
-                            l.push(format!("[SESSION] tokens ≈ {}", self.context_tokens_est));
-                        }
-                    }
-
                     // Auto-collapse previous turns and chips if enabled in Settings
                     if settings.auto_collapse_previous {
                         self.last_stagger_release = std::time::Instant::now()
@@ -4122,33 +4836,7 @@ impl App {
         };
 
         // Animation state updates for header dropdown and menu modal via KramaFrame
-        if self.show_menu {
-            if self.menu_closing {
-                if !self.krama.is_reversed("menu_fade", 0) {
-                    self.krama.reverse_animate("menu_fade", 0);
-                }
-                let t = self.krama.from_range_generic("menu_fade", 0, 0.0..=1.0);
-                self.menu_anim_progress = t;
-                if !self.krama.is_animating("menu_fade", 0) {
-                    self.show_menu = false;
-                    self.menu_closing = false;
-                    self.menu_anim_progress = 0.0;
-                    self.krama.restart_progress("menu_fade", 0);
-                }
-            } else {
-                if self.krama.is_reversed("menu_fade", 0) {
-                    self.krama.reverse_animate("menu_fade", 0);
-                }
-                let t = self.krama.from_range_generic("menu_fade", 0, 0.0..=1.0);
-                if self.krama.is_animating("menu_fade", 0) {
-                    self.menu_anim_progress = t;
-                } else {
-                    self.menu_anim_progress = 1.0;
-                }
-            }
-        } else {
-            self.menu_anim_progress = 0.0;
-        }
+        self.tick_menu_animation();
 
         if self.header_dropdown_open {
             if self.krama.is_reversed("slide", 0) {
@@ -5050,6 +5738,7 @@ impl App {
                 (3, " Settings "),
                 (4, " Session "),
                 (5, " Code Graph "),
+                (6, " Run "),
             ];
 
             menu_spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
@@ -5357,11 +6046,14 @@ impl App {
                     chat_lines.push(Line::from(""));
                 }
             } else if m.starts_with("Agent:") || m.starts_with("Error:") {
-                let content = if m.starts_with("Agent:") {
+                let content_raw = if m.starts_with("Agent:") {
                     &m[7..]
                 } else {
                     &m[7..]
                 };
+                // Ask Mode owns its UI: never render raw <askmode> XML as chat text.
+                let content_stripped = crate::ask_mode::strip_ask_mode_blocks(content_raw);
+                let content: &str = content_stripped.as_ref();
 
                 let (think_part, output_part, think_label) =
                     if let Some(start_think) = content.find("<think>") {
@@ -7039,7 +7731,7 @@ impl App {
             let anim_p = self.menu_anim_progress.clamp(0.0, 1.0);
             // Menu visibility must never depend on animation progress: render
             // immediately on open (anim_p only scales the intro size/fade).
-            if self.show_menu {
+            {
                 let full_w = area.width;
                 let full_h = area.height;
 
@@ -7271,60 +7963,196 @@ impl App {
                     0 => {
                         // === Help Section ===
                         let help_lines = vec![
-                            Line::from(Span::styled(" Hercules Keyboard Navigation & Quick Reference ", Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD))),
+                            Line::from(Span::styled(
+                                " Hercules Keyboard Navigation & Quick Reference ",
+                                Style::default()
+                                    .fg(Color::White)
+                                    .bg(NORDIC_BG)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
                             Line::from(Span::styled("", Style::default().bg(NORDIC_BG))),
                             Line::from(vec![
-                                Span::styled(" F1 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
-                                Span::styled("          Help & Keybindings guide", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " F1 ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "          Help & Keybindings guide",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(vec![
-                                Span::styled(" F2 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
-                                Span::styled("          Model Registry (Download from HuggingFace & Ollama)", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " F2 ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "          Model Registry (Download from HuggingFace & Ollama)",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(vec![
-                                Span::styled(" F3 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
-                                Span::styled("          Modal (Choose & activate installed local models)", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " F3 ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "          Modal (Choose & activate installed local models)",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(vec![
-                                Span::styled(" F4 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
-                                Span::styled("          Settings (Power mode, stall watchdog, permissions)", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " F4 ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "          Settings (Power mode, stall watchdog, permissions)",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(vec![
-                                Span::styled(" F5 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
-                                Span::styled("          Session Info (Context budget, hardware load, power, chips)", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " F5 ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "          Session Info (Context budget, hardware load, power, chips)",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(vec![
-                                Span::styled(" F6 ", Style::default().fg(NORDIC_BG).bg(Color::White).add_modifier(Modifier::BOLD)),
-                                Span::styled("          Code Graph (Tree-sitter + LSP: nodes, edges, call hierarchy)", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " F6 ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "          Code Graph (Tree-sitter + LSP: nodes, edges, call hierarchy)",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
+                            ]),
+                            Line::from(vec![
+                                Span::styled(
+                                    " F7 ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "          Agent Run Timeline (steps, progress, run history)",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(Span::styled("", Style::default().bg(NORDIC_BG))),
                             Line::from(vec![
-                                Span::styled(" Esc ", Style::default().fg(Color::Rgb(255, 180, 180)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                Span::styled("         Close menu / (Hold 1s) Quit application", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " Esc ",
+                                    Style::default()
+                                        .fg(Color::Rgb(255, 180, 180))
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "         Close menu / (Hold 1s) Quit application",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(vec![
-                                Span::styled(" Ctrl+Esc ", Style::default().fg(Color::Rgb(255, 120, 120)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                Span::styled("    Exit immediately", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " Ctrl+Esc ",
+                                    Style::default()
+                                        .fg(Color::Rgb(255, 120, 120))
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "    Exit immediately",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(vec![
-                                Span::styled(" Ctrl+F ", Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                Span::styled("      Focus / Unfocus user prompt bar", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " Ctrl+F ",
+                                    Style::default()
+                                        .fg(Color::Rgb(143, 218, 255))
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "      Focus / Unfocus user prompt bar",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(vec![
-                                Span::styled(" Ctrl+C ", Style::default().fg(Color::Rgb(255, 200, 100)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                Span::styled("      Interrupt streaming response or tool execution", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " Ctrl+C ",
+                                    Style::default()
+                                        .fg(Color::Rgb(255, 200, 100))
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "      Interrupt streaming response or tool execution",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(vec![
-                                Span::styled(" Ctrl+T ", Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                Span::styled("      Collapse all sections before current response", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " Ctrl+T ",
+                                    Style::default()
+                                        .fg(Color::Rgb(163, 190, 140))
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "      Collapse all sections before current response",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(vec![
-                                Span::styled(" Ctrl+O ", Style::default().fg(Color::Rgb(143, 218, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                Span::styled("      Open / expand all sections and labels", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " Ctrl+O ",
+                                    Style::default()
+                                        .fg(Color::Rgb(143, 218, 255))
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "      Open / expand all sections and labels",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                             Line::from(vec![
-                                Span::styled(" PgUp / PgDn ", Style::default().fg(Color::Rgb(180, 160, 255)).bg(NORDIC_BG).add_modifier(Modifier::BOLD)),
-                                Span::styled(" Scroll conversation history", Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
+                                Span::styled(
+                                    " PgUp / PgDn ",
+                                    Style::default()
+                                        .fg(Color::Rgb(180, 160, 255))
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    " Scroll conversation history",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
                             ]),
                         ];
                         frame.render_widget(
@@ -8003,7 +8831,13 @@ impl App {
                                         .add_modifier(Modifier::BOLD),
                                 )
                             } else if col2_focus {
-                                Span::styled(" [FOCUSED: A/D or Left/Right to Cycle | K=Edit Key | Del=Clear Key] ", Style::default().fg(NORDIC_BG).bg(Color::Rgb(143, 218, 255)).add_modifier(Modifier::BOLD))
+                                Span::styled(
+                                    " [FOCUSED: A/D or Left/Right to Cycle | K=Edit Key | Del=Clear Key] ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::Rgb(143, 218, 255))
+                                        .add_modifier(Modifier::BOLD),
+                                )
                             } else {
                                 Span::styled(
                                     " [Press Enter to Configure Web Search] ",
@@ -8188,8 +9022,14 @@ impl App {
                                 // Auto Collapse Previous options
                                 let auto_col = s.auto_collapse_previous;
                                 let options = [
-                                    (false, "Disabled (Keep all sections expanded unless manually collapsed)"),
-                                    (true, "Enabled (Auto-collapse messages & action chips after turn completion)"),
+                                    (
+                                        false,
+                                        "Disabled (Keep all sections expanded unless manually collapsed)",
+                                    ),
+                                    (
+                                        true,
+                                        "Enabled (Auto-collapse messages & action chips after turn completion)",
+                                    ),
                                 ];
                                 for (val, desc) in options {
                                     let active = auto_col == val;
@@ -8361,8 +9201,14 @@ impl App {
                                         .add_modifier(Modifier::BOLD),
                                 )]));
                                 let perms_modes = [
-                                    (PermissionMode::Ask, "Ask user (Approval prompt before file write or command execution)"),
-                                    (PermissionMode::AlwaysAllow, "Always Allow (Execute tool actions autonomously without asking)"),
+                                    (
+                                        PermissionMode::Ask,
+                                        "Ask user (Approval prompt before file write or command execution)",
+                                    ),
+                                    (
+                                        PermissionMode::AlwaysAllow,
+                                        "Always Allow (Execute tool actions autonomously without asking)",
+                                    ),
                                 ];
                                 for (m, desc) in perms_modes {
                                     let active = p.mode == m;
@@ -8830,38 +9676,71 @@ impl App {
 
                                 val_lines.push(Line::from(Span::styled(
                                     "Code Graph",
-                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Master toggle for the F6 Code Graph panel.",
                                     Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
                                 )));
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
 
-                                val_lines.push(crate::app::render_toggle("Code Graph Panel", cg_enabled, self.settings_col == 1 && opt == 0));
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(crate::app::render_toggle(
+                                    "Code Graph Panel",
+                                    cg_enabled,
+                                    self.settings_col == 1 && opt == 0,
+                                ));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
 
                                 val_lines.push(Line::from(Span::styled(
                                     "Include Comments",
-                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Include comments/docstrings in code graph nodes.",
                                     Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
                                 )));
-                                val_lines.push(crate::app::render_toggle("Include Comments", include_comments, self.settings_col == 1 && opt == 1));
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(crate::app::render_toggle(
+                                    "Include Comments",
+                                    include_comments,
+                                    self.settings_col == 1 && opt == 1,
+                                ));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
 
                                 val_lines.push(Line::from(Span::styled(
                                     "Bounce Response Write",
-                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Enable focused/bounce graph for AI write responses.",
                                     Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
                                 )));
-                                val_lines.push(crate::app::render_toggle("Bounce Response Write", bounce, self.settings_col == 1 && opt == 2));
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(crate::app::render_toggle(
+                                    "Bounce Response Write",
+                                    bounce,
+                                    self.settings_col == 1 && opt == 2,
+                                ));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
                             }
                             12 => {
                                 // LSP Diagnostics
@@ -8876,18 +9755,27 @@ impl App {
 
                                 val_lines.push(Line::from(Span::styled(
                                     "LSP Diagnostics",
-                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Master switch for showing LSP diagnostics in code graph.",
                                     Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
                                 )));
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
 
                                 // LSP Configuration Source
                                 val_lines.push(Line::from(Span::styled(
                                     "LSP Configuration",
-                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
                                 )));
                                 if let Some((name, command, source, status)) = lsp_config_info {
                                     let source_str = match source {
@@ -8896,66 +9784,121 @@ impl App {
                                         crate::lsp::LspConfigSource::Hercules => "Hercules",
                                         crate::lsp::LspConfigSource::Builtin => "Builtin",
                                     };
-                                    let status_color = if status == "Connected" { Color::Rgb(163, 190, 140) } else { Color::Rgb(255, 120, 120) };
+                                    let status_color = if status == "Connected" {
+                                        Color::Rgb(163, 190, 140)
+                                    } else {
+                                        Color::Rgb(255, 120, 120)
+                                    };
                                     val_lines.push(Line::from(Span::styled(
                                         format!("  Source: {}", source_str),
-                                        Style::default().fg(Color::Rgb(220, 230, 242)).bg(NORDIC_BG),
+                                        Style::default()
+                                            .fg(Color::Rgb(220, 230, 242))
+                                            .bg(NORDIC_BG),
                                     )));
                                     val_lines.push(Line::from(Span::styled(
                                         format!("  Server: {} ({})", name, command),
-                                        Style::default().fg(Color::Rgb(220, 230, 242)).bg(NORDIC_BG),
+                                        Style::default()
+                                            .fg(Color::Rgb(220, 230, 242))
+                                            .bg(NORDIC_BG),
                                     )));
                                     val_lines.push(Line::from(Span::styled(
                                         format!("  Status: {} ●", status),
-                                        Style::default().fg(status_color).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                        Style::default()
+                                            .fg(status_color)
+                                            .bg(NORDIC_BG)
+                                            .add_modifier(Modifier::BOLD),
                                     )));
                                 } else {
                                     val_lines.push(Line::from(Span::styled(
                                         "  No editor LSP configuration found.",
-                                        Style::default().fg(Color::Rgb(255, 120, 120)).bg(NORDIC_BG),
+                                        Style::default()
+                                            .fg(Color::Rgb(255, 120, 120))
+                                            .bg(NORDIC_BG),
                                     )));
                                     val_lines.push(Line::from(Span::styled(
                                         "  Checked: Helix, Neovim, VS Code, VSCodium, Zed",
-                                        Style::default().fg(Color::Rgb(160, 175, 195)).bg(NORDIC_BG),
+                                        Style::default()
+                                            .fg(Color::Rgb(160, 175, 195))
+                                            .bg(NORDIC_BG),
                                     )));
                                 }
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
 
-                                val_lines.push(crate::app::render_toggle("Diagnostics", diag_enabled, self.settings_col == 1 && opt == 0));
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(crate::app::render_toggle(
+                                    "Diagnostics",
+                                    diag_enabled,
+                                    self.settings_col == 1 && opt == 0,
+                                ));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
 
                                 val_lines.push(Line::from(Span::styled(
                                     "Show Errors",
-                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Display LSP error diagnostics (red).",
                                     Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
                                 )));
-                                val_lines.push(crate::app::render_toggle("Show Errors", show_errors, self.settings_col == 1 && opt == 1));
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(crate::app::render_toggle(
+                                    "Show Errors",
+                                    show_errors,
+                                    self.settings_col == 1 && opt == 1,
+                                ));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
 
                                 val_lines.push(Line::from(Span::styled(
                                     "Show Warnings",
-                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Display LSP warning diagnostics (yellow).",
                                     Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
                                 )));
-                                val_lines.push(crate::app::render_toggle("Show Warnings", show_warnings, self.settings_col == 1 && opt == 2));
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(crate::app::render_toggle(
+                                    "Show Warnings",
+                                    show_warnings,
+                                    self.settings_col == 1 && opt == 2,
+                                ));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
 
                                 val_lines.push(Line::from(Span::styled(
                                     "Show Info/Hints",
-                                    Style::default().fg(Color::White).bg(NORDIC_BG).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(NORDIC_BG)
+                                        .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Display LSP info/hint diagnostics (blue).",
                                     Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
                                 )));
-                                val_lines.push(crate::app::render_toggle("Show Info/Hints", show_info, self.settings_col == 1 && opt == 3));
-                                val_lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                                val_lines.push(crate::app::render_toggle(
+                                    "Show Info/Hints",
+                                    show_info,
+                                    self.settings_col == 1 && opt == 3,
+                                ));
+                                val_lines.push(Line::from(Span::styled(
+                                    "",
+                                    Style::default().bg(NORDIC_BG),
+                                )));
                             }
                             _ => {}
                         }
@@ -9348,9 +10291,19 @@ impl App {
                         // === Code Graph Section (Three-pane: Nodes | Graph | Details) ===
                         self.render_code_graph(frame, content_inner);
                     }
+                    6 => {
+                        // === Agent Run / Task Timeline ===
+                        self.render_run_timeline(frame, content_inner);
+                    }
                     _ => {}
                 }
             }
+        }
+
+        // Ask Mode modal renders LAST so it sits above chat/tool/menu UI.
+        // It is a user-interaction state, not a tool execution — never a chip.
+        if self.ask_mode_state.is_some() {
+            self.render_ask_mode(frame, area);
         }
     }
 
@@ -9438,12 +10391,13 @@ impl App {
                     self.build_code_graph_adjacency();
 
                     // Capture LSP configuration info for settings display (blocking)
-                    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let configs: Vec<crate::lsp::DiscoveredLspConfig> = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(
-                            crate::lsp::discover_lsp_configs(&workspace_root)
-                        )
-                    });
+                    let workspace_root =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let configs: Vec<crate::lsp::DiscoveredLspConfig> =
+                        tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current()
+                                .block_on(crate::lsp::discover_lsp_configs(&workspace_root))
+                        });
                     if let Some(best) = configs.into_iter().max_by_key(|c| match c.source {
                         crate::lsp::LspConfigSource::Project => 3,
                         crate::lsp::LspConfigSource::User => 2,
@@ -9451,12 +10405,8 @@ impl App {
                         crate::lsp::LspConfigSource::Builtin => 0,
                     }) {
                         let status = "Connected".to_string(); // We know it worked since graph was built
-                        self.lsp_config_info = Some((
-                            best.server.name,
-                            best.server.command,
-                            best.source,
-                            status,
-                        ));
+                        self.lsp_config_info =
+                            Some((best.server.name, best.server.command, best.source, status));
                     }
 
                     if failed_files > 0 {
@@ -9550,6 +10500,47 @@ impl App {
 
     /// Render Code Graph three-pane layout: Nodes | Graph | Details
     /// Render Code Graph three-pane layout: Nodes | Graph | Details
+    /// Agent Run / Task Timeline panel (menu section 6, F7).
+    /// First-class view of runs: history of finished runs plus the live
+    /// current run with steps bound to canonical tool `call_id`s.
+    fn render_run_timeline(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        use ratatui::widgets::{Block, Borders, Paragraph};
+        let mut text: Vec<ratatui::text::Line> = Vec::new();
+        if !self.run_history.is_empty() {
+            text.push(ratatui::text::Line::from("— Run history —"));
+            for s in self.run_history.iter().rev().take(8) {
+                let dur = s
+                    .duration_ms
+                    .map(|m| format!("{:.1}s", m as f64 / 1000.0))
+                    .unwrap_or_else(|| "—".to_string());
+                text.push(ratatui::text::Line::from(format!(
+                    "#{} {} {}/{} steps {} — {}",
+                    s.id, s.state, s.steps_done, s.steps_total, dur, s.prompt,
+                )));
+            }
+            text.push(ratatui::text::Line::from(""));
+        }
+        let title = match &self.current_run {
+            Some(run) => {
+                let (done, total) = run.progress();
+                for l in run.timeline_lines() {
+                    text.push(ratatui::text::Line::from(l));
+                }
+                format!(" Agent Run #{} ({done}/{total}) — F7 closes ", run.id)
+            }
+            None => " Agent Run Timeline — F7 closes ".to_string(),
+        };
+        if self.current_run.is_none() {
+            text.push(ratatui::text::Line::from(
+                "No agent run yet. Submit a prompt to start one.",
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(title)),
+            area,
+        );
+    }
+
     fn render_code_graph(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         use ratatui::style::{Color, Modifier, Style};
         use ratatui::text::{Line, Span};
@@ -10376,23 +11367,6 @@ impl App {
                     elem.value().to_string()
                 };
                 (prefix.to_string(), s, value)
-            } else if elem.is_question() {
-                let prefix = " ❓ ";
-                let s = if is_focused {
-                    Style::default()
-                        .fg(Color::Rgb(235, 203, 139))
-                        .bg(Color::Rgb(50, 60, 75))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(Color::Rgb(235, 203, 139))
-                        .bg(Color::Rgb(30, 35, 45))
-                };
-                (
-                    prefix.to_string(),
-                    s,
-                    format!("{} ({})", elem.label(), elem.action()),
-                )
             } else {
                 (
                     "".to_string(),
@@ -10436,7 +11410,7 @@ impl App {
 
         // Hints
         let hints = if state.input_editing {
-            "Type to edit | Enter/Esc: exit edit | s: submit | q: cancel"
+            "Type to edit | Enter/Esc: exit edit"
         } else {
             "↑/↓ or j/k: navigate | Space/Enter: toggle | s: submit | q: cancel"
         };
@@ -10467,6 +11441,7 @@ impl App {
                     | crossterm::event::KeyCode::F(4)
                     | crossterm::event::KeyCode::F(5)
                     | crossterm::event::KeyCode::F(6)
+                    | crossterm::event::KeyCode::F(7)
             )
         {
             return None;
@@ -10587,36 +11562,61 @@ impl App {
 
         // Ask Mode key handling (takes priority when active)
         if let Some(ref mut state) = self.ask_mode_state {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    state.move_focus_prev();
+            if state.input_editing {
+                // While editing an input field, text keys go to the field;
+                // Enter/Esc exit edit mode first (Esc only cancels when not editing).
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc => {
+                        state.exit_input_editing();
+                    }
+                    KeyCode::Up => {
+                        state.exit_input_editing();
+                        state.move_focus_prev();
+                    }
+                    KeyCode::Down => {
+                        state.exit_input_editing();
+                        state.move_focus_next();
+                    }
+                    KeyCode::Backspace => {
+                        state.handle_input_backspace();
+                    }
+                    KeyCode::Char(c) => {
+                        state.handle_input_char(c);
+                    }
+                    _ => {}
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    state.move_focus_next();
+            } else {
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.move_focus_prev();
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        state.move_focus_next();
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        state.toggle_focused();
+                    }
+                    KeyCode::Char('s') => {
+                        // Submit
+                        let response = state.submit();
+                        self.ask_mode_state = None;
+                        self.handle_ask_mode_response(response);
+                        self.status_message = "Ask Mode: submitted, resuming…".to_string();
+                    }
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        // Cancel
+                        state.cancel();
+                        self.ask_mode_state = None;
+                        self.status_message = "Ask Mode: cancelled".to_string();
+                    }
+                    KeyCode::Backspace => {
+                        state.handle_input_backspace();
+                    }
+                    KeyCode::Char(c) => {
+                        state.handle_input_char(c);
+                    }
+                    _ => {}
                 }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    state.toggle_focused();
-                }
-                KeyCode::Char('s') => {
-                    // Submit
-                    let response = state.submit();
-                    self.ask_mode_state = None;
-                    self.handle_ask_mode_response(response);
-                    self.status_message = "Ask Mode: submitted, resuming…".to_string();
-                }
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    // Cancel
-                    state.cancel();
-                    self.ask_mode_state = None;
-                    self.status_message = "Ask Mode: cancelled".to_string();
-                }
-                KeyCode::Backspace => {
-                    state.handle_input_backspace();
-                }
-                KeyCode::Char(c) => {
-                    state.handle_input_char(c);
-                }
-                _ => {}
             }
         } else if pending_consumed {
             // already handled accept/reject
@@ -10732,7 +11732,8 @@ impl App {
                 }
                 KeyCode::F(6) => {
                     if !crate::settings::get_code_graph_enabled() {
-                        self.status_message = "Code Graph Panel is disabled in Settings.".to_string();
+                        self.status_message =
+                            "Code Graph Panel is disabled in Settings.".to_string();
                         return None;
                     }
                     if self.show_menu && self.menu_section == 5 && !self.menu_closing {
@@ -10746,6 +11747,17 @@ impl App {
                         if self.code_graph.is_none() && !self.code_graph_loading {
                             self.build_code_graph_async();
                         }
+                    }
+                }
+                KeyCode::F(7) => {
+                    if self.show_menu && self.menu_section == 6 && !self.menu_closing {
+                        self.menu_closing = true;
+                    } else {
+                        self.menu_section = 6; // Agent Run Timeline
+                        self.show_menu = true;
+                        self.menu_closing = false;
+                        self.header_dropdown_open = false;
+                        self.krama.restart_progress("menu_fade", 0);
                     }
                 }
                 KeyCode::Char('f') | KeyCode::Char('F')
@@ -10778,15 +11790,20 @@ impl App {
                                         match self.settings_option {
                                             0 => {
                                                 crate::settings::set_code_graph_enabled(false);
-                                                self.status_message = "Code Graph Panel: OFF".to_string();
+                                                self.status_message =
+                                                    "Code Graph Panel: OFF".to_string();
                                             }
                                             1 => {
-                                                crate::settings::set_code_graph_include_comments(false);
-                                                self.status_message = "Include Comments: OFF".to_string();
+                                                crate::settings::set_code_graph_include_comments(
+                                                    false,
+                                                );
+                                                self.status_message =
+                                                    "Include Comments: OFF".to_string();
                                             }
                                             2 => {
                                                 crate::settings::set_code_graph_bounce_response_write(false);
-                                                self.status_message = "Bounce Response Write: OFF".to_string();
+                                                self.status_message =
+                                                    "Bounce Response Write: OFF".to_string();
                                             }
                                             _ => {}
                                         }
@@ -10796,19 +11813,23 @@ impl App {
                                         match self.settings_option {
                                             0 => {
                                                 crate::settings::set_lsp_diagnostics_enabled(false);
-                                                self.status_message = "LSP Diagnostics: OFF".to_string();
+                                                self.status_message =
+                                                    "LSP Diagnostics: OFF".to_string();
                                             }
                                             1 => {
                                                 crate::settings::set_lsp_show_errors(false);
-                                                self.status_message = "Show Errors: OFF".to_string();
+                                                self.status_message =
+                                                    "Show Errors: OFF".to_string();
                                             }
                                             2 => {
                                                 crate::settings::set_lsp_show_warnings(false);
-                                                self.status_message = "Show Warnings: OFF".to_string();
+                                                self.status_message =
+                                                    "Show Warnings: OFF".to_string();
                                             }
                                             3 => {
                                                 crate::settings::set_lsp_show_info(false);
-                                                self.status_message = "Show Info/Hints: OFF".to_string();
+                                                self.status_message =
+                                                    "Show Info/Hints: OFF".to_string();
                                             }
                                             _ => {}
                                         }
@@ -10864,23 +11885,21 @@ impl App {
                             if self.settings_col == 1 {
                                 // Right in value column: for Code Graph/LSP set ON, else adjust
                                 match self.settings_tab {
-                                    SETTINGS_CODE_GRAPH => {
-                                        match self.settings_option {
-                                            0 => crate::settings::set_code_graph_enabled(true),
-                                            1 => crate::settings::set_code_graph_include_comments(true),
-                                            2 => crate::settings::set_code_graph_bounce_response_write(true),
-                                            _ => {}
-                                        }
-                                    }
-                                    SETTINGS_LSP_DIAGNOSTICS => {
-                                        match self.settings_option {
-                                            0 => crate::settings::set_lsp_diagnostics_enabled(true),
-                                            1 => crate::settings::set_lsp_show_errors(true),
-                                            2 => crate::settings::set_lsp_show_warnings(true),
-                                            3 => crate::settings::set_lsp_show_info(true),
-                                            _ => {}
-                                        }
-                                    }
+                                    SETTINGS_CODE_GRAPH => match self.settings_option {
+                                        0 => crate::settings::set_code_graph_enabled(true),
+                                        1 => crate::settings::set_code_graph_include_comments(true),
+                                        2 => crate::settings::set_code_graph_bounce_response_write(
+                                            true,
+                                        ),
+                                        _ => {}
+                                    },
+                                    SETTINGS_LSP_DIAGNOSTICS => match self.settings_option {
+                                        0 => crate::settings::set_lsp_diagnostics_enabled(true),
+                                        1 => crate::settings::set_lsp_show_errors(true),
+                                        2 => crate::settings::set_lsp_show_warnings(true),
+                                        3 => crate::settings::set_lsp_show_info(true),
+                                        _ => {}
+                                    },
                                     _ => {
                                         self.adjust_setting_value(1);
                                     }
@@ -10949,14 +11968,21 @@ impl App {
                         self.hf_token_input.push('l');
                     }
                 }
-                KeyCode::Char('c') if self.show_menu && self.menu_section == 3 && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char('c')
+                    if self.show_menu
+                        && self.menu_section == 3
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     if !self.hf_token_editing && !self.search_token_editing {
                         if self.settings_col == 1 && self.settings_tab == 11 {
                             // Code Graph: Toggle Include Comments
                             let s = crate::settings::get_settings();
                             let new_val = !s.code_graph_include_comments;
                             crate::settings::set_code_graph_include_comments(new_val);
-                            self.status_message = format!("Code Graph Include Comments: {}", if new_val { "ENABLED" } else { "DISABLED" });
+                            self.status_message = format!(
+                                "Code Graph Include Comments: {}",
+                                if new_val { "ENABLED" } else { "DISABLED" }
+                            );
                         }
                     } else if self.search_token_editing {
                         self.search_token_input.push('c');
@@ -10971,7 +11997,10 @@ impl App {
                             let s = crate::settings::get_settings();
                             let new_val = !s.code_graph_bounce_response_write;
                             crate::settings::set_code_graph_bounce_response_write(new_val);
-                            self.status_message = format!("Code Graph Bounce Response Write: {}", if new_val { "ENABLED" } else { "DISABLED" });
+                            self.status_message = format!(
+                                "Code Graph Bounce Response Write: {}",
+                                if new_val { "ENABLED" } else { "DISABLED" }
+                            );
                         }
                     } else if self.search_token_editing {
                         self.search_token_input.push('b');
@@ -11068,11 +12097,19 @@ impl App {
                                 match self.settings_tab {
                                     SETTINGS_CODE_GRAPH => {
                                         // 3 options
-                                        self.settings_option = if self.settings_option == 0 { 2 } else { self.settings_option - 1 };
+                                        self.settings_option = if self.settings_option == 0 {
+                                            2
+                                        } else {
+                                            self.settings_option - 1
+                                        };
                                     }
                                     SETTINGS_LSP_DIAGNOSTICS => {
                                         // 4 options
-                                        self.settings_option = if self.settings_option == 0 { 3 } else { self.settings_option - 1 };
+                                        self.settings_option = if self.settings_option == 0 {
+                                            3
+                                        } else {
+                                            self.settings_option - 1
+                                        };
                                     }
                                     _ => {
                                         self.adjust_setting_value(-1);
@@ -11118,10 +12155,18 @@ impl App {
                             } else {
                                 match self.settings_tab {
                                     SETTINGS_CODE_GRAPH => {
-                                        self.settings_option = if self.settings_option == 0 { 2 } else { self.settings_option - 1 };
+                                        self.settings_option = if self.settings_option == 0 {
+                                            2
+                                        } else {
+                                            self.settings_option - 1
+                                        };
                                     }
                                     SETTINGS_LSP_DIAGNOSTICS => {
-                                        self.settings_option = if self.settings_option == 0 { 3 } else { self.settings_option - 1 };
+                                        self.settings_option = if self.settings_option == 0 {
+                                            3
+                                        } else {
+                                            self.settings_option - 1
+                                        };
                                     }
                                     _ => {
                                         self.adjust_setting_value(-1);
@@ -11328,16 +12373,12 @@ impl App {
                         let was_gen = *self.is_generating.lock().unwrap();
                         let n_tasks = self.task_manager.running_count();
                         if was_gen {
-                            // Signal cancel first; do not race process_response / re-prompt.
-                            self.user_cancelled_gen = true;
-                            self.auto_tool_turns = 0;
-                            *self.is_generating.lock().unwrap() = false;
+                            // Close an open thinking block so the
+                            // "Thinking" chip resolves instead of
+                            // staying stuck in its streaming state.
                             {
                                 let mut target = self.streaming_response.lock().unwrap();
                                 if !target.starts_with("__HERCULES") {
-                                    // Close an open thinking block so the
-                                    // "Thinking" chip resolves instead of
-                                    // staying stuck in its streaming state.
                                     if target.contains(" thinking") && !target.contains(" response")
                                     {
                                         target.push_str(" response\n");
@@ -11347,21 +12388,15 @@ impl App {
                             }
                             self.gen_last_progress = None;
                         }
-                        if n_tasks > 0 {
-                            self.task_manager.kill_all();
-                            self.messages.push(format!(
-                                "System: [CTRL+C] killed {n_tasks} background task(s)"
-                            ));
-                        }
+                        // Single unified cancellation path (token + flags +
+                        // process kill + run Cancelled). Idempotent.
+                        self.cancel_active_run("CTRL+C", true);
                         self.auto_tool_turns = 0;
                         if was_gen || n_tasks > 0 {
                             self.status_message = format!(
                                 "Interrupted (CTRL+C) — gen={} tasks_killed={}",
                                 was_gen, n_tasks
                             );
-                            if let Ok(mut l) = self.activity_logs.lock() {
-                                l.push(format!("[CANCEL] CTRL+C gen={was_gen} tasks={n_tasks}"));
-                            }
                         } else {
                             self.input.clear();
                             self.input_cursor_position = 0;
@@ -12046,8 +13081,12 @@ impl App {
                         let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                         if *self.is_generating.lock().unwrap() {
                             if is_ctrl {
-                                // CTRL + Enter forces prompt submission and interrupts ongoing generation
-                                *self.is_generating.lock().unwrap() = false;
+                                // CTRL + Enter: same unified cancellation as
+                                // Ctrl+C (token + flags + run Cancelled),
+                                // but running OS tasks stay alive detached —
+                                // their late events carry the old run_id and
+                                // are ignored. Submission below archives.
+                                self.cancel_active_run("CTRL+Enter", false);
                                 if let Some(last) = self.messages.last_mut() {
                                     if last.starts_with("Agent: ") {
                                         last.push_str("\n[Interrupted by User]");
@@ -12067,6 +13106,10 @@ impl App {
                         self.auto_tool_turns = 0;
                         self.recent_tool_calls.clear();
                         self.tool_result_context.clear();
+                        self.dispatch_registry.reset_turn();
+                        // A new user prompt opens a new first-class agent run.
+                        // Any live previous run is cancelled + archived first.
+                        self.start_new_run(prompt.clone());
 
                         let backend = self.backend.name();
                         if let Ok(mut l) = self.activity_logs.lock() {
@@ -12418,6 +13461,456 @@ mod tests {
             "Animation must complete"
         );
         assert!(frames >= 1, "Should have run at least one frame");
+    }
+
+    #[tokio::test]
+    async fn test_menu_animation_reaches_terminal_open_state() {
+        let mut app = App::new();
+        // Open menu with no further user events: advance Krama past its duration.
+        app.show_menu = true;
+        app.menu_closing = false;
+        app.krama.restart_progress("menu_fade", 0);
+        app.krama.update_progress(TRES16Bits::from_millis(500));
+        app.tick_menu_animation();
+        assert_eq!(
+            app.menu_anim_progress, 1.0,
+            "Open animation must settle at exactly 1.0 without further input"
+        );
+        assert!(app.show_menu);
+    }
+
+    #[tokio::test]
+    async fn test_menu_animation_reaches_terminal_closed_state() {
+        let mut app = App::new();
+        // Open fully first.
+        app.show_menu = true;
+        app.menu_closing = false;
+        app.krama.restart_progress("menu_fade", 0);
+        app.krama.update_progress(TRES16Bits::from_millis(500));
+        app.tick_menu_animation();
+        assert_eq!(app.menu_anim_progress, 1.0);
+
+        // Close menu with no further user events: first tick starts the
+        // reverse, then time advances past its duration, then tick settles it.
+        app.menu_closing = true;
+        app.tick_menu_animation();
+        app.krama.update_progress(TRES16Bits::from_millis(500));
+        app.tick_menu_animation();
+        assert!(
+            !app.show_menu,
+            "Closed menu must set show_menu=false without further input"
+        );
+        assert_eq!(
+            app.menu_anim_progress, 0.0,
+            "Close animation must settle at exactly 0.0 without further input"
+        );
+        assert!(!app.menu_closing);
+    }
+
+    fn ask_test_key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::empty())
+    }
+
+    fn ask_test_state() -> crate::ask_mode::AskModeState {
+        let ask = crate::ask_mode::AskModeParser::parse(
+            "<askmode ques=\"Which DB?\"><radio>SQLite</radio><radio>Postgres</radio><check>Cache</check><input>Notes</input></askmode>",
+        )
+        .unwrap()
+        .unwrap();
+        crate::ask_mode::AskModeState::new(ask)
+    }
+
+    #[tokio::test]
+    async fn test_ask_mode_submit_resumes_exactly_once() {
+        let mut app = App::new();
+        app.ask_mode_state = Some(ask_test_state());
+        // Select first radio, then submit.
+        app.handle_key(ask_test_key(crossterm::event::KeyCode::Enter))
+            .await;
+        app.handle_key(ask_test_key(crossterm::event::KeyCode::Char('s')))
+            .await;
+        assert!(app.ask_mode_state.is_none(), "submit must clear ask state");
+        let responses: Vec<_> = app
+            .tool_result_context
+            .iter()
+            .filter(|s| s.contains("[Ask Mode Response]"))
+            .collect();
+        assert_eq!(
+            responses.len(),
+            1,
+            "submit must resume generation exactly once"
+        );
+        assert!(responses[0].contains("SQLite"));
+    }
+
+    #[tokio::test]
+    async fn test_ask_mode_cancel_does_not_resume() {
+        let mut app = App::new();
+        app.ask_mode_state = Some(ask_test_state());
+        app.handle_key(ask_test_key(crossterm::event::KeyCode::Esc))
+            .await;
+        assert!(app.ask_mode_state.is_none(), "cancel must clear ask state");
+        assert!(
+            !app.tool_result_context
+                .iter()
+                .any(|s| s.contains("[Ask Mode Response]")),
+            "cancel must not resume generation"
+        );
+        assert_eq!(app.status_message, "Ask Mode: cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_ask_mode_edit_mode_keys_type_dont_submit() {
+        let mut app = App::new();
+        let ask = crate::ask_mode::AskModeParser::parse(
+            "<askmode ques=\"Notes?\"><input>Extra</input></askmode>",
+        )
+        .unwrap()
+        .unwrap();
+        app.ask_mode_state = Some(crate::ask_mode::AskModeState::new(ask));
+        // Enter starts editing the input.
+        app.handle_key(ask_test_key(crossterm::event::KeyCode::Enter))
+            .await;
+        assert!(app.ask_mode_state.as_ref().unwrap().input_editing);
+        // Typing 's'/'q'/space must go to the field, not submit/cancel/toggle.
+        for c in ['s', 'q', ' '] {
+            app.handle_key(ask_test_key(crossterm::event::KeyCode::Char(c)))
+                .await;
+        }
+        assert!(
+            app.ask_mode_state.is_some(),
+            "typing must not submit or cancel"
+        );
+        assert_eq!(
+            app.ask_mode_state.as_ref().unwrap().ask_mode.elements[0].value(),
+            "sq "
+        );
+        // Enter exits edit mode; dialog stays active.
+        app.handle_key(ask_test_key(crossterm::event::KeyCode::Enter))
+            .await;
+        assert!(app.ask_mode_state.is_some());
+        assert!(!app.ask_mode_state.as_ref().unwrap().input_editing);
+    }
+
+    #[tokio::test]
+    async fn test_ask_mode_draw_renders_modal_not_xml() {
+        use ratatui::backend::TestBackend;
+        let mut app = App::new();
+        app.messages.push("You: test askmode".into());
+        app.messages.push(
+            "Agent: <askmode ques=\"Which DB?\"><radio>SQLite</radio><radio>Postgres</radio></askmode>"
+                .into(),
+        );
+        app.ask_mode_state = Some(ask_test_state());
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            content.contains("Which DB?"),
+            "modal must show the question"
+        );
+        assert!(content.contains("SQLite"), "modal must show options");
+        assert!(
+            !content.contains("<askmode"),
+            "raw ask XML must not render as chat text"
+        );
+        assert!(
+            !content.contains("<radio>"),
+            "raw ask XML must not render as chat text"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_context_prompt_hides_ask_xml() {
+        let mut app = App::new();
+        app.messages.push("You: test askmode".into());
+        app.messages
+            .push("Agent: <askmode ques=\"Which DB?\"><radio>SQLite</radio></askmode>".into());
+        let ctx = app.build_context_prompt();
+        assert!(
+            !ctx.contains("<askmode"),
+            "raw ask XML must not re-enter model context"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_timeline_claim_and_finish() {
+        use crate::agent::{AgentEngine, ToolCallSource};
+        use crate::run_timeline::{AgentRun, AgentRunState, StepKind, StepStatus};
+        let mut app = App::new();
+        app.current_run = Some(AgentRun::new("do things".to_string()));
+        let calls = AgentEngine::parse_tool_calls(
+            "<cmd>cargo check</cmd>",
+            ToolCallSource::ModelCompletion,
+        );
+        assert_eq!(calls.len(), 1);
+        // Claim opens a Run step bound to the call id.
+        assert!(app.claim_tool_call(&calls[0]));
+        {
+            let run = app.current_run.as_ref().unwrap();
+            assert_eq!(run.steps.len(), 1);
+            assert_eq!(run.steps[0].kind, StepKind::Run);
+            assert_eq!(run.steps[0].call_id, Some(calls[0].call_id));
+        }
+        assert!(!app.claim_tool_call(&calls[0]));
+        assert_eq!(app.current_run.as_ref().unwrap().steps.len(), 1);
+        app.finish_run_call(calls[0].call_id, StepStatus::Succeeded, Some("ok".into()));
+        assert_eq!(app.current_run.as_ref().unwrap().progress(), (1, 1));
+        app.mark_ready();
+        assert_eq!(
+            app.current_run.as_ref().unwrap().state,
+            AgentRunState::Completed
+        );
+        // Cancellation path marks Cancelled.
+        app.current_run = Some(AgentRun::new("x".to_string()));
+        app.finish_current_run(AgentRunState::Cancelled);
+        assert!(app.current_run.as_ref().unwrap().is_terminal());
+        // New prompt archives the old run (cancel-first if still live).
+        let old_id = app.current_run.as_ref().unwrap().id;
+        app.start_new_run("second".to_string());
+        assert_eq!(app.run_history.len(), 1);
+        assert_eq!(app.run_history[0].id, old_id);
+        assert_eq!(app.run_history[0].state, "Cancelled");
+        assert_eq!(
+            app.current_run.as_ref().unwrap().state,
+            AgentRunState::Planning
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_during_generation_and_tool() {
+        use crate::agent::{AgentEngine, ToolCallSource};
+        use crate::run_timeline::{AgentRunState, StepStatus};
+        let mut app = App::new();
+        app.start_new_run("gen please".to_string());
+        // Simulate an in-flight generation owned by this run.
+        let run_id = app.current_run.as_ref().unwrap().id;
+        app.gen_run_id = Some(run_id);
+        *app.is_generating.lock().unwrap() = true;
+        // One finished tool + one running tool.
+        let calls = AgentEngine::parse_tool_calls(
+            "<cmd>cargo check</cmd>",
+            ToolCallSource::ModelCompletion,
+        );
+        assert!(app.claim_tool_call(&calls[0]));
+        app.finish_run_call(calls[0].call_id, StepStatus::Succeeded, Some("ok".into()));
+        let calls2 = AgentEngine::parse_tool_calls(
+            "<read src=\"$CURRENT/Cargo.toml\">",
+            ToolCallSource::ModelCompletion,
+        );
+        assert!(app.claim_tool_call(&calls2[0]));
+        // Cancel mid-generation.
+        app.cancel_active_run("CTRL+C", false);
+        assert!(app.run_cancel_token.as_ref().unwrap().is_cancelled());
+        let run = app.current_run.as_ref().unwrap();
+        assert_eq!(run.state, AgentRunState::Cancelled);
+        // Finished stays Succeeded, running became Cancelled.
+        assert_eq!(run.steps[0].status, StepStatus::Succeeded);
+        assert_eq!(run.steps[1].status, StepStatus::Cancelled);
+        assert!(!*app.is_generating.lock().unwrap());
+        // Stale completion no longer owns the run.
+        assert!(!app.completion_owns_current_run());
+    }
+
+    #[tokio::test]
+    async fn test_repeated_cancel_is_idempotent() {
+        use crate::run_timeline::AgentRunState;
+        let mut app = App::new();
+        app.start_new_run("x".to_string());
+        app.cancel_active_run("CTRL+C", false);
+        app.cancel_active_run("CTRL+C", false);
+        app.cancel_active_run("CTRL+C", false);
+        let run = app.current_run.as_ref().unwrap();
+        assert_eq!(run.state, AgentRunState::Cancelled);
+        // Cancel never archives: no duplicate history entries.
+        assert!(app.run_history.is_empty());
+        // Cancelled run cannot transition back to Executing.
+        assert!(
+            !app.current_run
+                .as_mut()
+                .unwrap()
+                .transition_to(AgentRunState::Executing)
+        );
+        assert_eq!(
+            app.current_run.as_ref().unwrap().state,
+            AgentRunState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ctrl_enter_then_new_prompt_archives_once() {
+        use crate::agent::{AgentEngine, ToolCallSource};
+        use crate::run_timeline::{AgentRunState, StepStatus};
+        let mut app = App::new();
+        app.start_new_run("first".to_string());
+        let first_id = app.current_run.as_ref().unwrap().id;
+        let calls =
+            AgentEngine::parse_tool_calls("<cmd>sleep 60</cmd>", ToolCallSource::ModelCompletion);
+        assert!(app.claim_tool_call(&calls[0]));
+        // Ctrl+Enter: unified cancel (no process kill), then submit archives.
+        app.cancel_active_run("CTRL+Enter", false);
+        app.start_new_run("second".to_string());
+        assert_eq!(app.run_history.len(), 1);
+        assert_eq!(app.run_history[0].id, first_id);
+        assert_eq!(app.run_history[0].state, "Cancelled");
+        assert_eq!(app.run_history[0].steps_done, 1); // claimed step cascaded
+        // Fresh token for the new run.
+        assert!(!app.run_cancel_token.as_ref().unwrap().is_cancelled());
+        assert_eq!(
+            app.current_run.as_ref().unwrap().state,
+            AgentRunState::Planning
+        );
+        let _ = StepStatus::Succeeded;
+    }
+
+    #[tokio::test]
+    async fn test_late_event_from_old_run_ignored() {
+        use crate::agent::{AgentEngine, ToolCallSource};
+        use crate::run_timeline::StepStatus;
+        use crate::task_manager::TaskEvent;
+        let mut app = App::new();
+        app.start_new_run("old".to_string());
+        let old_id = app.current_run.as_ref().unwrap().id;
+        let calls =
+            AgentEngine::parse_tool_calls("<cmd>echo hi</cmd>", ToolCallSource::ModelCompletion);
+        assert!(app.claim_tool_call(&calls[0]));
+        let ctx_before = app.tool_result_context.len();
+        // New prompt replaces the run (old archived).
+        app.start_new_run("new".to_string());
+        assert_eq!(app.run_history.len(), 1);
+        // Late Done from the OLD run: killed=true avoids re-trigger paths;
+        // the guard must drop it before context/timeline mutation.
+        app.deliver_task_event(TaskEvent::Done {
+            id: 999,
+            cmd: "echo hi".to_string(),
+            output: "hi".to_string(),
+            killed: true,
+            spawned_by: 0,
+            call_id: Some(calls[0].call_id),
+            run_id: Some(old_id),
+        });
+        assert_eq!(app.tool_result_context.len(), ctx_before);
+        // Current (new) run untouched: no steps leaked in.
+        assert!(app.current_run.as_ref().unwrap().steps.is_empty());
+        // Same event for the CURRENT run delivers + finishes by call id.
+        let calls2 =
+            AgentEngine::parse_tool_calls("<cmd>echo yo</cmd>", ToolCallSource::ModelCompletion);
+        assert!(app.claim_tool_call(&calls2[0]));
+        let new_id = app.current_run.as_ref().unwrap().id;
+        app.deliver_task_event(TaskEvent::Done {
+            id: 1000,
+            cmd: "echo yo".to_string(),
+            output: "yo".to_string(),
+            killed: true,
+            spawned_by: 0,
+            call_id: Some(calls2[0].call_id),
+            run_id: Some(new_id),
+        });
+        assert_eq!(app.tool_result_context.len(), ctx_before + 1);
+        let run = app.current_run.as_ref().unwrap();
+        let step = run
+            .steps
+            .iter()
+            .find(|s| s.call_id == Some(calls2[0].call_id))
+            .unwrap();
+        // killed=true test event → Skipped status, but bound to the exact call.
+        assert_eq!(step.status, StepStatus::Skipped);
+    }
+
+    #[tokio::test]
+    async fn test_child_token_tree_cancels_workers() {
+        // A child cloned from the run token observes run cancellation:
+        // this is the token handed to generation spawns, cmd tasks and
+        // sub-agent runtimes.
+        let mut app = App::new();
+        app.start_new_run("work".to_string());
+        let child = app.run_cancel_token.as_ref().unwrap().child_token();
+        assert!(!child.is_cancelled());
+        app.cancel_active_run("CTRL+C", false);
+        assert!(child.is_cancelled());
+        // New run gets a fresh, uncancelled tree.
+        app.start_new_run("more".to_string());
+        let child2 = app.run_cancel_token.as_ref().unwrap().child_token();
+        assert!(!child2.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_gen_cancel_leaves_run_token_alive() {
+        // Generation-scoped cancel (stall/reject) must not kill the run's
+        // token tree: workers bound to the run keep their cancellation
+        // source, only the in-flight generation stops.
+        let mut app = App::new();
+        app.start_new_run("work".to_string());
+        let gen_tok = app.run_cancel_token.as_ref().unwrap().child_token();
+        app.gen_cancel_token = Some(gen_tok.clone());
+        *app.is_generating.lock().unwrap() = true;
+        app.cancel_generation("test");
+        assert!(gen_tok.is_cancelled());
+        assert!(!app.run_cancel_token.as_ref().unwrap().is_cancelled());
+        assert!(!app.current_run.as_ref().unwrap().is_terminal());
+    }
+
+    #[tokio::test]
+    async fn test_stall_and_reject_cancel_generation_token() {
+        use crate::agent::{AgentEngine, ToolCallSource};
+        let mut app = App::new();
+        app.start_new_run("work".to_string());
+        // Simulate an in-flight generation: flag live + gen child token set
+        // (as trigger_generation_from_context would).
+        *app.is_generating.lock().unwrap() = true;
+        let gen_tok = app.run_cancel_token.as_ref().unwrap().child_token();
+        app.gen_cancel_token = Some(gen_tok.clone());
+        // Generation-scoped cancel stops the future, keeps the run alive.
+        app.cancel_generation("test-stall");
+        assert!(gen_tok.is_cancelled());
+        assert!(!*app.is_generating.lock().unwrap());
+        assert!(!app.current_run.as_ref().unwrap().is_terminal());
+        // Reject path uses the same primitive and fails pending steps.
+        let calls = AgentEngine::parse_tool_calls(
+            "<write src=\"$CURRENT/r.txt\">\nhi\n</write>",
+            ToolCallSource::ModelCompletion,
+        );
+        app.pending_actions = calls;
+        *app.is_generating.lock().unwrap() = true;
+        let gen_tok2 = app.run_cancel_token.as_ref().unwrap().child_token();
+        app.gen_cancel_token = Some(gen_tok2.clone());
+        app.reject_pending_actions();
+        assert!(gen_tok2.is_cancelled());
+        assert!(!app.current_run.as_ref().unwrap().is_terminal());
+    }
+
+    #[tokio::test]
+    async fn test_stale_sub_agent_reply_cannot_revive_run() {
+        use crate::run_timeline::AgentRunState;
+        use crate::task_manager::TaskEvent;
+        let mut app = App::new();
+        app.start_new_run("old".to_string());
+        let old_id = app.current_run.as_ref().unwrap().id;
+        app.cancel_active_run("CTRL+C", false);
+        // Sub-agent Done arrives after cancellation with the old run id.
+        let turns_before = app.auto_tool_turns;
+        app.deliver_task_event(TaskEvent::Done {
+            id: 4242,
+            cmd: "agent role=\"x\"".to_string(),
+            output: "<agent action=\"reply\">hello</agent>".to_string(),
+            killed: false,
+            spawned_by: 0,
+            call_id: Some(123456),
+            run_id: Some(old_id),
+        });
+        // No revival: no new generation turn, run stays Cancelled.
+        assert_eq!(app.auto_tool_turns, turns_before);
+        assert_eq!(
+            app.current_run.as_ref().unwrap().state,
+            AgentRunState::Cancelled
+        );
     }
 }
 

@@ -182,8 +182,20 @@ Help (inside think):  <help>
 6. For external tools provided via Model Context Protocol, use `<mcp server="..." tool="...">{"arg": "val"}</mcp>`.
 7. When using CLI tools, only consult help/manual flags (`--help`, `man`, `/?`) if you are unsure of the tool's exact usage syntax and require clarification. Do not run help commands in the first place without actual need.
 8. For pure conversation, planning, or questions, reply directly in natural language.
-9. Reasoning inside `<think>...</think>` is optional. If you use it, close with `</think>` and emit your tool calls or response outside `<think>`.
+9. Reasoning inside `<think>...</think>` is optional. If you use it, close with `</think>` and emit your tool calls or response outside `<think>`. NEVER put tool tags inside `<think>` — they will be ignored.
 10. Never state you lack access to the local machine or tools.
+11. Only real emitted tool tags count as actions. Do NOT narrate, quote, or repeat tool tags in prose or inside `<write>` file bodies — the host executes exactly what you emit, once. Do NOT invent tool results; wait for the host to return them.
+
+## Ask Mode
+Use Ask Mode ONLY when a choice materially changes the task, required info is genuinely missing, or confirmation is needed before proceeding. Do NOT use it for ordinary factual questions, simple calculations, or when a reasonable default is obvious.
+When Ask Mode is required, emit ONLY one complete block and stop — wait for the user:
+<askmode ques="Question">
+<radio>Option A</radio>
+<radio>Option B</radio>
+<check>Optional feature</check>
+<input>Additional information</input>
+</askmode>
+Do not describe the syntax in prose. Do not invent a user response. After the host returns an Ask Mode response, continue the task using it.
 "#;
 
 /// Compact system prompt for small GGUFs / llama-server chat.
@@ -217,26 +229,166 @@ Rules:
 - Line replacements: use `<write src="..." line=START..=END>`.
 - Git, web fetch (curl/wget), packages, file moves/deletes, or OS utilities: use `<cmd> tool run here </cmd>`.
 - Only check tool help (`--help`, `man`, `/?`) when syntax clarification is genuinely required, not by default.
-- Reasoning inside `<think>...</think>` is optional. If used, close with `</think>` and emit tool calls or response outside.
+- Reasoning inside `<think>...</think>` is optional. If used, close with `</think>` and emit tool calls or response outside. NEVER put tool tags inside `<think>`.
+- Only real emitted tool tags count as actions: never narrate, quote, or repeat tool tags in prose or inside `<write>` bodies. Never invent tool results; wait for the host.
 - Never claim you lack file access or tools.
+- Ask Mode: use ONLY when a choice changes the task or info is truly missing. Emit ONLY one <askmode ques="..."> block with radio/check/input children, then stop and wait. Never describe the syntax or invent a response.
 "#;
 
-/// Destructive / mutating action awaiting user accept (Ask mode).
+/// Canonical internal representation of ONE executable tool invocation.
+///
+/// Lifecycle (single authoritative pipeline):
+/// model/backend output (plain `String`; see backend-protocol note below)
+/// → [`AgentEngine::parse_tool_calls`] (sole parser) → dispatch
+/// (exactly-once via [`ToolDispatchRegistry`]) → execution event
+/// → Action UI chip (by `chip_id`) → executor
+/// ([`AgentEngine::execute_proposed`] / task-manager spawn) → [`ToolResult`]
+/// → `tool_result_context` → next generation.
+///
+/// BACKEND-PROTOCOL DECISION: none of the backends (`LlamaCppLib`,
+/// `Ollama`, Burn) expose structured `tool_calls` / `tool_call_id` /
+/// `reasoning_content` — `AgentBackend::generate[_stream]` returns plain
+/// text only (Ollama's native `thinking` field is wrapped into `<think>`
+/// text by the backend adapter). Hercules therefore intentionally uses its
+/// custom XML-tag protocol, and the `StreamingParser`-based
+/// [`AgentEngine::parse_tool_calls`] is the SINGLE canonical parser. No
+/// parallel semantic parser may decide executability.
 #[derive(Debug, Clone)]
 pub struct ProposedAction {
     pub kind: ProposedKind,
     pub target: String,
     pub body: String,
     pub line_attr: Option<String>,
-    /// True if the model put this tag inside `<think>` (misplaced but recoverable).
+    /// Always false: extractors only see outside-think content, so thinking
+    /// tags are never promoted to actions. Retained for struct compatibility.
     pub from_think: bool,
     pub chip_id: Option<u64>,
+    /// Stable identity minted at parse time; preserved onto the
+    /// [`ToolResult`] so results bind to the exact call, never to
+    /// "latest chip of this kind".
+    pub call_id: u64,
+    /// Where this call originated; recovery flows through the same pipeline.
+    pub source: ToolCallSource,
 }
 
+/// Origin of a [`ProposedAction`]. Model and host-recovery calls share the
+/// type and the pipeline; the source only records provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallSource {
+    /// Parsed from the live streaming text.
+    ModelStream,
+    /// Parsed from the completed response.
+    ModelCompletion,
+    /// Host-synthesized after a model refusal
+    /// ([`AgentEngine::recover_tools_from_refusal`]).
+    HostRecovery,
+    /// Re-confirmed by the user (accept flow).
+    UserAccept,
+}
+
+/// Monotonic mint for [`ProposedAction::call_id`].
+static NEXT_TOOL_CALL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_tool_call_id() -> u64 {
+    NEXT_TOOL_CALL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl ProposedAction {
+    /// Canonical constructor: every parsed call gets a fresh `call_id`.
+    pub fn new(
+        kind: ProposedKind,
+        target: String,
+        body: String,
+        line_attr: Option<String>,
+        source: ToolCallSource,
+    ) -> Self {
+        Self {
+            kind,
+            target,
+            body,
+            line_attr,
+            from_think: false,
+            chip_id: None,
+            call_id: next_tool_call_id(),
+            source,
+        }
+    }
+
+    /// Dedupe key: same kind + target + body = same logical call, even
+    /// across re-parses (streaming re-parses the full text every poll, so
+    /// `call_id` alone cannot dedupe).
+    pub fn fingerprint(&self) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.kind.hash(&mut h);
+        self.target.hash(&mut h);
+        self.body.hash(&mut h);
+        self.line_attr.hash(&mut h);
+        format!("{:?}:{:x}", self.kind, h.finish())
+    }
+}
+
+/// Exactly-once gate for the canonical dispatch pipeline.
+/// A fingerprint that was already claimed (executed or spawned) is rejected,
+/// so one model tool call cannot run twice through two paths (e.g. live
+/// streaming execution + completion re-dispatch).
+#[derive(Debug, Default)]
+pub struct ToolDispatchRegistry {
+    claimed: std::collections::HashSet<String>,
+}
+
+impl ToolDispatchRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim a call for execution. Returns `true` exactly once per unique
+    /// fingerprint; `false` means "already dispatched — skip".
+    pub fn try_claim(&mut self, action: &ProposedAction) -> bool {
+        self.claimed.insert(action.fingerprint())
+    }
+
+    pub fn is_claimed(&self, action: &ProposedAction) -> bool {
+        self.claimed.contains(&action.fingerprint())
+    }
+
+    /// Reset at the start of a new agent turn (new user message).
+    pub fn reset_turn(&mut self) {
+        self.claimed.clear();
+    }
+}
+
+/// Output of one dispatched [`ProposedAction`], bound to it by `call_id`.
+#[derive(Debug, Clone)]
+pub struct ToolResult {
+    pub call_id: u64,
+    pub fingerprint: String,
+    pub output: String,
+}
+
+impl ToolResult {
+    pub fn new(action: &ProposedAction, output: String) -> Self {
+        Self {
+            call_id: action.call_id,
+            fingerprint: action.fingerprint(),
+            output,
+        }
+    }
+
+    /// Context insertion format: carries the call id so the next generation
+    /// can attribute the result to the exact call.
+    pub fn context_entry(&self, label: &str) -> String {
+        format!("[{} result #{}]\n{}", label, self.call_id, self.output)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProposedKind {
     Write,
     Cmd,
+    Read,
+    Ls,
     Mcp,
     Skill,
     WebSearch,
@@ -248,6 +400,8 @@ impl ProposedKind {
         match self {
             Self::Write => "WRITE",
             Self::Cmd => "RUN",
+            Self::Read => "READ",
+            Self::Ls => "LIST",
             Self::Mcp => "MCP",
             Self::Skill => "SKILL",
             Self::WebSearch => "WEBSEARCH",
@@ -256,15 +410,168 @@ impl ProposedKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseState {
+    Normal,
+    Thinking,
+}
+
+impl Default for ParseState {
+    fn default() -> Self {
+        ParseState::Normal
+    }
+}
+
+pub struct StreamingParser {
+    state: ParseState,
+    buffer: String,
+    think_depth: usize,
+    source: ToolCallSource,
+}
+
+impl StreamingParser {
+    pub fn new() -> Self {
+        Self::with_source(ToolCallSource::ModelCompletion)
+    }
+
+    pub fn with_source(source: ToolCallSource) -> Self {
+        Self {
+            state: ParseState::Normal,
+            buffer: String::new(),
+            think_depth: 0,
+            source,
+        }
+    }
+
+    pub fn feed(&mut self, chunk: &str) -> Vec<ProposedAction> {
+        self.buffer.push_str(chunk);
+        let mut actions = Vec::new();
+        let mut iterations = 0;
+        const MAX_ITERATIONS: usize = 1000;
+
+        while let Some(pos) = self.find_next_boundary() {
+            iterations += 1;
+            if iterations > MAX_ITERATIONS {
+                self.buffer.clear();
+                break;
+            }
+            match self.state {
+                ParseState::Normal => {
+                    let segment = &self.buffer[..pos];
+                    actions.extend(Self::extract_from_segment(segment, self.source));
+                    self.buffer.drain(..pos);
+                    self.consume_think_start();
+                }
+                ParseState::Thinking => {
+                    let think_end_start = pos - 8;
+                    self.buffer.drain(..think_end_start);
+                    self.consume_think_end();
+                }
+            }
+        }
+
+        if self.state == ParseState::Normal && !self.buffer.is_empty() {
+            actions.extend(Self::extract_from_segment(&self.buffer, self.source));
+            self.buffer.clear();
+        }
+
+        actions
+    }
+
+    fn find_next_boundary(&self) -> Option<usize> {
+        let think_start = self.buffer.find("<think>");
+        let think_end = self.buffer.find("</think>");
+
+        match (self.state, think_start, think_end) {
+            (ParseState::Normal, Some(s), _) => Some(s),
+            (ParseState::Thinking, _, Some(e)) => {
+                let end_pos = e + 8;
+                if end_pos <= self.buffer.len() {
+                    Some(end_pos)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn consume_think_start(&mut self) {
+        if self.buffer.len() >= 7 && self.buffer.starts_with("<think>") {
+            self.buffer.drain(..7);
+            self.state = ParseState::Thinking;
+            self.think_depth += 1;
+        }
+    }
+
+    fn consume_think_end(&mut self) {
+        if self.buffer.len() >= 8 && self.buffer.starts_with("</think>") {
+            self.buffer.drain(..8);
+            self.state = ParseState::Normal;
+            self.think_depth = self.think_depth.saturating_sub(1);
+        }
+    }
+
+    fn extract_from_segment(segment: &str, source: ToolCallSource) -> Vec<ProposedAction> {
+        let outside = AgentEngine::strip_code_fences(&AgentEngine::strip_think_blocks(segment));
+        let mut from_out = AgentEngine::parse_write_cmd_actions(&outside, source);
+        from_out.extend(AgentEngine::parse_mcp_skill_actions(&outside, source));
+        from_out.extend(AgentEngine::parse_read_ls_actions(&outside, source));
+        from_out.retain(|a| AgentEngine::action_is_sane(a));
+        from_out
+    }
+
+    pub fn flush(&mut self) -> Vec<ProposedAction> {
+        if self.state == ParseState::Normal && !self.buffer.is_empty() {
+            let actions = Self::extract_from_segment(&self.buffer, self.source);
+            self.buffer.clear();
+            actions
+        } else {
+            self.buffer.clear();
+            Vec::new()
+        }
+    }
+
+    pub fn in_thinking(&self) -> bool {
+        self.state == ParseState::Thinking
+    }
+
+    pub fn reset(&mut self) {
+        self.state = ParseState::Normal;
+        self.buffer.clear();
+        self.think_depth = 0;
+    }
+}
+
+impl Default for StreamingParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// First-class classification of raw model output.
+///
+/// The host must treat model text as untrusted: this single entry point
+/// decides whether a completed response is an Ask Mode control-flow event,
+/// an executable tool call, or plain text — before anything with side
+/// effects runs. Tool detection is evaluated on outside-think content only.
+pub enum ModelOutput {
+    AskMode(crate::ask_mode::AskMode),
+    ToolCall,
+    Text,
+}
+
 pub struct AgentEngine;
 
 impl AgentEngine {
     pub fn format_markdown_tables(text: &str, max_width: usize, scroll_x: usize) -> String {
         let mut out = String::new();
         let mut table_lines = Vec::new();
-        
+
         fn render_table(lines: &[&str], out: &mut String, max_width: usize, scroll_x: usize) {
-            if lines.is_empty() { return; }
+            if lines.is_empty() {
+                return;
+            }
             let mut rows: Vec<Vec<String>> = Vec::new();
             for line in lines {
                 let mut parts: Vec<&str> = line.split('|').collect();
@@ -286,10 +593,14 @@ impl AgentEngine {
                     rows.push(row);
                 }
             }
-            if rows.is_empty() { return; }
+            if rows.is_empty() {
+                return;
+            }
             let mut has_sep = false;
             if rows.len() > 1 {
-                let is_sep = rows[1].iter().all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '));
+                let is_sep = rows[1].iter().all(|c| {
+                    !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')
+                });
                 if is_sep {
                     has_sep = true;
                     rows.remove(1);
@@ -302,9 +613,16 @@ impl AgentEngine {
                     widths[i] = widths[i].max(col.chars().count());
                 }
             }
-            let top = format!("┌{}┐", widths.iter().map(|w| "─".repeat(*w + 2)).collect::<Vec<_>>().join("┬"));
+            let top = format!(
+                "┌{}┐",
+                widths
+                    .iter()
+                    .map(|w| "─".repeat(*w + 2))
+                    .collect::<Vec<_>>()
+                    .join("┬")
+            );
             let mut table_rows = vec![top];
-            
+
             for (r_idx, row) in rows.iter().enumerate() {
                 let mut row_str = String::from("│");
                 for i in 0..cols {
@@ -314,18 +632,36 @@ impl AgentEngine {
                 }
                 table_rows.push(row_str);
                 if r_idx == 0 && has_sep {
-                    let mid = format!("├{}┤", widths.iter().map(|w| "─".repeat(*w + 2)).collect::<Vec<_>>().join("┼"));
+                    let mid = format!(
+                        "├{}┤",
+                        widths
+                            .iter()
+                            .map(|w| "─".repeat(*w + 2))
+                            .collect::<Vec<_>>()
+                            .join("┼")
+                    );
                     table_rows.push(mid);
                 }
             }
-            let bot = format!("└{}┘", widths.iter().map(|w| "─".repeat(*w + 2)).collect::<Vec<_>>().join("┴"));
+            let bot = format!(
+                "└{}┘",
+                widths
+                    .iter()
+                    .map(|w| "─".repeat(*w + 2))
+                    .collect::<Vec<_>>()
+                    .join("┴")
+            );
             table_rows.push(bot);
-            
+
             let table_width = table_rows[0].chars().count();
             let eff_width = max_width.saturating_sub(2); // leaving margin
             let needs_scroll = table_width > eff_width;
-            let actual_scroll = if needs_scroll { scroll_x.min(table_width - eff_width) } else { 0 };
-            
+            let actual_scroll = if needs_scroll {
+                scroll_x.min(table_width - eff_width)
+            } else {
+                0
+            };
+
             for r in table_rows {
                 let chars: Vec<char> = r.chars().collect();
                 if needs_scroll {
@@ -340,13 +676,16 @@ impl AgentEngine {
                 }
                 out.push('\n');
             }
-            
+
             if needs_scroll {
                 // Windows 98 style scrollbar: [◄][████░░░░░░░][►]
                 let track_len = eff_width.saturating_sub(6).max(5);
-                let thumb_size = (track_len as f64 * (eff_width as f64 / table_width as f64)).max(1.0) as usize;
-                let thumb_pos = (track_len as f64 * (actual_scroll as f64 / (table_width - eff_width) as f64)).min((track_len - thumb_size) as f64) as usize;
-                
+                let thumb_size =
+                    (track_len as f64 * (eff_width as f64 / table_width as f64)).max(1.0) as usize;
+                let thumb_pos = (track_len as f64
+                    * (actual_scroll as f64 / (table_width - eff_width) as f64))
+                    .min((track_len - thumb_size) as f64) as usize;
+
                 let mut scrollbar = String::from("[◄][");
                 for i in 0..track_len {
                     if i >= thumb_pos && i < thumb_pos + thumb_size {
@@ -548,7 +887,8 @@ Common Tasks:
                     || t.contains("svelte")
                     || t.contains("react")
                     || t.contains("file")))
-            || (t.contains("build") && (t.contains("page") || t.contains("app") || t.contains("ui")))
+            || (t.contains("build")
+                && (t.contains("page") || t.contains("app") || t.contains("ui")))
     }
 
     /// True when the user text looks like a filesystem / shell request that needs tools.
@@ -623,8 +963,11 @@ Common Tasks:
     }
 
     /// True if the assistant text already contains an executable tool tag.
+    /// Thinking zones are reasoning text, not executable calls: only tags
+    /// outside `<think>` count.
     pub fn response_has_tool_tags(text: &str) -> bool {
-        let t = text;
+        let stripped = Self::strip_think_blocks(text);
+        let t = stripped.as_str();
         t.contains("<read src=")
             || t.contains("<ls path=")
             || t.contains("<ls>")
@@ -828,7 +1171,7 @@ Common Tasks:
         if tag.contains("<ls") && !user_text.to_ascii_lowercase().contains("list") {
             return None;
         }
-Some(tag)
+        Some(tag)
     }
 
     /// When a small model answers with a fenced code block (```lang ... ```)
@@ -887,6 +1230,8 @@ Some(tag)
             line_attr: None,
             from_think: false,
             chip_id: None,
+            call_id: next_tool_call_id(),
+            source: ToolCallSource::ModelCompletion,
         })
     }
 
@@ -974,46 +1319,40 @@ Some(tag)
         out
     }
 
-    /// Collect write/cmd from outside-think first; only recover *clean* tools from think.
-    /// Ollama R1-style models dump prose into fake `<cmd>` tags inside thinking — reject those.
-    pub fn extract_proposed_actions(response: &str) -> Vec<ProposedAction> {
-        let outside = Self::strip_code_fences(&Self::strip_think_blocks(response));
-        let mut from_out = Self::parse_write_cmd_actions(&outside, false);
-        from_out.extend(Self::parse_mcp_skill_actions(&outside, false));
-        from_out.retain(|a| Self::action_is_sane(a));
-        if !from_out.is_empty() {
-            return from_out;
-        }
-        let think = {
-            let mut t = Self::extract_think_contents(response);
-            if t.is_empty() {
-                if let Some(i) = response.find("<think>") {
-                    t = response[i + 7..].to_string();
-                    if let Some(j) = t.find("</think>") {
-                        t = t[..j].to_string();
-                    }
-                }
-            }
-            Self::strip_code_fences(&t)
-        };
-        let mut from_think = Self::parse_write_cmd_actions(&think, true);
-        from_think.extend(Self::parse_mcp_skill_actions(&think, true));
-        // From think: only accept fully closed, sane write/cmd (no prose dumps)
-        from_think.retain(|a| Self::action_is_sane(a) && Self::think_action_ok(a));
-        from_think
+    /// Collect write/cmd from outside-think only; NEVER execute tools from thinking.
+    /// Models dump prose into fake `<cmd>` tags inside thinking — never execute those.
+    /// THE canonical tool-call parser — the single authority that turns
+    /// model/host text into executable [`ProposedAction`]s. All pipelines
+    /// (streaming preview, completion dispatch, host recovery) must go
+    /// through here; nothing else may decide raw text is executable.
+    /// Thinking zones and code fences are stripped before parsing, so
+    /// `<think>` content and quoted examples can never become calls.
+    pub fn parse_tool_calls(text: &str, source: ToolCallSource) -> Vec<ProposedAction> {
+        let mut parser = StreamingParser::with_source(source);
+        let actions = parser.feed(text);
+        actions.into_iter().chain(parser.flush()).collect()
     }
 
-    fn think_action_ok(a: &ProposedAction) -> bool {
-        match a.kind {
-            ProposedKind::Write => {
-                // Need a real file path + some body (not empty narration)
-                !a.target.trim().is_empty()
-                    && a.body.trim().len() > 8
-                    && !a.body.to_ascii_lowercase().contains("i should emit")
-            }
-            ProposedKind::Cmd => Self::looks_like_shell_cmd(&a.target),
-            ProposedKind::Mcp | ProposedKind::Skill | ProposedKind::WebSearch | ProposedKind::Agent => true,
+    /// Legacy alias for [`Self::parse_tool_calls`] with
+    /// [`ToolCallSource::ModelCompletion`]. Kept for call-site compatibility.
+    pub fn extract_proposed_actions(response: &str) -> Vec<ProposedAction> {
+        Self::parse_tool_calls(response, ToolCallSource::ModelCompletion)
+    }
+
+    /// Classify a completed model response into its control-flow meaning.
+    /// Ask Mode wins over tool calls: when the model asks the user something,
+    /// the host must pause generation and wait instead of executing anything.
+    pub fn classify_output(response: &str) -> ModelOutput {
+        if let Some(ask) = crate::ask_mode::AskModeParser::parse(response)
+            .ok()
+            .flatten()
+        {
+            return ModelOutput::AskMode(ask);
         }
+        if Self::response_has_tool_tags(&Self::strip_think_blocks(response)) {
+            return ModelOutput::ToolCall;
+        }
+        ModelOutput::Text
     }
 
     fn action_is_sane(a: &ProposedAction) -> bool {
@@ -1026,7 +1365,15 @@ Some(tag)
                     && !t.to_ascii_lowercase().contains("maybe")
             }
             ProposedKind::Cmd => Self::looks_like_shell_cmd(&a.target),
-            ProposedKind::Mcp | ProposedKind::Skill | ProposedKind::WebSearch | ProposedKind::Agent => true,
+            ProposedKind::Read => {
+                let t = a.target.trim();
+                !t.is_empty() && t.len() < 400 && !t.contains('\n')
+            }
+            ProposedKind::Ls => true,
+            ProposedKind::Mcp
+            | ProposedKind::Skill
+            | ProposedKind::WebSearch
+            | ProposedKind::Agent => true,
         }
     }
 
@@ -1417,9 +1764,11 @@ Some(tag)
     /// file (e.g. model writes HTML then CSS into same `index.html`) from
     /// clobbering the first write.
 
-    fn parse_mcp_skill_actions(text: &str, from_think: bool) -> Vec<ProposedAction> {
+    fn parse_mcp_skill_actions(text: &str, source: ToolCallSource) -> Vec<ProposedAction> {
+        // Never match tags quoted inside a <write> file body.
+        let scrubbed = Self::blank_closed_write_blocks(text);
         let mut out = Vec::new();
-        let mut rest = text;
+        let mut rest: &str = &scrubbed;
         while let Some(start_tag) = rest.find("<mcp") {
             let r = &rest[start_tag..];
             if let Some(close_bracket) = r.find('>') {
@@ -1436,44 +1785,43 @@ Some(tag)
                 let after = &r[close_bracket + 1..];
                 if let Some(end_tag) = after.find("</mcp>") {
                     let body = after[..end_tag].trim().to_string();
-                    out.push(ProposedAction {
-                        kind: ProposedKind::Mcp,
+                    out.push(ProposedAction::new(
+                        ProposedKind::Mcp,
                         target,
                         body,
-                        line_attr: None,
-                        from_think,
-                        chip_id: None,
-                    });
+                        None,
+                        source,
+                    ));
                     rest = &after[end_tag + 6..];
                     continue;
                 }
             }
             break;
         }
-        rest = text;
+        rest = &scrubbed;
         while let Some(start_tag) = rest.find("<skill ") {
             let r = &rest[start_tag..];
             if let Some(close_bracket) = r.find('>') {
                 let header = &r[..close_bracket + 1];
-                let action = Self::extract_attribute(header, "action").unwrap_or_else(|| "search".to_string());
+                let action = Self::extract_attribute(header, "action")
+                    .unwrap_or_else(|| "search".to_string());
                 let after = &r[close_bracket + 1..];
                 if let Some(end_tag) = after.find("</skill>") {
                     let body = after[..end_tag].trim().to_string();
-                    out.push(ProposedAction {
-                        kind: ProposedKind::Skill,
-                        target: action,
+                    out.push(ProposedAction::new(
+                        ProposedKind::Skill,
+                        action,
                         body,
-                        line_attr: None,
-                        from_think,
-                        chip_id: None,
-                    });
+                        None,
+                        source,
+                    ));
                     rest = &after[end_tag + 8..];
                     continue;
                 }
             }
             break;
         }
-        rest = text;
+        rest = &scrubbed;
         while let Some(start_tag) = rest.find("<websearch") {
             let r = &rest[start_tag..];
             if let Some(close_bracket) = r.find('>') {
@@ -1488,10 +1836,19 @@ Some(tag)
                     if query_attr.is_some() {
                         end_pos = Some(0);
                     } else {
-                        let next_tool_pos = ["<write", "<cmd", "<read", "<ls", "<agent", "<mcp", "<skill", "<websearch"]
-                            .iter()
-                            .filter_map(|tag| after.find(tag))
-                            .min();
+                        let next_tool_pos = [
+                            "<write",
+                            "<cmd",
+                            "<read",
+                            "<ls",
+                            "<agent",
+                            "<mcp",
+                            "<skill",
+                            "<websearch",
+                        ]
+                        .iter()
+                        .filter_map(|tag| after.find(tag))
+                        .min();
                         end_pos = next_tool_pos.or_else(|| after.find('\n'));
                     }
                 }
@@ -1500,25 +1857,34 @@ Some(tag)
                 let body = after[..end].trim().to_string();
                 let advance = if is_explicit_closed { end + 12 } else { end };
 
-                for stop in ["<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|endoftext|>", "</s>"] {
+                for stop in [
+                    "<|im_end|>",
+                    "<|im_start|>",
+                    "<|eot_id|>",
+                    "<|endoftext|>",
+                    "</s>",
+                ] {
                     if let Some(ref mut q) = query_attr {
                         *q = q.replace(stop, "").trim().to_string();
                     }
                 }
 
                 let target = query_attr.unwrap_or_else(|| {
-                    if !body.is_empty() { body.clone() } else { "search".to_string() }
+                    if !body.is_empty() {
+                        body.clone()
+                    } else {
+                        "search".to_string()
+                    }
                 });
 
                 if !target.is_empty() && target != "search" {
-                    out.push(ProposedAction {
-                        kind: ProposedKind::WebSearch,
+                    out.push(ProposedAction::new(
+                        ProposedKind::WebSearch,
                         target,
                         body,
-                        line_attr: None,
-                        from_think,
-                        chip_id: None,
-                    });
+                        None,
+                        source,
+                    ));
                 }
                 rest = &after[advance.min(after.len())..];
                 continue;
@@ -1537,10 +1903,9 @@ Some(tag)
                 continue;
             }
             // Check if we already have a full-file write to the same target
-            if let Some(existing) = merged
-                .iter_mut()
-                .find(|a| a.kind == ProposedKind::Write && a.line_attr.is_none() && a.target == action.target)
-            {
+            if let Some(existing) = merged.iter_mut().find(|a| {
+                a.kind == ProposedKind::Write && a.line_attr.is_none() && a.target == action.target
+            }) {
                 // Append the new body — the model split one file across two write tags
                 if !existing.body.ends_with('\n') {
                     existing.body.push('\n');
@@ -1553,7 +1918,56 @@ Some(tag)
         merged
     }
 
-    fn parse_write_cmd_actions(text: &str, from_think: bool) -> Vec<ProposedAction> {
+    /// Parse `<read>` / `<ls>` into canonical calls. Input must already be
+    /// outside-think (and fence-stripped); write bodies are quarantined here
+    /// so quoted example markup never becomes a call.
+    fn parse_read_ls_actions(text: &str, source: ToolCallSource) -> Vec<ProposedAction> {
+        let scrubbed = Self::blank_closed_write_blocks(text);
+        let mut out = Vec::new();
+        let mut rest: &str = &scrubbed;
+        while let Some(start_tag) = rest.find("<read src=") {
+            let r = &rest[start_tag..];
+            if let Some(close_bracket) = r.find('>') {
+                let tag_header = &r[..close_bracket + 1];
+                let path_attr = Self::extract_attribute(tag_header, "src");
+                let line_attr = Self::extract_attribute(tag_header, "line");
+                rest = &r[close_bracket + 1..];
+                if let Some(path_str) = path_attr {
+                    out.push(ProposedAction::new(
+                        ProposedKind::Read,
+                        path_str,
+                        String::new(),
+                        line_attr,
+                        source,
+                    ));
+                }
+            } else {
+                break;
+            }
+        }
+        rest = &scrubbed;
+        while let Some(start_tag) = rest.find("<ls") {
+            let r = &rest[start_tag..];
+            if let Some(close_bracket) = r.find('>') {
+                let tag_header = &r[..close_bracket + 1];
+                let path_attr = Self::extract_attribute(tag_header, "path");
+                rest = &r[close_bracket + 1..];
+                let path_str = path_attr.unwrap_or_else(|| "$CURRENT".to_string());
+                out.push(ProposedAction::new(
+                    ProposedKind::Ls,
+                    path_str,
+                    String::new(),
+                    None,
+                    source,
+                ));
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    fn parse_write_cmd_actions(text: &str, source: ToolCallSource) -> Vec<ProposedAction> {
         let mut out = Vec::new();
         let mut rest = text;
         while let Some(start_tag) = rest.find("<write") {
@@ -1578,14 +1992,13 @@ Some(tag)
                 if let Some(path_str) = path_attr {
                     let body = body.trim_matches(|c| c == '\n' || c == '\r').to_string();
                     let target = Self::normalize_write_path(&path_str, &body);
-                    out.push(ProposedAction {
-                        kind: ProposedKind::Write,
+                    out.push(ProposedAction::new(
+                        ProposedKind::Write,
                         target,
                         body,
                         line_attr,
-                        from_think,
-                        chip_id: None,
-                    });
+                        source,
+                    ));
                 }
                 if next.is_empty() {
                     break;
@@ -1595,22 +2008,23 @@ Some(tag)
                 break;
             }
         }
-        // cmd parsing follows — merge writes at the very end
-        rest = text;
+        // cmd parsing follows — <cmd> tags quoted inside a <write> file
+        // body are example text, never commands. Merge writes at the end.
+        let cmd_scan = Self::blank_closed_write_blocks(text);
+        rest = &cmd_scan;
         while let Some(start_tag) = rest.find("<cmd>") {
             let r = &rest[start_tag + 5..];
             if let Some(end_tag) = r.find("</cmd>") {
                 let cmd_str = r[..end_tag].trim().to_string();
                 rest = &r[end_tag + 6..];
                 if Self::looks_like_shell_cmd(&cmd_str) {
-                    out.push(ProposedAction {
-                        kind: ProposedKind::Cmd,
-                        target: cmd_str,
-                        body: String::new(),
-                        line_attr: None,
-                        from_think,
-                        chip_id: None,
-                    });
+                    out.push(ProposedAction::new(
+                        ProposedKind::Cmd,
+                        cmd_str,
+                        String::new(),
+                        None,
+                        source,
+                    ));
                 }
             } else {
                 // Unclosed: only if it already looks like a real one-liner command
@@ -1621,14 +2035,13 @@ Some(tag)
                 // Only first line for unclosed stream
                 let cmd_str = cmd_str.lines().next().unwrap_or("").trim().to_string();
                 if Self::looks_like_shell_cmd(&cmd_str) {
-                    out.push(ProposedAction {
-                        kind: ProposedKind::Cmd,
-                        target: cmd_str,
-                        body: String::new(),
-                        line_attr: None,
-                        from_think,
-                        chip_id: None,
-                    });
+                    out.push(ProposedAction::new(
+                        ProposedKind::Cmd,
+                        cmd_str,
+                        String::new(),
+                        None,
+                        source,
+                    ));
                 }
                 break;
             }
@@ -1642,7 +2055,20 @@ Some(tag)
                 let path = Self::normalize_write_path(&action.target, &action.body);
                 Self::execute_write(&path, action.line_attr.as_deref(), &action.body)
             }
- 
+
+            ProposedKind::Read => {
+                let output = Self::execute_read(&action.target, action.line_attr.as_deref());
+                let expanded = Self::expand_path(&action.target);
+                crate::smart_system::get_smart_system().register_read(
+                    crate::smart_system::AgentId::H0,
+                    &expanded,
+                    &output,
+                );
+                output
+            }
+
+            ProposedKind::Ls => Self::execute_ls(&action.target),
+
             ProposedKind::WebSearch => {
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
@@ -1714,25 +2140,24 @@ Some(tag)
                 } else {
                     (None, action.target.as_str())
                 };
-tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(async {
-                            let mcp_mgr_lock = crate::mcp::McpManager::instance().await;
-                            let mut mcp_guard = mcp_mgr_lock.lock().await;
-                            if let Some(ref mut mgr) = *mcp_guard {
-                                mgr.sync_with_settings().await;
-                                match mgr.execute_tool(server_opt, tool_name, &action.body).await {
-                                    Ok(res) => res.to_plain_text(),
-                                    Err(e) => e,
-                                }
-                            } else {
-                                "Error: MCP Manager is not initialized.".to_string()
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let mcp_mgr_lock = crate::mcp::McpManager::instance().await;
+                        let mut mcp_guard = mcp_mgr_lock.lock().await;
+                        if let Some(ref mut mgr) = *mcp_guard {
+                            mgr.sync_with_settings().await;
+                            match mgr.execute_tool(server_opt, tool_name, &action.body).await {
+                                Ok(res) => res.to_plain_text(),
+                                Err(e) => e,
                             }
-                        })
+                        } else {
+                            "Error: MCP Manager is not initialized.".to_string()
+                        }
                     })
+                })
             }
             ProposedKind::Skill | ProposedKind::Agent => String::new(), // handled elsewhere
             ProposedKind::Cmd => {
- 
                 if !Self::looks_like_shell_cmd(&action.target) {
                     return format!(
                         "Error: Rejected non-command text in <cmd>: {}",
@@ -1800,11 +2225,23 @@ tokio::task::block_in_place(|| {
 
     /// Process tool tags in an agent response.
     ///
-    /// - **Inside `<think>`:** only `<help>` is auto-executed.
-    /// - **Outside:** `<read>`, `<ls>`, `<memory>` auto-run.
-    /// - **Write/cmd:** auto-run only if AlwaysAllow / session `/allow`; otherwise
-    ///   returned as [`ProposedAction`] via [`extract_proposed_actions`] (caller must accept).
+    /// Canonical split of responsibilities:
+    /// - `<read>` / `<ls>` are parsed into canonical [`ProposedAction`]s by
+    ///   [`Self::parse_tool_calls`] and executed ONLY through the App-level
+    ///   canonical dispatcher (claim → [`Self::execute_proposed`] → chip →
+    ///   result → context). They NEVER run here.
+    /// - This function handles `<help>` (think-only), `<write>` (AlwaysAllow
+    ///   only, minus already-streamed targets) and `<memory>`.
+    /// - **Cmds never run here** — they go through the app task manager.
     pub fn process_response(response: &str) -> Option<String> {
+        Self::process_response_with(response, &[])
+    }
+
+    /// Same as [`Self::process_response`], but skips `<write>` actions whose
+    /// target already executed during streaming (`skip_write_targets`).
+    /// Without this, AlwaysAllow mode applies every streamed write twice:
+    /// once live from `sync` polling and once here at completion.
+    pub fn process_response_with(response: &str, skip_write_targets: &[String]) -> Option<String> {
         let tag_errors = Self::validate_tool_tags(response);
         if !tag_errors.is_empty() {
             return Some(tag_errors.join("\n"));
@@ -1831,98 +2268,20 @@ tokio::task::block_in_place(|| {
             );
             for action in actions {
                 if action.kind == ProposedKind::Write {
+                    if skip_write_targets.iter().any(|t| t == &action.target) {
+                        continue;
+                    }
                     results.push(Self::execute_proposed(&action));
                 }
             }
         }
 
-        // 2. Read tags — OUTSIDE <think> only (also promote from think if no outside tools)
-        let mut text = cleaned_outside_think.as_str();
-        let mut did_read = false;
-        while let Some(start_tag) = text.find("<read src=") {
-            let rest = &text[start_tag..];
-            if let Some(close_bracket) = rest.find('>') {
-                let tag_header = &rest[..close_bracket + 1];
-                let path_attr = Self::extract_attribute(tag_header, "src");
-                let line_attr = Self::extract_attribute(tag_header, "line");
-                text = &rest[close_bracket + 1..];
-
-                if let Some(path_str) = path_attr {
-                    let output = Self::execute_read(&path_str, line_attr.as_deref());
-                    let expanded = Self::expand_path(&path_str);
-                    crate::smart_system::get_smart_system().register_read(
-                        crate::smart_system::AgentId::H0,
-                        &expanded,
-                        &output,
-                    );
-                    results.push(output);
-                    did_read = true;
-                }
-            } else {
-                break;
-            }
-        }
-        if !did_read {
-            // Promote misplaced <read> from think
-            let mut t = think_body.as_str();
-            while let Some(start_tag) = t.find("<read src=") {
-                let rest = &t[start_tag..];
-                if let Some(close_bracket) = rest.find('>') {
-                    let tag_header = &rest[..close_bracket + 1];
-                    let path_attr = Self::extract_attribute(tag_header, "src");
-                    let line_attr = Self::extract_attribute(tag_header, "line");
-                    t = &rest[close_bracket + 1..];
-                    if let Some(path_str) = path_attr {
-                        let output = Self::execute_read(&path_str, line_attr.as_deref());
-                        let expanded = Self::expand_path(&path_str);
-                        crate::smart_system::get_smart_system().register_read(
-                            crate::smart_system::AgentId::H0,
-                            &expanded,
-                            &output,
-                        );
-                        results.push(output);
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // 3. List dir — outside, else promote from think
-        text = cleaned_outside_think.as_str();
-        let mut did_ls = false;
-        while let Some(start_tag) = text.find("<ls") {
-            let rest = &text[start_tag..];
-            if let Some(close_bracket) = rest.find('>') {
-                let tag_header = &rest[..close_bracket + 1];
-                let path_attr = Self::extract_attribute(tag_header, "path");
-                text = &rest[close_bracket + 1..];
-
-                let path_str = path_attr.unwrap_or_else(|| "$CURRENT".to_string());
-                results.push(Self::execute_ls(&path_str));
-                did_ls = true;
-            } else {
-                break;
-            }
-        }
-        if !did_ls {
-            let mut t = think_body.as_str();
-            while let Some(start_tag) = t.find("<ls") {
-                let rest = &t[start_tag..];
-                if let Some(close_bracket) = rest.find('>') {
-                    let tag_header = &rest[..close_bracket + 1];
-                    let path_attr = Self::extract_attribute(tag_header, "path");
-                    t = &rest[close_bracket + 1..];
-                    let path_str = path_attr.unwrap_or_else(|| "$CURRENT".to_string());
-                    results.push(Self::execute_ls(&path_str));
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // 4. Memory — OUTSIDE <think> only
-        text = cleaned_outside_think.as_str();
+        // 2. <read> / <ls> NEVER run here — canonical dispatcher owns them
+        // (see parse_read_ls_actions + App::claim_tool_call). Kept out so one
+        // model tag cannot execute through two paths.
+        // 3. Memory — OUTSIDE <think> and <write> bodies only
+        let scan_text = Self::blank_closed_write_blocks(&cleaned_outside_think);
+        let mut text = scan_text.as_str();
         while let Some(start_tag) = text.find("<memory") {
             let rest = &text[start_tag..];
             if let Some(close_bracket) = rest.find('>') {
@@ -1952,6 +2311,37 @@ tokio::task::block_in_place(|| {
         } else {
             Some(results.join("\n\n"))
         }
+    }
+
+    /// Remove closed `<write …>…</write>` blocks from scan input so searches
+    /// for OTHER tool tags never match example markup inside a file body
+    /// being written (e.g. an HTML sample containing `<read src=…>` text).
+    /// Only fully closed blocks are removed; a trailing unclosed write keeps
+    /// current semantics (streaming live-detect relies on it).
+    fn blank_closed_write_blocks(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find("<write") {
+            let r = &rest[start..];
+            let Some(hdr_end) = r.find('>') else {
+                break; // partial header — keep remainder as-is
+            };
+            let after_hdr = &r[hdr_end + 1..];
+            let Some(close_start) = after_hdr.find("</write") else {
+                break; // unclosed trailing write — keep remainder as-is
+            };
+            let close_abs = hdr_end + 1 + close_start;
+            let tail = &after_hdr[close_start..];
+            let cut = if let Some(gt) = tail.find('>') {
+                close_abs + gt + 1
+            } else {
+                r.len()
+            };
+            out.push_str(&rest[..start]);
+            rest = &r[cut.min(r.len())..];
+        }
+        out.push_str(rest);
+        out
     }
 
     /// Strip markdown code fences so tool tags inside examples are not executed.
@@ -2016,11 +2406,10 @@ tokio::task::block_in_place(|| {
         .to_string()
     }
 
-    
     fn compute_diff(old: &str, new: &str) -> String {
         let old_lines: Vec<&str> = old.lines().collect();
         let new_lines: Vec<&str> = new.lines().collect();
-        
+
         if old_lines.is_empty() {
             let mut out = Vec::new();
             for (idx, line) in new_lines.iter().enumerate() {
@@ -2036,33 +2425,33 @@ tokio::task::block_in_place(|| {
             }
             return out.join("\n");
         }
-        
+
         let n = old_lines.len();
         let m = new_lines.len();
         let mut dp = vec![vec![0; m + 1]; n + 1];
         for i in 1..=n {
             for j in 1..=m {
-                if old_lines[i-1] == new_lines[j-1] {
-                    dp[i][j] = dp[i-1][j-1] + 1;
+                if old_lines[i - 1] == new_lines[j - 1] {
+                    dp[i][j] = dp[i - 1][j - 1] + 1;
                 } else {
-                    dp[i][j] = dp[i-1][j].max(dp[i][j-1]);
+                    dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
                 }
             }
         }
-        
+
         let mut i = n;
         let mut j = m;
         let mut diff = Vec::new();
         while i > 0 || j > 0 {
-            if i > 0 && j > 0 && old_lines[i-1] == new_lines[j-1] {
-                diff.push(format!("  {:4} | {}", j, new_lines[j-1]));
+            if i > 0 && j > 0 && old_lines[i - 1] == new_lines[j - 1] {
+                diff.push(format!("  {:4} | {}", j, new_lines[j - 1]));
                 i -= 1;
                 j -= 1;
-            } else if j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]) {
-                diff.push(format!("+ {:4} | {}", j, new_lines[j-1]));
+            } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+                diff.push(format!("+ {:4} | {}", j, new_lines[j - 1]));
                 j -= 1;
-            } else if i > 0 && (j == 0 || dp[i][j-1] < dp[i-1][j]) {
-                diff.push(format!("- {:4} | {}", i, old_lines[i-1]));
+            } else if i > 0 && (j == 0 || dp[i][j - 1] < dp[i - 1][j]) {
+                diff.push(format!("- {:4} | {}", i, old_lines[i - 1]));
                 i -= 1;
             }
         }
@@ -2398,14 +2787,216 @@ mod tests {
     }
 
     #[test]
-    fn test_ls_promoted_from_think_when_no_outside() {
-        // Misplaced <ls> inside think is promoted (small models put tools in think).
-        let sample = "<think>Let me list <ls path=\".\"></think>";
-        assert!(AgentEngine::process_response(sample).is_some());
+    fn test_think_tools_never_execute() {
+        // Tools inside <think> are reasoning text, NEVER executable actions.
+        // They must not even parse into canonical calls...
+        for sample in [
+            "<think>Let me list <ls path=\".\"></think>",
+            "<think>Reading <read src=\"Cargo.toml\"></think>",
+            "<think>Running <cmd>ls</cmd></think>",
+        ] {
+            assert!(
+                AgentEngine::parse_tool_calls(sample, ToolCallSource::ModelCompletion).is_empty()
+            );
+            assert!(AgentEngine::process_response(sample).is_none());
+        }
 
-        // ls outside think runs
-        let sample2 = "<ls path=\".\">";
-        assert!(AgentEngine::process_response(sample2).is_some());
+        // ...while the same tags outside think parse to exactly one call and
+        // execute through the canonical executor.
+        let read_calls = AgentEngine::parse_tool_calls(
+            "<read src=\"Cargo.toml\">",
+            ToolCallSource::ModelCompletion,
+        );
+        assert_eq!(read_calls.len(), 1);
+        assert_eq!(read_calls[0].kind, ProposedKind::Read);
+        assert!(AgentEngine::execute_proposed(&read_calls[0]).contains("version"));
+
+        let ls_calls =
+            AgentEngine::parse_tool_calls("<ls path=\".\">", ToolCallSource::ModelCompletion);
+        assert_eq!(ls_calls.len(), 1);
+        assert!(AgentEngine::execute_proposed(&ls_calls[0]).contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn test_write_body_tags_are_not_actions() {
+        // Tags quoted inside a <write> file body are content, never actions.
+        let sample = "<write src=\"$CURRENT/probe.html\">\n<html>\n<read src=\"$CURRENT/other\">\n<cmd>rm -rf /tmp/probe</cmd>\n<mcp server=\"s\" tool=\"t\">{}</mcp>\n<websearch>docs</websearch>\n</write>";
+        let actions = AgentEngine::extract_proposed_actions(sample);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ProposedKind::Write);
+        // process_response must not execute the quoted read either
+        // (outer write is inert under default Ask permissions).
+        assert!(AgentEngine::process_response(sample).is_none());
+    }
+
+    #[test]
+    fn test_response_has_tool_tags_ignores_thinking() {
+        assert!(!AgentEngine::response_has_tool_tags(
+            "<think><cmd>ls</cmd></think>"
+        ));
+        // Unclosed think (still streaming): everything after is thinking.
+        assert!(!AgentEngine::response_has_tool_tags(
+            "hmm <think><cmd>ls</cmd>"
+        ));
+        assert!(AgentEngine::response_has_tool_tags(
+            "<think>hmm</think><cmd>ls</cmd>"
+        ));
+        assert!(matches!(
+            AgentEngine::classify_output("<think><cmd>ls</cmd></think>"),
+            ModelOutput::Text
+        ));
+    }
+
+    // ── Canonical ToolCall lifecycle tests ──────────────────────────────
+    use ToolCallSource::*;
+
+    #[test]
+    fn test_lifecycle_think_tools_yield_no_calls() {
+        for sample in [
+            "<think>I should use read</think>",
+            "<think><cmd>ls</cmd></think>",
+            "<think><websearch>foo</websearch></think>",
+            "<think><read src=\"a\"><write src=\"b\">x</write></think>",
+        ] {
+            assert!(
+                AgentEngine::parse_tool_calls(sample, ModelCompletion).is_empty(),
+                "think must never become ToolCall: {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_prose_yields_no_calls() {
+        for sample in [
+            "I should use read.",
+            "I will search the web.",
+            "Action: SEARCH.",
+            "Tool: read.",
+            "I ran cargo check and it passed.",
+        ] {
+            assert!(
+                AgentEngine::parse_tool_calls(sample, ModelCompletion).is_empty(),
+                "prose must never become ToolCall: {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_real_tags_yield_one_call_each() {
+        let cases = [
+            ("<read src=\"$CURRENT/Cargo.toml\">", ProposedKind::Read),
+            ("<ls path=\"$CURRENT\">", ProposedKind::Ls),
+            ("<cmd>cargo check</cmd>", ProposedKind::Cmd),
+            (
+                "<write src=\"$CURRENT/f.txt\">\nhello\n</write>",
+                ProposedKind::Write,
+            ),
+            (
+                "<websearch query=\"rust borrow checker\">",
+                ProposedKind::WebSearch,
+            ),
+            (
+                "<mcp server=\"s\" tool=\"t\">{\"a\": 1}</mcp>",
+                ProposedKind::Mcp,
+            ),
+            ("<skill action=\"search\">q</skill>", ProposedKind::Skill),
+        ];
+        for (sample, kind) in cases {
+            let calls = AgentEngine::parse_tool_calls(sample, ModelCompletion);
+            assert_eq!(calls.len(), 1, "wrong call count: {sample}");
+            assert_eq!(calls[0].kind, kind, "wrong kind: {sample}");
+        }
+        // And classification agrees each is a ToolCall.
+        assert!(matches!(
+            AgentEngine::classify_output("<read src=\"$CURRENT/Cargo.toml\">"),
+            ModelOutput::ToolCall
+        ));
+    }
+
+    #[test]
+    fn test_lifecycle_multiple_calls_count() {
+        let sample = "<cmd>cargo check</cmd>\n<websearch query=\"x\">";
+        let calls = AgentEngine::parse_tool_calls(sample, ModelCompletion);
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0].call_id, calls[1].call_id);
+    }
+
+    #[test]
+    fn test_lifecycle_incomplete_stream_is_preview_only() {
+        // Incomplete tool: preview view exists but is NOT closed → the
+        // dispatcher must never see it as executable.
+        let views = crate::tool_panel::detect_all_stream_tools("<cmd>cargo check");
+        assert!(!views.iter().any(|v| v.tag_closed));
+        let views_closed = crate::tool_panel::detect_all_stream_tools("<cmd>cargo check</cmd>");
+        assert!(views_closed.iter().any(|v| v.tag_closed));
+    }
+
+    #[test]
+    fn test_lifecycle_completed_call_executes_exactly_once() {
+        let calls = AgentEngine::parse_tool_calls("<cmd>cargo check</cmd>", ModelStream);
+        assert_eq!(calls.len(), 1);
+        let mut reg = ToolDispatchRegistry::new();
+        assert!(reg.try_claim(&calls[0])); // streaming dispatch
+        assert!(!reg.try_claim(&calls[0])); // completion re-dispatch refused
+        // Re-parse (as completion does on the full text) → same fingerprint.
+        let again = AgentEngine::parse_tool_calls("<cmd>cargo check</cmd>", ModelCompletion);
+        assert_eq!(again.len(), 1);
+        assert!(!reg.try_claim(&again[0]));
+    }
+
+    #[test]
+    fn test_lifecycle_recovery_is_host_recovery_call() {
+        let tag = AgentEngine::recover_tools_from_refusal(
+            "please read Cargo.toml",
+            "I cannot read files.",
+        );
+        let tag = tag.expect("read request must recover");
+        let calls = AgentEngine::parse_tool_calls(&tag, HostRecovery);
+        assert!(!calls.is_empty());
+        assert!(calls.iter().all(|c| c.source == HostRecovery));
+    }
+
+    #[test]
+    fn test_lifecycle_result_binds_to_call_and_context() {
+        let calls = AgentEngine::parse_tool_calls("<cmd>cargo check</cmd>", ModelCompletion);
+        let res = ToolResult::new(&calls[0], "ok".to_string());
+        assert_eq!(res.call_id, calls[0].call_id);
+        assert_eq!(res.fingerprint, calls[0].fingerprint());
+        let entry = res.context_entry("RUN");
+        assert!(entry.contains(&calls[0].call_id.to_string()));
+        assert!(entry.contains("ok"));
+    }
+
+    #[test]
+    fn test_lifecycle_no_duplicate_execution_paths() {
+        // Same write seen by streaming + completion: registry suppresses 2nd.
+        let stream_calls = AgentEngine::parse_tool_calls(
+            "<write src=\"$CURRENT/d.txt\">\nhi\n</write>",
+            ModelStream,
+        );
+        let mut reg = ToolDispatchRegistry::new();
+        assert!(reg.try_claim(&stream_calls[0]));
+        let completion_calls = AgentEngine::parse_tool_calls(
+            "<write src=\"$CURRENT/d.txt\">\nhi\n</write>",
+            ModelCompletion,
+        );
+        assert!(!reg.try_claim(&completion_calls[0]));
+        // And the target skip-list also suppresses re-execution.
+        let out = AgentEngine::process_response_with(
+            "<write src=\"$CURRENT/d.txt\">\nhi\n</write>",
+            &["$CURRENT/d.txt".to_string()],
+        );
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_lifecycle_call_ids_unique_no_backend_ids() {
+        // Backends return plain text (no tool_call_id); the parser mints
+        // unique ids while fingerprints stay stable across re-parses.
+        let a = AgentEngine::parse_tool_calls("<cmd>cargo check</cmd>", ModelStream);
+        let b = AgentEngine::parse_tool_calls("<cmd>cargo check</cmd>", ModelCompletion);
+        assert_ne!(a[0].call_id, b[0].call_id);
+        assert_eq!(a[0].fingerprint(), b[0].fingerprint());
     }
 
     #[test]
@@ -2503,5 +3094,116 @@ mod tests {
         // Must not recover ls for create/plan
         assert!(AgentEngine::recover_tools_from_refusal(plan, "sure").is_none());
         assert!(AgentEngine::recover_tools_from_refusal(go, "ok").is_none());
+    }
+
+    #[test]
+    fn test_streaming_parser_blocks_tools_in_thinking() {
+        use crate::agent::StreamingParser;
+
+        // Tools outside thinking should be extracted immediately
+        let mut parser = StreamingParser::new();
+        let actions = parser.feed(r#"<write src="$CURRENT/test.txt">hello</write>"#);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ProposedKind::Write);
+        let actions = parser.flush();
+        assert_eq!(actions.len(), 0);
+
+        // Tool inside thinking should be blocked
+        let mut parser = StreamingParser::new();
+        let actions =
+            parser.feed(r#"<think> <write src="$CURRENT/test.txt">hello</write> </think>"#);
+        assert_eq!(actions.len(), 0);
+
+        // Tool after thinking should work
+        let mut parser = StreamingParser::new();
+        let actions = parser
+            .feed(r#"<think> thinking </think> <write src="$CURRENT/test.txt">hello</write>"#);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ProposedKind::Write);
+
+        // Streaming chunks: thinking starts in one chunk, ends in another
+        let mut parser = StreamingParser::new();
+        let actions1 = parser.feed(r#"<think> <write src="$CURRENT/inside.txt">"#);
+        assert_eq!(actions1.len(), 0);
+
+        let actions2 =
+            parser.feed(r#"blocked</write> </think> <write src="$CURRENT/outside.txt">ok</write>"#);
+        assert_eq!(actions2.len(), 1);
+        assert_eq!(actions2[0].kind, ProposedKind::Write);
+        assert_eq!(actions2[0].target, "$CURRENT/outside.txt");
+
+        let actions3 = parser.flush();
+        assert_eq!(actions3.len(), 0);
+    }
+
+    #[test]
+    fn test_streaming_parser_nested_thinking() {
+        use crate::agent::StreamingParser;
+
+        // Nested query in thinking should be treated as content, not as exit
+        let mut parser = StreamingParser::new();
+        let actions = parser.feed(r#"<think> outer <think> nested query <write src="$CURRENT/test.txt">hello</write> </think>"#);
+        assert_eq!(actions.len(), 0);
+
+        // Proper exit
+        let mut parser = StreamingParser::new();
+        let actions = parser
+            .feed(r#"<think> thinking </think> <write src="$CURRENT/test.txt">hello</write>"#);
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn test_streaming_parser_in_thinking_state() {
+        use crate::agent::StreamingParser;
+
+        let mut parser = StreamingParser::new();
+        assert!(!parser.in_thinking());
+
+        parser.feed("<think>");
+        assert!(parser.in_thinking());
+
+        parser.feed("</think>");
+        assert!(!parser.in_thinking());
+    }
+
+    #[test]
+    fn test_classify_output_ask_mode_wins_over_tools() {
+        use crate::agent::{ModelOutput, ProposedKind};
+
+        // Plain question text → Text.
+        assert!(matches!(
+            AgentEngine::classify_output("What is 2 + 2?"),
+            ModelOutput::Text
+        ));
+
+        // Tool tags outside think → ToolCall.
+        assert!(matches!(
+            AgentEngine::classify_output(r#"<read src="$CURRENT/Cargo.toml">"#),
+            ModelOutput::ToolCall
+        ));
+
+        // Tool-like text inside think only → Text (never executable).
+        assert!(matches!(
+            AgentEngine::classify_output("<think>Maybe <cmd>ls</cmd>?</think>"),
+            ModelOutput::Text
+        ));
+
+        // Ask Mode wins even when tool-like text is also present.
+        let ask = "<askmode ques=\"Which database?\"><radio>SQLite</radio><radio>Postgres</radio></askmode>";
+        let mixed = format!("{ask}\n<read src=\"$CURRENT/Cargo.toml\">");
+        match AgentEngine::classify_output(&mixed) {
+            ModelOutput::AskMode(mode) => {
+                assert_eq!(mode.question, "Which database?");
+                assert_eq!(mode.radio_count(), 2);
+            }
+            _ => panic!("Ask Mode must classify before tool execution"),
+        }
+
+        // extract_proposed_actions agrees: think-only tools yield nothing.
+        let actions = AgentEngine::extract_proposed_actions("<think><cmd>rm -rf /</cmd></think>");
+        assert!(actions.is_empty());
+        let actions = AgentEngine::extract_proposed_actions("<think>hmm</think><cmd>ls</cmd>");
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0].kind, ProposedKind::Cmd));
     }
 }
