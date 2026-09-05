@@ -214,7 +214,9 @@ impl McpToolConfig {
     pub fn sanitize_name(input: &str) -> String {
         input
             .chars()
-            .filter(|c| !c.is_whitespace() && *c != '<' && *c != '>' && *c != '"' && *c != '\'' && *c != '&')
+            .filter(|c| {
+                !c.is_whitespace() && *c != '<' && *c != '>' && *c != '"' && *c != '\'' && *c != '&'
+            })
             .collect()
     }
 
@@ -275,6 +277,13 @@ pub struct RuntimeSettings {
     /// HuggingFace API token for authenticated searches & downloads.
     #[serde(default)]
     pub hf_token: Option<String>,
+    /// Python executable for the Transformers worker (Phase 4).
+    /// None = auto (`HERCULES_TRANSFORMERS_PYTHON` or `python3`).
+    #[serde(default)]
+    pub transformers_python: Option<String>,
+    /// Device preference for the Transformers worker: auto|cpu|cuda|mps.
+    #[serde(default = "default_transformers_device")]
+    pub transformers_device: String,
     /// Google Custom Search API Key
     #[serde(default)]
     pub google_api_key: Option<String>,
@@ -328,26 +337,63 @@ pub struct RuntimeSettings {
     pub lsp_show_info: bool,
 }
 
-fn default_target_fps() -> u32 { 60 }
-fn default_media_storage_location() -> MediaStorageLocation { MediaStorageLocation::Local }
-fn default_media_storage_delete_on_clear() -> MediaStorageDeleteOnClear { MediaStorageDeleteOnClear::AlwaysDelete }
-fn default_power_mode() -> PowerMode { PowerMode::Normal }
-fn default_mtp_mode() -> MtpMode { MtpMode::PromptLookup3 }
-fn default_web_search_provider() -> WebSearchProvider { WebSearchProvider::DuckDuckGo }
-fn default_max_subagents() -> usize { 4 }
-fn default_max_subagent_depth() -> usize { 3 }
-fn default_stall_timeout_secs() -> u64 { 300 }
-fn default_repeat_threshold() -> usize { 10 }
-fn default_true() -> bool { true }
-fn default_false() -> bool { false }
-fn default_compact_ratio() -> f32 { CONTEXT_COMPACT_RATIO }
-fn default_temperature() -> f32 { DEFAULT_TEMPERATURE }
-fn default_none() -> String { "none".to_string() }
-fn default_auto() -> String { "auto".to_string() }
+fn default_target_fps() -> u32 {
+    60
+}
+fn default_media_storage_location() -> MediaStorageLocation {
+    MediaStorageLocation::Local
+}
+fn default_media_storage_delete_on_clear() -> MediaStorageDeleteOnClear {
+    MediaStorageDeleteOnClear::AlwaysDelete
+}
+fn default_power_mode() -> PowerMode {
+    PowerMode::Normal
+}
+fn default_mtp_mode() -> MtpMode {
+    MtpMode::PromptLookup3
+}
+fn default_web_search_provider() -> WebSearchProvider {
+    WebSearchProvider::DuckDuckGo
+}
+fn default_max_subagents() -> usize {
+    4
+}
+fn default_max_subagent_depth() -> usize {
+    3
+}
+fn default_stall_timeout_secs() -> u64 {
+    300
+}
+fn default_repeat_threshold() -> usize {
+    10
+}
+fn default_true() -> bool {
+    true
+}
+fn default_false() -> bool {
+    false
+}
+fn default_compact_ratio() -> f32 {
+    CONTEXT_COMPACT_RATIO
+}
+fn default_temperature() -> f32 {
+    DEFAULT_TEMPERATURE
+}
+fn default_none() -> String {
+    "none".to_string()
+}
+fn default_auto() -> String {
+    "auto".to_string()
+}
+fn default_transformers_device() -> String {
+    "auto".to_string()
+}
 
 impl Default for RuntimeSettings {
     fn default() -> Self {
-        let env_tok = std::env::var("HF_TOKEN").ok().filter(|s| !s.trim().is_empty());
+        let env_tok = std::env::var("HF_TOKEN")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         Self {
             power_mode: PowerMode::Normal,
             mtp_mode: MtpMode::PromptLookup3,
@@ -366,6 +412,10 @@ impl Default for RuntimeSettings {
             image_gen_model: "none".to_string(),
             video_gen_model: "none".to_string(),
             hf_token: env_tok,
+            transformers_python: std::env::var("HERCULES_TRANSFORMERS_PYTHON")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            transformers_device: default_transformers_device(),
             google_api_key: None,
             google_cx: None,
             brave_api_key: None,
@@ -457,7 +507,12 @@ pub fn set_code_graph_bounce_response_write(val: bool) {
     }
 }
 
-pub fn add_mcp_tool(name: String, command_path: String, args: Vec<String>, env_vars: HashMap<String, String>) {
+pub fn add_mcp_tool(
+    name: String,
+    command_path: String,
+    args: Vec<String>,
+    env_vars: HashMap<String, String>,
+) {
     let clean_name = McpToolConfig::sanitize_name(&name);
     let clean_path = McpToolConfig::sanitize_path(&command_path);
     if clean_name.is_empty() || clean_path.is_empty() {
@@ -744,6 +799,20 @@ pub fn get_hf_token() -> Option<String> {
     get_settings().hf_token
 }
 
+/// Python executable + device preference for the Transformers worker.
+pub fn get_transformers_python() -> Option<String> {
+    get_settings().transformers_python
+}
+
+pub fn get_transformers_device() -> String {
+    let d = get_settings().transformers_device;
+    if d.trim().is_empty() {
+        "auto".to_string()
+    } else {
+        d
+    }
+}
+
 pub fn set_hf_token(tok: String) {
     if let Ok(mut g) = SETTINGS.lock() {
         let s = g.get_or_insert_with(RuntimeSettings::default);
@@ -780,7 +849,11 @@ pub fn set_search_token(provider: WebSearchProvider, tok: String) {
     if let Ok(mut g) = SETTINGS.lock() {
         let s = g.get_or_insert_with(RuntimeSettings::default);
         let trimmed = tok.trim().to_string();
-        let val = if trimmed.is_empty() { None } else { Some(trimmed) };
+        let val = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
         match provider {
             WebSearchProvider::Google => s.google_api_key = val,
             WebSearchProvider::Brave => s.brave_api_key = val,
@@ -848,7 +921,11 @@ pub fn available_vit_models() -> Vec<String> {
             for entry in entries.flatten() {
                 let p = entry.path();
                 if p.is_file() {
-                    let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    let name = p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
                     let low = name.to_lowercase();
                     if (low.contains("mmproj") || low.contains("vit") || low.contains("clip"))
                         && low.ends_with(".gguf")
@@ -888,7 +965,10 @@ pub fn get_selected_vit_model() -> String {
 pub fn nudge_vit_model(dir: i32) -> String {
     let avail = available_vit_models();
     let current = get_selected_vit_model();
-    let idx = avail.iter().position(|m| m.eq_ignore_ascii_case(&current)).unwrap_or(0);
+    let idx = avail
+        .iter()
+        .position(|m| m.eq_ignore_ascii_case(&current))
+        .unwrap_or(0);
     let next_idx = if dir > 0 {
         (idx + 1) % avail.len()
     } else if idx == 0 {
@@ -984,7 +1064,11 @@ fn detect_ollama_vision_models() -> Vec<String> {
             for line in stdout.lines().skip(1) {
                 let name = line.split_whitespace().next().unwrap_or("");
                 let lower = name.to_lowercase();
-                if lower.contains("llava") || lower.contains("vision") || lower.contains("qwen2-vl") || lower.contains("bakllava") {
+                if lower.contains("llava")
+                    || lower.contains("vision")
+                    || lower.contains("qwen2-vl")
+                    || lower.contains("bakllava")
+                {
                     models.push(name.to_string());
                 }
             }
@@ -994,7 +1078,11 @@ fn detect_ollama_vision_models() -> Vec<String> {
 }
 
 pub fn get_available_ocr_engines() -> Vec<String> {
-    let mut engines = vec!["none".to_string(), "auto".to_string(), "integrated".to_string()];
+    let mut engines = vec![
+        "none".to_string(),
+        "auto".to_string(),
+        "integrated".to_string(),
+    ];
     if is_command_available("tesseract") {
         engines.push("tesseract".to_string());
     }
@@ -1007,7 +1095,11 @@ pub fn get_available_ocr_engines() -> Vec<String> {
 }
 
 pub fn get_available_image_gen_engines() -> Vec<String> {
-    let mut engines = vec!["none".to_string(), "auto".to_string(), "integrated".to_string()];
+    let mut engines = vec![
+        "none".to_string(),
+        "auto".to_string(),
+        "integrated".to_string(),
+    ];
     if is_command_available("python3") {
         engines.push("python-pil".to_string());
     }
@@ -1015,7 +1107,11 @@ pub fn get_available_image_gen_engines() -> Vec<String> {
 }
 
 pub fn get_available_video_gen_engines() -> Vec<String> {
-    let mut engines = vec!["none".to_string(), "auto".to_string(), "integrated".to_string()];
+    let mut engines = vec![
+        "none".to_string(),
+        "auto".to_string(),
+        "integrated".to_string(),
+    ];
     if is_command_available("ffmpeg") || is_command_available("python3") {
         engines.push("ffmpeg".to_string());
     }
@@ -1433,7 +1529,7 @@ pub fn detect_project_languages() -> Vec<crate::code_graph::GraphLanguage> {
     use std::collections::HashSet;
     let mut languages = HashSet::new();
     let project_root = std::env::current_dir().unwrap_or_default();
-    
+
     fn scan_dir(dir: &std::path::Path, languages: &mut HashSet<crate::code_graph::GraphLanguage>) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -1441,7 +1537,10 @@ pub fn detect_project_languages() -> Vec<crate::code_graph::GraphLanguage> {
                 if path.is_dir() {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     // Skip common directories that shouldn't be scanned
-                    if !matches!(name, "target" | "node_modules" | ".git" | "dist" | "build" | ".cargo" | "vendor") {
+                    if !matches!(
+                        name,
+                        "target" | "node_modules" | ".git" | "dist" | "build" | ".cargo" | "vendor"
+                    ) {
                         scan_dir(&path, languages);
                     }
                 } else if path.is_file() {
@@ -1454,12 +1553,12 @@ pub fn detect_project_languages() -> Vec<crate::code_graph::GraphLanguage> {
             }
         }
     }
-    
+
     scan_dir(&project_root, &mut languages);
-    
+
     // Always include Rust as default fallback
     languages.insert(crate::code_graph::GraphLanguage::Rust);
-    
+
     let mut result: Vec<_> = languages.into_iter().collect();
     // Sort by preferred order: Rust, Python, JavaScript, TypeScript
     result.sort_by_key(|l| match l {

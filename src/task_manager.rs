@@ -635,7 +635,10 @@ fn spawn_shell(cmd: &str) -> std::io::Result<Child> {
     c.spawn()
 }
 
-fn kill_child_tree(child: &mut Child) {
+/// Terminate a child + its process group (setsid'd at spawn): SIGTERM to
+/// group and pid, brief grace, SIGKILL to group and pid, then reap.
+/// Shared by shell tasks and the Transformers worker — one kill path.
+pub(crate) fn kill_child_tree(child: &mut Child) {
     let pid = child.id();
     #[cfg(unix)]
     {

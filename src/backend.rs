@@ -1,14 +1,12 @@
-use ollama_rs::{
-    generation::completion::request::GenerationRequest,
-    generation::images::Image,
-    Ollama,
-};
-#[cfg(feature = "gpu")]
-use burn::backend::wgpu::WgpuDevice;
 #[cfg(feature = "gpu")]
 use burn::backend::Wgpu;
 #[cfg(feature = "gpu")]
+use burn::backend::wgpu::WgpuDevice;
+#[cfg(feature = "gpu")]
 use burn::tensor::Tensor;
+use ollama_rs::{
+    Ollama, generation::completion::request::GenerationRequest, generation::images::Image,
+};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +19,8 @@ pub enum AgentBackend {
     /// In-process static libllama engine (C FFI / static — no subprocess).
     LlamaCppLib(LlamaCppLibBackend),
     Ollama(OllamaBackend),
+    /// Isolated Python Transformers worker (SafeTensors/PyTorch).
+    Transformers(crate::model::transformers::TransformersBackend),
 }
 
 impl AgentBackend {
@@ -30,6 +30,7 @@ impl AgentBackend {
             Self::BurnWgpu(backend) => backend.generate(prompt).await,
             Self::LlamaCppLib(backend) => backend.generate(prompt).await,
             Self::Ollama(backend) => backend.generate(prompt).await,
+            Self::Transformers(backend) => backend.generate(prompt).await,
         }
     }
 
@@ -51,6 +52,11 @@ impl AgentBackend {
                     .generate_stream(prompt, Vec::new(), stream_target, is_generating)
                     .await
             }
+            Self::Transformers(backend) => {
+                backend
+                    .generate_stream(prompt, stream_target, is_generating)
+                    .await
+            }
             #[cfg(feature = "gpu")]
             Self::BurnWgpu(backend) => {
                 let result = backend.generate(prompt).await?;
@@ -65,6 +71,7 @@ impl AgentBackend {
     pub fn current_model_path(&self) -> Option<PathBuf> {
         match self {
             Self::LlamaCppLib(b) => b.runtime.model_path.clone(),
+            Self::Transformers(b) => Some(b.model_dir.clone()),
             _ => None,
         }
     }
@@ -75,6 +82,7 @@ impl AgentBackend {
             Self::BurnWgpu(b) => format!("Burn/WGPU ({})", b.model_name),
             Self::LlamaCppLib(b) => b.name(),
             Self::Ollama(b) => format!("Ollama ({})", b.model),
+            Self::Transformers(b) => b.name(),
         }
     }
 
@@ -95,15 +103,35 @@ impl AgentBackend {
                         || e.filename.eq_ignore_ascii_case(trimmed)
                         || e.path.ends_with(trimmed)
                 }) {
-                    Self::LlamaCppLib(LlamaCppLibBackend::gguf_with_name(std::path::PathBuf::from(&entry.path), trimmed))
+                    Self::LlamaCppLib(LlamaCppLibBackend::gguf_with_name(
+                        std::path::PathBuf::from(&entry.path),
+                        trimmed,
+                    ))
                 } else if std::path::Path::new(trimmed).exists() {
-                    Self::LlamaCppLib(LlamaCppLibBackend::gguf_with_name(std::path::PathBuf::from(trimmed), trimmed))
+                    Self::LlamaCppLib(LlamaCppLibBackend::gguf_with_name(
+                        std::path::PathBuf::from(trimmed),
+                        trimmed,
+                    ))
                 } else {
-                    Self::LlamaCppLib(LlamaCppLibBackend::http("http://localhost:8080".into(), trimmed.into()))
+                    Self::LlamaCppLib(LlamaCppLibBackend::http(
+                        "http://localhost:8080".into(),
+                        trimmed.into(),
+                    ))
                 }
             }
             #[cfg(feature = "gpu")]
             Self::BurnWgpu(_) => self.clone(),
+            Self::Transformers(_) => {
+                // Local model directory only in Phase 4 (no downloading here).
+                let dir = std::path::PathBuf::from(trimmed);
+                if dir.is_dir() {
+                    Self::Transformers(crate::model::transformers::TransformersBackend::new(dir))
+                } else {
+                    // Not a local dir: keep current backend instead of
+                    // inventing a model that does not exist.
+                    self.clone()
+                }
+            }
         }
     }
 }

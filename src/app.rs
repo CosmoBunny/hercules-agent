@@ -123,11 +123,7 @@ pub fn render_toggle<'a>(label: &'a str, enabled: bool, focused: bool) -> Line<'
         ),
         Span::styled(label, Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
         Span::styled(" ", Style::default().bg(NORDIC_BG)),
-        Span::styled(
-            "[",
-            Style::default().fg(TOGGLE_CONTAINER_GRAY).bg(NORDIC_BG),
-        ),
-        // I cell
+        // I cell (no brackets)
         Span::styled(
             " I ",
             Style::default()
@@ -145,7 +141,7 @@ pub fn render_toggle<'a>(label: &'a str, enabled: bool, focused: bool) -> Line<'
         ),
         // separator
         Span::styled(
-            " | ",
+            "|",
             Style::default()
                 .fg(TOGGLE_INACTIVE_FG)
                 .bg(TOGGLE_CONTAINER_GRAY),
@@ -165,10 +161,6 @@ pub fn render_toggle<'a>(label: &'a str, enabled: bool, focused: bool) -> Line<'
                     TOGGLE_CONTAINER_GRAY
                 })
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "]",
-            Style::default().fg(TOGGLE_CONTAINER_GRAY).bg(NORDIC_BG),
         ),
     ])
 }
@@ -939,6 +931,12 @@ impl App {
                 .map(|m| m.trim_start_matches("Ollama:").trim().to_string())
                 .collect(),
             AgentBackend::LlamaCppLib(_) => self
+                .installed_models
+                .iter()
+                .filter(|m| !m.starts_with("Ollama:"))
+                .cloned()
+                .collect(),
+            AgentBackend::Transformers(_) => self
                 .installed_models
                 .iter()
                 .filter(|m| !m.starts_with("Ollama:"))
@@ -3142,6 +3140,31 @@ impl App {
                                 Some("[Generation Cancelled by User]".to_string());
                         }
                         r = backend_clone.generate_stream(&context_prompt, vec![], stream_target, is_gen_task) => {
+                            match r {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    *gen_err.lock().unwrap() = Some(e);
+                                }
+                            }
+                        }
+                    }
+                    *is_gen.lock().unwrap() = false;
+                });
+            }
+            AgentBackend::Transformers(tf_backend) => {
+                // Run token goes INTO the runtime (cooperative cancel +
+                // group kill); the outer select! is the final backstop.
+                let cancel_child = child_token.clone();
+                let mut backend_clone = tf_backend.clone();
+                backend_clone.set_run_token(cancel_child.clone());
+                let is_gen_task = is_gen.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = cancel_child.cancelled() => {
+                            *gen_err.lock().unwrap() =
+                                Some("[Generation Cancelled by User]".to_string());
+                        }
+                        r = backend_clone.generate_stream(&context_prompt, stream_target, is_gen_task) => {
                             match r {
                                 Ok(_) => {}
                                 Err(e) => {
@@ -13158,6 +13181,9 @@ impl App {
                                         AgentBackend::Ollama(_) => "Ollama repository",
                                         AgentBackend::LlamaCppLib(_) => {
                                             "llama.cpp / local GGUF repository"
+                                        }
+                                        AgentBackend::Transformers(_) => {
+                                            "Transformers / local SafeTensors repository"
                                         }
                                         #[cfg(feature = "gpu")]
                                         AgentBackend::BurnWgpu(_) => "WGPU repository",

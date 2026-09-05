@@ -22,6 +22,7 @@ pub mod manager;
 pub mod markdown;
 pub mod mcp;
 pub mod media;
+pub mod model;
 pub mod ocr;
 pub mod run_timeline;
 pub mod session;
