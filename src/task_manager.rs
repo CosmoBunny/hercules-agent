@@ -616,8 +616,9 @@ fn combine_out(out_buf: &Arc<Mutex<String>>, err_buf: &Arc<Mutex<String>>) -> St
 }
 
 fn spawn_shell(cmd: &str) -> std::io::Result<Child> {
-    let mut c = Command::new("sh");
-    c.arg("-c")
+    // Native Windows has no `sh`: use the platform shell.
+    let mut c = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
+    c.arg(if cfg!(windows) { "/C" } else { "-c" })
         .arg(cmd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -25,6 +25,9 @@ pub enum BackendKind {
     /// Any OpenAI-compatible HTTP server: vLLM, llama.cpp server,
     /// Ollama, LM Studio (Phase 6).
     OpenAiCompatible,
+    /// Shared Thunder P2P inference: a paired peer's model over the
+    /// encrypted Thunder protocol (Phase 5/T8).
+    SharedThunder,
 }
 
 impl BackendKind {
@@ -36,6 +39,7 @@ impl BackendKind {
             Self::Transformers => "Transformers",
             Self::Mlx => "MLX",
             Self::OpenAiCompatible => "OpenAI-compatible",
+            Self::SharedThunder => "Shared Thunder",
         }
     }
 }
@@ -192,6 +196,24 @@ impl BackendCapabilities {
             requires_local_artifact: false,
         }
     }
+    /// Shared Thunder: the remote peer runs its own models, so no local
+    /// artifact decides compatibility — pairing + remote advertisement
+    /// do. Host gate is decided by Thunder pairing state.
+    pub fn shared_thunder() -> Self {
+        Self {
+            kind: BackendKind::SharedThunder,
+            formats: Vec::new(),
+            layouts: Vec::new(),
+            architectures: Vec::new(),
+            streaming: true,
+            cancellation: true,
+            tool_calling: false,
+            vision: false,
+            quantization: true,
+            available_on_this_host: true,
+            requires_local_artifact: false,
+        }
+    }
 }
 
 /// A backend provider: answers identity, availability, capabilities and
@@ -271,4 +293,10 @@ static_provider_caps!(
     "OpenAI-compatible",
     OpenAiCompatible,
     openai_compatible
+);
+static_provider_caps!(
+    SharedThunderProvider,
+    "Shared Thunder",
+    SharedThunder,
+    shared_thunder
 );

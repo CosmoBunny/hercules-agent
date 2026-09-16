@@ -8,7 +8,7 @@
 
 use hercules_agent::llama::gguf::GgmlType;
 use hercules_agent::llama::{
-    build_default_backend, ComputeBackend, ComputeError, ComputePrefs, ScalarBackend,
+    ComputeBackend, ComputeError, ComputePrefs, ScalarBackend, build_default_backend,
 };
 
 /// Toy backend that logs each GEMV then defers to scalar.
@@ -66,6 +66,10 @@ fn main() {
     let mut y = [0.0f32; 2];
     log.gemv_quant(GgmlType::F32, &raw, 2, 2, 4, &x, &mut y)
         .expect("gemv");
-    println!("y = {:?} after {} gemv call(s)", y, log.calls.load(std::sync::atomic::Ordering::Relaxed));
+    println!(
+        "y = {:?} after {} gemv call(s)",
+        y,
+        log.calls.load(std::sync::atomic::Ordering::Relaxed)
+    );
     println!("Load a GGUF with: LlamaRsEngine::load_with_backend(path, Box::new(your_backend))");
 }

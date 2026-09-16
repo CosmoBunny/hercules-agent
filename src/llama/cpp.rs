@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub enum LlamaCppMode {
-    Cli { model_path: PathBuf },
+    Cli {
+        model_path: PathBuf,
+    },
     Server {
         endpoint: String,
         model_name: String,
@@ -99,8 +101,11 @@ impl LlamaCppRuntime {
                     .await
             }
             LlamaCppMode::Cli { model_path } => {
-                let runtime = crate::llama::libinfer::LlamaCppLibRuntime::with_gguf(model_path.clone());
-                runtime.generate_stream(prompt, stream_target, is_generating).await
+                let runtime =
+                    crate::llama::libinfer::LlamaCppLibRuntime::with_gguf(model_path.clone());
+                runtime
+                    .generate_stream(prompt, stream_target, is_generating)
+                    .await
             }
         }
     }
@@ -119,9 +124,7 @@ fn extract_user_utterance(prompt: &str) -> String {
         .lines()
         .filter(|l| {
             let t = l.trim();
-            !t.starts_with("System:")
-                && !t.starts_with("Agent:")
-                && !t.is_empty()
+            !t.starts_with("System:") && !t.starts_with("Agent:") && !t.is_empty()
         })
         .collect();
     if cleaned.is_empty() {
@@ -133,12 +136,7 @@ fn extract_user_utterance(prompt: &str) -> String {
 
 /// Prefer completion binary (clean one-shot), then llama-cli.
 pub fn find_llama_binary() -> Option<PathBuf> {
-    find_named_binary(&[
-        "llama-completion",
-        "llama-cli",
-        "llama",
-        "main",
-    ])
+    find_named_binary(&["llama-completion", "llama-cli", "llama", "main"])
 }
 
 fn find_named_binary(names: &[&str]) -> Option<PathBuf> {
@@ -160,7 +158,10 @@ fn find_named_binary(names: &[&str]) -> Option<PathBuf> {
             }
         }
         if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            for rel in [format!(".local/bin/{}", name), format!(".cargo/bin/{}", name)] {
+            for rel in [
+                format!(".local/bin/{}", name),
+                format!(".cargo/bin/{}", name),
+            ] {
                 let path = PathBuf::from(&home).join(rel);
                 if path.is_file() {
                     return Some(path);
@@ -272,7 +273,9 @@ fn run_llama_completion(
         }
         if start.elapsed() > Duration::from_secs(600) {
             let _ = child.kill();
-            return Err("[llama.cpp] Timed out after 10 minutes (model load can take ~30s on CPU)".into());
+            return Err(
+                "[llama.cpp] Timed out after 10 minutes (model load can take ~30s on CPU)".into(),
+            );
         }
     }
 
@@ -392,8 +395,21 @@ fn is_chrome_line(t: &str) -> bool {
         || t.chars().all(|c| {
             matches!(
                 c,
-                '█' | '▄' | '▀' | ' ' | '│' | '─' | '┌' | '┐' | '└' | '┘' | '▒' | '░' | '|'
-                    | '/' | '-' | '\\'
+                '█' | '▄'
+                    | '▀'
+                    | ' '
+                    | '│'
+                    | '─'
+                    | '┌'
+                    | '┐'
+                    | '└'
+                    | '┘'
+                    | '▒'
+                    | '░'
+                    | '|'
+                    | '/'
+                    | '-'
+                    | '\\'
             )
         })
 }

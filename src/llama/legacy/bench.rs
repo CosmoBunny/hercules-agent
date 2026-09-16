@@ -12,15 +12,15 @@
 //! ```
 
 #[cfg(test)]
-use crate::llama::compute::{build_default_backend, ComputeBackend, ComputePrefs, ScalarBackend};
-#[cfg(test)]
 use crate::llama::compute::simd::SimdBackend;
 #[cfg(test)]
-use crate::llama::legacy::infer::LlamaRsEngine;
+use crate::llama::compute::{ComputeBackend, ComputePrefs, ScalarBackend, build_default_backend};
 #[cfg(test)]
 use crate::llama::gguf::GgmlType;
 #[cfg(test)]
 use crate::llama::kernels::gemv_quant_fused;
+#[cfg(test)]
+use crate::llama::legacy::infer::LlamaRsEngine;
 #[cfg(test)]
 use std::path::PathBuf;
 #[cfg(test)]
@@ -35,13 +35,8 @@ fn test_gguf_path() -> Option<PathBuf> {
         }
     }
     let home = std::env::var_os("HOME")?;
-    let p = PathBuf::from(home)
-        .join(".local/hercules/model/qwen2.5-1.5b-instruct-q4_k_m.gguf");
-    if p.is_file() {
-        Some(p)
-    } else {
-        None
-    }
+    let p = PathBuf::from(home).join(".local/hercules/model/qwen2.5-1.5b-instruct-q4_k_m.gguf");
+    if p.is_file() { Some(p) } else { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -75,10 +70,16 @@ fn make_q4_k(rows: usize, cols: usize) -> Vec<u8> {
     let block = 144;
     let mut raw = vec![0u8; rows * blocks_per_row * block];
     for chunk in raw.chunks_mut(block) {
-        chunk[0] = 0x00; chunk[1] = 0x3C; // d = 1.0
-        chunk[2] = 0x00; chunk[3] = 0x38; // dmin = 0.5
-        for i in 4..16 { chunk[i] = (i * 3) as u8; }
-        for i in 16..144 { chunk[i] = (i * 11) as u8; }
+        chunk[0] = 0x00;
+        chunk[1] = 0x3C; // d = 1.0
+        chunk[2] = 0x00;
+        chunk[3] = 0x38; // dmin = 0.5
+        for i in 4..16 {
+            chunk[i] = (i * 3) as u8;
+        }
+        for i in 16..144 {
+            chunk[i] = (i * 11) as u8;
+        }
     }
     raw
 }
@@ -134,9 +135,14 @@ mod tests {
         let backend = build_default_backend(&ComputePrefs::from_settings());
         eprintln!("[bench] default backend: {}", backend.name());
         let (total_ns, per_us) = time_iters(iters, || {
-            backend.gemv_quant(GgmlType::Q8_0, &raw, rows, cols, n, &x, &mut y).unwrap();
+            backend
+                .gemv_quant(GgmlType::Q8_0, &raw, rows, cols, n, &x, &mut y)
+                .unwrap();
         });
-        eprintln!("[bench] Q8_0 {} {rows}×{cols}: {per_us:.1} µs/iter", backend.name());
+        eprintln!(
+            "[bench] Q8_0 {} {rows}×{cols}: {per_us:.1} µs/iter",
+            backend.name()
+        );
         print_gflops(backend.name(), rows, cols, iters, total_ns);
     }
 
@@ -159,9 +165,14 @@ mod tests {
 
         let backend = build_default_backend(&ComputePrefs::from_settings());
         let (total_ns, per_us) = time_iters(iters, || {
-            backend.gemv_quant(GgmlType::Q4_K, &raw, rows, cols, n, &x, &mut y).unwrap();
+            backend
+                .gemv_quant(GgmlType::Q4_K, &raw, rows, cols, n, &x, &mut y)
+                .unwrap();
         });
-        eprintln!("[bench] Q4_K {} {rows}×{cols}: {per_us:.1} µs/iter", backend.name());
+        eprintln!(
+            "[bench] Q4_K {} {rows}×{cols}: {per_us:.1} µs/iter",
+            backend.name()
+        );
         print_gflops(backend.name(), rows, cols, iters, total_ns);
     }
 
@@ -186,7 +197,10 @@ mod tests {
         let (_, per_us) = time_iters(iters, || {
             backend.rms_norm(&x, &w, eps, &mut out);
         });
-        eprintln!("[bench] RMSNorm {} n={n}: {per_us:.3} µs/iter", backend.name());
+        eprintln!(
+            "[bench] RMSNorm {} n={n}: {per_us:.3} µs/iter",
+            backend.name()
+        );
     }
 
     #[test]
@@ -205,30 +219,41 @@ mod tests {
         {
             let b = ScalarBackend::new();
             let (total_ns, per_us) = time_iters(iters, || {
-                b.gemv_quant(GgmlType::Q8_0, &raw, rows, cols, n, &x, &mut y).unwrap();
+                b.gemv_quant(GgmlType::Q8_0, &raw, rows, cols, n, &x, &mut y)
+                    .unwrap();
             });
-            eprintln!("  [scalar-fused]   {per_us:.1} µs   ({:.2} GFLOPS)",
-                2.0 * rows as f64 * cols as f64 * iters as f64 / total_ns);
+            eprintln!(
+                "  [scalar-fused]   {per_us:.1} µs   ({:.2} GFLOPS)",
+                2.0 * rows as f64 * cols as f64 * iters as f64 / total_ns
+            );
         }
 
         // SIMD (if available)
         if SimdBackend::is_supported() {
             let b = SimdBackend::new(1);
             let (total_ns, per_us) = time_iters(iters, || {
-                b.gemv_quant(GgmlType::Q8_0, &raw, rows, cols, n, &x, &mut y).unwrap();
+                b.gemv_quant(GgmlType::Q8_0, &raw, rows, cols, n, &x, &mut y)
+                    .unwrap();
             });
-            eprintln!("  [{}]   {per_us:.1} µs   ({:.2} GFLOPS)", b.name(),
-                2.0 * rows as f64 * cols as f64 * iters as f64 / total_ns);
+            eprintln!(
+                "  [{}]   {per_us:.1} µs   ({:.2} GFLOPS)",
+                b.name(),
+                2.0 * rows as f64 * cols as f64 * iters as f64 / total_ns
+            );
         }
 
         // Default (best available)
         {
             let b = build_default_backend(&ComputePrefs::from_settings());
             let (total_ns, per_us) = time_iters(iters, || {
-                b.gemv_quant(GgmlType::Q8_0, &raw, rows, cols, n, &x, &mut y).unwrap();
+                b.gemv_quant(GgmlType::Q8_0, &raw, rows, cols, n, &x, &mut y)
+                    .unwrap();
             });
-            eprintln!("  [{}] {per_us:.1} µs   ({:.2} GFLOPS)", b.name(),
-                2.0 * rows as f64 * cols as f64 * iters as f64 / total_ns);
+            eprintln!(
+                "  [{}] {per_us:.1} µs   ({:.2} GFLOPS)",
+                b.name(),
+                2.0 * rows as f64 * cols as f64 * iters as f64 / total_ns
+            );
         }
     }
 

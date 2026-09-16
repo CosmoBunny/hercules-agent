@@ -155,7 +155,14 @@ pub fn check_compatibility(
     }
     // Remote/service backends run whatever the endpoint serves: repository
     // artifacts never decide their compatibility — endpoint configuration
-    // (Phase 6) does. Local backends must match weights + layout.
+    // (Phase 6) or pairing + remote advertisement (Shared Thunder) does.
+    // They are therefore NEVER auto-resolved from a repo artifact.
+    if !caps.requires_local_artifact {
+        return Compatibility::no(format!(
+            "{} is selected by its own configuration (endpoint/pairing), not repository artifacts",
+            provider.name()
+        ));
+    }
     if caps.requires_local_artifact {
         if !caps.formats.contains(&format) {
             return Compatibility::no(format!(

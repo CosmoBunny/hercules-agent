@@ -12,21 +12,21 @@
 //! 4. scalar  — single-thread portable (always available).
 
 use crate::llama::gguf::GgmlType;
-use crate::settings::{get_settings, PowerMode};
+use crate::settings::{PowerMode, get_settings};
 
-#[cfg(feature = "parallel")]
-mod parallel;
-pub mod simd;
-mod scalar;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(feature = "parallel")]
+mod parallel;
+mod scalar;
+pub mod simd;
 
+#[cfg(feature = "gpu")]
+pub use gpu::GpuBackend;
 #[cfg(feature = "parallel")]
 pub use parallel::ParallelBackend;
 pub use scalar::ScalarBackend;
 pub use simd::SimdBackend;
-#[cfg(feature = "gpu")]
-pub use gpu::GpuBackend;
 
 /// Error from a compute kernel.
 #[derive(Debug, Clone)]
@@ -86,7 +86,9 @@ impl Default for ComputePrefs {
         };
 
         let max_threads = if let Ok(v) = std::env::var("HERCULES_THREADS") {
-            v.parse::<usize>().unwrap_or_else(|_| power.threads()).max(1)
+            v.parse::<usize>()
+                .unwrap_or_else(|_| power.threads())
+                .max(1)
         } else if embedded {
             1
         } else {

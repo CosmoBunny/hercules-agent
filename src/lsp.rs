@@ -11,10 +11,9 @@ use anyhow::{Context, Result};
 use lsp_types::{
     ClientCapabilities, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
     DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    HoverParams, Hover, InitializeParams, InitializeResult, Location, LocationLink,
-    Position, Range, ReferenceParams, ReferenceContext, SymbolInformation,
-    SymbolKind, TextDocumentIdentifier, TextDocumentItem, Uri, WorkspaceFolder,
-    WorkDoneProgressParams,
+    Hover, HoverParams, InitializeParams, InitializeResult, Location, LocationLink, Position,
+    Range, ReferenceContext, ReferenceParams, SymbolInformation, SymbolKind,
+    TextDocumentIdentifier, TextDocumentItem, Uri, WorkDoneProgressParams, WorkspaceFolder,
 };
 
 pub use lsp_types::{
@@ -22,10 +21,10 @@ pub use lsp_types::{
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
@@ -70,11 +69,21 @@ pub async fn discover_lsp_configs(workspace_root: &Path) -> Vec<DiscoveredLspCon
 
     // Priority 2: User-level editor configs
     if let Some(home) = dirs::home_dir() {
-        configs.extend(discover_helix_configs(&home.join(".config/helix"), LspConfigSource::User).await);
-        configs.extend(discover_neovim_configs(&home.join(".config/nvim"), LspConfigSource::User).await);
-        configs.extend(discover_vscode_configs(&home.join(".config/Code/User"), LspConfigSource::User).await);
-        configs.extend(discover_vscode_configs(&home.join(".config/VSCodium/User"), LspConfigSource::User).await);
-        configs.extend(discover_zed_configs(&home.join(".config/zed"), LspConfigSource::User).await);
+        configs.extend(
+            discover_helix_configs(&home.join(".config/helix"), LspConfigSource::User).await,
+        );
+        configs.extend(
+            discover_neovim_configs(&home.join(".config/nvim"), LspConfigSource::User).await,
+        );
+        configs.extend(
+            discover_vscode_configs(&home.join(".config/Code/User"), LspConfigSource::User).await,
+        );
+        configs.extend(
+            discover_vscode_configs(&home.join(".config/VSCodium/User"), LspConfigSource::User)
+                .await,
+        );
+        configs
+            .extend(discover_zed_configs(&home.join(".config/zed"), LspConfigSource::User).await);
     }
 
     configs
@@ -88,7 +97,9 @@ async fn discover_helix_configs(dir: &Path, source: LspConfigSource) -> Vec<Disc
             if let Ok(value) = content.parse::<toml::Value>() {
                 if let Some(languages) = value.get("language-server") {
                     for (name, config) in languages.as_table().unwrap_or(&toml::Table::new()) {
-                        if let Some(server_config) = parse_helix_server(name, config, &config_file, source) {
+                        if let Some(server_config) =
+                            parse_helix_server(name, config, &config_file, source)
+                        {
                             configs.push(server_config);
                         }
                     }
@@ -99,19 +110,39 @@ async fn discover_helix_configs(dir: &Path, source: LspConfigSource) -> Vec<Disc
     configs
 }
 
-fn parse_helix_server(name: &str, config: &toml::Value, config_path: &Path, source: LspConfigSource) -> Option<DiscoveredLspConfig> {
+fn parse_helix_server(
+    name: &str,
+    config: &toml::Value,
+    config_path: &Path,
+    source: LspConfigSource,
+) -> Option<DiscoveredLspConfig> {
     let command = config.get("command")?.as_str()?.to_string();
-    let args = config.get("args")
+    let args = config
+        .get("args")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
-    let file_extensions = config.get("file-types")
+    let file_extensions = config
+        .get("file-types")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
-    let root_markers = config.get("root-markers")
+    let root_markers = config
+        .get("root-markers")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
 
     Some(DiscoveredLspConfig {
@@ -234,15 +265,18 @@ pub struct LspClient {
 impl LspClient {
     /// Create a new LSP client for the given workspace root with default rust-analyzer
     pub fn new(workspace_root: PathBuf) -> Self {
-        Self::with_config(workspace_root, LspServerConfig {
-            name: "rust-analyzer".to_string(),
-            command: "rust-analyzer".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            file_extensions: vec!["rs".to_string()],
-            root_markers: vec!["Cargo.toml".to_string()],
-            initialization_options: None,
-        })
+        Self::with_config(
+            workspace_root,
+            LspServerConfig {
+                name: "rust-analyzer".to_string(),
+                command: "rust-analyzer".to_string(),
+                args: vec![],
+                env: HashMap::new(),
+                file_extensions: vec!["rs".to_string()],
+                root_markers: vec!["Cargo.toml".to_string()],
+                initialization_options: None,
+            },
+        )
     }
 
     /// Create a new LSP client with a specific server configuration
@@ -261,15 +295,17 @@ impl LspClient {
 
     /// Convert a file path to a file:// URI
     fn path_to_uri(path: &Path) -> Result<Uri> {
-        let url = Url::from_file_path(path)
-            .map_err(|_| anyhow::anyhow!("Invalid file path"))?;
+        let url = Url::from_file_path(path).map_err(|_| anyhow::anyhow!("Invalid file path"))?;
         let uri_str = url.to_string();
         Ok(Uri::from_str(&uri_str)?)
     }
 
     /// Start the configured LSP server and initialize the LSP connection
     pub async fn start(&mut self) -> Result<()> {
-        info!("Starting LSP server '{}' for workspace: {:?}", self.server_config.name, self.workspace_root);
+        info!(
+            "Starting LSP server '{}' for workspace: {:?}",
+            self.server_config.name, self.workspace_root
+        );
 
         // Check if the LSP server is available
         let server_path = which::which(&self.server_config.command)
@@ -281,7 +317,7 @@ impl LspClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .current_dir(&self.workspace_root);
-        
+
         // Apply environment variables
         for (key, value) in &self.server_config.env {
             cmd.env(key, value);
@@ -299,11 +335,11 @@ impl LspClient {
 
         // Start response reader task
         let pending_requests = self.pending_requests.clone();
-        
+
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             let mut buffer = Vec::new();
-            
+
             loop {
                 // Read headers
                 let mut content_length = 0;
@@ -316,7 +352,8 @@ impl LspClient {
                                 break; // End of headers
                             }
                             if line.starts_with("Content-Length:") {
-                                content_length = line["Content-Length:".len()..].trim().parse().unwrap_or(0);
+                                content_length =
+                                    line["Content-Length:".len()..].trim().parse().unwrap_or(0);
                             }
                         }
                         Err(e) => {
@@ -325,31 +362,37 @@ impl LspClient {
                         }
                     }
                 }
-                
+
                 if content_length == 0 {
                     continue;
                 }
-                
+
                 // Read body
                 buffer.resize(content_length, 0);
                 if let Err(e) = reader.read_exact(&mut buffer).await {
                     error!("Error reading LSP body: {}", e);
                     continue;
                 }
-                
+
                 let body_str = String::from_utf8_lossy(&buffer);
                 debug!("LSP Response: {}", body_str);
-                
+
                 if let Ok(msg) = serde_json::from_str::<LspMessage>(&body_str) {
                     if let Some(id) = msg.id.as_ref().and_then(|v| v.as_u64()) {
                         let mut pending = pending_requests.write().await;
                         if let Some(pending_req) = pending.remove(&id) {
                             if let Some(error) = msg.error {
-                                let _ = pending_req.sender.send(Err(anyhow::anyhow!("LSP error {}: {}", error.code, error.message)));
+                                let _ = pending_req.sender.send(Err(anyhow::anyhow!(
+                                    "LSP error {}: {}",
+                                    error.code,
+                                    error.message
+                                )));
                             } else if let Some(result) = msg.result {
                                 let _ = pending_req.sender.send(Ok(result));
                             } else {
-                                let _ = pending_req.sender.send(Err(anyhow::anyhow!("No result or error in response")));
+                                let _ = pending_req
+                                    .sender
+                                    .send(Err(anyhow::anyhow!("No result or error in response")));
                             }
                         }
                     } else if msg.method.is_some() {
@@ -371,7 +414,8 @@ impl LspClient {
 
     /// Get next request ID
     fn next_id(&self) -> u64 {
-        self.request_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        self.request_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Send a request and wait for response
@@ -439,7 +483,8 @@ impl LspClient {
             capabilities: ClientCapabilities::default(),
             workspace_folders: Some(vec![WorkspaceFolder {
                 uri: root_uri.clone(),
-                name: self.workspace_root
+                name: self
+                    .workspace_root
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("workspace")
@@ -450,7 +495,8 @@ impl LspClient {
         };
 
         let result: InitializeResult = serde_json::from_value(
-            self.send_request("initialize", serde_json::to_value(init_params)?).await?
+            self.send_request("initialize", serde_json::to_value(init_params)?)
+                .await?,
         )?;
 
         info!("LSP initialized: {:?}", result.capabilities);
@@ -458,7 +504,8 @@ impl LspClient {
         // Send initialized notification
         self.send_notification("initialized", json!({})).await?;
 
-        self.initialized.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.initialized
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -480,7 +527,8 @@ impl LspClient {
             },
         };
 
-        self.send_notification("textDocument/didOpen", serde_json::to_value(params)?).await
+        self.send_notification("textDocument/didOpen", serde_json::to_value(params)?)
+            .await
     }
 
     /// Notify LSP of document changes
@@ -488,10 +536,7 @@ impl LspClient {
         let uri = Self::path_to_uri(file_path)?;
 
         let params = DidChangeTextDocumentParams {
-            text_document: lsp_types::VersionedTextDocumentIdentifier {
-                uri,
-                version,
-            },
+            text_document: lsp_types::VersionedTextDocumentIdentifier { uri, version },
             content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
                 range: None,
                 range_length: None,
@@ -499,7 +544,8 @@ impl LspClient {
             }],
         };
 
-        self.send_notification("textDocument/didChange", serde_json::to_value(params)?).await
+        self.send_notification("textDocument/didChange", serde_json::to_value(params)?)
+            .await
     }
 
     /// Get document symbols for a file
@@ -513,7 +559,8 @@ impl LspClient {
         };
 
         let response: DocumentSymbolResponse = serde_json::from_value(
-            self.send_request("textDocument/documentSymbol", serde_json::to_value(params)?).await?
+            self.send_request("textDocument/documentSymbol", serde_json::to_value(params)?)
+                .await?,
         )?;
 
         // Flatten hierarchical symbols
@@ -561,7 +608,11 @@ impl LspClient {
     }
 
     /// Get definition location for a symbol at position
-    pub async fn goto_definition(&self, file_path: &Path, position: Position) -> Result<Vec<Location>> {
+    pub async fn goto_definition(
+        &self,
+        file_path: &Path,
+        position: Position,
+    ) -> Result<Vec<Location>> {
         let uri = Self::path_to_uri(file_path)?;
 
         let params = GotoDefinitionParams {
@@ -574,16 +625,20 @@ impl LspClient {
         };
 
         let response: GotoDefinitionResponse = serde_json::from_value(
-            self.send_request("textDocument/definition", serde_json::to_value(params)?).await?
+            self.send_request("textDocument/definition", serde_json::to_value(params)?)
+                .await?,
         )?;
 
         Ok(match response {
             GotoDefinitionResponse::Scalar(loc) => vec![loc],
             GotoDefinitionResponse::Array(locs) => locs,
-            GotoDefinitionResponse::Link(links) => links.into_iter().map(|l| Location {
-                uri: l.target_uri,
-                range: l.target_range,
-            }).collect(),
+            GotoDefinitionResponse::Link(links) => links
+                .into_iter()
+                .map(|l| Location {
+                    uri: l.target_uri,
+                    range: l.target_range,
+                })
+                .collect(),
         })
     }
 
@@ -604,14 +659,19 @@ impl LspClient {
         };
 
         let response: Option<Vec<Location>> = serde_json::from_value(
-            self.send_request("textDocument/references", serde_json::to_value(params)?).await?
+            self.send_request("textDocument/references", serde_json::to_value(params)?)
+                .await?,
         )?;
 
         Ok(response.unwrap_or_default())
     }
 
     /// Get implementations for a symbol at position
-    pub async fn implementations(&self, file_path: &Path, position: Position) -> Result<Vec<Location>> {
+    pub async fn implementations(
+        &self,
+        file_path: &Path,
+        position: Position,
+    ) -> Result<Vec<Location>> {
         let uri = Self::path_to_uri(file_path)?;
 
         let params = GotoImplementationParams {
@@ -624,14 +684,19 @@ impl LspClient {
         };
 
         let response: Option<Vec<Location>> = serde_json::from_value(
-            self.send_request("textDocument/implementation", serde_json::to_value(params)?).await?
+            self.send_request("textDocument/implementation", serde_json::to_value(params)?)
+                .await?,
         )?;
 
         Ok(response.unwrap_or_default())
     }
 
     /// Prepare call hierarchy for a symbol
-    pub async fn prepare_call_hierarchy(&self, file_path: &Path, position: Position) -> Result<Vec<CallHierarchyItem>> {
+    pub async fn prepare_call_hierarchy(
+        &self,
+        file_path: &Path,
+        position: Position,
+    ) -> Result<Vec<CallHierarchyItem>> {
         let uri = Self::path_to_uri(file_path)?;
 
         let params = CallHierarchyPrepareParams {
@@ -643,14 +708,21 @@ impl LspClient {
         };
 
         let response: Option<Vec<CallHierarchyItem>> = serde_json::from_value(
-            self.send_request("textDocument/prepareCallHierarchy", serde_json::to_value(params)?).await?
+            self.send_request(
+                "textDocument/prepareCallHierarchy",
+                serde_json::to_value(params)?,
+            )
+            .await?,
         )?;
 
         Ok(response.unwrap_or_default())
     }
 
     /// Get incoming calls for a call hierarchy item
-    pub async fn incoming_calls(&self, item: CallHierarchyItem) -> Result<Vec<CallHierarchyIncomingCall>> {
+    pub async fn incoming_calls(
+        &self,
+        item: CallHierarchyItem,
+    ) -> Result<Vec<CallHierarchyIncomingCall>> {
         let params = CallHierarchyIncomingCallsParams {
             item,
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -658,14 +730,18 @@ impl LspClient {
         };
 
         let response: Option<Vec<CallHierarchyIncomingCall>> = serde_json::from_value(
-            self.send_request("callHierarchy/incomingCalls", serde_json::to_value(params)?).await?
+            self.send_request("callHierarchy/incomingCalls", serde_json::to_value(params)?)
+                .await?,
         )?;
 
         Ok(response.unwrap_or_default())
     }
 
     /// Get outgoing calls for a call hierarchy item
-    pub async fn outgoing_calls(&self, item: CallHierarchyItem) -> Result<Vec<CallHierarchyOutgoingCall>> {
+    pub async fn outgoing_calls(
+        &self,
+        item: CallHierarchyItem,
+    ) -> Result<Vec<CallHierarchyOutgoingCall>> {
         let params = CallHierarchyOutgoingCallsParams {
             item,
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -673,7 +749,8 @@ impl LspClient {
         };
 
         let response: Option<Vec<CallHierarchyOutgoingCall>> = serde_json::from_value(
-            self.send_request("callHierarchy/outgoingCalls", serde_json::to_value(params)?).await?
+            self.send_request("callHierarchy/outgoingCalls", serde_json::to_value(params)?)
+                .await?,
         )?;
 
         Ok(response.unwrap_or_default())
@@ -724,7 +801,12 @@ impl From<lsp_types::DocumentSymbol> for DocumentSymbol {
             range: sym.range,
             selection_range: sym.selection_range,
             detail: sym.detail,
-            children: sym.children.unwrap_or_default().into_iter().map(Into::into).collect(),
+            children: sym
+                .children
+                .unwrap_or_default()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             parent: None,
         }
     }
@@ -768,13 +850,12 @@ impl LspManager {
         if self.discovered_config.is_none() {
             let configs = discover_lsp_configs(&self.workspace_root).await;
             // Prefer Project > User > Builtin
-            self.discovered_config = configs.into_iter()
-                .max_by_key(|c| match c.source {
-                    LspConfigSource::Project => 3,
-                    LspConfigSource::User => 2,
-                    LspConfigSource::Hercules => 1,
-                    LspConfigSource::Builtin => 0,
-                });
+            self.discovered_config = configs.into_iter().max_by_key(|c| match c.source {
+                LspConfigSource::Project => 3,
+                LspConfigSource::User => 2,
+                LspConfigSource::Hercules => 1,
+                LspConfigSource::Builtin => 0,
+            });
         }
 
         let config = if let Some(ref discovered) = self.discovered_config {
@@ -814,14 +895,26 @@ impl LspManager {
 
     /// Check if LSP is available and initialized
     pub fn is_available(&self) -> bool {
-        self.client.as_ref().map(|c| c.is_initialized()).unwrap_or(false)
+        self.client
+            .as_ref()
+            .map(|c| c.is_initialized())
+            .unwrap_or(false)
     }
 
     /// Get the discovered LSP configuration info for display
     pub fn get_config_info(&self) -> Option<(String, String, LspConfigSource, String)> {
         self.discovered_config.as_ref().map(|c| {
-            let status = if self.is_available() { "Connected" } else { "Disconnected" };
-            (c.server.name.clone(), c.server.command.clone(), c.source, status.to_string())
+            let status = if self.is_available() {
+                "Connected"
+            } else {
+                "Disconnected"
+            };
+            (
+                c.server.name.clone(),
+                c.server.command.clone(),
+                c.source,
+                status.to_string(),
+            )
         })
     }
 
@@ -852,7 +945,11 @@ impl LspManager {
     }
 
     /// Get definition locations
-    pub async fn get_definition(&self, file_path: &Path, position: Position) -> Result<Vec<Location>> {
+    pub async fn get_definition(
+        &self,
+        file_path: &Path,
+        position: Position,
+    ) -> Result<Vec<Location>> {
         if let Some(client) = &self.client {
             if client.is_initialized() {
                 return client.goto_definition(file_path, position).await;
@@ -862,7 +959,11 @@ impl LspManager {
     }
 
     /// Get references
-    pub async fn get_references(&self, file_path: &Path, position: Position) -> Result<Vec<Location>> {
+    pub async fn get_references(
+        &self,
+        file_path: &Path,
+        position: Position,
+    ) -> Result<Vec<Location>> {
         if let Some(client) = &self.client {
             if client.is_initialized() {
                 return client.references(file_path, position).await;
@@ -872,7 +973,11 @@ impl LspManager {
     }
 
     /// Get implementations
-    pub async fn get_implementations(&self, file_path: &Path, position: Position) -> Result<Vec<Location>> {
+    pub async fn get_implementations(
+        &self,
+        file_path: &Path,
+        position: Position,
+    ) -> Result<Vec<Location>> {
         if let Some(client) = &self.client {
             if client.is_initialized() {
                 return client.implementations(file_path, position).await;
@@ -882,7 +987,14 @@ impl LspManager {
     }
 
     /// Get call hierarchy (incoming/outgoing)
-    pub async fn get_call_hierarchy(&self, file_path: &Path, position: Position) -> Result<(Vec<CallHierarchyIncomingCall>, Vec<CallHierarchyOutgoingCall>)> {
+    pub async fn get_call_hierarchy(
+        &self,
+        file_path: &Path,
+        position: Position,
+    ) -> Result<(
+        Vec<CallHierarchyIncomingCall>,
+        Vec<CallHierarchyOutgoingCall>,
+    )> {
         if let Some(client) = &self.client {
             if client.is_initialized() {
                 let items = client.prepare_call_hierarchy(file_path, position).await?;

@@ -122,7 +122,10 @@ impl OcrService {
             return res;
         }
 
-        Err(format!("Could not extract text from PDF: {}", path.display()))
+        Err(format!(
+            "Could not extract text from PDF: {}",
+            path.display()
+        ))
     }
 
     /// Extract text from video by taking a screenshot frame via ffmpeg and running OCR.
@@ -153,6 +156,9 @@ impl OcrService {
             }
         }
 
-        Err(format!("Could not extract video keyframe from: {}", path.display()))
+        Err(format!(
+            "Could not extract video keyframe from: {}",
+            path.display()
+        ))
     }
 }

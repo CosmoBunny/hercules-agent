@@ -24,11 +24,15 @@ pub mod mcp;
 pub mod media;
 pub mod model;
 pub mod ocr;
+pub mod prefetch;
 pub mod run_timeline;
 pub mod session;
 pub mod settings;
 pub mod smart_system;
+pub mod splash;
 pub mod task_manager;
+pub mod thunder;
+pub mod thunder_ui;
 pub mod tool_panel;
 
 // TUI lives with the binary but is part of the crate so `app` can use `crate::`.

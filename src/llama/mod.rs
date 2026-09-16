@@ -49,22 +49,22 @@ pub use legacy::tokenizer;
 
 // Re-export legacy compute traits at crate::llama level (legacy code uses
 // `crate::llama::ComputeBackend` without the ::compute:: path component).
-#[allow(unused_imports)]
-pub use legacy::compute::{
-    ComputeBackend, ComputeError, ComputePrefs, ScalarBackend, SimdBackend,
-    build_default_backend, default_backend, default_rms_norm,
-};
-#[allow(unused_imports)]
-pub use legacy::infer::{ensure_warm_rs_engine, shutdown_warm_rs_engine, LlamaRsEngine};
 #[cfg(feature = "parallel")]
 #[allow(unused_imports)]
 pub use legacy::compute::ParallelBackend;
+#[allow(unused_imports)]
+pub use legacy::compute::{
+    ComputeBackend, ComputeError, ComputePrefs, ScalarBackend, SimdBackend, build_default_backend,
+    default_backend, default_rms_norm,
+};
+#[allow(unused_imports)]
+pub use legacy::infer::{LlamaRsEngine, ensure_warm_rs_engine, shutdown_warm_rs_engine};
 
 // Active public API
 pub use http::HttpInferenceClient;
 pub use libinfer::{
-    ensure_warm_lib_engine, get_warm_lib_engine, shutdown_warm_lib_engine,
-    LlamaCppLib, LlamaCppLibRuntime,
+    LlamaCppLib, LlamaCppLibRuntime, ensure_warm_lib_engine, get_warm_lib_engine,
+    shutdown_warm_lib_engine,
 };
 
 /// Engine choice exposed to the application.

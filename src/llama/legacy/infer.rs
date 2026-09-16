@@ -10,11 +10,11 @@
 //! GGUF is kept **warm in-process** (no llama.cpp / llama-server). First load
 //! reads weights once; later prompts reuse the same engine.
 
-use crate::llama::compute::{build_default_backend, ComputeBackend, ComputePrefs};
+use crate::llama::compute::{ComputeBackend, ComputePrefs, build_default_backend};
 use crate::llama::gguf::GgufFile;
-use crate::llama::model::{forward_token, KvCache, LlamaModel};
-use crate::llama::sample::{apply_repeat_penalty, sample_token, Rng64, SamplerParams};
-use crate::llama::tokenizer::{format_chat_prompt, Tokenizer};
+use crate::llama::model::{KvCache, LlamaModel, forward_token};
+use crate::llama::sample::{Rng64, SamplerParams, apply_repeat_penalty, sample_token};
+use crate::llama::tokenizer::{Tokenizer, format_chat_prompt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -115,9 +115,7 @@ impl LlamaRsEngine {
             ));
         }
 
-        let n_predict = n_predict_override
-            .unwrap_or(self.config.n_predict)
-            .max(1);
+        let n_predict = n_predict_override.unwrap_or(self.config.n_predict).max(1);
 
         let h = &self.model.hparams;
         let mut cache = KvCache::new(h.n_layer, h.n_head_kv, h.head_dim(), h.n_ctx);
@@ -172,11 +170,7 @@ impl LlamaRsEngine {
                 }
             }
 
-            apply_repeat_penalty(
-                &mut logits,
-                &all_tokens,
-                self.config.sampler.repeat_penalty,
-            );
+            apply_repeat_penalty(&mut logits, &all_tokens, self.config.sampler.repeat_penalty);
             let next = sample_token(&logits, &self.config.sampler, &mut rng);
             if self.tokenizer.is_eos(next) {
                 break;
@@ -232,9 +226,7 @@ static WARM_RS: Mutex<Option<WarmRsEngine>> = Mutex::new(None);
 
 /// Ensure pure-Rust engine is loaded for this GGUF (reloads only if path changes).
 pub fn ensure_warm_rs_engine(path: &Path) -> Result<Arc<LlamaRsEngine>, String> {
-    let path = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !path.is_file() {
         return Err(format!("[llama.rs] Model not found: {}", path.display()));
     }
@@ -268,10 +260,10 @@ pub fn shutdown_warm_rs_engine() {
 
 /// Info for UI: (model path, summary) if loaded.
 pub fn warm_rs_info() -> Option<(PathBuf, String)> {
-    WARM_RS.lock().ok().and_then(|g| {
-        g.as_ref()
-            .map(|w| (w.path.clone(), w.engine.summary()))
-    })
+    WARM_RS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|w| (w.path.clone(), w.engine.summary())))
 }
 
 /// Shared runtime state: optional GGUF path or HTTP fallback (remote only).
@@ -319,14 +311,10 @@ impl LlamaRsRuntime {
     ) -> Result<String, String> {
         // Local GGUF → pure-Rust warm engine (never llama-server / llama.cpp)
         if let Some(ref path) = self.model_path {
-            let need_load = warm_rs_info()
-                .map(|(p, _)| p != *path)
-                .unwrap_or(true);
+            let need_load = warm_rs_info().map(|(p, _)| p != *path).unwrap_or(true);
             if need_load {
                 if let Ok(mut t) = stream_target.lock() {
-                    t.push_str(
-                        "[llama.rs] Loading pure-Rust engine (one-time; no llama.cpp)…\n",
-                    );
+                    t.push_str("[llama.rs] Loading pure-Rust engine (one-time; no llama.cpp)…\n");
                 }
             }
 
@@ -366,9 +354,7 @@ impl LlamaRsRuntime {
 
         // HTTP endpoint only (user-configured remote; not local GGUF)
         if self.endpoint.is_empty() {
-            return Err(
-                "[llama.rs] No GGUF path and no HTTP endpoint configured".into(),
-            );
+            return Err("[llama.rs] No GGUF path and no HTTP endpoint configured".into());
         }
         let client = crate::llama::http::HttpInferenceClient::new(
             self.endpoint.clone(),

@@ -60,8 +60,12 @@ impl Tokenizer {
             }
         }
 
-        let bos_id = gguf.meta_u64("tokenizer.ggml.bos_token_id").map(|v| v as u32);
-        let eos_id = gguf.meta_u64("tokenizer.ggml.eos_token_id").map(|v| v as u32);
+        let bos_id = gguf
+            .meta_u64("tokenizer.ggml.bos_token_id")
+            .map(|v| v as u32);
+        let eos_id = gguf
+            .meta_u64("tokenizer.ggml.eos_token_id")
+            .map(|v| v as u32);
         let unk_id = gguf
             .meta_u64("tokenizer.ggml.unknown_token_id")
             .map(|v| v as u32);

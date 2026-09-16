@@ -76,7 +76,9 @@ pub fn read_clipboard_silent() -> Option<String> {
         }
     }
     // Fallback to local clipboard file
-    std::fs::read_to_string(CLIP_FILE).ok().filter(|s| !s.is_empty())
+    std::fs::read_to_string(CLIP_FILE)
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 pub fn read_clipboard_image_bytes() -> Option<(Vec<u8>, &'static str)> {
@@ -93,12 +95,18 @@ pub fn read_clipboard_image_bytes() -> Option<(Vec<u8>, &'static str)> {
         }
     }
     // 2. Try X11 xclip
-    if let Some(bytes) = try_read_cmd_bytes("xclip", &["-selection", "clipboard", "-t", "image/png", "-out"]) {
+    if let Some(bytes) = try_read_cmd_bytes(
+        "xclip",
+        &["-selection", "clipboard", "-t", "image/png", "-out"],
+    ) {
         if !bytes.is_empty() {
             return Some((bytes, "png"));
         }
     }
-    if let Some(bytes) = try_read_cmd_bytes("xclip", &["-selection", "clipboard", "-t", "image/jpeg", "-out"]) {
+    if let Some(bytes) = try_read_cmd_bytes(
+        "xclip",
+        &["-selection", "clipboard", "-t", "image/jpeg", "-out"],
+    ) {
         if !bytes.is_empty() {
             return Some((bytes, "jpg"));
         }
@@ -138,4 +146,3 @@ fn try_read_cmd_bytes(bin: &str, args: &[&str]) -> Option<Vec<u8>> {
 pub fn clipboard_file_path() -> &'static str {
     CLIP_FILE
 }
-

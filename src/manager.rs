@@ -9,8 +9,8 @@
 //!   - `models.toml` — installed model index (name → path)
 
 use futures_util::StreamExt;
-use ollama_rs::models::LocalModel;
 use ollama_rs::Ollama;
+use ollama_rs::models::LocalModel;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -102,7 +102,10 @@ fn format_unix(ts: u64) -> String {
     let secs = rem % 60;
     // Days since 1970-01-01 → rough YYYY-MM-DD via civil conversion
     let (y, m, d) = civil_from_days(days as i64);
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m, d, hours, mins, secs)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        y, m, d, hours, mins, secs
+    )
 }
 
 /// Howard Hinnant civil-from-days (UTC calendar date from days since epoch).
@@ -173,7 +176,7 @@ pub fn format_byte_size(bytes: u64) -> String {
 /// Used when HuggingFace API omits LFS sizes (common for large files).
 fn estimate_q4_size_label(model_id: &str) -> String {
     let lower = model_id.to_lowercase();
-    
+
     // Extract parameter count using regex-like token boundaries (e.g. -27b, _27b, -4b, :4b, -0.5b)
     let mut param_val: Option<f32> = None;
     for part in lower.split(|c: char| !c.is_alphanumeric() && c != '.') {
@@ -321,9 +324,7 @@ fn find_multipart_siblings(name: &str, all_files: &[String]) -> Vec<String> {
                 .iter()
                 .filter(|f| {
                     let fl = f.to_lowercase();
-                    fl.starts_with(&stem_lower)
-                        && fl.ends_with(".gguf")
-                        && fl.contains("-of-")
+                    fl.starts_with(&stem_lower) && fl.ends_with(".gguf") && fl.contains("-of-")
                 })
                 .cloned()
                 .collect();
@@ -646,7 +647,9 @@ impl ModelManager {
             // If offline (or no results fetched), fall back to cached models.list matching query
             let cached = load_models_list_cache();
             for m in cached {
-                if (query_lower.is_empty() || m.to_lowercase().contains(&query_lower)) && !results.contains(&m) {
+                if (query_lower.is_empty() || m.to_lowercase().contains(&query_lower))
+                    && !results.contains(&m)
+                {
                     results.push(m);
                 }
             }
@@ -658,7 +661,7 @@ impl ModelManager {
     pub async fn fetch_hf_models(&self, search: &str) -> Result<Vec<String>, String> {
         let trimmed = search.trim();
         let query_lower = trimmed.to_lowercase();
-        
+
         let urls_to_try: Vec<String> = if query_lower.contains('/') {
             let parts: Vec<&str> = trimmed.splitn(2, '/').collect();
             let p0 = parts[0].to_lowercase();
@@ -674,14 +677,29 @@ impl ModelManager {
             let sub = parts.get(1).unwrap_or(&"").trim();
             if sub.is_empty() {
                 vec![
-                    format!("https://huggingface.co/api/models?author={}&blobs=true&full=true&limit=30", author),
-                    format!("https://huggingface.co/api/models?search={}&blobs=true&full=true&limit=30", parts[0]),
+                    format!(
+                        "https://huggingface.co/api/models?author={}&blobs=true&full=true&limit=30",
+                        author
+                    ),
+                    format!(
+                        "https://huggingface.co/api/models?search={}&blobs=true&full=true&limit=30",
+                        parts[0]
+                    ),
                 ]
             } else {
                 vec![
-                    format!("https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&limit=30", trimmed),
-                    format!("https://huggingface.co/api/models?author={}&search={}&blobs=true&full=true&limit=30", author, sub),
-                    format!("https://huggingface.co/api/models?search={}&blobs=true&full=true&limit=30", trimmed),
+                    format!(
+                        "https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&limit=30",
+                        trimmed
+                    ),
+                    format!(
+                        "https://huggingface.co/api/models?author={}&search={}&blobs=true&full=true&limit=30",
+                        author, sub
+                    ),
+                    format!(
+                        "https://huggingface.co/api/models?search={}&blobs=true&full=true&limit=30",
+                        trimmed
+                    ),
                 ]
             }
         } else if query_lower.is_empty() {
@@ -691,14 +709,26 @@ impl ModelManager {
             ]
         } else {
             vec![
-                format!("https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&limit=30", trimmed),
-                format!("https://huggingface.co/api/models?search={}&tags=gguf&sort=downloads&direction=-1&limit=30", trimmed),
-                format!("https://huggingface.co/api/models?author={}&limit=30", trimmed),
+                format!(
+                    "https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&limit=30",
+                    trimmed
+                ),
+                format!(
+                    "https://huggingface.co/api/models?search={}&tags=gguf&sort=downloads&direction=-1&limit=30",
+                    trimmed
+                ),
+                format!(
+                    "https://huggingface.co/api/models?author={}&limit=30",
+                    trimmed
+                ),
             ]
         };
 
-        let hf_token = crate::settings::get_hf_token()
-            .or_else(|| std::env::var("HF_TOKEN").ok().filter(|s| !s.trim().is_empty()));
+        let hf_token = crate::settings::get_hf_token().or_else(|| {
+            std::env::var("HF_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
 
         let client = reqwest::Client::new();
         let mut model_ids = Vec::new();
@@ -736,7 +766,9 @@ impl ModelManager {
             fetch_futs.push(async move {
                 let single_url = format!("https://huggingface.co/api/models/{}?blobs=true", id);
                 let mut size_tag = "[-]".to_string();
-                let mut req = client.get(&single_url).header("User-Agent", "Hercules-CLI/1.0");
+                let mut req = client
+                    .get(&single_url)
+                    .header("User-Agent", "Hercules-CLI/1.0");
                 if let Some(ref tok) = tok_opt {
                     req = req.header("Authorization", format!("Bearer {}", tok));
                 }
@@ -745,16 +777,23 @@ impl ModelManager {
                         if let Ok(item_json) = serde_json::from_str::<serde_json::Value>(&t) {
                             let mut gguf_sizes: Vec<(String, u64)> = Vec::new();
                             let mut total_weight_size: u64 = 0;
-                            if let Some(siblings) = item_json.get("siblings").and_then(|s| s.as_array()) {
+                            if let Some(siblings) =
+                                item_json.get("siblings").and_then(|s| s.as_array())
+                            {
                                 for f in siblings {
                                     let rfilename = f
                                         .get("rfilename")
                                         .or_else(|| f.get("filename"))
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
-                                    let sz = f.get("size")
+                                    let sz = f
+                                        .get("size")
                                         .and_then(|s| s.as_u64())
-                                        .or_else(|| f.get("lfs").and_then(|l| l.get("size")).and_then(|s| s.as_u64()))
+                                        .or_else(|| {
+                                            f.get("lfs")
+                                                .and_then(|l| l.get("size"))
+                                                .and_then(|s| s.as_u64())
+                                        })
                                         .unwrap_or(0);
                                     if sz > 0 {
                                         total_weight_size = total_weight_size.saturating_add(sz);
@@ -766,7 +805,8 @@ impl ModelManager {
                             }
 
                             if !gguf_sizes.is_empty() {
-                                let names: Vec<String> = gguf_sizes.iter().map(|(n, _)| n.clone()).collect();
+                                let names: Vec<String> =
+                                    gguf_sizes.iter().map(|(n, _)| n.clone()).collect();
                                 let best = pick_best_gguf(&names);
                                 let best_sz = gguf_sizes
                                     .iter()
@@ -808,8 +848,7 @@ impl ModelManager {
             .map_err(|e| e.to_string())?;
 
         let text = res.text().await.map_err(|e| e.to_string())?;
-        
-        
+
         let mut models = Vec::new();
         let parts = text.split("href=\"/library/");
         let mut first = true;
@@ -820,7 +859,7 @@ impl ModelManager {
             }
             if let Some(idx) = part.find('"') {
                 let model = &part[..idx];
-                
+
                 // Extract sizes/tags
                 let mut tags = Vec::new();
                 let mut rest = part;
@@ -839,7 +878,7 @@ impl ModelManager {
                         break;
                     }
                 }
-                
+
                 if tags.is_empty() {
                     let entry = model.to_string();
                     if !models.contains(&entry) {
@@ -856,7 +895,6 @@ impl ModelManager {
             }
         }
         Ok(models)
-
     }
 
     /// Abandon incomplete downloads whose last update is older than 10 minutes.
@@ -917,7 +955,10 @@ impl ModelManager {
     /// 4. Prefer Q4_K_M / Q4_0 single-file quantizations
     ///
     /// Returns `(download_repo_id, filename)`. Never returns safetensors.
-    pub async fn resolve_gguf_file(&self, repo_id: &str) -> Result<(String, String, Vec<String>), String> {
+    pub async fn resolve_gguf_file(
+        &self,
+        repo_id: &str,
+    ) -> Result<(String, String, Vec<String>), String> {
         let clean_repo = repo_id
             .split('[')
             .next()
@@ -1020,11 +1061,7 @@ impl ModelManager {
             "https://huggingface.co/api/models?search={}&limit=15&full=true&sort=downloads&direction=-1",
             urlencoding_loose(&q)
         );
-        let res = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
         if !res.status().is_success() {
             return Ok(Vec::new());
         }
@@ -1081,7 +1118,8 @@ impl ModelManager {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                         if let Some(siblings) = json.get("siblings").and_then(|s| s.as_array()) {
                             for file in siblings {
-                                if let Some(rfile) = file.get("rfilename").and_then(|f| f.as_str()) {
+                                if let Some(rfile) = file.get("rfilename").and_then(|f| f.as_str())
+                                {
                                     if rfile.to_lowercase().ends_with(".gguf") {
                                         ggufs.push(rfile.to_string());
                                     }
@@ -1132,7 +1170,7 @@ impl ModelManager {
                 return Some(p);
             }
         }
-        
+
         self.list_installed_entries()
             .into_iter()
             .rev()
@@ -1144,7 +1182,9 @@ impl ModelManager {
     pub fn cancel_download(&self) -> String {
         Self::cleanup_stale_downloads();
         match DownloadLock::force_cancel() {
-            Some(name) => format!("Cancelled download session for '{name}'. You can install another model now."),
+            Some(name) => format!(
+                "Cancelled download session for '{name}'. You can install another model now."
+            ),
             None => "No download lock to cancel.".into(),
         }
     }
@@ -1184,17 +1224,15 @@ impl ModelManager {
             .trim()
             .trim_start_matches("HuggingFace: ")
             .trim();
-        let base_name = filename
-            .rsplit('/')
-            .next()
-            .unwrap_or(filename)
-            .to_string();
+        let base_name = filename.rsplit('/').next().unwrap_or(filename).to_string();
         let model_name = format!("{}/{}", clean_repo, base_name);
 
         // Check if model is ALREADY installed on disk
         let installed_dest = models_dir().join(&base_name);
         if installed_dest.exists() {
-            let meta_len = std::fs::metadata(&installed_dest).map(|m| m.len()).unwrap_or(0);
+            let meta_len = std::fs::metadata(&installed_dest)
+                .map(|m| m.len())
+                .unwrap_or(0);
             if meta_len > 1_000_000 {
                 let mut reg = ModelsRegistry::load();
                 reg.upsert(InstalledModel {
@@ -1245,9 +1283,7 @@ impl ModelManager {
                         format_unix(existing.time_started)
                     ));
                 }
-            } else if existing.status == DownloadStatus::InProgress
-                && !existing.is_stale()
-                && !same
+            } else if existing.status == DownloadStatus::InProgress && !existing.is_stale() && !same
             {
                 // Different model requested while another runs → replace after short grace
                 // (user started a new install on purpose)
@@ -1311,10 +1347,7 @@ impl ModelManager {
                 model_name,
                 format_unix(lock.time_started)
             ));
-            l.push(format!(
-                "[SESSION] Staging: {}",
-                staging_dir.display()
-            ));
+            l.push(format!("[SESSION] Staging: {}", staging_dir.display()));
         }
 
         let actual_shards = if shard_files.is_empty() {
@@ -1340,7 +1373,11 @@ impl ModelManager {
         let mut total_downloaded_all = 0u64;
 
         for (shard_idx, shard_name) in actual_shards.iter().enumerate() {
-            let shard_base = shard_name.rsplit('/').next().unwrap_or(shard_name).to_string();
+            let shard_base = shard_name
+                .rsplit('/')
+                .next()
+                .unwrap_or(shard_name)
+                .to_string();
             let shard_url = format!(
                 "https://huggingface.co/{}/resolve/main/{}",
                 clean_repo, shard_name
@@ -1349,7 +1386,12 @@ impl ModelManager {
 
             if let Ok(mut l) = logs.lock() {
                 if actual_shards.len() > 1 {
-                    l.push(format!("[MULTI-PART] Starting shard {}/{} -> {}", shard_idx + 1, actual_shards.len(), shard_base));
+                    l.push(format!(
+                        "[MULTI-PART] Starting shard {}/{} -> {}",
+                        shard_idx + 1,
+                        actual_shards.len(),
+                        shard_base
+                    ));
                 }
                 l.push(format!("[HTTP] Connecting to {}", shard_url));
             }
@@ -1435,7 +1477,11 @@ impl ModelManager {
                     continue;
                 }
 
-                if let Some(cr) = res.headers().get("content-range").and_then(|v| v.to_str().ok()) {
+                if let Some(cr) = res
+                    .headers()
+                    .get("content-range")
+                    .and_then(|v| v.to_str().ok())
+                {
                     if let Some(total_s) = cr.split('/').nth(1) {
                         if let Ok(t) = total_s.parse::<u64>() {
                             total_size = Some(t);
@@ -1487,7 +1533,10 @@ impl ModelManager {
                                 ));
                             }
                             let _ = file.flush();
-                            lock.touch_progress(total_downloaded_all + downloaded, lock.bytes_total);
+                            lock.touch_progress(
+                                total_downloaded_all + downloaded,
+                                lock.bytes_total,
+                            );
                             lock.status = DownloadStatus::Incomplete;
                             lock.error = Some(format!("stream: {}", e));
                             let _ = lock.save();
@@ -1575,7 +1624,10 @@ impl ModelManager {
                         }
                         lock.touch_progress(total_downloaded_all + downloaded, lock.bytes_total);
                         if attempt == MAX_ATTEMPTS {
-                            let msg = format!("Incomplete download: got {} of {} bytes", downloaded, total);
+                            let msg = format!(
+                                "Incomplete download: got {} of {} bytes",
+                                downloaded, total
+                            );
                             lock.status = DownloadStatus::Incomplete;
                             lock.error = Some(msg.clone());
                             lock.bytes_downloaded = total_downloaded_all + downloaded;
@@ -1610,9 +1662,15 @@ impl ModelManager {
         let mut first_installed_path = None;
 
         for (shard_idx, shard_name) in actual_shards.iter().enumerate() {
-            let shard_base = shard_name.rsplit('/').next().unwrap_or(shard_name).to_string();
+            let shard_base = shard_name
+                .rsplit('/')
+                .next()
+                .unwrap_or(shard_name)
+                .to_string();
             let shard_staging = staging_dir.join(&shard_base);
-            let size = std::fs::metadata(&shard_staging).map(|m| m.len()).unwrap_or(0);
+            let size = std::fs::metadata(&shard_staging)
+                .map(|m| m.len())
+                .unwrap_or(0);
 
             let installed_path = match self.promote_to_local(
                 &shard_staging,
@@ -1648,12 +1706,17 @@ impl ModelManager {
 
         if is_vl_model && !filename.to_lowercase().contains("mmproj") {
             if let Ok(mut l) = logs.lock() {
-                l.push("[VISION] Checking for companion mmproj vision weights in HuggingFace repo...".to_string());
+                l.push(
+                    "[VISION] Checking for companion mmproj vision weights in HuggingFace repo..."
+                        .to_string(),
+                );
             }
 
             // Query HF API for mmproj in the same repository
             let info_url = format!("https://huggingface.co/api/models/{}", clean_repo);
-            let mut req = client.get(&info_url).header("User-Agent", "Hercules-CLI/1.0");
+            let mut req = client
+                .get(&info_url)
+                .header("User-Agent", "Hercules-CLI/1.0");
             if let Some(tok) = crate::settings::get_hf_token() {
                 req = req.header("Authorization", format!("Bearer {}", tok));
             }
@@ -1673,23 +1736,34 @@ impl ModelManager {
                             });
 
                             if let Some(mmproj_rfile) = mmproj_entry {
-                                let mmproj_base = mmproj_rfile.rsplit('/').next().unwrap_or(&mmproj_rfile).to_string();
+                                let mmproj_base = mmproj_rfile
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(&mmproj_rfile)
+                                    .to_string();
                                 let mmproj_dest = models_dir().join(&mmproj_base);
                                 if !mmproj_dest.exists() {
                                     if let Ok(mut l) = logs.lock() {
                                         l.push(format!("[VISION] Auto-downloading companion Vision weights '{}'...", mmproj_base));
                                     }
 
-                                    let mmproj_url = format!("https://huggingface.co/{}/resolve/main/{}", clean_repo, mmproj_rfile);
-                                    let mut dl_req = client.get(&mmproj_url).header("User-Agent", "Hercules-CLI/1.0");
+                                    let mmproj_url = format!(
+                                        "https://huggingface.co/{}/resolve/main/{}",
+                                        clean_repo, mmproj_rfile
+                                    );
+                                    let mut dl_req = client
+                                        .get(&mmproj_url)
+                                        .header("User-Agent", "Hercules-CLI/1.0");
                                     if let Some(tok) = crate::settings::get_hf_token() {
-                                        dl_req = dl_req.header("Authorization", format!("Bearer {}", tok));
+                                        dl_req = dl_req
+                                            .header("Authorization", format!("Bearer {}", tok));
                                     }
 
                                     if let Ok(dl_resp) = dl_req.send().await {
                                         if dl_resp.status().is_success() {
                                             if let Ok(bytes) = dl_resp.bytes().await {
-                                                if let Ok(()) = std::fs::write(&mmproj_dest, &bytes) {
+                                                if let Ok(()) = std::fs::write(&mmproj_dest, &bytes)
+                                                {
                                                     if let Ok(mut l) = logs.lock() {
                                                         l.push(format!("[VISION] Companion mmproj installed: {}", mmproj_dest.display()));
                                                     }
@@ -1698,7 +1772,10 @@ impl ModelManager {
                                         }
                                     }
                                 } else if let Ok(mut l) = logs.lock() {
-                                    l.push(format!("[VISION] Companion mmproj already present: {}", mmproj_dest.display()));
+                                    l.push(format!(
+                                        "[VISION] Companion mmproj already present: {}",
+                                        mmproj_dest.display()
+                                    ));
                                 }
                             }
                         }
@@ -1827,7 +1904,10 @@ impl ModelManager {
                 model_name,
                 format_unix(lock.time_started)
             ));
-            l.push(format!("[OLLAMA] Pulling model from registry: {}", model_name));
+            l.push(format!(
+                "[OLLAMA] Pulling model from registry: {}",
+                model_name
+            ));
         }
         *progress.lock().unwrap() = Some(0.1);
 

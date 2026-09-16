@@ -7,7 +7,7 @@
 //!
 //! Full dequant of all weights to f32 is **never** done (that was ~6 GB for 1.5B and OOM’d laptops).
 
-use crate::llama::gguf::{load_tensor_f32, GgmlType, GgufFile, TensorInfo};
+use crate::llama::gguf::{GgmlType, GgufFile, TensorInfo, load_tensor_f32};
 use std::sync::Arc;
 
 /// Hard cap for pure-Rust KV cache (tokens). Full model ctx (e.g. 32k) is too large.
@@ -214,10 +214,7 @@ impl QuantMatrix {
             (cols, rows)
         };
 
-        let raw = gguf
-            .tensor_bytes(info)
-            .map_err(|e| e.to_string())?
-            .to_vec();
+        let raw = gguf.tensor_bytes(info).map_err(|e| e.to_string())?.to_vec();
 
         Ok(Self {
             rows,
@@ -407,18 +404,12 @@ fn dequant_row_slice(q: &QuantMatrix, start: usize, len: usize) -> Result<Vec<f3
 
 /// Gather one column without materializing the full f32 table.
 fn dequant_column_slice(q: &QuantMatrix, col: usize, n_rows: usize) -> Result<Vec<f32>, String> {
-    // Column-major-ish emb: element at (r, col) is at linear index r if cols==vocab? 
+    // Column-major-ish emb: element at (r, col) is at linear index r if cols==vocab?
     // Stored as rows=n_embd, cols=vocab → index = r * cols + col
     let mut out = vec![0.0f32; n_rows];
     for r in 0..n_rows {
         let idx = r * q.cols + col;
-        let one = crate::llama::kernels::dequant_slice(
-            &q.raw,
-            q.ggml_type,
-            q.n_elements,
-            idx,
-            1,
-        )?;
+        let one = crate::llama::kernels::dequant_slice(&q.raw, q.ggml_type, q.n_elements, idx, 1)?;
         out[r] = one[0];
     }
     Ok(out)
@@ -543,8 +534,7 @@ mod tests {
             .map(PathBuf::from)
             .or_else(|| {
                 std::env::var_os("HOME").map(|h| {
-                    PathBuf::from(h)
-                        .join(".local/hercules/model/qwen2.5-1.5b-instruct-q4_k_m.gguf")
+                    PathBuf::from(h).join(".local/hercules/model/qwen2.5-1.5b-instruct-q4_k_m.gguf")
                 })
             });
         let Some(path) = path else { return };
@@ -629,13 +619,25 @@ pub fn rope_inplace(
     for h in 0..n_head {
         let off = h * head_dim;
         if off + head_dim <= q.len() {
-            rope_vec(&mut q[off..off + head_dim], pos, rope_dim, freq_base, is_neox);
+            rope_vec(
+                &mut q[off..off + head_dim],
+                pos,
+                rope_dim,
+                freq_base,
+                is_neox,
+            );
         }
     }
     for h in 0..n_head_kv {
         let off = h * head_dim;
         if off + head_dim <= k.len() {
-            rope_vec(&mut k[off..off + head_dim], pos, rope_dim, freq_base, is_neox);
+            rope_vec(
+                &mut k[off..off + head_dim],
+                pos,
+                rope_dim,
+                freq_base,
+                is_neox,
+            );
         }
     }
 }
@@ -975,7 +977,11 @@ pub fn forward_batch_with_buffers(
             buf.q_full[b * layer.wq.rows..(b + 1) * layer.wq.rows].copy_from_slice(&q_single);
             buf.k_full[b * layer.wk.rows..(b + 1) * layer.wk.rows].copy_from_slice(&k_single);
 
-            let kv_head_dim = if h.n_head_kv > 0 { k_single.len() / h.n_head_kv } else { head_dim };
+            let kv_head_dim = if h.n_head_kv > 0 {
+                k_single.len() / h.n_head_kv
+            } else {
+                head_dim
+            };
             let cache_stride = h.n_head_kv.max(1) * kv_head_dim.max(1);
             if pos < h.n_ctx {
                 let off = pos * cache_stride;
@@ -993,7 +999,11 @@ pub fn forward_batch_with_buffers(
 
         let kv_head_dim = if h.n_head_kv > 0 { head_dim } else { head_dim };
         let cache_stride = h.n_head_kv.max(1) * kv_head_dim.max(1);
-        let n_rep = if h.n_head_kv > 0 { h.n_head / h.n_head_kv.max(1) } else { 1 };
+        let n_rep = if h.n_head_kv > 0 {
+            h.n_head / h.n_head_kv.max(1)
+        } else {
+            1
+        };
         let dim = head_dim.min(kv_head_dim);
 
         for b in 0..b_size {
@@ -1007,7 +1017,9 @@ pub fn forward_batch_with_buffers(
                 let q_off = q_base + head * head_dim;
                 let scale = 1.0 / (head_dim as f32).sqrt();
 
-                if q_off + dim > buf.q_full.len() { continue; }
+                if q_off + dim > buf.q_full.len() {
+                    continue;
+                }
                 let q_slice = &buf.q_full[q_off..q_off + dim];
 
                 for t in 0..seq_len {
@@ -1015,7 +1027,9 @@ pub fn forward_batch_with_buffers(
                     if k_base + dim <= cache.k[il].len() {
                         let k_slice = &cache.k[il][k_base..k_base + dim];
                         let mut dot = 0.0f32;
-                        for i in 0..dim { dot += q_slice[i] * k_slice[i]; }
+                        for i in 0..dim {
+                            dot += q_slice[i] * k_slice[i];
+                        }
                         buf.scores[t] = dot * scale;
                     }
                 }
@@ -1027,7 +1041,9 @@ pub fn forward_batch_with_buffers(
                     sum += *s;
                 }
                 let inv_sum = 1.0 / sum.max(1e-12);
-                for s in &mut buf.scores { *s *= inv_sum; }
+                for s in &mut buf.scores {
+                    *s *= inv_sum;
+                }
 
                 let out_off = out_base + head * head_dim;
                 if out_off + dim <= buf.attn_out.len() {
@@ -1037,7 +1053,9 @@ pub fn forward_batch_with_buffers(
                         if v_base + dim <= cache.v[il].len() {
                             let v_slice = &cache.v[il][v_base..v_base + dim];
                             let s = buf.scores[t];
-                            for i in 0..dim { out_slice[i] += s * v_slice[i]; }
+                            for i in 0..dim {
+                                out_slice[i] += s * v_slice[i];
+                            }
                         }
                     }
                 }
@@ -1045,7 +1063,9 @@ pub fn forward_batch_with_buffers(
         }
 
         buf.att_proj.resize(b_size * layer.wo.rows, 0.0);
-        layer.wo.gemm(&buf.attn_out, b_size, &mut buf.att_proj, compute)?;
+        layer
+            .wo
+            .gemm(&buf.attn_out, b_size, &mut buf.att_proj, compute)?;
         for i in 0..x_batch.len().min(buf.att_proj.len()) {
             x_batch[i] += buf.att_proj[i];
         }

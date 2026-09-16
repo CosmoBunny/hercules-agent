@@ -47,7 +47,8 @@ impl DiagramRenderer {
             } else if ch == ']' {
                 in_bracket = false;
                 sanitized.push(ch);
-            } else if in_bracket && !in_quote && (ch == '(' || ch == ')' || ch == '{' || ch == '}') {
+            } else if in_bracket && !in_quote && (ch == '(' || ch == ')' || ch == '{' || ch == '}')
+            {
                 sanitized.push(' ');
             } else {
                 sanitized.push(ch);
@@ -97,7 +98,8 @@ impl DiagramRenderer {
     fn sanitize_mermaid(body: &str) -> String {
         let mut clean_lines = Vec::new();
         let mut seen_edges = std::collections::HashSet::new();
-        let mut target_incoming_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut target_incoming_count: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
         // First pass: count incoming edges per target node
         for line in body.lines() {
@@ -308,7 +310,8 @@ impl DiagramRenderer {
         let mut i = 0;
         while i < n {
             if chars[i] == '┌' || chars[i] == '╭' {
-                if let Some(close_idx) = (i + 1..n).find(|&j| chars[j] == '┐' || chars[j] == '╮') {
+                if let Some(close_idx) = (i + 1..n).find(|&j| chars[j] == '┐' || chars[j] == '╮')
+                {
                     if (i + 1..close_idx).all(|k| chars[k] == '─' || chars[k] == '-') {
                         chars[i] = '▛';
                         for k in i + 1..close_idx {
@@ -327,7 +330,8 @@ impl DiagramRenderer {
         let mut i = 0;
         while i < n {
             if chars[i] == '└' || chars[i] == '╰' {
-                if let Some(close_idx) = (i + 1..n).find(|&j| chars[j] == '┘' || chars[j] == '╯') {
+                if let Some(close_idx) = (i + 1..n).find(|&j| chars[j] == '┘' || chars[j] == '╯')
+                {
                     if (i + 1..close_idx).all(|k| chars[k] == '─' || chars[k] == '-') {
                         chars[i] = '▙';
                         for k in i + 1..close_idx {
@@ -350,7 +354,9 @@ impl DiagramRenderer {
                 if chars[i] == '│' {
                     if let Some(close_idx) = (i + 2..n).find(|&j| chars[j] == '│') {
                         let inner: String = chars[i + 1..close_idx].iter().collect();
-                        if node_labels.values().any(|lbl| inner.contains(lbl)) || inner.chars().any(|c| c.is_alphanumeric()) {
+                        if node_labels.values().any(|lbl| inner.contains(lbl))
+                            || inner.chars().any(|c| c.is_alphanumeric())
+                        {
                             chars[i] = '▌';
                             chars[close_idx] = '▐';
                             i = close_idx + 1;
@@ -449,11 +455,18 @@ impl DiagramRenderer {
         let connector_fg = Color::Rgb(100, 140, 180);
         let natural_w = (node_labels.len() * 42).max(inner_w).max(280);
 
-        if let Some(rendered) = ratatui_markdown::mermaid::render_mermaid(&sanitized, natural_w, None, &theme) {
+        if let Some(rendered) =
+            ratatui_markdown::mermaid::render_mermaid(&sanitized, natural_w, None, &theme)
+        {
             if !rendered.is_empty() {
                 let full_lines: Vec<String> = rendered
                     .iter()
-                    .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
                     .collect();
 
                 let leading_blank = full_lines
@@ -521,7 +534,11 @@ impl DiagramRenderer {
             }
 
             if let Some(colon) = trimmed.find(':') {
-                let label = trimmed[..colon].trim().trim_matches('"').trim_matches('\'').to_string();
+                let label = trimmed[..colon]
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
                 let val_str = trimmed[colon + 1..].trim();
                 if let Ok(v) = val_str.parse::<f64>() {
                     slices.push((label, v));
@@ -531,8 +548,18 @@ impl DiagramRenderer {
         }
 
         out.push(Line::from(vec![
-            Span::styled(" ◐ ", Style::default().fg(Color::Rgb(255, 180, 0)).add_modifier(Modifier::BOLD)),
-            Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ◐ ",
+                Style::default()
+                    .fg(Color::Rgb(255, 180, 0))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]));
         out.push(Line::from("─".repeat(inner_w.min(50))));
 
@@ -547,7 +574,11 @@ impl DiagramRenderer {
 
         let bar_width: usize = 24;
         for (idx, (label, val)) in slices.iter().enumerate() {
-            let pct = if total > 0.0 { (val / total) * 100.0 } else { 0.0 };
+            let pct = if total > 0.0 {
+                (val / total) * 100.0
+            } else {
+                0.0
+            };
             let filled = ((pct / 100.0) * (bar_width as f64)).round() as usize;
             let color = colors[idx % colors.len()];
 
@@ -555,10 +586,16 @@ impl DiagramRenderer {
             let bar_empty = "░".repeat(bar_width.saturating_sub(filled));
 
             out.push(Line::from(vec![
-                Span::styled(format!(" {:<14} ", label), Style::default().fg(Color::Rgb(220, 220, 220))),
+                Span::styled(
+                    format!(" {:<14} ", label),
+                    Style::default().fg(Color::Rgb(220, 220, 220)),
+                ),
                 Span::styled(bar_filled, Style::default().fg(color)),
                 Span::styled(bar_empty, Style::default().fg(Color::Rgb(60, 60, 60))),
-                Span::styled(format!(" {:>5.1}% ({})", pct, val), Style::default().fg(Color::Rgb(160, 160, 160))),
+                Span::styled(
+                    format!(" {:>5.1}% ({})", pct, val),
+                    Style::default().fg(Color::Rgb(160, 160, 160)),
+                ),
             ]));
         }
 
@@ -572,7 +609,10 @@ impl DiagramRenderer {
 
         for line in body.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with("%%") || trimmed.to_lowercase().starts_with("sequencediagram") {
+            if trimmed.is_empty()
+                || trimmed.starts_with("%%")
+                || trimmed.to_lowercase().starts_with("sequencediagram")
+            {
                 continue;
             }
 
@@ -602,7 +642,10 @@ impl DiagramRenderer {
                     let from = trimmed[..arrow_pos].trim().to_string();
                     let rest = trimmed[arrow_pos + arr.len()..].trim();
                     let (to, msg) = if let Some(colon) = rest.find(':') {
-                        (rest[..colon].trim().to_string(), rest[colon + 1..].trim().to_string())
+                        (
+                            rest[..colon].trim().to_string(),
+                            rest[colon + 1..].trim().to_string(),
+                        )
                     } else {
                         (rest.to_string(), String::new())
                     };
@@ -624,8 +667,18 @@ impl DiagramRenderer {
         }
 
         out.push(Line::from(vec![
-            Span::styled(" ⇄ ", Style::default().fg(Color::Rgb(0, 230, 255)).add_modifier(Modifier::BOLD)),
-            Span::styled("Sequence Diagram", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ⇄ ",
+                Style::default()
+                    .fg(Color::Rgb(0, 230, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Sequence Diagram",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]));
         out.push(Line::from("─".repeat(inner_w.min(60))));
 
@@ -635,7 +688,10 @@ impl DiagramRenderer {
         for p in &participants {
             header_spans.push(Span::styled(
                 format!(" {:^width$} ", p, width = col_w.saturating_sub(2)),
-                Style::default().fg(Color::Black).bg(Color::Rgb(0, 200, 255)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(0, 200, 255))
+                    .add_modifier(Modifier::BOLD),
             ));
             header_spans.push(Span::styled(" ", Style::default()));
         }
@@ -662,14 +718,23 @@ impl DiagramRenderer {
         let (node_styles, _) = Self::extract_mermaid_styles(raw_body);
         let sanitized = Self::sanitize_mermaid(raw_body);
         let mut out = Vec::new();
-        let lines: Vec<&str> = sanitized.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        let lines: Vec<&str> = sanitized
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
 
         let mut nodes: HashMap<String, String> = HashMap::new();
         let mut node_order: Vec<String> = Vec::new();
         let mut edges: Vec<(String, String, String)> = Vec::new();
 
-        let insert_node = |nodes: &mut HashMap<String, String>, order: &mut Vec<String>, id: String, label: String| {
-            if id.is_empty() { return; }
+        let insert_node = |nodes: &mut HashMap<String, String>,
+                           order: &mut Vec<String>,
+                           id: String,
+                           label: String| {
+            if id.is_empty() {
+                return;
+            }
             if !nodes.contains_key(&id) {
                 order.push(id.clone());
                 nodes.insert(id, label);
@@ -753,7 +818,10 @@ impl DiagramRenderer {
 
         let mut outgoing_by_source: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for (from, to, elabel) in &edges {
-            outgoing_by_source.entry(from.clone()).or_default().push((to.clone(), elabel.clone()));
+            outgoing_by_source
+                .entry(from.clone())
+                .or_default()
+                .push((to.clone(), elabel.clone()));
         }
 
         let targets: HashSet<String> = edges.iter().map(|(_, t, _)| t.clone()).collect();
@@ -785,9 +853,14 @@ impl DiagramRenderer {
                 Style::default().fg(fg)
             };
             let text_style = if bg != Color::Reset {
-                Style::default().fg(Color::Rgb(20, 20, 20)).bg(bg).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Rgb(20, 20, 20))
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
             };
 
             let box_w = label.chars().count() + 4;
@@ -823,13 +896,24 @@ impl DiagramRenderer {
 
                     if !elabel.is_empty() {
                         out.push(Line::from(vec![
-                            Span::styled("      │ ", Style::default().fg(Color::Rgb(120, 140, 160))),
-                            Span::styled(format!("|{}|", elabel), Style::default().fg(Color::Rgb(80, 220, 255)).add_modifier(Modifier::BOLD)),
+                            Span::styled(
+                                "      │ ",
+                                Style::default().fg(Color::Rgb(120, 140, 160)),
+                            ),
+                            Span::styled(
+                                format!("|{}|", elabel),
+                                Style::default()
+                                    .fg(Color::Rgb(80, 220, 255))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
                         ]));
                     }
                     out.push(Line::from(vec![
                         Span::styled("      ▼ ", Style::default().fg(Color::Rgb(80, 255, 140))),
-                        Span::styled(format!("──► [{}]", to_label), Style::default().fg(Color::Rgb(200, 255, 200))),
+                        Span::styled(
+                            format!("──► [{}]", to_label),
+                            Style::default().fg(Color::Rgb(200, 255, 200)),
+                        ),
                     ]));
                 }
             }
@@ -869,16 +953,37 @@ impl DiagramRenderer {
     fn render_generic<'a>(diag_type: &str, body: &str, inner_w: usize) -> Vec<Line<'a>> {
         let mut out = Vec::new();
         out.push(Line::from(vec![
-            Span::styled(" [DIAGRAM: ", Style::default().fg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD)),
-            Span::styled(diag_type.to_uppercase(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("] ", Style::default().fg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [DIAGRAM: ",
+                Style::default()
+                    .fg(Color::Rgb(255, 140, 0))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                diag_type.to_uppercase(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "] ",
+                Style::default()
+                    .fg(Color::Rgb(255, 140, 0))
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]));
         out.push(Line::from("─".repeat(inner_w.min(60))));
 
         for (idx, line) in body.lines().enumerate() {
             out.push(Line::from(vec![
-                Span::styled(format!(" {:2} │ ", idx + 1), Style::default().fg(Color::Rgb(100, 100, 100))),
-                Span::styled(line.to_string(), Style::default().fg(Color::Rgb(220, 220, 220))),
+                Span::styled(
+                    format!(" {:2} │ ", idx + 1),
+                    Style::default().fg(Color::Rgb(100, 100, 100)),
+                ),
+                Span::styled(
+                    line.to_string(),
+                    Style::default().fg(Color::Rgb(220, 220, 220)),
+                ),
             ]));
         }
 
@@ -894,7 +999,10 @@ mod tests {
         lines
             .iter()
             .map(|l| {
-                l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -912,7 +1020,8 @@ mod tests {
 
     #[test]
     fn test_render_mermaid_sequence() {
-        let body = "sequenceDiagram\n    participant Alice\n    participant Bob\n    Alice->>Bob: Hello";
+        let body =
+            "sequenceDiagram\n    participant Alice\n    participant Bob\n    Alice->>Bob: Hello";
         let lines = DiagramRenderer::render_to_lines("mermaid", body, 60);
         assert!(!lines.is_empty());
         let text = lines_to_text(&lines);
@@ -980,9 +1089,18 @@ mod tests {
         assert!(!lines.is_empty());
         let text = lines_to_text(&lines);
         // Verify custom block characters ▛, ▌, ▙ are used for node frames
-        assert!(text.contains('▛') && text.contains('▜'), "Should contain top border ▛ ▜");
-        assert!(text.contains('▌') && text.contains('▐'), "Should contain middle border ▌ ▐");
-        assert!(text.contains('▙') && text.contains('▟'), "Should contain bottom border ▙ ▟");
+        assert!(
+            text.contains('▛') && text.contains('▜'),
+            "Should contain top border ▛ ▜"
+        );
+        assert!(
+            text.contains('▌') && text.contains('▐'),
+            "Should contain middle border ▌ ▐"
+        );
+        assert!(
+            text.contains('▙') && text.contains('▟'),
+            "Should contain bottom border ▙ ▟"
+        );
         // Verify |Output| edge label is retained on the connector/diagram text
         assert!(text.contains("Output") || text.contains("NE555 Timer"));
     }

@@ -1,11 +1,14 @@
-use ratatui::text::Line;
 use hercules_agent::diagram::DiagramRenderer;
+use ratatui::text::Line;
 
 fn lines_to_text(lines: &[Line]) -> String {
     lines
         .iter()
         .map(|l| {
-            l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -188,7 +191,12 @@ fn test_intermediate_05_gantt_chart() {
     let lines = DiagramRenderer::render_to_lines("mermaid", body, 120);
     assert!(!lines.is_empty());
     let text = lines_to_text(&lines);
-    assert!(text.contains("Roadmap") || text.contains("Release") || text.contains("Optimization") || text.contains("Development"));
+    assert!(
+        text.contains("Roadmap")
+            || text.contains("Release")
+            || text.contains("Optimization")
+            || text.contains("Development")
+    );
 }
 
 #[test]
@@ -221,7 +229,12 @@ fn test_intermediate_07_git_graph() {
     let lines = DiagramRenderer::render_to_lines("mermaid", body, 120);
     assert!(!lines.is_empty());
     let text = lines_to_text(&lines);
-    assert!(text.contains("commit") || text.contains("Initial") || text.contains("simd") || text.contains("Release"));
+    assert!(
+        text.contains("commit")
+            || text.contains("Initial")
+            || text.contains("simd")
+            || text.contains("Release")
+    );
 }
 
 // =========================================================================
@@ -343,7 +356,12 @@ fn test_professional_04_ci_cd_pipeline_workflow() {
     let text = lines_to_text(&lines);
     assert!(text.contains("Push") || text.contains("Git"));
     assert!(text.contains("Static Analysis") || text.contains("Lint") || text.contains("Clippy"));
-    assert!(text.contains("Docker") || text.contains("Build") || text.contains("Canary") || text.contains("Test"));
+    assert!(
+        text.contains("Docker")
+            || text.contains("Build")
+            || text.contains("Canary")
+            || text.contains("Test")
+    );
 }
 
 #[test]
@@ -431,18 +449,51 @@ fn test_small_graph_ui_styling_and_alignment() {
                 || s.style.fg == Some(ratatui::style::Color::Rgb(51, 204, 255))
         })
     });
-    assert!(has_yellow, "Sensor node yellow fill/stroke styling should be applied");
-    assert!(has_cyan, "Actuator node cyan fill/stroke styling should be applied");
+    assert!(
+        has_yellow,
+        "Sensor node yellow fill/stroke styling should be applied"
+    );
+    assert!(
+        has_cyan,
+        "Actuator node cyan fill/stroke styling should be applied"
+    );
 
     // Verify box width alignment: top, middle, and bottom rows of node A have identical character counts
-    let top_row = lines.iter().find(|l| lines_to_text(&[(*l).clone()]).contains('▛')).unwrap();
-    let mid_row = lines.iter().find(|l| lines_to_text(&[(*l).clone()]).contains("Sensor")).unwrap();
-    let bot_row = lines.iter().find(|l| lines_to_text(&[(*l).clone()]).contains('▙')).unwrap();
+    let top_row = lines
+        .iter()
+        .find(|l| lines_to_text(&[(*l).clone()]).contains('▛'))
+        .unwrap();
+    let mid_row = lines
+        .iter()
+        .find(|l| lines_to_text(&[(*l).clone()]).contains("Sensor"))
+        .unwrap();
+    let bot_row = lines
+        .iter()
+        .find(|l| lines_to_text(&[(*l).clone()]).contains('▙'))
+        .unwrap();
 
-    let top_len = top_row.spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
-    let mid_len = mid_row.spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
-    let bot_len = bot_row.spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    let top_len = top_row
+        .spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>();
+    let mid_len = mid_row
+        .spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>();
+    let bot_len = bot_row
+        .spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>();
 
-    assert_eq!(top_len, mid_len, "Top border and middle content row must have matching character width");
-    assert_eq!(mid_len, bot_len, "Middle content row and bottom border must have matching character width");
+    assert_eq!(
+        top_len, mid_len,
+        "Top border and middle content row must have matching character width"
+    );
+    assert_eq!(
+        mid_len, bot_len,
+        "Middle content row and bottom border must have matching character width"
+    );
 }

@@ -112,7 +112,7 @@ fn tools_allowed_for_write_cmd() -> Result<(), String> {
     }
 }
 
-fn path_allowed(path: &Path) -> Result<(), String> {
+pub(crate) fn path_allowed(path: &Path) -> Result<(), String> {
     let p = get_tool_permissions();
     match p.folder_scope {
         FolderScope::AllDirs => Ok(()),
@@ -349,6 +349,15 @@ impl ToolDispatchRegistry {
         self.claimed.insert(action.fingerprint())
     }
 
+    /// Release a claim whose execution FAILED (permission denied,
+    /// sandbox block, IO error — anything that produced no side
+    /// effect). The next explicit user acceptance (`/allow`, Y) may
+    /// then claim and execute it. Never call after a SUCCESSFUL
+    /// execution: that would allow the same logical call to run twice.
+    pub fn release(&mut self, action: &ProposedAction) {
+        self.claimed.remove(&action.fingerprint());
+    }
+
     pub fn is_claimed(&self, action: &ProposedAction) -> bool {
         self.claimed.contains(&action.fingerprint())
     }
@@ -434,6 +443,126 @@ impl StreamingParser {
         Self::with_source(ToolCallSource::ModelCompletion)
     }
 
+    /// Tag markers whose split-across-chunks prefix must survive `feed()`.
+    /// If the buffer tail is a proper prefix of one of these, the next
+    /// chunk may complete a `<think>` boundary or a tool tag — parsing
+    /// and clearing the tail would lose it.
+    const STREAM_MARKERS: &[&'static str] = &[
+        "<think>",
+        "</think>",
+        "<write",
+        "</write",
+        "<cmd>",
+        "</cmd>",
+        "<read",
+        "</read>",
+        "<ls",
+        "</ls>",
+        "<mcp",
+        "</mcp>",
+        "<skill",
+        "</skill>",
+        "<agent",
+        "</agent>",
+        "<memory",
+        "</memory>",
+        "<websearch",
+        "</websearch>",
+        "```",
+    ];
+
+    /// Tool constructs with a body: opener prefix + closer prefix.
+    /// Only constructs the canonical parser extracts (`<read>`/`<ls>`
+    /// are self-closing — their incompleteness is just a missing `>`,
+    /// covered by the unterminated-`<` rule).
+    const TOOL_BLOCKS: &[(&'static str, &'static str)] = &[
+        ("<write", "</write"),
+        ("<cmd>", "</cmd>"),
+        ("<mcp", "</mcp>"),
+        ("<skill", "</skill>"),
+        ("<websearch", "</websearch>"),
+    ];
+
+    /// Byte index of the first tool opener with no matching closer
+    /// after it, if any. Closed pairs are skipped left to right, so a
+    /// complete prefix (`<write A>x</write> `) still parses now while
+    /// only the unfinished tail (`<write B>y`) is retained. Matches
+    /// one-shot semantics: the sub-parsers pair each opener with the
+    /// next following closer.
+    fn unclosed_construct_start(buf: &str) -> Option<usize> {
+        let mut pos = 0;
+        loop {
+            let mut next: Option<(usize, usize)> = None;
+            for (pi, (open, _)) in Self::TOOL_BLOCKS.iter().enumerate() {
+                if let Some(rel) = buf[pos..].find(open) {
+                    let idx = pos + rel;
+                    if next.map(|(ni, _)| idx < ni).unwrap_or(true) {
+                        next = Some((idx, pi));
+                    }
+                }
+            }
+            let Some((idx, pi)) = next else {
+                return None;
+            };
+            let (open, close) = Self::TOOL_BLOCKS[pi];
+            let after_open = idx + open.len();
+            if buf[after_open..].find(close).is_some() {
+                pos = after_open;
+            } else {
+                return Some(idx);
+            }
+        }
+    }
+
+    /// Length of the trailing suffix that must survive `feed()` (0
+    /// when the whole buffer is safe to parse). Three cases, in order:
+    /// 1. An unclosed tool construct: a tool opener with no matching
+    ///    closer yet (`<write src=..>body` with `</write>` still in
+    ///    flight). Retain from the FIRST such opener so complete
+    ///    prefix actions still emit now while the unfinished
+    ///    construct waits for its body/closer. Without this, the
+    ///    incomplete construct would be parsed (partially or not at
+    ///    all) and cleared — losing the body when the closer arrives
+    ///    in the next chunk.
+    /// 2. An unterminated `<...` fragment (a split tag opener/closer:
+    ///    `<` with no `>` after it) — the next chunk may complete it.
+    /// 3. A proper prefix of a marker with no `<` at all (e.g. a split
+    ///    code fence `` `` + "`"). Complete markers need no retention:
+    ///    they are consumed as boundaries (or parse as ordinary text).
+    fn partial_marker_suffix_len(buf: &str) -> usize {
+        if let Some(idx) = Self::unclosed_construct_start(buf) {
+            return buf.len() - idx;
+        }
+        if let Some(lt) = buf.rfind('<') {
+            if !buf[lt..].contains('>') {
+                return buf.len() - lt;
+            }
+        }
+        let max_prefix = Self::STREAM_MARKERS
+            .iter()
+            .map(|m| m.len())
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let window = buf.len().min(max_prefix);
+        let mut i = buf.len() - window;
+        while i < buf.len() {
+            if !buf.is_char_boundary(i) {
+                i += 1;
+                continue;
+            }
+            let suffix = &buf[i..];
+            if Self::STREAM_MARKERS
+                .iter()
+                .any(|m| m.len() > suffix.len() && m.starts_with(suffix))
+            {
+                return buf.len() - i;
+            }
+            i += 1;
+        }
+        0
+    }
+
     pub fn with_source(source: ToolCallSource) -> Self {
         Self {
             state: ParseState::Normal,
@@ -471,8 +600,17 @@ impl StreamingParser {
         }
 
         if self.state == ParseState::Normal && !self.buffer.is_empty() {
-            actions.extend(Self::extract_from_segment(&self.buffer, self.source));
-            self.buffer.clear();
+            // Chunk-boundary safety: retain an unclosed tool construct,
+            // a split tag fragment, or a split fence marker. Parsing
+            // those now would lose them when the next chunk completes
+            // them. `flush()` parses the remainder at end of stream.
+            let retain = Self::partial_marker_suffix_len(&self.buffer);
+            let parse_len = self.buffer.len() - retain;
+            if parse_len > 0 {
+                let head = self.buffer[..parse_len].to_string();
+                actions.extend(Self::extract_from_segment(&head, self.source));
+                self.buffer.drain(..parse_len);
+            }
         }
 
         actions
@@ -2064,6 +2202,12 @@ Common Tasks:
                     &expanded,
                     &output,
                 );
+                // Latency hiding: while the LLM reasons over this result,
+                // warm likely-next files in the background. Read-only
+                // speculation — the canonical executor stays authoritative.
+                if output.len() <= 512 * 1024 {
+                    crate::prefetch::speculate_from_read(expanded, output.clone());
+                }
                 output
             }
 
@@ -2362,22 +2506,46 @@ Common Tasks:
     }
 
     pub fn extract_attribute(tag: &str, attr_name: &str) -> Option<String> {
+        // Attribute-name boundary: `src=` must not match inside another
+        // name (`xsrc=`) or inside a quoted value (`title="src="`).
+        // Accept only when preceded by whitespace, `<`, or start.
         let pattern = format!("{}=", attr_name);
-        if let Some(idx) = tag.find(&pattern) {
-            let rest = &tag[idx + pattern.len()..];
-            if rest.starts_with('"') || rest.starts_with('\'') {
-                let quote = rest.chars().next().unwrap();
-                let end = rest[1..].find(quote)?;
-                Some(rest[1..1 + end].to_string())
-            } else {
-                let end = rest
-                    .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-                    .unwrap_or(rest.len());
-                Some(rest[..end].to_string())
+        let mut search_from = 0;
+        while let Some(rel) = tag[search_from..].find(&pattern) {
+            let idx = search_from + rel;
+            let boundary_ok =
+                idx == 0 || matches!(tag.as_bytes()[idx - 1], b' ' | b'\t' | b'\n' | b'\r' | b'<');
+            // Reject hits inside a quoted value: an odd number of
+            // unescaped quotes before the hit means we are in a string.
+            let in_quotes = {
+                let mut in_q: Option<u8> = None;
+                for b in tag[..idx].bytes() {
+                    if b == b'"' || b == b'\'' {
+                        if in_q == Some(b) {
+                            in_q = None;
+                        } else if in_q.is_none() {
+                            in_q = Some(b);
+                        }
+                    }
+                }
+                in_q.is_some()
+            };
+            if boundary_ok && !in_quotes {
+                let rest = &tag[idx + pattern.len()..];
+                if rest.starts_with('"') || rest.starts_with('\'') {
+                    let quote = rest.chars().next().unwrap();
+                    let end = rest[1..].find(quote)?;
+                    return Some(rest[1..1 + end].to_string());
+                } else {
+                    let end = rest
+                        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+                        .unwrap_or(rest.len());
+                    return Some(rest[..end].to_string());
+                }
             }
-        } else {
-            None
+            search_from = idx + 1;
         }
+        None
     }
 
     fn parse_range(range_str: &str) -> Option<(usize, usize)> {
@@ -2523,6 +2691,8 @@ Common Tasks:
             if fs::write(&path, new_content).is_err() {
                 return format!("Error: Permission error writing '{}'", path.display());
             }
+            // A write supersedes any speculatively cached bytes.
+            crate::prefetch::invalidate(&path);
 
             let mut diff = String::new();
             for (idx, old) in old_removed.iter().enumerate() {
@@ -2549,6 +2719,8 @@ Common Tasks:
             let old_content = fs::read_to_string(&path).unwrap_or_default();
             match fs::write(&path, clean_body) {
                 Ok(()) => {
+                    // A write supersedes any speculatively cached bytes.
+                    crate::prefetch::invalidate(&path);
                     let diff = Self::compute_diff(&old_content, clean_body);
                     if diff.trim().is_empty() {
                         "No changes.".to_string()
@@ -2581,9 +2753,16 @@ Common Tasks:
             return format!("Error: File '{}' doesn't exist", path.display());
         }
 
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return format!("Error: Permission error reading '{}'", path.display()),
+        // Speculative read-ahead: serve fresh cache entries so a file the
+        // background prefetcher already warmed costs no disk wait. The
+        // sandbox gate above still runs on every call — the cache never
+        // bypasses it.
+        let content = match crate::prefetch::get(&path) {
+            Some(cached) => cached,
+            None => match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => return format!("Error: Permission error reading '{}'", path.display()),
+            },
         };
 
         if let Some(range_str) = line_attr {
@@ -2642,6 +2821,12 @@ Common Tasks:
             return "Error: Empty command".to_string();
         }
 
+        // Native Windows has no `sh`: use the platform shell so the
+        // advertised Windows execution path (cmd / PowerShell) matches
+        // the actual executor.
+        #[cfg(windows)]
+        let output = Command::new("cmd").arg("/C").arg(trimmed).output();
+        #[cfg(not(windows))]
         let output = Command::new("sh").arg("-c").arg(trimmed).output();
 
         match output {
@@ -2744,6 +2929,12 @@ Common Tasks:
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the global TOOL_PERMS (save / mutate /
+    /// restore). Folder scope stays CurrentDir in every mutation so
+    /// read-only perm consumers are unaffected; the mode flip is what
+    /// must not interleave.
+    static PERM_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_expand_path() {
         let p = AgentEngine::expand_path("$CURRENT/src/main.rs");
@@ -2820,6 +3011,9 @@ mod tests {
     #[test]
     fn test_write_body_tags_are_not_actions() {
         // Tags quoted inside a <write> file body are content, never actions.
+        // Guarded: asserts Ask-mode inertia, which a concurrent
+        // perm-mutating test must not disturb mid-flight.
+        let _perm_guard = PERM_TEST_GUARD.lock().unwrap();
         let sample = "<write src=\"$CURRENT/probe.html\">\n<html>\n<read src=\"$CURRENT/other\">\n<cmd>rm -rf /tmp/probe</cmd>\n<mcp server=\"s\" tool=\"t\">{}</mcp>\n<websearch>docs</websearch>\n</write>";
         let actions = AgentEngine::extract_proposed_actions(sample);
         assert_eq!(actions.len(), 1);
@@ -2965,6 +3159,35 @@ mod tests {
         let entry = res.context_entry("RUN");
         assert!(entry.contains(&calls[0].call_id.to_string()));
         assert!(entry.contains("ok"));
+    }
+
+    #[test]
+    fn test_lifecycle_denied_claim_releases_for_later_accept() {
+        // Ask-mode transition: claim → permission denial → release →
+        // explicit acceptance claims + executes exactly once.
+        let calls = AgentEngine::parse_tool_calls(
+            "<write src=\"$CURRENT/d.txt\">\nhi\n</write>",
+            ModelCompletion,
+        );
+        assert_eq!(calls.len(), 1);
+        let mut reg = ToolDispatchRegistry::new();
+        assert!(reg.try_claim(&calls[0])); // completion attempt claims…
+        reg.release(&calls[0]); // …denied (nothing ran) → claim released…
+        let accepted = AgentEngine::parse_tool_calls(
+            "<write src=\"$CURRENT/d.txt\">\nhi\n</write>",
+            ModelCompletion,
+        );
+        assert!(reg.try_claim(&accepted[0])); // …user accept claims again…
+        assert!(!reg.try_claim(&accepted[0])); // …but never a third time.
+    }
+
+    #[test]
+    fn test_lifecycle_successful_claim_never_released() {
+        // Without release, re-claim always fails: exactly-once holds.
+        let calls = AgentEngine::parse_tool_calls("<cmd>cargo check</cmd>", ModelCompletion);
+        let mut reg = ToolDispatchRegistry::new();
+        assert!(reg.try_claim(&calls[0]));
+        assert!(!reg.try_claim(&calls[0]));
     }
 
     #[test]
@@ -3164,6 +3387,276 @@ mod tests {
 
         parser.feed("</think>");
         assert!(!parser.in_thinking());
+    }
+
+    #[test]
+    fn test_streaming_parser_split_tags_across_chunks() {
+        use crate::agent::StreamingParser;
+
+        // Review scenario: `<think>` split across chunks must still
+        // enter Thinking, and reasoning must not leak into actions.
+        let mut parser = StreamingParser::new();
+        let a1 = parser.feed("<thi");
+        assert_eq!(a1.len(), 0);
+        assert!(!parser.in_thinking());
+        let a2 = parser.feed("nk>reasoning</think><write src=\"$CURRENT/a.txt\">hi</write>");
+        assert!(!parser.in_thinking());
+        assert_eq!(a2.len(), 1);
+        assert_eq!(a2[0].kind, ProposedKind::Write);
+        assert_eq!(a2[0].target, "$CURRENT/a.txt");
+        assert_eq!(parser.flush().len(), 0);
+
+        // Split tool opener: `<wr` + `ite ...` must yield one write.
+        let mut parser = StreamingParser::new();
+        assert_eq!(parser.feed("<wr").len(), 0);
+        let actions = parser.feed("ite src=\"$CURRENT/b.txt\">body</write>");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].target, "$CURRENT/b.txt");
+        assert_eq!(actions[0].body, "body");
+        assert_eq!(parser.flush().len(), 0);
+
+        // Split `</think>`: thinking must still exit, later tools fire.
+        let mut parser = StreamingParser::new();
+        parser.feed("<think>secret");
+        assert!(parser.in_thinking());
+        assert_eq!(parser.feed("</thi").len(), 0);
+        assert!(parser.in_thinking());
+        let actions = parser.feed("nk><cmd>echo hi</cmd>");
+        assert!(!parser.in_thinking());
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ProposedKind::Cmd);
+        assert_eq!(parser.flush().len(), 0);
+
+        // Split `<cmd>` opener.
+        let mut parser = StreamingParser::new();
+        assert_eq!(parser.feed("run <c").len(), 0);
+        let actions = parser.feed("md>echo hi</cmd>");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ProposedKind::Cmd);
+        assert_eq!(parser.flush().len(), 0);
+
+        // Byte-identical to one-shot parsing: chunked feed + flush
+        // must equal a single feed of the whole text.
+        let text = "hello <think>hmm</think> <write src=\"$CURRENT/c.txt\">x</write> tail";
+        let mut chunked = StreamingParser::new();
+        let mut acc = Vec::new();
+        for chunk in [
+            "hel",
+            "lo <th",
+            "ink>hmm</th",
+            "ink> <write src=\"$CUR",
+            "RENT/c.txt\">x</write> ta",
+            "il",
+        ] {
+            acc.extend(chunked.feed(chunk));
+        }
+        acc.extend(chunked.flush());
+        let mut whole = StreamingParser::new();
+        let mut expected = whole.feed(text);
+        expected.extend(whole.flush());
+        assert_eq!(acc.len(), expected.len());
+        assert_eq!(acc[0].target, expected[0].target);
+        assert_eq!(acc[0].body, expected[0].body);
+    }
+
+    #[test]
+    fn test_streaming_parser_split_write_body_and_close() {
+        use crate::agent::StreamingParser;
+
+        // Complete opener, body split from closer: nothing may emit
+        // until `</write>` arrives, then exactly one complete action.
+        let mut parser = StreamingParser::new();
+        assert_eq!(
+            parser
+                .feed(r#"<write src="$CURRENT/test.txt">hello world"#)
+                .len(),
+            0
+        );
+        let actions = parser.feed("</write>");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ProposedKind::Write);
+        assert_eq!(actions[0].target, "$CURRENT/test.txt");
+        assert_eq!(actions[0].body, "hello world");
+        assert_eq!(parser.flush().len(), 0);
+
+        // Closer itself split across chunks.
+        let mut parser = StreamingParser::new();
+        assert_eq!(parser.feed(r#"<write src="$CURRENT/t2.txt">abc"#).len(), 0);
+        assert_eq!(parser.feed("</wr").len(), 0);
+        let actions = parser.feed("ite>");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].body, "abc");
+        assert_eq!(parser.flush().len(), 0);
+
+        // Complete prefix still emits now; only the unfinished tail waits.
+        let mut parser = StreamingParser::new();
+        let actions = parser.feed(
+            r#"<write src="$CURRENT/done.txt">x</write> <write src="$CURRENT/pending.txt">y"#,
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].target, "$CURRENT/done.txt");
+        let actions = parser.feed("z</write>");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].target, "$CURRENT/pending.txt");
+        assert_eq!(actions[0].body, "yz");
+        assert_eq!(parser.flush().len(), 0);
+    }
+
+    #[test]
+    fn test_streaming_parser_split_bodies_other_tools() {
+        use crate::agent::StreamingParser;
+
+        // <cmd> body split from closer.
+        let mut parser = StreamingParser::new();
+        assert_eq!(parser.feed("<cmd>cargo bu").len(), 0);
+        let actions = parser.feed("ild</cmd>");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ProposedKind::Cmd);
+
+        // <mcp> body split from closer (unclosed mcp never emits early).
+        let mut parser = StreamingParser::new();
+        assert_eq!(parser.feed(r#"<mcp server="s" tool="t">{"foo":"#).len(), 0);
+        let actions = parser.feed(r#""bar"}</mcp>"#);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ProposedKind::Mcp);
+        assert_eq!(parser.flush().len(), 0);
+
+        // <skill> body split from closer.
+        let mut parser = StreamingParser::new();
+        assert_eq!(parser.feed(r#"<skill action="search">part one "#).len(), 0);
+        let actions = parser.feed("part two</skill>");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ProposedKind::Skill);
+        assert_eq!(parser.flush().len(), 0);
+
+        // <websearch> body split from closer.
+        let mut parser = StreamingParser::new();
+        assert_eq!(parser.feed("<websearch>partial quer").len(), 0);
+        let actions = parser.feed("y</websearch>");
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].kind, ProposedKind::WebSearch);
+        assert_eq!(parser.flush().len(), 0);
+    }
+
+    #[test]
+    fn test_extract_attribute_rejects_substring_hits() {
+        // `src=` inside another attribute name must not match.
+        assert_eq!(
+            AgentEngine::extract_attribute(r#"<write xsrc="evil" src="real">"#, "src"),
+            Some("real".to_string())
+        );
+        // `src=` inside a quoted value must not match.
+        assert_eq!(
+            AgentEngine::extract_attribute(r#"<write title="src=fake" src="real">"#, "src"),
+            Some("real".to_string())
+        );
+        // Normal cases still work (quoted, single-quoted, bare).
+        assert_eq!(
+            AgentEngine::extract_attribute(r#"<write src="a.txt">"#, "src"),
+            Some("a.txt".to_string())
+        );
+        assert_eq!(
+            AgentEngine::extract_attribute(r#"<read src='b.txt'>"#, "src"),
+            Some("b.txt".to_string())
+        );
+        assert_eq!(
+            AgentEngine::extract_attribute(r#"<ls path="/tmp">"#, "path"),
+            Some("/tmp".to_string())
+        );
+        assert_eq!(AgentEngine::extract_attribute(r#"<write>"#, "src"), None);
+    }
+
+    #[test]
+    fn test_write_enforces_ask_permission_and_sandbox() {
+        // Single test owns the global perm state end-to-end (save /
+        // mutate / restore synchronously) so parallel tests are
+        // unaffected.
+        let _perm_guard = PERM_TEST_GUARD.lock().unwrap();
+        let saved = *crate::agent::TOOL_PERMS.lock().unwrap();
+
+        // Ask mode without /allow: write denied, nothing written.
+        *crate::agent::TOOL_PERMS.lock().unwrap() = crate::agent::ToolPermissions {
+            mode: crate::agent::PermissionMode::Ask,
+            folder_scope: crate::agent::FolderScope::CurrentDir,
+            session_allow: false,
+        };
+        let denied = AgentEngine::execute_write("$CURRENT/nope.txt", None, "x");
+        assert!(
+            denied.trim_start().starts_with("Error:"),
+            "ask-mode write must be denied, got: {denied}"
+        );
+        assert!(denied.contains("/allow"));
+
+        // AlwaysAllow but CurrentDir sandbox: absolute outside path denied.
+        *crate::agent::TOOL_PERMS.lock().unwrap() = crate::agent::ToolPermissions {
+            mode: crate::agent::PermissionMode::AlwaysAllow,
+            folder_scope: crate::agent::FolderScope::CurrentDir,
+            session_allow: false,
+        };
+        let blocked = AgentEngine::execute_write(
+            "/definitely-not-hercules-sandbox-test-xyz/file.txt",
+            None,
+            "x",
+        );
+        assert!(
+            blocked.trim_start().starts_with("Error:"),
+            "outside-sandbox write must be denied, got: {blocked}"
+        );
+        assert!(blocked.contains("Safefolder"));
+
+        *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+    }
+
+    #[test]
+    fn test_read_serves_prefetch_and_write_invalidates() {
+        // End-to-end through the canonical paths: prefetch warms the file,
+        // `execute_read` serves identical bytes, and `execute_write`
+        // invalidates so the next read sees fresh content.
+        let _perm_guard = PERM_TEST_GUARD.lock().unwrap();
+        let saved = *crate::agent::TOOL_PERMS.lock().unwrap();
+        *crate::agent::TOOL_PERMS.lock().unwrap() = crate::agent::ToolPermissions {
+            mode: crate::agent::PermissionMode::AlwaysAllow,
+            folder_scope: crate::agent::FolderScope::CurrentDir,
+            session_allow: false,
+        };
+
+        let dir = std::env::current_dir().unwrap().join(format!(
+            "target/hercules-read-cache-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = format!(
+            "$CURRENT/target/hercules-read-cache-test-{}/f.txt",
+            std::process::id()
+        );
+        crate::prefetch::invalidate(&crate::agent::AgentEngine::expand_path(&target));
+
+        let w = AgentEngine::execute_write(&target, None, "first version here\n");
+        assert!(!w.trim_start().starts_with("Error:"), "write failed: {w}");
+
+        // Warm the cache the way the background prefetcher does.
+        crate::prefetch::speculate_from_read(
+            crate::agent::AgentEngine::expand_path(&target),
+            "first version here\n".to_string(),
+        );
+        // Direct fetch-one as well (deterministic, no thread timing).
+        let expanded = crate::agent::AgentEngine::expand_path(&target);
+        let _ = crate::prefetch::get(&expanded);
+
+        let r1 = AgentEngine::execute_read(&target, None);
+        assert_eq!(r1, "first version here\n", "cached or disk read agrees");
+
+        // Rewrite through the canonical path → cache must not go stale.
+        let w2 = AgentEngine::execute_write(&target, None, "second version, longer\n");
+        assert!(
+            !w2.trim_start().starts_with("Error:"),
+            "rewrite failed: {w2}"
+        );
+        let r2 = AgentEngine::execute_read(&target, None);
+        assert_eq!(r2, "second version, longer\n", "write invalidated cache");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
     }
 
     #[test]

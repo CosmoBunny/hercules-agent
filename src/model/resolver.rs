@@ -35,6 +35,7 @@ fn backend_rank(kind: BackendKind, hardware: &HardwareInfo) -> u32 {
         BackendKind::Transformers => 40,
         // Remote last: needs an endpoint and leaves the machine.
         BackendKind::OpenAiCompatible => 100,
+        BackendKind::SharedThunder => 300,
     }
 }
 

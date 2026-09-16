@@ -7,7 +7,7 @@ mod common;
 
 use common::*;
 use hercules_agent::llama::gguf::GgmlType;
-use hercules_agent::llama::{default_rms_norm, ComputeBackend, ParallelBackend, ScalarBackend};
+use hercules_agent::llama::{ComputeBackend, ParallelBackend, ScalarBackend, default_rms_norm};
 
 #[test]
 fn test_tier1_correctness_q8_0_scalar() {
@@ -19,7 +19,15 @@ fn test_tier1_correctness_q8_0_scalar() {
 
     let backend = ScalarBackend::with_threads(1);
     backend
-        .gemv_quant(GgmlType::Q8_0, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::Q8_0,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("Q8_0 Scalar GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q8_0, rows, cols, &x);
@@ -36,7 +44,15 @@ fn test_tier1_correctness_q4_0_scalar() {
 
     let backend = ScalarBackend::with_threads(1);
     backend
-        .gemv_quant(GgmlType::Q4_0, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::Q4_0,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("Q4_0 Scalar GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q4_0, rows, cols, &x);
@@ -53,7 +69,15 @@ fn test_tier1_correctness_q4_k_scalar() {
 
     let backend = ScalarBackend::with_threads(1);
     backend
-        .gemv_quant(GgmlType::Q4_K, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::Q4_K,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("Q4_K Scalar GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q4_K, rows, cols, &x);
@@ -70,7 +94,15 @@ fn test_tier1_correctness_q5_k_scalar() {
 
     let backend = ScalarBackend::with_threads(1);
     backend
-        .gemv_quant(GgmlType::Q5_K, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::Q5_K,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("Q5_K Scalar GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q5_K, rows, cols, &x);
@@ -87,7 +119,15 @@ fn test_tier1_correctness_f16_scalar() {
 
     let backend = ScalarBackend::with_threads(1);
     backend
-        .gemv_quant(GgmlType::F16, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::F16,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("F16 Scalar GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::F16, rows, cols, &x);
@@ -104,7 +144,15 @@ fn test_tier1_correctness_f32_scalar() {
 
     let backend = ScalarBackend::with_threads(1);
     backend
-        .gemv_quant(GgmlType::F32, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::F32,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("F32 Scalar GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::F32, rows, cols, &x);
@@ -121,7 +169,15 @@ fn test_tier1_correctness_q8_0_parallel() {
 
     let backend = ParallelBackend::new(4);
     backend
-        .gemv_quant(GgmlType::Q8_0, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::Q8_0,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("Q8_0 Parallel GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q8_0, rows, cols, &x);
@@ -138,7 +194,15 @@ fn test_tier1_correctness_q4_k_parallel() {
 
     let backend = ParallelBackend::new(4);
     backend
-        .gemv_quant(GgmlType::Q4_K, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::Q4_K,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("Q4_K Parallel GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q4_K, rows, cols, &x);
@@ -155,7 +219,15 @@ fn test_tier1_correctness_q5_k_parallel() {
 
     let backend = ParallelBackend::new(4);
     backend
-        .gemv_quant(GgmlType::Q5_K, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::Q5_K,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("Q5_K Parallel GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q5_K, rows, cols, &x);
@@ -186,7 +258,15 @@ fn test_tier2_correctness_single_block_q8_0() {
 
     let backend = ScalarBackend::with_threads(1);
     backend
-        .gemv_quant(GgmlType::Q8_0, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::Q8_0,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("Single block Q8_0 GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q8_0, rows, cols, &x);
@@ -203,7 +283,15 @@ fn test_tier2_correctness_single_block_q4_k() {
 
     let backend = ScalarBackend::with_threads(1);
     backend
-        .gemv_quant(GgmlType::Q4_K, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::Q4_K,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("Single block Q4_K GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q4_K, rows, cols, &x);
@@ -220,7 +308,15 @@ fn test_tier2_correctness_large_matrix_q4_k() {
 
     let backend = ScalarBackend::with_threads(1);
     backend
-        .gemv_quant(GgmlType::Q4_K, &raw, rows, cols, rows * cols, &x, &mut y_actual)
+        .gemv_quant(
+            GgmlType::Q4_K,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_actual,
+        )
         .expect("Large matrix Q4_K GEMV failed");
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q4_K, rows, cols, &x);

@@ -27,10 +27,7 @@ fn default_gguf() -> PathBuf {
 fn require_gguf() -> PathBuf {
     let p = default_gguf();
     if !p.is_file() {
-        panic!(
-            "missing GGUF at {} (set HERCULES_TEST_GGUF)",
-            p.display()
-        );
+        panic!("missing GGUF at {} (set HERCULES_TEST_GGUF)", p.display());
     }
     p
 }
@@ -51,7 +48,11 @@ fn context_params_layout_has_outputs_fields() {
     let p = unsafe { (lib.context_default_params)() };
     // Defaults from current llama.cpp: n_ctx=512, n_batch=2048 typically.
     assert!(p.n_ctx > 0, "n_ctx default should be > 0, got {}", p.n_ctx);
-    assert!(p.n_batch > 0, "n_batch default should be > 0, got {}", p.n_batch);
+    assert!(
+        p.n_batch > 0,
+        "n_batch default should be > 0, got {}",
+        p.n_batch
+    );
     // If layout is wrong, n_threads often lands on garbage / zero.
     assert!(
         p.n_threads > 0 && p.n_threads < 512,

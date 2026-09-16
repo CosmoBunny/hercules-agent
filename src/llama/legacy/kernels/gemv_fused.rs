@@ -1,6 +1,6 @@
 //! Fused quant GEMV: dequant block → accumulate, no full-matrix alloc.
 
-use crate::llama::gguf::{f16_to_f32, GgmlType};
+use crate::llama::gguf::{GgmlType, f16_to_f32};
 
 const QK_K: usize = 256;
 const K_SCALE_SIZE: usize = 12;
@@ -68,8 +68,8 @@ pub fn gemv_quant_fused(
         GgmlType::F32 => gemv_f32(raw, rows, cols, n, x, y),
         GgmlType::F16 => gemv_f16(raw, rows, cols, n, x, y),
         _ => {
-            let data = crate::llama::gguf::dequant_buffer(raw, quant, n)
-                .map_err(|e| e.to_string())?;
+            let data =
+                crate::llama::gguf::dequant_buffer(raw, quant, n).map_err(|e| e.to_string())?;
             if data.len() < rows * cols {
                 return Err(format!(
                     "dequant size {} < rows*cols {}",
@@ -247,12 +247,13 @@ fn gemv_q5_0(
         if idx + block > raw.len() {
             return Err(format!(
                 "Q5_0 truncated at block offset {} (raw len={})",
-                idx, raw.len()
+                idx,
+                raw.len()
             ));
         }
         let d = read_f16_le(raw, idx);
-        let qh = u32::from_le_bytes([raw[idx+2], raw[idx+3], raw[idx+4], raw[idx+5]]);
-        let qs = &raw[idx+6..idx+22];
+        let qh = u32::from_le_bytes([raw[idx + 2], raw[idx + 3], raw[idx + 4], raw[idx + 5]]);
+        let qs = &raw[idx + 6..idx + 22];
         idx += block;
 
         for j in 0..16usize {
@@ -616,4 +617,3 @@ mod tests {
         check_vs_dequant(GgmlType::Q5_0, &raw, rows, cols);
     }
 }
-

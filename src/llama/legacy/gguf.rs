@@ -936,24 +936,9 @@ fn dequant_q3_k(raw: &[u8], n: usize) -> io::Result<Vec<f32>> {
 
         // Unpack 6-bit scales into 16 signed values (offset 32)
         let mut aux = [0u32; 4];
-        aux[0] = u32::from_le_bytes([
-            scales_raw[0],
-            scales_raw[1],
-            scales_raw[2],
-            scales_raw[3],
-        ]);
-        aux[1] = u32::from_le_bytes([
-            scales_raw[4],
-            scales_raw[5],
-            scales_raw[6],
-            scales_raw[7],
-        ]);
-        aux[2] = u32::from_le_bytes([
-            scales_raw[8],
-            scales_raw[9],
-            scales_raw[10],
-            scales_raw[11],
-        ]);
+        aux[0] = u32::from_le_bytes([scales_raw[0], scales_raw[1], scales_raw[2], scales_raw[3]]);
+        aux[1] = u32::from_le_bytes([scales_raw[4], scales_raw[5], scales_raw[6], scales_raw[7]]);
+        aux[2] = u32::from_le_bytes([scales_raw[8], scales_raw[9], scales_raw[10], scales_raw[11]]);
         let tmp = aux[2];
         aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
         aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);

@@ -16,8 +16,8 @@
 //! ## Thread safety
 //! `burn` tensor handles are `Send + Sync`; `GpuBackend` is `Send + Sync`.
 
-use crate::llama::gguf::{dequant_buffer, GgmlType};
 use crate::llama::compute::{ComputeBackend, ComputeError, default_rms_norm};
+use crate::llama::gguf::{GgmlType, dequant_buffer};
 use crate::llama::kernels::gemv_quant_fused;
 
 // -------------------------------------------------------------------
@@ -232,8 +232,7 @@ impl ComputeBackend for GpuBackend {
         x: &[f32],
         y: &mut [f32],
     ) -> Result<(), ComputeError> {
-        gemv_quant_fused(quant, raw, rows, cols, n_elements, x, y)
-            .map_err(ComputeError)
+        gemv_quant_fused(quant, raw, rows, cols, n_elements, x, y).map_err(ComputeError)
     }
 
     fn gemm_quant(

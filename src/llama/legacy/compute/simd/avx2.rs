@@ -3,7 +3,7 @@
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::arch::x86_64::*;
 
-use crate::llama::gguf::{f16_to_f32, GgmlType};
+use crate::llama::gguf::{GgmlType, f16_to_f32};
 use crate::llama::kernels::gemv_quant_fused;
 
 const QK_K: usize = 256;
@@ -450,8 +450,8 @@ pub unsafe fn rms_norm_avx2(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]
     let mut j = 0;
     while j + 8 <= n {
         unsafe {
-            let xv  = _mm256_loadu_ps(x.as_ptr().add(j));
-            let wv  = _mm256_loadu_ps(weight.as_ptr().add(j));
+            let xv = _mm256_loadu_ps(x.as_ptr().add(j));
+            let wv = _mm256_loadu_ps(weight.as_ptr().add(j));
             let res = _mm256_mul_ps(_mm256_mul_ps(xv, scale_v), wv);
             _mm256_storeu_ps(out.as_mut_ptr().add(j), res);
         }

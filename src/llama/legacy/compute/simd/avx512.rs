@@ -3,7 +3,7 @@
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::arch::x86_64::*;
 
-use crate::llama::gguf::{f16_to_f32, GgmlType};
+use crate::llama::gguf::{GgmlType, f16_to_f32};
 use crate::llama::kernels::gemv_quant_fused;
 
 const QK_K: usize = 256;

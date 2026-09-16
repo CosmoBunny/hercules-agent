@@ -1,6 +1,6 @@
-use std::path::Path;
 use crate::agent::AgentEngine;
 use crate::settings;
+use std::path::Path;
 
 pub struct GraphicEngine;
 
@@ -10,7 +10,10 @@ impl GraphicEngine {
         match clean_action.as_str() {
             "generate" | "gen" | "create" => Self::execute_generate(target_path, body),
             "ocr" | "read" | "scan" => Self::execute_ocr(target_path, body),
-            _ => format!("Error: Unknown <graphic> action '{}'. Expected 'generate' or 'ocr'.", action),
+            _ => format!(
+                "Error: Unknown <graphic> action '{}'. Expected 'generate' or 'ocr'.",
+                action
+            ),
         }
     }
 
@@ -19,7 +22,11 @@ impl GraphicEngine {
         if let Some(parent) = dest.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let ext = dest.extension().and_then(|s| s.to_str()).unwrap_or("png").to_lowercase();
+        let ext = dest
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("png")
+            .to_lowercase();
         let is_video = matches!(ext.as_str(), "mp4" | "gif" | "webm" | "avi" | "mov");
         let prompt_text = prompt.trim();
 
@@ -42,7 +49,11 @@ impl GraphicEngine {
             return format!("Error: OCR source file not found at {}", src.display());
         }
 
-        let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        let ext = src
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
         let ocr_model = settings::get_ocr_model();
 
         // 1. PDF Documents
@@ -90,7 +101,10 @@ impl GraphicEngine {
                 return Some(format!(
                     "System: [OK] Generated {} ({}) saved to {}",
                     kind,
-                    dest.extension().and_then(|s| s.to_str()).unwrap_or("png").to_uppercase(),
+                    dest.extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("png")
+                        .to_uppercase(),
                     dest.display()
                 ));
             }
@@ -109,7 +123,10 @@ impl GraphicEngine {
     }
 
     fn create_placeholder_video(dest: &Path, prompt: &str) -> String {
-        let content = format!("Hercules Agent Video Container\nPrompt: {}\nFormat: MP4 Container\n", prompt);
+        let content = format!(
+            "Hercules Agent Video Container\nPrompt: {}\nFormat: MP4 Container\n",
+            prompt
+        );
         let _ = std::fs::write(dest, content);
         format!("System: [OK] Generated Video saved to {}", dest.display())
     }
@@ -186,7 +203,10 @@ impl GraphicsProtocol {
             if prog_low.contains("iterm") || prog_low.contains("wezterm") {
                 return GraphicsProtocol::ITerm2;
             }
-            if prog_low.contains("foot") || prog_low.contains("contour") || prog_low.contains("mlterm") {
+            if prog_low.contains("foot")
+                || prog_low.contains("contour")
+                || prog_low.contains("mlterm")
+            {
                 return GraphicsProtocol::Sixel;
             }
         }
@@ -284,17 +304,21 @@ impl RasterCompositor {
             }
             let src_offset_x = (clipped_x0 - img.x).max(0) as u32;
             let src_offset_y = (clipped_y0 - img.y).max(0) as u32;
-            let (target_x, target_y, target_w, target_h) = (clipped_x0.max(0) as u16, clipped_y0.max(0) as u16, w, h);
+            let (target_x, target_y, target_w, target_h) =
+                (clipped_x0.max(0) as u16, clipped_y0.max(0) as u16, w, h);
 
             match self.protocol {
                 GraphicsProtocol::Kitty => {
-                    let (px_w, px_h) = *self.image_pixel_sizes.entry(img.attachment_id).or_insert_with(|| {
-                        if let Ok(dyn_img) = image::open(&img.path) {
-                            (dyn_img.width(), dyn_img.height())
-                        } else {
-                            (100, 100)
-                        }
-                    });
+                    let (px_w, px_h) = *self
+                        .image_pixel_sizes
+                        .entry(img.attachment_id)
+                        .or_insert_with(|| {
+                            if let Ok(dyn_img) = image::open(&img.path) {
+                                (dyn_img.width(), dyn_img.height())
+                            } else {
+                                (100, 100)
+                            }
+                        });
 
                     let k_id = if let Some(&id) = self.transmitted.get(&img.attachment_id) {
                         id
@@ -320,8 +344,12 @@ impl RasterCompositor {
                     let crop_src_h = (target_h as u32 * px_h) / total_rows;
 
                     // Match existing active placement ID for this image at same position if possible, otherwise allocate new placement ID
-                    let placement_id = self.active_placements.iter()
-                        .find(|old| old.image_id == k_id && old.dst_x == target_x && old.dst_y == target_y)
+                    let placement_id = self
+                        .active_placements
+                        .iter()
+                        .find(|old| {
+                            old.image_id == k_id && old.dst_x == target_x && old.dst_y == target_y
+                        })
                         .map(|old| old.placement_id)
                         .unwrap_or_else(|| {
                             let pid = self.next_placement_id;
@@ -348,19 +376,32 @@ impl RasterCompositor {
                     let total_cols = img.width.max(1) as u32;
                     let total_rows = img.height.max(1) as u32;
 
-                    if src_offset_x > 0 || src_offset_y > 0 || target_w < img.width || target_h < img.height {
+                    if src_offset_x > 0
+                        || src_offset_y > 0
+                        || target_w < img.width
+                        || target_h < img.height
+                    {
                         // Dynamically crop the in-memory image buffer to the exact visible viewport slice
                         if let Ok(dyn_img) = image::open(&img.path) {
                             let (px_w, px_h) = (dyn_img.width(), dyn_img.height());
                             let crop_x = (src_offset_x * px_w) / total_cols;
                             let crop_y = (src_offset_y * px_h) / total_rows;
-                            let crop_w = ((target_w as u32 * px_w) / total_cols).clamp(1, px_w.saturating_sub(crop_x));
-                            let crop_h = ((target_h as u32 * px_h) / total_rows).clamp(1, px_h.saturating_sub(crop_y));
+                            let crop_w = ((target_w as u32 * px_w) / total_cols)
+                                .clamp(1, px_w.saturating_sub(crop_x));
+                            let crop_h = ((target_h as u32 * px_h) / total_rows)
+                                .clamp(1, px_h.saturating_sub(crop_y));
 
                             let cropped = dyn_img.crop_imm(crop_x, crop_y, crop_w, crop_h);
                             let mut buf = std::io::Cursor::new(Vec::new());
                             if cropped.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
-                                self.iterm2_place(writer, buf.get_ref(), target_x, target_y, target_w, target_h)?;
+                                self.iterm2_place(
+                                    writer,
+                                    buf.get_ref(),
+                                    target_x,
+                                    target_y,
+                                    target_w,
+                                    target_h,
+                                )?;
                             }
                         }
                     } else if let Ok(bytes) = std::fs::read(&img.path) {
@@ -395,7 +436,12 @@ impl RasterCompositor {
     }
 
     /// Transmit image data into Kitty's GPU memory without immediate display (q=2 suppresses OK response echo)
-    fn kitty_transmit<W: std::io::Write>(&self, writer: &mut W, id: u32, data: &[u8]) -> std::io::Result<()> {
+    fn kitty_transmit<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        id: u32,
+        data: &[u8],
+    ) -> std::io::Result<()> {
         let b64 = crate::media::base64_encode(data);
         let chunks: Vec<&[u8]> = b64.as_bytes().chunks(4096).collect();
         let num_chunks = chunks.len();
@@ -407,7 +453,10 @@ impl RasterCompositor {
 
             if i == 0 {
                 // a=t (transmit only, don't display yet), t=d (direct payload), f=100 (PNG), i=id, q=2 (quiet mode, no OK response)
-                write!(writer, "\x1b_Ga=t,t=d,f=100,i={id},m={m},q=2;{chunk_str}\x1b\\")?;
+                write!(
+                    writer,
+                    "\x1b_Ga=t,t=d,f=100,i={id},m={m},q=2;{chunk_str}\x1b\\"
+                )?;
             } else {
                 write!(writer, "\x1b_Gm={m},q=2;{chunk_str}\x1b\\")?;
             }
@@ -416,7 +465,12 @@ impl RasterCompositor {
     }
 
     /// Place a transmitted image with exact source-pixel cropping (x, y, w, h), destination cells (c, r), and specific placement_id (p=)
-    fn kitty_place_cropped<W: std::io::Write>(&self, writer: &mut W, id: u32, p: KittyPlacementKey) -> std::io::Result<()> {
+    fn kitty_place_cropped<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        id: u32,
+        p: KittyPlacementKey,
+    ) -> std::io::Result<()> {
         // Save cursor position, move to (dst_x, dst_y), place cropped sub-rectangle with placement ID, restore cursor
         write!(
             writer,
@@ -435,13 +489,26 @@ impl RasterCompositor {
     }
 
     /// Delete ONLY a single specific placement (p=) of an image without deleting other placements or the transmitted image data
-    fn kitty_delete_single_placement<W: std::io::Write>(&self, writer: &mut W, id: u32, placement_id: u32) -> std::io::Result<()> {
+    fn kitty_delete_single_placement<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        id: u32,
+        placement_id: u32,
+    ) -> std::io::Result<()> {
         write!(writer, "\x1b_Ga=d,d=i,i={id},p={placement_id},q=2;\x1b\\")?;
         Ok(())
     }
 
     /// Place an image using iTerm2 inline graphics protocol
-    fn iterm2_place<W: std::io::Write>(&self, writer: &mut W, data: &[u8], x: u16, y: u16, cols: u16, rows: u16) -> std::io::Result<()> {
+    fn iterm2_place<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        data: &[u8],
+        x: u16,
+        y: u16,
+        cols: u16,
+        rows: u16,
+    ) -> std::io::Result<()> {
         let b64 = crate::media::base64_encode(data);
         write!(
             writer,

@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,12 +26,9 @@ impl MediaType {
             "png" | "jpg" | "jpeg" | "webp" | "svg" | "bmp" | "gif" | "tiff" | "ico" => {
                 MediaType::Image
             }
-            "mp4" | "mkv" | "webm" | "mov" | "avi" | "flv" | "wmv" | "m4v" => {
-                MediaType::Video
-            }
-            "pdf" | "txt" | "md" | "json" | "csv" | "docx" | "epub" | "log" | "xml" | "toml" | "yaml" | "yml" => {
-                MediaType::Document
-            }
+            "mp4" | "mkv" | "webm" | "mov" | "avi" | "flv" | "wmv" | "m4v" => MediaType::Video,
+            "pdf" | "txt" | "md" | "json" | "csv" | "docx" | "epub" | "log" | "xml" | "toml"
+            | "yaml" | "yml" => MediaType::Document,
             _ => MediaType::Other,
         }
     }
@@ -125,7 +122,11 @@ pub fn stage_image_bytes(bytes: &[u8], ext: &str) -> Result<MediaAttachment, Str
     stage_image_bytes_for_session(bytes, ext, None)
 }
 
-pub fn stage_image_bytes_for_session(bytes: &[u8], ext: &str, session_id: Option<&str>) -> Result<MediaAttachment, String> {
+pub fn stage_image_bytes_for_session(
+    bytes: &[u8],
+    ext: &str,
+    session_id: Option<&str>,
+) -> Result<MediaAttachment, String> {
     let dir = media_staging_dir_for_session(session_id);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -222,7 +223,10 @@ impl TerminalGraphicsProtocol {
             if prog_low.contains("iterm") || prog_low.contains("wezterm") {
                 return TerminalGraphicsProtocol::ITerm2;
             }
-            if prog_low.contains("foot") || prog_low.contains("contour") || prog_low.contains("mlterm") {
+            if prog_low.contains("foot")
+                || prog_low.contains("contour")
+                || prog_low.contains("mlterm")
+            {
                 return TerminalGraphicsProtocol::Sixel;
             }
         }
@@ -239,11 +243,16 @@ impl TerminalGraphicsProtocol {
             TerminalGraphicsProtocol::ITerm2 => {
                 let data = fs::read(path).map_err(|e| e.to_string())?;
                 let b64 = base64_encode(&data);
-                Ok(format!("\x1b]1337;File=inline=1;width={max_w};height={max_h}:{b64}\x07"))
+                Ok(format!(
+                    "\x1b]1337;File=inline=1;width={max_w};height={max_h}:{b64}\x07"
+                ))
             }
-            _ => {
-                Ok(format!("[Graphical Preview: {} ({}x{})]", path.display(), max_w, max_h))
-            }
+            _ => Ok(format!(
+                "[Graphical Preview: {} ({}x{})]",
+                path.display(),
+                max_w,
+                max_h
+            )),
         }
     }
 }
@@ -310,7 +319,7 @@ pub fn get_image_dimensions(path: &Path) -> Option<(usize, usize)> {
 
 /// Parses raw ANSI escape strings (containing \x1b[38;2;R;G;Bm, \x1b[48;2;R;G;Bm, \x1b[0m, etc.) into styled Ratatui Spans.
 pub fn parse_ansi_to_line(ansi_str: &str) -> ratatui::text::Line<'static> {
-    use ratatui::style::{Color, Style, Modifier};
+    use ratatui::style::{Color, Modifier, Style};
     let mut spans: Vec<ratatui::text::Span<'static>> = Vec::new();
     let mut cur_style = Style::default();
     let mut cur_text = String::new();
@@ -332,7 +341,10 @@ pub fn parse_ansi_to_line(ansi_str: &str) -> ratatui::text::Line<'static> {
                 }
 
                 if !cur_text.is_empty() {
-                    spans.push(ratatui::text::Span::styled(std::mem::take(&mut cur_text), cur_style));
+                    spans.push(ratatui::text::Span::styled(
+                        std::mem::take(&mut cur_text),
+                        cur_style,
+                    ));
                 }
 
                 // Parse CSI SGR parameters (e.g. 0, 38;2;r;g;b, 48;2;r;g;b)
@@ -345,21 +357,37 @@ pub fn parse_ansi_to_line(ansi_str: &str) -> ratatui::text::Line<'static> {
                         let mut i = 0;
                         while i < parts.len() {
                             match parts[i] {
-                                "0" => { cur_style = Style::default(); i += 1; }
-                                "1" => { cur_style = cur_style.add_modifier(Modifier::BOLD); i += 1; }
+                                "0" => {
+                                    cur_style = Style::default();
+                                    i += 1;
+                                }
+                                "1" => {
+                                    cur_style = cur_style.add_modifier(Modifier::BOLD);
+                                    i += 1;
+                                }
                                 "38" if i + 4 < parts.len() && parts[i + 1] == "2" => {
-                                    if let (Ok(r), Ok(g), Ok(b)) = (parts[i + 2].parse::<u8>(), parts[i + 3].parse::<u8>(), parts[i + 4].parse::<u8>()) {
+                                    if let (Ok(r), Ok(g), Ok(b)) = (
+                                        parts[i + 2].parse::<u8>(),
+                                        parts[i + 3].parse::<u8>(),
+                                        parts[i + 4].parse::<u8>(),
+                                    ) {
                                         cur_style = cur_style.fg(Color::Rgb(r, g, b));
                                     }
                                     i += 5;
                                 }
                                 "48" if i + 4 < parts.len() && parts[i + 1] == "2" => {
-                                    if let (Ok(r), Ok(g), Ok(b)) = (parts[i + 2].parse::<u8>(), parts[i + 3].parse::<u8>(), parts[i + 4].parse::<u8>()) {
+                                    if let (Ok(r), Ok(g), Ok(b)) = (
+                                        parts[i + 2].parse::<u8>(),
+                                        parts[i + 3].parse::<u8>(),
+                                        parts[i + 4].parse::<u8>(),
+                                    ) {
                                         cur_style = cur_style.bg(Color::Rgb(r, g, b));
                                     }
                                     i += 5;
                                 }
-                                _ => { i += 1; }
+                                _ => {
+                                    i += 1;
+                                }
                             }
                         }
                     }
@@ -381,7 +409,11 @@ pub fn parse_ansi_to_line(ansi_str: &str) -> ratatui::text::Line<'static> {
 /// Uses the pure Rust `image` crate to decode and sample pixels directly into native Ratatui `Line`s
 /// with upper half-block characters (`▀`) combining foreground (upper pixel) and background (lower pixel).
 /// Calculates dynamic width based on the image's aspect ratio up to `max_h` (max 12 rows).
-pub fn generate_image_thumbnail_lines(path: &Path, max_avail_w: usize, max_h: usize) -> (Vec<ratatui::text::Line<'static>>, usize) {
+pub fn generate_image_thumbnail_lines(
+    path: &Path,
+    max_avail_w: usize,
+    max_h: usize,
+) -> (Vec<ratatui::text::Line<'static>>, usize) {
     use ratatui::style::{Color, Style};
     use ratatui::text::{Line, Span};
 
@@ -399,7 +431,8 @@ pub fn generate_image_thumbnail_lines(path: &Path, max_avail_w: usize, max_h: us
             let pixel_h = (target_h * 2) as u32;
             let pixel_w = target_w as u32;
 
-            let resized = dyn_img.resize_exact(pixel_w, pixel_h, image::imageops::FilterType::Triangle);
+            let resized =
+                dyn_img.resize_exact(pixel_w, pixel_h, image::imageops::FilterType::Triangle);
             let rgb = resized.to_rgb8();
 
             let mut lines = Vec::new();
@@ -431,6 +464,11 @@ pub fn generate_image_thumbnail_lines(path: &Path, max_avail_w: usize, max_h: us
     }
 
     // Fallback if image decode fails
-    (vec![Line::from(format!("  [Thumbnail: {}]", path.file_name().unwrap_or_default().to_string_lossy()))], 30)
+    (
+        vec![Line::from(format!(
+            "  [Thumbnail: {}]",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ))],
+        30,
+    )
 }
-

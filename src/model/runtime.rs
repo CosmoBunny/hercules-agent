@@ -22,6 +22,7 @@ pub enum ExistingRuntime {
     Ollama,
     Transformers,
     BurnWgpu,
+    SharedThunder,
 }
 
 impl ExistingRuntime {
@@ -31,6 +32,7 @@ impl ExistingRuntime {
             Self::Ollama => BackendKind::Ollama,
             Self::Transformers => BackendKind::Transformers,
             Self::BurnWgpu => BackendKind::BurnWgpu,
+            Self::SharedThunder => BackendKind::SharedThunder,
         }
     }
 
@@ -41,6 +43,9 @@ impl ExistingRuntime {
             Self::Ollama => "OllamaBackend (local daemon HTTP, droppable streams)",
             Self::Transformers => "TransformersBackend (isolated Python worker, kill_on_drop)",
             Self::BurnWgpu => "BurnWgpuBackend (demo engine, gpu feature)",
+            Self::SharedThunder => {
+                "SharedThunderBackend (paired peer, encrypted P2P, cancel via flag)"
+            }
         }
     }
 }
@@ -53,6 +58,7 @@ impl BackendKind {
             crate::backend::AgentBackend::LlamaCppLib(_) => BackendKind::LlamaCpp,
             crate::backend::AgentBackend::Ollama(_) => BackendKind::Ollama,
             crate::backend::AgentBackend::Transformers(_) => BackendKind::Transformers,
+            crate::backend::AgentBackend::SharedThunder(_) => BackendKind::SharedThunder,
             #[cfg(feature = "gpu")]
             crate::backend::AgentBackend::BurnWgpu(_) => BackendKind::BurnWgpu,
         }
@@ -81,6 +87,7 @@ pub fn runtime_for_kind(kind: BackendKind) -> Result<ExistingRuntime, ModelError
             backend: kind.label().to_string(),
             reason: "Remote endpoint support arrives in Phase 6".to_string(),
         }),
+        BackendKind::SharedThunder => Ok(ExistingRuntime::SharedThunder),
     }
 }
 
@@ -106,6 +113,15 @@ pub fn construct_existing_runtime(
                 model_ref,
             )),
         )),
+        ExistingRuntime::SharedThunder => {
+            // Remote: model_ref is `peer_id::model_id@host:port` — the
+            // EXACT selected peer is resolved by id from the trust store.
+            // No arbitrary first peer, no invented host; malformed refs
+            // and unknown peers fail typed.
+            crate::thunder::runtime::SharedThunderBackend::from_ref(model_ref)
+                .map(crate::backend::AgentBackend::SharedThunder)
+                .map_err(thunder_to_model_error)
+        }
         ExistingRuntime::BurnWgpu => {
             #[cfg(feature = "gpu")]
             {
@@ -121,6 +137,13 @@ pub fn construct_existing_runtime(
                 })
             }
         }
+    }
+}
+
+fn thunder_to_model_error(e: crate::thunder::ThunderError) -> ModelError {
+    ModelError::BackendUnavailable {
+        backend: "Shared Thunder".to_string(),
+        reason: e.message(),
     }
 }
 
@@ -228,6 +251,11 @@ mod tests {
         );
         assert!(runtime_for_kind(BackendKind::Mlx).is_err());
         assert!(runtime_for_kind(BackendKind::OpenAiCompatible).is_err());
+        // Phase 5/T8: Shared Thunder is a real runtime.
+        assert_eq!(
+            runtime_for_kind(BackendKind::SharedThunder).unwrap(),
+            ExistingRuntime::SharedThunder
+        );
     }
 
     #[test]
@@ -390,6 +418,30 @@ mod tests {
             BackendKind::of_agent_backend(&rt),
             BackendKind::Transformers
         );
+        // Phase 5/T8: Shared Thunder constructs the runtime from a ref
+        // (config only) — malformed refs fail typed. Refs bind the EXACT
+        // peer by id; without a persisted peer they fail PeerUnavailable.
+        assert!(construct_existing_runtime(BackendKind::SharedThunder, "no-address").is_err());
+        assert!(
+            construct_existing_runtime(
+                BackendKind::SharedThunder,
+                "thunder-nopeer::qwen3-30b@127.0.0.1:9100"
+            )
+            .is_err()
+        );
+        match construct_existing_runtime(
+            BackendKind::SharedThunder,
+            "thunder-x::qwen3-30b@127.0.0.1:9100",
+        ) {
+            Ok(b) => assert_eq!(
+                BackendKind::of_agent_backend(&b),
+                BackendKind::SharedThunder
+            ),
+            Err(e) => assert!(
+                matches!(e, crate::model::ModelError::BackendUnavailable { .. }),
+                "{e:?}"
+            ),
+        }
         // Future kinds fail typed, never stubbed.
         assert!(construct_existing_runtime(BackendKind::Mlx, "x").is_err());
     }

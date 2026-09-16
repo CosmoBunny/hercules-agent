@@ -1,6 +1,6 @@
 //! Dequantize a contiguous element range without expanding the full tensor.
 
-use crate::llama::gguf::{dequant_buffer, f16_to_f32, GgmlType};
+use crate::llama::gguf::{GgmlType, dequant_buffer, f16_to_f32};
 
 const QK_K: usize = 256;
 const K_SCALE_SIZE: usize = 12;

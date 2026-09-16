@@ -7,7 +7,7 @@ mod common;
 
 use common::*;
 use hercules_agent::llama::gguf::GgmlType;
-use hercules_agent::llama::{default_rms_norm, ComputeBackend, ParallelBackend, ScalarBackend};
+use hercules_agent::llama::{ComputeBackend, ParallelBackend, ScalarBackend, default_rms_norm};
 
 #[test]
 fn test_tier3_combo_q4_k_scalar_vs_parallel() {
@@ -21,12 +21,28 @@ fn test_tier3_combo_q4_k_scalar_vs_parallel() {
 
     let scalar = ScalarBackend::with_threads(1);
     scalar
-        .gemv_quant(GgmlType::Q4_K, &raw, rows, cols, rows * cols, &x, &mut y_scalar)
+        .gemv_quant(
+            GgmlType::Q4_K,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_scalar,
+        )
         .unwrap();
 
     let parallel = ParallelBackend::new(4);
     parallel
-        .gemv_quant(GgmlType::Q4_K, &raw, rows, cols, rows * cols, &x, &mut y_parallel)
+        .gemv_quant(
+            GgmlType::Q4_K,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_parallel,
+        )
         .unwrap();
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q4_K, rows, cols, &x);
@@ -46,12 +62,28 @@ fn test_tier3_combo_q5_k_scalar_vs_parallel() {
 
     let scalar = ScalarBackend::with_threads(1);
     scalar
-        .gemv_quant(GgmlType::Q5_K, &raw, rows, cols, rows * cols, &x, &mut y_scalar)
+        .gemv_quant(
+            GgmlType::Q5_K,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_scalar,
+        )
         .unwrap();
 
     let parallel = ParallelBackend::new(4);
     parallel
-        .gemv_quant(GgmlType::Q5_K, &raw, rows, cols, rows * cols, &x, &mut y_parallel)
+        .gemv_quant(
+            GgmlType::Q5_K,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_parallel,
+        )
         .unwrap();
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q5_K, rows, cols, &x);
@@ -71,12 +103,28 @@ fn test_tier3_combo_q8_0_scalar_vs_parallel() {
 
     let scalar = ScalarBackend::with_threads(1);
     scalar
-        .gemv_quant(GgmlType::Q8_0, &raw, rows, cols, rows * cols, &x, &mut y_scalar)
+        .gemv_quant(
+            GgmlType::Q8_0,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_scalar,
+        )
         .unwrap();
 
     let parallel = ParallelBackend::new(4);
     parallel
-        .gemv_quant(GgmlType::Q8_0, &raw, rows, cols, rows * cols, &x, &mut y_parallel)
+        .gemv_quant(
+            GgmlType::Q8_0,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut y_parallel,
+        )
         .unwrap();
 
     let y_ref = f64_reference_gemv(&raw, GgmlType::Q8_0, rows, cols, &x);
@@ -94,7 +142,15 @@ fn test_tier3_combo_gemv_followed_by_rmsnorm() {
 
     let backend = ParallelBackend::new(2);
     backend
-        .gemv_quant(GgmlType::Q8_0, &raw, rows, cols, rows * cols, &x, &mut gemv_out)
+        .gemv_quant(
+            GgmlType::Q8_0,
+            &raw,
+            rows,
+            cols,
+            rows * cols,
+            &x,
+            &mut gemv_out,
+        )
         .unwrap();
 
     let weight = generate_synthetic_vector(rows, 8009);

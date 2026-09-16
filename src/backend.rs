@@ -21,6 +21,8 @@ pub enum AgentBackend {
     Ollama(OllamaBackend),
     /// Isolated Python Transformers worker (SafeTensors/PyTorch).
     Transformers(crate::model::transformers::TransformersBackend),
+    /// Shared Thunder P2P inference on a paired peer's host (T7).
+    SharedThunder(crate::thunder::runtime::SharedThunderBackend),
 }
 
 impl AgentBackend {
@@ -31,6 +33,7 @@ impl AgentBackend {
             Self::LlamaCppLib(backend) => backend.generate(prompt).await,
             Self::Ollama(backend) => backend.generate(prompt).await,
             Self::Transformers(backend) => backend.generate(prompt).await,
+            Self::SharedThunder(backend) => backend.generate(prompt).await,
         }
     }
 
@@ -53,6 +56,11 @@ impl AgentBackend {
                     .await
             }
             Self::Transformers(backend) => {
+                backend
+                    .generate_stream(prompt, stream_target, is_generating)
+                    .await
+            }
+            Self::SharedThunder(backend) => {
                 backend
                     .generate_stream(prompt, stream_target, is_generating)
                     .await
@@ -83,6 +91,7 @@ impl AgentBackend {
             Self::LlamaCppLib(b) => b.name(),
             Self::Ollama(b) => format!("Ollama ({})", b.model),
             Self::Transformers(b) => b.name(),
+            Self::SharedThunder(b) => b.name(),
         }
     }
 
@@ -130,6 +139,22 @@ impl AgentBackend {
                     // Not a local dir: keep current backend instead of
                     // inventing a model that does not exist.
                     self.clone()
+                }
+            }
+            Self::SharedThunder(current) => {
+                // `peer_id::model_id@host:port` re-targets peer+model
+                // atomically; a bare name re-targets the model on the
+                // SAME selected peer. Anything else keeps the current
+                // backend (never invents a host or a peer).
+                if trimmed.contains("::") {
+                    match crate::thunder::runtime::SharedThunderBackend::from_ref(trimmed) {
+                        Ok(b) => Self::SharedThunder(b),
+                        Err(_) => self.clone(),
+                    }
+                } else if trimmed.is_empty() {
+                    self.clone()
+                } else {
+                    Self::SharedThunder(current.with_model_id(trimmed))
                 }
             }
         }

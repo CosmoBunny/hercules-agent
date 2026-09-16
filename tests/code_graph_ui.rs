@@ -5,9 +5,9 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use hercules_agent::app::{App, CodeGraphPane};
 use hercules_agent::code_graph::{CodeGraphBuilder, CodeGraphConfig, EdgeKind};
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
-use ratatui::Terminal;
 
 fn key(code: KeyCode) -> crossterm::event::KeyEvent {
     crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)

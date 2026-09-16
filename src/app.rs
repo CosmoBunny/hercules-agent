@@ -6,6 +6,7 @@ use crate::ask_mode::{AskModeResponse, AskModeState};
 use crate::backend::{AgentBackend, LlamaCppLibBackend, OllamaBackend};
 use crate::manager::ModelManager;
 use crate::task_manager::{QUICK_SECS, TaskEvent, TaskManager};
+use crate::thunder::runtime::SharedThunderBackend;
 use crate::tool_panel::{self, PanelChromeHit, ToolChip, ToolPanel, ToolPanelKind};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use kramaframe::prelude::{KeyFrameFunction, KeyList};
@@ -297,7 +298,7 @@ pub struct App {
     // Config & Navigation
     pub theme_color: Color,
     pub show_menu: bool,
-    pub menu_section: usize, // 0: Help, 1: Registry, 2: Modal (Installed), 3: Settings, 4: Session Info
+    pub menu_section: usize, // 0: Help, 1: Registry, 2: Modal (Installed), 3: Settings, 4: Session Info, 5: Code Graph, 6: Run, 7: Thunder
     pub header_dropdown_open: bool,
     pub header_anim_progress: f32, // 0.0 = top header at row 0, 1.0 = top header at row 1 (revealing menu on row 0)
     pub menu_anim_progress: f32,   // 0.0 = closed, 1.0 = fully open (fade up/down)
@@ -515,6 +516,12 @@ pub struct App {
 
     /// Ask Mode interactive state
     pub ask_mode_state: Option<AskModeState>,
+    /// Shared Thunder transient UI state (selected tab/peer/model,
+    /// input buffers, pending pairing, host operation). Persistent
+    /// trust/network/model state lives in the Thunder modules.
+    pub thunder_ui: crate::thunder_ui::ThunderUiState,
+    /// Thunder peer discovery socket (bound lazily on first Thunder open).
+    pub thunder_discovery: Option<crate::thunder::discovery::Discovery>,
 }
 
 /// Map a canonical tool kind to its timeline step kind.
@@ -743,6 +750,8 @@ impl App {
             gen_run_id: None,
             gen_cancel_token: None,
             ask_mode_state: None,
+            thunder_ui: crate::thunder_ui::ThunderUiState::default(),
+            thunder_discovery: None,
             code_graph: None,
             code_graph_loading: false,
             code_graph_error: None,
@@ -942,6 +951,8 @@ impl App {
                 .filter(|m| !m.starts_with("Ollama:"))
                 .cloned()
                 .collect(),
+            // Remote: the paired host advertises its own models.
+            AgentBackend::SharedThunder(b) => vec![b.target.model_id.clone()],
             #[cfg(feature = "gpu")]
             AgentBackend::BurnWgpu(_) => vec![],
         }
@@ -1030,6 +1041,128 @@ impl App {
             .rev()
             .find(|(_, m)| m.starts_with("Agent:"))
             .map(|(i, _)| i)
+    }
+
+    /// Genuinely fresh, empty workspace: only the initial welcome
+    /// message exists, nothing is generating, no agent run is active,
+    /// no streamed content, no pending tool activity, no chat history
+    /// beyond the welcome. An empty message list is NOT pristine — a
+    /// fresh launch always carries the initial welcome message, so an
+    /// empty list means unknown state. The splash is DERIVED from this
+    /// state — never persisted — so a restored session with real
+    /// history never shows it.
+    pub(crate) fn is_pristine_start_screen(&self) -> bool {
+        if *self.is_generating.lock().unwrap() {
+            return false;
+        }
+        if self.current_run.is_some() {
+            return false;
+        }
+        if let Ok(s) = self.streaming_response.lock() {
+            if !s.is_empty() {
+                return false;
+            }
+        }
+        if !self.pending_agent_messages.is_empty() || !self.tool_result_context.is_empty() {
+            return false;
+        }
+        if self.messages.is_empty() {
+            return false;
+        }
+        // Meaningful history: anything besides the initial welcome
+        // message(s) means the workspace has been used — and at least
+        // one welcome message must be present to qualify at all.
+        self.messages
+            .iter()
+            .any(|m| m.starts_with("System: Welcome to Hercules"))
+            && self
+                .messages
+                .iter()
+                .all(|m| m.starts_with("System: Welcome to Hercules"))
+    }
+
+    /// Start-screen splash: the exact artwork from `splash.txt`
+    /// (canonical source, cached by the loader), centered in the chat
+    /// area using Unicode display width. Each source line is one
+    /// terminal row — no wrapping, no reflow, no borders. Small
+    /// terminals clip the artwork safely (rows/columns beyond the area
+    /// are simply not rendered); glyphs are never scaled.
+    fn render_splash(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        use ratatui::style::{Color, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::Paragraph;
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let art = crate::splash::load_splash();
+        if art.is_empty() {
+            return;
+        }
+        let muted = Color::Rgb(110, 120, 135);
+        let light = Color::Rgb(150, 160, 175);
+        // Vertical center: artwork rows + one blank line + subtitle.
+        let art_h = art.lines.len() as u16;
+        let total_h = art_h.saturating_add(2);
+        let top = area.y + area.height.saturating_sub(total_h) / 2;
+        for (i, line) in art.lines.iter().enumerate() {
+            let y = top + i as u16;
+            if y >= area.y + area.height {
+                break; // clip rows beyond the chat area (small terminals)
+            }
+            let w = art.widths[i];
+            if w == 0 {
+                continue;
+            }
+            // Wide artwork on a narrow chat area: crop around the
+            // artwork center so the middle stays visible. Glyphs are
+            // never scaled, split, or reflowed.
+            let visible: String = if w > area.width as usize {
+                let start = (w - area.width as usize) / 2;
+                crate::splash::crop_centered(line, start, area.width as usize)
+            } else {
+                line.clone()
+            };
+            let visible_w = crate::splash::line_display_width(&visible);
+            let x = area.x
+                + area
+                    .width
+                    .saturating_sub(visible_w.min(area.width as usize) as u16)
+                    / 2;
+            let color = if line.trim().is_empty() { muted } else { light };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    visible,
+                    Style::default().fg(color).bg(NORDIC_BG),
+                )))
+                .style(Style::default().bg(NORDIC_BG)),
+                ratatui::layout::Rect {
+                    x,
+                    y,
+                    width: area.width.saturating_sub((x - area.x)),
+                    height: 1,
+                },
+            );
+        }
+        // Subtitle rendered separately below the artwork (splash.txt
+        // stays artwork-only), in the existing muted style.
+        let sub_y = top + art_h + 1;
+        if sub_y < area.y + area.height {
+            let msg = "Ask me anything.";
+            let x = area.x + area.width.saturating_sub(msg.chars().count() as u16) / 2;
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    msg,
+                    Style::default().fg(Color::Rgb(120, 135, 155)).bg(NORDIC_BG),
+                )))
+                .style(Style::default().bg(NORDIC_BG)),
+                ratatui::layout::Rect {
+                    x,
+                    y: sub_y,
+                    width: area.width.saturating_sub(x - area.x),
+                    height: 1,
+                },
+            );
+        }
     }
 
     fn sync_tool_chips(&mut self, stream: &str) {
@@ -1685,10 +1818,46 @@ impl App {
 
         if !mcps.is_empty() {
             let mut agent_ids = Vec::new();
-            for a in &mcps {
-                if !self.claim_tool_call(a) {
-                    continue;
-                }
+            // Phase 1 — claim everything up-front, sequentially, through the
+            // canonical gate (order of claims is deterministic).
+            let claimed: Vec<&crate::agent::ProposedAction> =
+                mcps.iter().filter(|a| self.claim_tool_call(a)).collect();
+            // Phase 2 — independent Read/Ls executions run CONCURRENTLY
+            // (pure filesystem + global registries only). Spawns, smart
+            // writes and runtime-bound calls stay sequential below.
+            // Results are re-associated by index so Phase 3 stays ordered.
+            let mut read_results: std::collections::HashMap<usize, String> =
+                std::thread::scope(|s| {
+                    let handles: Vec<(usize, std::thread::ScopedJoinHandle<'_, String>)> = claimed
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| {
+                            matches!(
+                                a.kind,
+                                crate::agent::ProposedKind::Read | crate::agent::ProposedKind::Ls
+                            )
+                        })
+                        .map(|(i, a)| {
+                            (
+                                i,
+                                s.spawn(move || crate::agent::AgentEngine::execute_proposed(a)),
+                            )
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|(i, h)| {
+                            (
+                                i,
+                                h.join()
+                                    .unwrap_or_else(|_| "Error: read task panicked".to_string()),
+                            )
+                        })
+                        .collect()
+                });
+            // Phase 3 — UI + context updates strictly in original order, so
+            // the next generation sees a deterministic tool-result sequence.
+            for (idx, a) in claimed.iter().enumerate() {
                 if a.kind == crate::agent::ProposedKind::Agent {
                     let role = crate::agent::AgentEngine::extract_attribute(&a.target, "role")
                         .unwrap_or_default();
@@ -1753,6 +1922,16 @@ impl App {
                         }
                         crate::smart_system::SmartWriteResult::Error(e) => e,
                     }
+                } else if matches!(
+                    a.kind,
+                    crate::agent::ProposedKind::Read | crate::agent::ProposedKind::Ls
+                ) {
+                    // Served from the Phase-2 concurrent execution (which
+                    // went through the same canonical `execute_proposed`,
+                    // including sandbox checks and prefetch warm-up).
+                    read_results
+                        .remove(&idx)
+                        .unwrap_or_else(|| crate::agent::AgentEngine::execute_proposed(a))
                 } else {
                     crate::agent::AgentEngine::execute_proposed(a)
                 };
@@ -3176,6 +3355,41 @@ impl App {
                     *is_gen.lock().unwrap() = false;
                 });
             }
+            AgentBackend::SharedThunder(st_backend) => {
+                // Same cooperative cancellation as the other backends: the
+                // run token backstops the in-flight remote stream.
+                let backend_clone = st_backend.clone();
+                let is_gen_task = is_gen.clone();
+                let cancel_child = child_token.clone();
+                let stream_target2 = stream_target.clone();
+                let prompt = if self.auto_tool_turns > 0
+                    || !self.tool_result_context.is_empty()
+                    || context_prompt.lines().count() > 1
+                {
+                    context_prompt.clone()
+                } else {
+                    self.last_user_message()
+                        .filter(|m| !m.trim().is_empty())
+                        .unwrap_or_else(|| context_prompt.clone())
+                };
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = cancel_child.cancelled() => {
+                            *gen_err.lock().unwrap() =
+                                Some("[Generation Cancelled by User]".to_string());
+                        }
+                        r = backend_clone.generate_stream(&prompt, stream_target2, is_gen_task) => {
+                            match r {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    *gen_err.lock().unwrap() = Some(e);
+                                }
+                            }
+                        }
+                    }
+                    *is_gen.lock().unwrap() = false;
+                });
+            }
             #[cfg(feature = "gpu")]
             AgentBackend::BurnWgpu(_) => {
                 let backend_clone = self.backend.clone();
@@ -4545,8 +4759,17 @@ impl App {
                                 self.recent_tool_calls.clear();
                                 self.repeat_count = 0;
                             } else if need_accept {
-                                // "Ask" permission mode — auto-execute writes immediately for
-                                // continuous operation. Ctrl+C is the user's stop signal.
+                                // "Ask" permission mode WITHOUT session allow:
+                                // writes must go through the canonical
+                                // executor (`execute_proposed` →
+                                // `execute_write`), which enforces BOTH the
+                                // Ask-mode permission gate
+                                // (`tools_allowed_for_write_cmd`) AND the
+                                // filesystem sandbox (`path_allowed`).
+                                // Raw `fs::write` here would bypass both.
+                                // Without `/allow` this records a permission
+                                // denial (nothing is written); with freshly
+                                // granted allow the next turn proceeds.
                                 // Reuse the result already computed above; re-running
                                 // process_response here would execute every tool twice.
                                 let tool_out = tool_output_opt.clone().or_else(|| {
@@ -4560,22 +4783,42 @@ impl App {
                                         if !self.claim_tool_call(a) {
                                             continue;
                                         }
-                                        let path =
-                                            crate::agent::AgentEngine::expand_path(&a.target);
-                                        if let Some(parent) = path.parent() {
-                                            let _ = std::fs::create_dir_all(parent);
+                                        let write_result =
+                                            crate::agent::AgentEngine::execute_proposed(a);
+                                        let ok = !write_result.trim_start().starts_with("Error:");
+                                        if !ok {
+                                            // Failed executions hold no claim:
+                                            // nothing ran, so an explicit
+                                            // later acceptance (`/allow`, Y)
+                                            // can still claim + execute it.
+                                            // Releasing only on failure keeps
+                                            // exactly-once for successes.
+                                            self.dispatch_registry.release(a);
                                         }
-                                        let _ = std::fs::write(&path, &a.body);
                                         self.finish_run_call(
                                             a.call_id,
-                                            crate::run_timeline::StepStatus::Succeeded,
-                                            Some(format!(
-                                                "wrote {} lines (ask-mode auto-execute)",
-                                                a.body.lines().count()
-                                            )),
+                                            if ok {
+                                                crate::run_timeline::StepStatus::Succeeded
+                                            } else {
+                                                crate::run_timeline::StepStatus::Failed
+                                            },
+                                            Some(if ok {
+                                                format!(
+                                                    "wrote {} lines (ask-mode auto-execute)",
+                                                    a.body.lines().count()
+                                                )
+                                            } else {
+                                                write_result
+                                                    .lines()
+                                                    .next()
+                                                    .unwrap_or("write blocked")
+                                                    .to_string()
+                                            }),
                                         );
                                         let anchor = self.latest_agent_msg_idx();
                                         let kind = tool_panel::ToolPanelKind::Write;
+                                        let path =
+                                            crate::agent::AgentEngine::expand_path(&a.target);
                                         let target_str = tool_panel::normalize_target(
                                             kind,
                                             &path.display().to_string(),
@@ -5019,6 +5262,29 @@ impl App {
                                     self.menu_closing = false;
                                     self.header_dropdown_open = false; // slide header back up
                                     self.krama.restart_progress("menu_fade", 0);
+                                    if *sec_idx == 7 {
+                                        self.ensure_thunder_discovery();
+                                    }
+                                    self.clear_selection();
+                                    self.exit_term_interactive();
+                                    return Ok(true);
+                                }
+                            }
+                        }
+
+                        // Thunder internal tabs + action rows (same rects as render)
+                        if self.show_menu && self.menu_section == 7 {
+                            for (tab_idx, row, x0, x1) in self.thunder_ui.tab_hits.clone() {
+                                if mouse.row == row && mouse.column >= x0 && mouse.column <= x1 {
+                                    self.thunder_ui.set_tab(tab_idx);
+                                    self.clear_selection();
+                                    self.exit_term_interactive();
+                                    return Ok(true);
+                                }
+                            }
+                            for (action_idx, row) in self.thunder_ui.row_hits.clone() {
+                                if mouse.row == row {
+                                    self.thunder_ui.list_selected = action_idx;
                                     self.clear_selection();
                                     self.exit_term_interactive();
                                     return Ok(true);
@@ -5762,6 +6028,7 @@ impl App {
                 (4, " Session "),
                 (5, " Code Graph "),
                 (6, " Run "),
+                (7, " Thunder "),
             ];
 
             menu_spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
@@ -7295,46 +7562,54 @@ impl App {
             }
         }
 
-        let chat_box = Paragraph::new(chat_lines)
-            .style(Style::default().bg(NORDIC_BG))
-            .scroll((self.scroll_offset, 0))
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .block(Block::default().borders(Borders::NONE));
-        frame.render_widget(chat_box, chat_area);
+        // Start screen: render the splash instead of the chat — splash
+        // lines never enter the chat line vector, scrolling, selection,
+        // or session persistence. The input bar below stays functional.
+        if self.is_pristine_start_screen() {
+            self.render_splash(frame, chat_area);
+            self.last_chat_area = Some(chat_area);
+        } else {
+            let chat_box = Paragraph::new(chat_lines)
+                .style(Style::default().bg(NORDIC_BG))
+                .scroll((self.scroll_offset, 0))
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(Block::default().borders(Borders::NONE));
+            frame.render_widget(chat_box, chat_area);
 
-        // Sticky process title on top of chat area (like code review sticky header)
-        if self.scroll_offset > 0 {
-            // Find active section at top of viewport (visual line == self.scroll_offset)
-            let mut active_header: Option<(&str, Color)> = None;
-            for (line_idx, label, color) in &section_headers {
-                let vis = visual_at.get(*line_idx).copied().unwrap_or(0);
-                if vis <= self.scroll_offset {
-                    active_header = Some((label.as_str(), *color));
-                } else {
-                    break;
+            // Sticky process title on top of chat area (like code review sticky header)
+            if self.scroll_offset > 0 {
+                // Find active section at top of viewport (visual line == self.scroll_offset)
+                let mut active_header: Option<(&str, Color)> = None;
+                for (line_idx, label, color) in &section_headers {
+                    let vis = visual_at.get(*line_idx).copied().unwrap_or(0);
+                    if vis <= self.scroll_offset {
+                        active_header = Some((label.as_str(), *color));
+                    } else {
+                        break;
+                    }
+                }
+
+                if let Some((label, bg_col)) = active_header {
+                    let sticky_label = format!(" {label} ");
+                    let sticky_w = (sticky_label.chars().count() as u16)
+                        .min(chat_area.width.saturating_sub(4));
+                    let sticky_area = Rect {
+                        x: chat_area.x, // Sticky to left side matching actual section label direction
+                        y: chat_area.y,
+                        width: sticky_w,
+                        height: 1,
+                    };
+                    let sticky_span = Span::styled(
+                        sticky_label,
+                        Style::default()
+                            .fg(NORDIC_BG)
+                            .bg(bg_col)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                    frame.render_widget(Paragraph::new(Line::from(sticky_span)), sticky_area);
                 }
             }
-
-            if let Some((label, bg_col)) = active_header {
-                let sticky_label = format!(" {label} ");
-                let sticky_w =
-                    (sticky_label.chars().count() as u16).min(chat_area.width.saturating_sub(4));
-                let sticky_area = Rect {
-                    x: chat_area.x, // Sticky to left side matching actual section label direction
-                    y: chat_area.y,
-                    width: sticky_w,
-                    height: 1,
-                };
-                let sticky_span = Span::styled(
-                    sticky_label,
-                    Style::default()
-                        .fg(NORDIC_BG)
-                        .bg(bg_col)
-                        .add_modifier(Modifier::BOLD),
-                );
-                frame.render_widget(Paragraph::new(Line::from(sticky_span)), sticky_area);
-            }
-        }
+        } // end non-pristine chat render
 
         // Draw chips at their agent-turn anchors (visual line + scroll)
         {
@@ -7758,9 +8033,10 @@ impl App {
                 let full_w = area.width;
                 let full_h = area.height;
 
-                // Modal dimensions with smooth width and height slide/fade animation via KramaFrame
-                let target_w = (full_w.saturating_sub(10)).min(120).max(70);
-                let target_h = (full_h.saturating_sub(6)).min(32).max(20);
+                // Content-aware target size (max ~90% width, ~86% height);
+                // the Krama animation interpolates from closed to THIS size,
+                // never to an oversized fixed rectangle.
+                let (target_w, target_h) = self.modal_target_size(area);
                 let modal_w = ((target_w as f32 * (0.6 + 0.4 * anim_p)).round() as u16).max(36);
                 let modal_h = ((target_h as f32 * (0.6 + 0.4 * anim_p)).round() as u16).max(14);
 
@@ -7787,6 +8063,8 @@ impl App {
                     3 => " Settings ",
                     4 => " Session Info ",
                     5 => " Code Graph ",
+                    6 => " Run ",
+                    7 => " Thunder ",
                     _ => " Session Info ",
                 };
 
@@ -7975,11 +8253,22 @@ impl App {
                 );
 
                 // --- Inner Container Content Area ---
-                let content_inner = Rect {
+                // One row reserved at the bottom for the shared keyboard
+                // footer; content sections get the rows above it.
+                let content_full = Rect {
                     x: modal_x + 3,
                     y: modal_y + 2,
                     width: modal_w.saturating_sub(6),
                     height: modal_h.saturating_sub(4),
+                };
+                let content_inner = Rect {
+                    height: content_full.height.saturating_sub(1),
+                    ..content_full
+                };
+                let modal_footer_area = Rect {
+                    y: content_full.y + content_full.height.saturating_sub(1),
+                    height: 1,
+                    ..content_full
                 };
 
                 match self.menu_section {
@@ -8082,6 +8371,19 @@ impl App {
                                 ),
                                 Span::styled(
                                     "          Agent Run Timeline (steps, progress, run history)",
+                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                ),
+                            ]),
+                            Line::from(vec![
+                                Span::styled(
+                                    " F8 ",
+                                    Style::default()
+                                        .fg(NORDIC_BG)
+                                        .bg(Color::White)
+                                        .add_modifier(Modifier::BOLD),
+                                ),
+                                Span::styled(
+                                    "          Shared Thunder (P2P inference: host, pair, remotes)",
                                     Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
                                 ),
                             ]),
@@ -8614,13 +8916,14 @@ impl App {
                         .style(Style::default().bg(NORDIC_BG));
                         frame.render_widget(info, chunks[0]);
 
-                        if self.installed_models.is_empty() {
+                        let total_rows =
+                            self.installed_models.len() + self.thunder_ui.remote_models.len();
+                        if total_rows == 0 {
                             self.installed_state.select(None);
                         } else {
                             let cur_sel = self.installed_state.selected().unwrap_or(0);
-                            if cur_sel >= self.installed_models.len() {
-                                self.installed_state
-                                    .select(Some(self.installed_models.len() - 1));
+                            if cur_sel >= total_rows {
+                                self.installed_state.select(Some(total_rows - 1));
                             } else if self.installed_state.selected().is_none() {
                                 self.installed_state.select(Some(0));
                             }
@@ -8775,6 +9078,89 @@ impl App {
                                 }
                             })
                             .collect();
+                        let mut items: Vec<ListItem> = items;
+                        // Thunder remotes: explicit remote targets in the
+                        // Main AI selector — visually distinct, never
+                        // presented as local repository artifacts.
+                        {
+                            let base = self.installed_models.len();
+                            let total_w = chunks[1].width as usize;
+                            for (ri, entry) in self.thunder_ui.remote_models.iter().enumerate() {
+                                let row_idx = base + ri;
+                                let is_selected = selected_idx == Some(row_idx);
+                                let row_bg = if is_selected {
+                                    Color::Rgb(59, 66, 82)
+                                } else {
+                                    NORDIC_BG
+                                };
+                                let is_active = match &self.backend {
+                                    AgentBackend::SharedThunder(b) => {
+                                        b.target.peer_id == entry.peer_id
+                                            && b.target.model_id == entry.model.id
+                                    }
+                                    _ => false,
+                                };
+                                let (badge_txt, badge_fg, badge_bg) = if is_active {
+                                    (" ACTIVE ", NORDIC_BG, Color::Rgb(163, 190, 140))
+                                } else {
+                                    (" REMOTE ", NORDIC_BG, Color::Rgb(180, 160, 255))
+                                };
+                                let repo_col = format!("{:<14}", "thunder");
+                                let used_w = 9 + 1 + 14 + 3;
+                                let name_max_w = total_w.saturating_sub(used_w).max(10);
+                                let name_col = format!(
+                                    "{:<width$}",
+                                    {
+                                        let full =
+                                            format!("{} / {}", entry.peer_name, entry.model.name);
+                                        if full.len() > name_max_w {
+                                            full[..name_max_w].to_string()
+                                        } else {
+                                            full
+                                        }
+                                    },
+                                    width = name_max_w
+                                );
+                                items.push(
+                                    ListItem::new(Line::from(vec![
+                                        Span::styled(
+                                            badge_txt,
+                                            Style::default()
+                                                .fg(badge_fg)
+                                                .bg(badge_bg)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(" ", Style::default().bg(row_bg)),
+                                        Span::styled(
+                                            repo_col,
+                                            Style::default()
+                                                .fg(Color::Rgb(180, 160, 255))
+                                                .bg(row_bg),
+                                        ),
+                                        Span::styled(
+                                            " │ ",
+                                            Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
+                                        ),
+                                        Span::styled(
+                                            name_col,
+                                            Style::default()
+                                                .fg(if is_selected {
+                                                    Color::White
+                                                } else {
+                                                    Color::Rgb(220, 230, 242)
+                                                })
+                                                .bg(row_bg)
+                                                .add_modifier(if is_selected {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
+                                    ]))
+                                    .style(Style::default().bg(row_bg)),
+                                );
+                            }
+                        }
 
                         let list = List::new(items).style(Style::default().bg(NORDIC_BG));
                         frame.render_stateful_widget(list, chunks[1], &mut self.installed_state);
@@ -9953,7 +10339,7 @@ impl App {
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
-                                " (Live diagnostics, hardware metrics, context budget & power)",
+                                " (live diagnostics)",
                                 Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
                             ),
                         ]))
@@ -9973,37 +10359,73 @@ impl App {
                             )
                             .split(chunks[1]);
 
+                        // Small terminals: compress the card grid instead of
+                        // letting fixed-height cards silently disappear.
+                        let tight = chunks[1].height < 26;
+                        // Left Column Cards
+                        let left_constraints: &[Constraint] = if tight {
+                            &[
+                                Constraint::Ratio(1, 4), // LLM Inference & Throughput Card
+                                Constraint::Ratio(1, 4), // Context Budget Card
+                                Constraint::Ratio(1, 4), // AI Engine & Agents Card
+                                Constraint::Ratio(1, 4), // Session State Card
+                            ]
+                        } else {
+                            &[
+                                Constraint::Length(5), // LLM Inference & Throughput Card
+                                Constraint::Length(1), // Gap
+                                Constraint::Length(4), // Context Budget Card
+                                Constraint::Length(1), // Gap
+                                Constraint::Length(4), // AI Engine & Agents Card
+                                Constraint::Length(1), // Gap
+                                Constraint::Length(4), // Session State Card
+                            ]
+                        };
                         // Left Column Cards
                         let left_rows = Layout::default()
                             .direction(Direction::Vertical)
-                            .constraints(
-                                [
-                                    Constraint::Length(5), // LLM Inference & Throughput Card
-                                    Constraint::Length(1), // Gap
-                                    Constraint::Length(4), // Context Budget Card
-                                    Constraint::Length(1), // Gap
-                                    Constraint::Length(4), // AI Engine & Agents Card
-                                    Constraint::Length(1), // Gap
-                                    Constraint::Length(4), // Session State Card
-                                ]
-                                .as_ref(),
-                            )
+                            .constraints(left_constraints)
                             .split(grid_cols[0]);
 
                         // Right Column Cards
+                        let right_constraints: &[Constraint] = if tight {
+                            &[
+                                Constraint::Ratio(1, 3), // Hardware & Memory Card
+                                Constraint::Ratio(1, 3), // Session Energy & Cost Card
+                                Constraint::Ratio(1, 3), // Action & Tool Chips Card
+                            ]
+                        } else {
+                            &[
+                                Constraint::Length(5), // Hardware & Memory Card
+                                Constraint::Length(1), // Gap
+                                Constraint::Length(4), // Session Energy & Cost Card
+                                Constraint::Length(1), // Gap
+                                Constraint::Length(4), // Action & Tool Chips Card
+                            ]
+                        };
                         let right_rows = Layout::default()
                             .direction(Direction::Vertical)
-                            .constraints(
-                                [
-                                    Constraint::Length(5), // Hardware & Memory Card
-                                    Constraint::Length(1), // Gap
-                                    Constraint::Length(4), // Session Energy & Cost Card
-                                    Constraint::Length(1), // Gap
-                                    Constraint::Length(4), // Action & Tool Chips Card
-                                ]
-                                .as_ref(),
-                            )
+                            .constraints(right_constraints)
                             .split(grid_cols[2]);
+
+                        // Card area lookup: loose layout has gap rows
+                        // between cards; tight layout packs them. Cards
+                        // beyond the compressed grid degrade gracefully
+                        // (render_info_table guards tiny areas).
+                        let lcard = |i: usize| -> Rect {
+                            if tight {
+                                left_rows[i.min(left_rows.len().saturating_sub(1))]
+                            } else {
+                                left_rows[i * 2]
+                            }
+                        };
+                        let rcard = |i: usize| -> Rect {
+                            if tight {
+                                right_rows[i.min(right_rows.len().saturating_sub(1))]
+                            } else {
+                                right_rows[i * 2]
+                            }
+                        };
 
                         // Helper to render exact table design:
                         // ▐Title ████████████████▌
@@ -10116,7 +10538,7 @@ impl App {
                         ];
                         render_info_table(
                             frame,
-                            left_rows[0],
+                            lcard(0),
                             "Inference Diagnostics",
                             infer_color,
                             12,
@@ -10146,7 +10568,7 @@ impl App {
                         ];
                         render_info_table(
                             frame,
-                            left_rows[2],
+                            lcard(1),
                             "Context Budget",
                             ctx_color,
                             12,
@@ -10169,7 +10591,7 @@ impl App {
                         ];
                         render_info_table(
                             frame,
-                            left_rows[4],
+                            lcard(2),
                             "AI Engine & Agents",
                             agent_color,
                             12,
@@ -10190,7 +10612,7 @@ impl App {
                         ];
                         render_info_table(
                             frame,
-                            left_rows[6],
+                            lcard(3),
                             "Session State",
                             session_color,
                             12,
@@ -10228,7 +10650,7 @@ impl App {
                         ];
                         render_info_table(
                             frame,
-                            right_rows[0],
+                            rcard(0),
                             "Hardware & Memory",
                             hw_color,
                             12,
@@ -10259,7 +10681,7 @@ impl App {
                         ];
                         render_info_table(
                             frame,
-                            right_rows[2],
+                            rcard(1),
                             "Session Energy",
                             power_color,
                             12,
@@ -10303,7 +10725,7 @@ impl App {
                         ];
                         render_info_table(
                             frame,
-                            right_rows[4],
+                            rcard(2),
                             "Action & Tool Chips",
                             chip_color,
                             12,
@@ -10318,8 +10740,15 @@ impl App {
                         // === Agent Run / Task Timeline ===
                         self.render_run_timeline(frame, content_inner);
                     }
+                    7 => {
+                        // === Shared Thunder (P2P inference) ===
+                        self.poll_thunder_discovery();
+                        self.render_thunder(frame, content_inner);
+                    }
                     _ => {}
                 }
+                // Shared footer: one consistent keyboard-hint row.
+                Self::render_modal_footer(frame, modal_footer_area, self.menu_section);
             }
         }
 
@@ -10523,45 +10952,1601 @@ impl App {
 
     /// Render Code Graph three-pane layout: Nodes | Graph | Details
     /// Render Code Graph three-pane layout: Nodes | Graph | Details
-    /// Agent Run / Task Timeline panel (menu section 6, F7).
-    /// First-class view of runs: history of finished runs plus the live
-    /// current run with steps bound to canonical tool `call_id`s.
-    fn render_run_timeline(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-        use ratatui::widgets::{Block, Borders, Paragraph};
-        let mut text: Vec<ratatui::text::Line> = Vec::new();
-        if !self.run_history.is_empty() {
-            text.push(ratatui::text::Line::from("— Run history —"));
-            for s in self.run_history.iter().rev().take(8) {
-                let dur = s
-                    .duration_ms
-                    .map(|m| format!("{:.1}s", m as f64 / 1000.0))
-                    .unwrap_or_else(|| "—".to_string());
-                text.push(ratatui::text::Line::from(format!(
-                    "#{} {} {}/{} steps {} — {}",
-                    s.id, s.state, s.steps_done, s.steps_total, dur, s.prompt,
-                )));
-            }
-            text.push(ratatui::text::Line::from(""));
-        }
-        let title = match &self.current_run {
-            Some(run) => {
-                let (done, total) = run.progress();
-                for l in run.timeline_lines() {
-                    text.push(ratatui::text::Line::from(l));
+    /// Content-aware modal target size: max ~90% of terminal width,
+    /// max ~86% of terminal height, never larger than the content
+    /// needs for sparse panels. The Krama animation interpolates from
+    /// closed to THIS size — never to an oversized fixed rectangle.
+    fn modal_target_size(&self, area: ratatui::layout::Rect) -> (u16, u16) {
+        let full_w = area.width;
+        let full_h = area.height;
+        let target_w = (full_w.saturating_sub(10))
+            .min(120)
+            .max(70.min(full_w))
+            .min(full_w.saturating_sub(2));
+        let max_h = ((full_h as f32 * 0.86).round() as u16)
+            .max(12)
+            .min(full_h.saturating_sub(2));
+        let default_h = (full_h.saturating_sub(6)).min(32).max(20.min(full_h));
+        let target_h = match self.menu_section {
+            6 => {
+                // Agent Run: compact when empty, grows with steps and
+                // history — never a huge empty rectangle.
+                let mut content = match &self.current_run {
+                    Some(run) => {
+                        let mut c = 2 + run.steps.len().min(24) + 1; // header rows + steps + progress bar
+                        if run.steps.is_empty() {
+                            c += 2; // deliberate empty state
+                        }
+                        c
+                    }
+                    None => 4, // title + centered empty state + spacing
+                };
+                let history = self.run_history.len().min(8);
+                if history > 0 {
+                    content += history + 2; // section header + entries + gap
                 }
-                format!(" Agent Run #{} ({done}/{total}) — F7 closes ", run.id)
+                content += 1; // footer hints
+                (content as u16 + 4).clamp(11, max_h)
             }
-            None => " Agent Run Timeline — F7 closes ".to_string(),
+            4 => {
+                // Session Info: fixed two-column card grid (degrades to
+                // one column on narrow terminals inside the renderer).
+                let content: u16 = 2 + (5 + 1 + 4 + 1 + 4 + 1 + 4) + 1; // title + cards + gaps + footer
+                (content + 4).clamp(14, max_h)
+            }
+            7 => {
+                // Thunder: tab bar + content rows + footer. Content rows
+                // scale with the active tab's list, capped so the modal
+                // never exceeds the terminal.
+                let rows = match crate::thunder_ui::ThunderTab::from_index(self.thunder_ui.tab) {
+                    crate::thunder_ui::ThunderTab::Overview => 12,
+                    // Host tab: status + single hosted model + policy + code.
+                    crate::thunder_ui::ThunderTab::Host => 14,
+                    crate::thunder_ui::ThunderTab::Connect => {
+                        6 + (self.thunder_ui.discovered.len()
+                            + usize::from(!self.thunder_ui.manual_endpoint.is_empty()))
+                        .min(10)
+                    }
+                    crate::thunder_ui::ThunderTab::Peers => {
+                        4 + (crate::thunder::pairing::PeerStore::load().peers_len()
+                            + self.thunder_ui.inbound_peers().len())
+                        .min(12)
+                    }
+                    crate::thunder_ui::ThunderTab::Models => {
+                        4 + self.thunder_ui.remote_models.len().min(12)
+                    }
+                    crate::thunder_ui::ThunderTab::Settings => 8,
+                };
+                ((rows + 2 + 1 + 4) as u16).clamp(12, max_h)
+            }
+            _ => default_h.min(max_h),
         };
-        if self.current_run.is_none() {
-            text.push(ratatui::text::Line::from(
-                "No agent run yet. Submit a prompt to start one.",
+        (target_w, target_h)
+    }
+
+    /// Shared modal footer: one consistent keyboard-hint row rendered at
+    /// the bottom of the modal content area. Only controls that work in
+    /// the active panel are shown.
+    fn render_modal_footer(
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        section: usize,
+    ) {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+        if area.height == 0 || area.width < 12 {
+            return;
+        }
+        let hints: &[(&str, &str)] = match section {
+            1 => &[
+                ("↑↓", " Navigate "),
+                ("Enter", " Install "),
+                ("/", " Search "),
+                ("Esc", " Close "),
+            ],
+            2 => &[
+                ("↑↓", " Navigate "),
+                ("Enter", " Select "),
+                ("Esc", " Close "),
+            ],
+            3 => &[
+                ("↑↓", " Navigate "),
+                ("Enter", " Edit "),
+                ("Esc", " Close "),
+            ],
+            4 => &[("Esc", " Close ")],
+            5 => &[("Tab", " Pane "), ("↑↓", " Navigate "), ("Esc", " Close ")],
+            6 => &[("F7", " Close "), ("↑↓", " Navigate ")],
+            7 => &[
+                ("F8", " Close "),
+                ("←→", " Tabs "),
+                ("↑↓", " Select "),
+                ("Enter", " Action "),
+            ],
+            _ => &[("Esc", " Close ")],
+        };
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, (key, label)) in hints.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(
+                    "  ",
+                    Style::default().fg(Color::Rgb(90, 100, 110)).bg(NORDIC_BG),
+                ));
+            }
+            spans.push(Span::styled(
+                format!(" {key} "),
+                Style::default()
+                    .fg(NORDIC_BG)
+                    .bg(Color::Rgb(120, 140, 160))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                *label,
+                Style::default().fg(Color::Rgb(140, 155, 170)).bg(NORDIC_BG),
             ));
         }
         frame.render_widget(
-            Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(title)),
+            ratatui::widgets::Paragraph::new(Line::from(spans))
+                .style(Style::default().bg(NORDIC_BG)),
             area,
         );
+    }
+
+    /// Agent Run / Task Timeline panel (menu section 6, F7).
+    /// First-class view of runs: history of finished runs plus the live
+    /// current run with steps bound to canonical tool `call_id`s.
+    ///
+    /// Hierarchy: HEADER (title, state, progress) → BODY (steps) →
+    /// FOOTER (hints, rendered by the shared modal footer). Borderless:
+    /// the custom Hercules modal frame is the only frame.
+    fn render_run_timeline(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::Paragraph;
+        if area.height == 0 || area.width < 20 {
+            return;
+        }
+        let dim = Color::Rgb(90, 100, 110);
+        let accent = Color::Rgb(180, 160, 255);
+        let green = Color::Rgb(163, 190, 140);
+        let red = Color::Rgb(255, 120, 120);
+        let cyan = Color::Rgb(120, 190, 220);
+        let style = |fg: Color, bold: bool| {
+            if bold {
+                Style::default()
+                    .fg(fg)
+                    .bg(NORDIC_BG)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(fg).bg(NORDIC_BG)
+            }
+        };
+        // Right-aligned helper: pad a left span so a right span ends at
+        // the panel edge (single line, no clipping).
+        let two_side = |left: Span<'static>,
+                        left_w: usize,
+                        right: Span<'static>,
+                        right_w: usize,
+                        width: u16|
+         -> Line<'static> {
+            let width = width as usize;
+            let gap = width.saturating_sub(left_w + right_w);
+            Line::from(vec![
+                left,
+                Span::styled(" ".repeat(gap), Style::default().bg(NORDIC_BG)),
+                right,
+            ])
+        };
+
+        let mut lines: Vec<ratatui::text::Line> = Vec::new();
+        match &self.current_run {
+            Some(run) => {
+                let (done, total) = run.progress();
+                let (state_label, state_color) = match run.state {
+                    crate::run_timeline::AgentRunState::Completed => ("COMPLETED", green),
+                    crate::run_timeline::AgentRunState::Failed => ("FAILED", red),
+                    crate::run_timeline::AgentRunState::Cancelled => ("CANCELLED", red),
+                    crate::run_timeline::AgentRunState::WaitingForUser => ("WAITING", cyan),
+                    _ => ("RUNNING", accent),
+                };
+                // HEADER
+                lines.push(two_side(
+                    Span::styled("AGENT RUN", style(Color::White, true)),
+                    9,
+                    Span::styled(state_label, style(state_color, true)),
+                    state_label.chars().count(),
+                    area.width,
+                ));
+                lines.push(two_side(
+                    Span::styled(format!("Run #{}", run.id), style(accent, true)),
+                    format!("Run #{}", run.id).chars().count(),
+                    Span::styled(
+                        format!("{done} / {total}"),
+                        style(
+                            if total > 0 && done >= total {
+                                green
+                            } else {
+                                dim
+                            },
+                            false,
+                        ),
+                    ),
+                    format!("{done} / {total}").chars().count(),
+                    area.width,
+                ));
+                lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                // BODY: steps
+                for s in run
+                    .steps
+                    .iter()
+                    .take(area.height.saturating_sub(8) as usize)
+                {
+                    let (mark, mark_color) = match s.status {
+                        crate::run_timeline::StepStatus::Succeeded => ("✓", green),
+                        crate::run_timeline::StepStatus::Failed => ("✗", red),
+                        crate::run_timeline::StepStatus::Cancelled
+                        | crate::run_timeline::StepStatus::Skipped => ("⊘", dim),
+                        crate::run_timeline::StepStatus::WaitingApproval => ("⏳", cyan),
+                        crate::run_timeline::StepStatus::Running => ("●", accent),
+                        crate::run_timeline::StepStatus::Pending => ("○", dim),
+                    };
+                    let elapsed = if s.status.is_done() {
+                        format!("{:.1}s", s.elapsed().as_secs_f64())
+                    } else if s.status == crate::run_timeline::StepStatus::Running {
+                        "…".to_string()
+                    } else {
+                        String::new()
+                    };
+                    let summary_w = (area.width as usize)
+                        .saturating_sub(6)
+                        .saturating_sub(elapsed.chars().count());
+                    let summary: String = s.summary.chars().take(summary_w).collect();
+                    let mut row = vec![
+                        Span::styled(format!("{mark} "), style(mark_color, true)),
+                        Span::styled(
+                            summary,
+                            style(
+                                if s.status.is_done() {
+                                    dim
+                                } else {
+                                    Color::White
+                                },
+                                false,
+                            ),
+                        ),
+                    ];
+                    if !elapsed.is_empty() {
+                        row.push(Span::styled(format!("  {elapsed}"), style(dim, false)));
+                    }
+                    lines.push(Line::from(row));
+                }
+                // Progress bar
+                if total > 0 {
+                    let bar_w = (area.width as usize).saturating_sub(20).max(8);
+                    let filled = bar_w * done / total;
+                    let bar = format!(
+                        "{}{}",
+                        "█".repeat(filled),
+                        "░".repeat(bar_w.saturating_sub(filled))
+                    );
+                    lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                    lines.push(Line::from(vec![
+                        Span::styled("Progress  ", style(dim, false)),
+                        Span::styled(
+                            bar,
+                            style(if done >= total { green } else { accent }, false),
+                        ),
+                        Span::styled(format!("  {done}/{total}"), style(dim, false)),
+                    ]));
+                }
+                // HISTORY
+                if !self.run_history.is_empty() {
+                    lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                    lines.push(Line::from(Span::styled(
+                        "— Run history —",
+                        style(dim, false),
+                    )));
+                    let rows_left = (area.height as usize)
+                        .saturating_sub(lines.len())
+                        .saturating_sub(1);
+                    for s in self.run_history.iter().rev().take(rows_left.min(8)) {
+                        let dur = s
+                            .duration_ms
+                            .map(|m| format!("{:.1}s", m as f64 / 1000.0))
+                            .unwrap_or_else(|| "—".to_string());
+                        let (state_color) = match s.state.as_str() {
+                            "Completed" => green,
+                            "Failed" | "Cancelled" => red,
+                            _ => dim,
+                        };
+                        let prompt_w = (area.width as usize).saturating_sub(24);
+                        let prompt: String = s.prompt.chars().take(prompt_w).collect();
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("#{} ", s.id), style(accent, false)),
+                            Span::styled(format!("{prompt} "), style(Color::White, false)),
+                            Span::styled(
+                                format!("{} {}/{} {}", s.state, s.steps_done, s.steps_total, dur),
+                                style(state_color, false),
+                            ),
+                        ]));
+                    }
+                }
+            }
+            None => {
+                // HEADER
+                lines.push(two_side(
+                    Span::styled("AGENT RUN", style(Color::White, true)),
+                    9,
+                    Span::styled("IDLE", style(dim, true)),
+                    4,
+                    area.width,
+                ));
+                // Deliberate, vertically balanced empty state.
+                let pad = (area.height.saturating_sub(4)) / 2;
+                for _ in 0..pad {
+                    lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                }
+                let msg = "No active agent run";
+                let lead = (area.width as usize).saturating_sub(msg.chars().count()) / 2;
+                lines.push(Line::from(Span::styled(
+                    format!("{}{msg}", " ".repeat(lead)),
+                    style(dim, true),
+                )));
+                let hint = "Submit a prompt to start one.";
+                let lead = (area.width as usize).saturating_sub(hint.chars().count()) / 2;
+                lines.push(Line::from(Span::styled(
+                    format!("{}{hint}", " ".repeat(lead)),
+                    style(Color::Rgb(140, 155, 170), false),
+                )));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    // === Shared Thunder (menu section 7, F8) ===
+    // Transient UI orchestration over the existing Thunder modules:
+    // identity / trust / discovery / host / receiver. No second
+    // networking layer, no fake host state, inference-only.
+
+    fn ensure_thunder_discovery(&mut self) {
+        if self.thunder_discovery.is_some() {
+            return;
+        }
+        match crate::thunder::discovery::Discovery::bind(0) {
+            Ok(d) => {
+                self.thunder_discovery = Some(d);
+                self.thunder_broadcast();
+            }
+            Err(_) => {
+                self.thunder_ui.status =
+                    "Discovery unavailable (UDP port busy) — manual peers only.".to_string();
+            }
+        }
+    }
+
+    fn thunder_broadcast(&mut self) {
+        let now = std::time::Instant::now();
+        let due = self
+            .thunder_ui
+            .last_broadcast
+            .map(|t| now.duration_since(t).as_secs() >= 5)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        if let Ok(id) =
+            crate::thunder::identity::ThunderIdentity::load_or_generate("Hercules".to_string())
+        {
+            if let Some(d) = self.thunder_discovery.as_ref() {
+                let _ = d.broadcast(&id);
+                self.thunder_ui.last_broadcast = Some(now);
+            }
+        }
+    }
+
+    fn poll_thunder_discovery(&mut self) {
+        let own = match crate::thunder::identity::ThunderIdentity::load_or_generate(
+            "Hercules".to_string(),
+        ) {
+            Ok(id) => id.peer_id,
+            Err(_) => String::new(),
+        };
+        if let Some(d) = self.thunder_discovery.as_mut() {
+            d.poll(&own);
+            let mut peers: Vec<_> = d.peers().into_iter().cloned().collect();
+            peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+            self.thunder_ui.discovered = peers;
+        }
+        for p in self
+            .thunder_ui
+            .discovered
+            .iter()
+            .chain(self.thunder_ui.manual_peers.iter())
+        {
+            // Real TCP dial address: beacon source IP + advertised
+            // Thunder port (never the ephemeral UDP source port).
+            if !p.peer_id.is_empty() {
+                self.thunder_ui.peer_addrs.insert(
+                    p.peer_id.clone(),
+                    crate::thunder_ui::ThunderUiState::tcp_addr(p),
+                );
+            }
+        }
+        self.thunder_broadcast();
+    }
+
+    fn thunder_trusted_peers(&self) -> Vec<crate::thunder::pairing::TrustedPeer> {
+        crate::thunder::pairing::PeerStore::load()
+            .all()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Ordered selectable actions for the active Thunder tab. Render and
+    /// keyboard/mouse activation share this list, so hit rows and Enter
+    /// can never disagree.
+    fn thunder_action_list(&self) -> Vec<crate::thunder_ui::ThunderAction> {
+        use crate::thunder_ui::{ThunderAction as A, ThunderTab};
+        match self.thunder_ui.tab() {
+            ThunderTab::Overview => {
+                vec![A::GotoTab(1), A::GotoTab(2), A::GotoTab(3), A::GotoTab(4)]
+            }
+            ThunderTab::Host => {
+                let mut v = Vec::new();
+                if self.thunder_ui.host_running() {
+                    v.push(A::HostStop);
+                } else {
+                    v.push(A::HostStart);
+                }
+                v.push(A::RegenCode);
+                v.push(A::ToggleInference);
+                v.push(A::CycleConcurrency);
+                v
+            }
+            ThunderTab::Connect => {
+                let mut v = Vec::new();
+                for p in self
+                    .thunder_ui
+                    .discovered
+                    .iter()
+                    .chain(self.thunder_ui.manual_peers.iter())
+                {
+                    v.push(A::SelectConnectPeer(
+                        crate::thunder_ui::ThunderUiState::peer_key(&p.peer_id, p.addr),
+                    ));
+                }
+                v.push(A::EditManual);
+                v.push(A::SubmitManual);
+                v.push(A::EditCode);
+                v.push(A::SubmitCode);
+                if self
+                    .thunder_ui
+                    .pending_pairing
+                    .as_ref()
+                    .is_some_and(|p| p.accepted.is_some())
+                {
+                    v.push(A::TrustHost);
+                    v.push(A::DiscardPending);
+                }
+                v
+            }
+            ThunderTab::Peers => {
+                let mut v = Vec::new();
+                for t in self.thunder_trusted_peers() {
+                    v.push(A::PeerToggleInference(t.peer_id.clone()));
+                    v.push(A::PeerToggleForwarding(t.peer_id.clone()));
+                    v.push(A::PeerUntrust(t.peer_id.clone()));
+                }
+                for p in self.thunder_ui.pending_requests() {
+                    v.push(A::TrustPending(p.peer_id.clone()));
+                    v.push(A::RejectPending(p.peer_id.clone()));
+                }
+                for p in self.thunder_ui.inbound_peers() {
+                    if crate::thunder::pairing::PeerStore::load().is_trusted(&p.peer_id) {
+                        continue;
+                    }
+                    v.push(A::DismissInbound(p.peer_id.clone()));
+                }
+                v
+            }
+            ThunderTab::Models => {
+                let mut v = vec![A::ModelsRefresh];
+                for i in 0..self.thunder_ui.remote_models.len() {
+                    v.push(A::SelectRemote(i));
+                }
+                if self.thunder_ui.selected_remote.is_some() {
+                    v.push(A::SetMainAi);
+                }
+                v
+            }
+            ThunderTab::Settings => {
+                if self.thunder_ui.host_running() {
+                    vec![A::HostStop]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    /// Content rows for the Thunder modal: info lines (no action)
+    /// followed by one row per entry of `thunder_action_list`, in the
+    /// same order — render and activation share indices by construction.
+    fn thunder_content_rows(&self) -> Vec<(Option<usize>, ratatui::text::Line<'static>)> {
+        let mut out: Vec<(Option<usize>, ratatui::text::Line<'static>)> = self
+            .thunder_info_rows()
+            .into_iter()
+            .map(|l| (None, l))
+            .collect();
+        let actions = self.thunder_action_list();
+        for (i, a) in actions.iter().enumerate() {
+            out.push((Some(i), self.thunder_action_line(a, i)));
+        }
+        out
+    }
+
+    fn thunder_info_rows(&self) -> Vec<ratatui::text::Line<'static>> {
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+        let dim = Color::Rgb(120, 140, 160);
+        let info = |label: &str, value: String| {
+            Line::from(vec![
+                Span::styled(format!("{label} "), Style::default().fg(dim).bg(NORDIC_BG)),
+                Span::styled(value, Style::default().fg(Color::White).bg(NORDIC_BG)),
+            ])
+        };
+        let head = |text: &str| {
+            Line::from(Span::styled(
+                text.to_string(),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(NORDIC_BG)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        };
+        let blank = || Line::from(Span::styled("", Style::default().bg(NORDIC_BG)));
+        match self.thunder_ui.tab() {
+            crate::thunder_ui::ThunderTab::Overview => {
+                let (name, peer_id, fp) = crate::thunder_ui::ThunderUiState::local_identity();
+                let (host_state, endpoint) = match self.thunder_ui.host_runtime.as_ref() {
+                    Some(r) if r.lan_available => (
+                        "Listening".to_string(),
+                        format!("{} (iface {})", r.endpoint, r.iface_name),
+                    ),
+                    Some(r) => (
+                        "Listening (loopback only — not LAN reachable)".to_string(),
+                        r.endpoint.to_string(),
+                    ),
+                    None => ("Stopped".to_string(), "—".to_string()),
+                };
+                let hosted = match self.thunder_ui.host_runtime.as_ref() {
+                    Some(r) => format!("{} ({})", r.model_name, r.model_id),
+                    None => match crate::thunder_ui::host_model_from_backend(&self.backend) {
+                        Ok(h) => format!("{} (not hosting)", h.display_name),
+                        Err(_) => "no servable local model".to_string(),
+                    },
+                };
+                let store = crate::thunder::pairing::PeerStore::load();
+                vec![
+                    head("Shared Thunder — encrypted P2P inference (inference-only)"),
+                    blank(),
+                    info("Local identity:", name),
+                    info("Peer ID:", peer_id),
+                    info("Fingerprint:", fp),
+                    info("Host:", format!("{host_state}  {endpoint}")),
+                    info("Hosted model:", hosted),
+                    info(
+                        "Discovered peers:",
+                        self.thunder_ui.discovered.len().to_string(),
+                    ),
+                    info("Trusted peers:", store.peers_len().to_string()),
+                    info(
+                        "Remote models (last fetch):",
+                        self.thunder_ui.remote_models.len().to_string(),
+                    ),
+                    info("Main AI:", crate::thunder_ui::main_ai_label(&self.backend)),
+                    blank(),
+                ]
+            }
+            crate::thunder_ui::ThunderTab::Host => {
+                let (_, peer_id, fp) = crate::thunder_ui::ThunderUiState::local_identity();
+                let (host_state, endpoint) = match self.thunder_ui.host_runtime.as_ref() {
+                    Some(r) if r.lan_available => (
+                        "HOSTING".to_string(),
+                        format!("{} (iface {})", r.endpoint, r.iface_name),
+                    ),
+                    Some(r) => (
+                        "HOSTING (loopback only — not LAN reachable)".to_string(),
+                        r.endpoint.to_string(),
+                    ),
+                    None => ("STOPPED".to_string(), "—".to_string()),
+                };
+                let mut rows = vec![
+                    head("Host — serve the active local model to trusted peers"),
+                    blank(),
+                    info("Status:", host_state),
+                    info("Endpoint:", endpoint),
+                    info("Identity:", format!("{peer_id}  {fp}")),
+                    blank(),
+                ];
+                match self.thunder_ui.host_runtime.as_ref() {
+                    Some(r) => {
+                        rows.push(info("Model:", format!("{} ({})", r.model_name, r.model_id)));
+                        rows.push(info("Backend:", r.backend_label.clone()));
+                        if r.all_endpoints.len() > 1 {
+                            let rest: Vec<String> = r
+                                .all_endpoints
+                                .iter()
+                                .filter(|a| **a != r.endpoint)
+                                .map(|a| a.to_string())
+                                .collect();
+                            rows.push(info("Also on:", rest.join(", ")));
+                        }
+                        if !r.lan_available {
+                            rows.push(info(
+                                "Reachability:",
+                                "no usable LAN interface — peers on other machines cannot connect"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    None => match crate::thunder_ui::host_model_from_backend(&self.backend) {
+                        Ok(h) => {
+                            let ctx = if h.context_source == "backend" {
+                                format!("{} (backend)", h.context_tokens)
+                            } else {
+                                format!("{} (default bound)", h.context_tokens)
+                            };
+                            rows.push(info(
+                                "Will serve:",
+                                format!("{} [{}] ctx:{}", h.display_name, h.wire_id, ctx),
+                            ));
+                            rows.push(info("Backend:", h.backend_label));
+                        }
+                        Err(e) => {
+                            rows.push(info("Will serve:", format!("refusing: {e}")));
+                        }
+                    },
+                }
+                rows.push(blank());
+                rows.push(info(
+                    "Policy:",
+                    format!(
+                        "inference={} forwarding=unsupported concurrency={}",
+                        if self.thunder_ui.allow_inference {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                        self.thunder_ui.max_concurrent,
+                    ),
+                ));
+                match self.thunder_ui.active_code() {
+                    Some(code) => {
+                        rows.push(info(
+                            "Pairing code:",
+                            format!("{code}  (10 min, single secret)"),
+                        ));
+                    }
+                    None => {
+                        rows.push(info(
+                            "Pairing code:",
+                            "none — generate to accept pairing".to_string(),
+                        ));
+                    }
+                }
+                rows.push(blank());
+                rows
+            }
+            crate::thunder_ui::ThunderTab::Connect => {
+                let mut rows = vec![
+                    head("Connect — real discovery + manual endpoints (untrusted until pairing)"),
+                    blank(),
+                ];
+                let store = crate::thunder::pairing::PeerStore::load();
+                for p in self
+                    .thunder_ui
+                    .discovered
+                    .iter()
+                    .chain(self.thunder_ui.manual_peers.iter())
+                {
+                    let trusted = store.is_trusted(&p.peer_id);
+                    let fresh = p.last_seen.elapsed() < crate::thunder::discovery::PEER_EXPIRY;
+                    let health = self
+                        .thunder_ui
+                        .peer_health
+                        .get(&p.peer_id)
+                        .map(|h| h.label(trusted, fresh))
+                        .unwrap_or(if trusted {
+                            "trusted"
+                        } else if p.peer_id.is_empty() {
+                            "manual·unverified"
+                        } else if fresh {
+                            "discovered·unverified"
+                        } else {
+                            "stale·unverified"
+                        });
+                    let tcp = crate::thunder_ui::ThunderUiState::tcp_addr(p);
+                    let id_shown = if p.peer_id.is_empty() {
+                        "(identity unknown)".to_string()
+                    } else {
+                        p.peer_id.clone()
+                    };
+                    let fp = if p.public_key == [0u8; 32] {
+                        "identity unknown".to_string()
+                    } else {
+                        format!(
+                            "fp:{}",
+                            crate::thunder::identity::ThunderIdentity::fingerprint_of(
+                                &p.public_key
+                            )
+                        )
+                    };
+                    rows.push(info(
+                        if trusted { "  [=]" } else { "  [?]" },
+                        format!("{}  {}  {}  {health}  {fp}", p.name, id_shown, tcp),
+                    ));
+                }
+                rows.push(blank());
+                let caret = match self.thunder_ui.input_mode {
+                    crate::thunder_ui::ThunderInputMode::ManualEndpoint => "▌",
+                    _ => "",
+                };
+                rows.push(info(
+                    "Manual host:port:",
+                    format!("{}{}", self.thunder_ui.manual_endpoint, caret),
+                ));
+                let caret = match self.thunder_ui.input_mode {
+                    crate::thunder_ui::ThunderInputMode::PairingCode => "▌",
+                    _ => "",
+                };
+                rows.push(info(
+                    "Pairing code:",
+                    format!("{}{}", self.thunder_ui.code_input, caret),
+                ));
+                if let Some(pending) = &self.thunder_ui.pending_pairing {
+                    match &pending.accepted {
+                        Some(a) => {
+                            let fp = crate::thunder::identity::ThunderIdentity::fingerprint_of(
+                                &a.public_key,
+                            );
+                            rows.push(info(
+                                "Host accepted:",
+                                format!("{}  {}  fp:{fp} — confirm, then Trust", a.name, a.peer_id),
+                            ));
+                        }
+                        None => {
+                            rows.push(info(
+                                "Pairing:",
+                                "no host acceptance yet — submit the code".to_string(),
+                            ));
+                        }
+                    }
+                }
+                rows.push(blank());
+                rows
+            }
+            crate::thunder_ui::ThunderTab::Peers => {
+                let mut rows = vec![head("Peers — trusted peers and pairing requests"), blank()];
+                for t in self.thunder_trusted_peers() {
+                    let fp =
+                        crate::thunder::identity::ThunderIdentity::fingerprint_of(&t.public_key);
+                    let health = self
+                        .thunder_ui
+                        .peer_health
+                        .get(&t.peer_id)
+                        .map(|h| h.label(true, true))
+                        .unwrap_or("trusted");
+                    rows.push(info(
+                        "  [=]",
+                        format!(
+                            "{}  {}  fp:{fp}  paired:{}  inference={} forwarding={}  {health}",
+                            t.name,
+                            t.peer_id,
+                            t.paired_at_epoch,
+                            if t.permissions.inference { "on" } else { "off" },
+                            if t.permissions.forwarding {
+                                "on"
+                            } else {
+                                "off"
+                            },
+                        ),
+                    ));
+                }
+                let store = crate::thunder::pairing::PeerStore::load();
+                // Validated pairing attempts: code verified, fingerprint
+                // shown — Trust persists, Reject drops.
+                let pending = self.thunder_ui.pending_requests();
+                if !pending.is_empty() {
+                    rows.push(blank());
+                    rows.push(head("Pairing requests (code verified — Trust or Reject):"));
+                    for p in &pending {
+                        let fp = crate::thunder::identity::ThunderIdentity::fingerprint_of(
+                            &p.public_key,
+                        );
+                        rows.push(info(
+                            "  [?]",
+                            format!(
+                                "{}  {}  fp:{fp}  received:{}",
+                                p.name, p.peer_id, p.received_epoch
+                            ),
+                        ));
+                    }
+                }
+                // Raw handshake-level inbound attempts (informational —
+                // trust requires a validated Pair request above).
+                let mut any_inbound = false;
+                for p in self.thunder_ui.inbound_peers() {
+                    if store.is_trusted(&p.peer_id) {
+                        continue;
+                    }
+                    if pending.iter().any(|q| q.peer_id == p.peer_id) {
+                        continue;
+                    }
+                    if !any_inbound {
+                        rows.push(blank());
+                        rows.push(head(
+                            "Inbound attempts (no validated pairing — cannot Trust):",
+                        ));
+                        any_inbound = true;
+                    }
+                    rows.push(info("  [·]", format!("{}  {}", p.name, p.peer_id)));
+                }
+                rows.push(blank());
+                rows
+            }
+            crate::thunder_ui::ThunderTab::Models => {
+                let mut rows = vec![head("Models — remote models from trusted peers"), blank()];
+                for e in &self.thunder_ui.remote_models {
+                    let m = &e.model;
+                    rows.push(info(
+                        "  ○",
+                        format!(
+                            "{}  {}  arch:{} fmt:{} quant:{} ctx:{} stream:{}",
+                            e.peer_name,
+                            m.name,
+                            m.architecture,
+                            m.format,
+                            m.quantization.as_deref().unwrap_or("—"),
+                            m.context_length,
+                            if m.streaming { "yes" } else { "no" },
+                        ),
+                    ));
+                }
+                if self.thunder_ui.remote_models.is_empty() {
+                    rows.push(info(
+                        "",
+                        "No remote models yet — Refresh after pairing.".to_string(),
+                    ));
+                }
+                if let Some(sel) = &self.thunder_ui.selected_remote {
+                    rows.push(blank());
+                    rows.push(info(
+                        "Selected:",
+                        format!("{}  {} @ {}", sel.peer_id, sel.model_id, sel.address),
+                    ));
+                }
+                rows.push(blank());
+                rows
+            }
+            crate::thunder_ui::ThunderTab::Settings => vec![
+                head("Thunder settings"),
+                blank(),
+                info(
+                    "Data dir:",
+                    format!("{:?}", crate::thunder::identity_path()),
+                ),
+                info(
+                    "Discovery:",
+                    format!("UDP port {}", crate::thunder::discovery::DISCOVERY_PORT),
+                ),
+                info(
+                    "Host TCP port:",
+                    format!(
+                        "configured {} / live {}",
+                        self.thunder_ui.host_port,
+                        match self.thunder_ui.host_endpoint() {
+                            Some(a) => a.to_string(),
+                            None => "stopped".to_string(),
+                        }
+                    ),
+                ),
+                blank(),
+                info(
+                    "",
+                    "Thunder is inference-only: no filesystem, shell, tool, or credential sharing."
+                        .to_string(),
+                ),
+                blank(),
+            ],
+        }
+    }
+
+    fn thunder_action_line(
+        &self,
+        action: &crate::thunder_ui::ThunderAction,
+        idx: usize,
+    ) -> ratatui::text::Line<'static> {
+        use crate::thunder_ui::ThunderAction as A;
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+        let selected = idx == self.thunder_ui.list_selected;
+        let (prefix, text) = match action {
+            A::GotoTab(t) => (
+                "› ",
+                format!(
+                    "Open {}",
+                    crate::thunder_ui::ThunderTab::from_index(*t).label()
+                ),
+            ),
+            A::ToggleInference => (
+                "› ",
+                format!(
+                    "{} host inference (applies on next start)",
+                    if self.thunder_ui.allow_inference {
+                        "Disable"
+                    } else {
+                        "Enable"
+                    }
+                ),
+            ),
+            A::CycleConcurrency => (
+                "› ",
+                format!(
+                    "Concurrency limit: {} (Enter to cycle, applies on next start)",
+                    self.thunder_ui.max_concurrent
+                ),
+            ),
+            A::HostStart => ("› ", "Start host".to_string()),
+            A::HostStop => ("› ", "Stop host".to_string()),
+            A::RegenCode => ("› ", "Generate pairing code".to_string()),
+            A::EditManual => ("› ", "Edit manual host:port".to_string()),
+            A::SubmitManual => ("› ", "Add manual peer".to_string()),
+            A::SelectConnectPeer(id) => ("› ", format!("Select peer {id}")),
+            A::EditCode => ("› ", "Enter pairing code".to_string()),
+            A::SubmitCode => ("› ", "Submit pairing code to host".to_string()),
+            A::TrustHost => ("› ", "Trust host (confirm fingerprint above)".to_string()),
+            A::DiscardPending => ("› ", "Discard pending pairing".to_string()),
+            A::TrustPending(id) => ("› ", format!("Trust {id} (validated request)")),
+            A::RejectPending(id) => ("› ", format!("Reject {id}")),
+            A::DismissInbound(id) => ("› ", format!("Dismiss inbound {id}")),
+            A::PeerToggleInference(id) => ("› ", format!("Toggle inference for {id}")),
+            A::PeerToggleForwarding(id) => ("› ", format!("Toggle forwarding for {id}")),
+            A::PeerUntrust(id) => ("› ", format!("Remove trust for {id}")),
+            A::ModelsRefresh => ("› ", "Refresh remote models".to_string()),
+            A::SelectRemote(i) => {
+                let label = self
+                    .thunder_ui
+                    .remote_models
+                    .get(*i)
+                    .map(|e| e.selector_label())
+                    .unwrap_or_default();
+                ("› ", format!("Select {label}"))
+            }
+            A::SetMainAi => ("› ", "Set selected as Main AI".to_string()),
+        };
+        let bg = if selected {
+            Color::Rgb(59, 66, 82)
+        } else {
+            NORDIC_BG
+        };
+        let fg = if selected {
+            Color::White
+        } else {
+            Color::Rgb(180, 160, 255)
+        };
+        Line::from(vec![
+            Span::styled(
+                prefix,
+                Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(text, Style::default().fg(Color::Rgb(220, 230, 242)).bg(bg)),
+        ])
+    }
+
+    /// Shared Thunder modal renderer: one Nordic frame (outer chrome),
+    /// borderless tab bar + content. No generic Ratatui borders inside.
+    fn render_thunder(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        use crate::thunder_ui::ThunderTab;
+        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::Paragraph;
+        if area.height < 4 || area.width < 24 {
+            return;
+        }
+        let accent = Color::Rgb(180, 160, 255);
+        let sel_bg = Color::Rgb(59, 66, 82);
+        let _ = sel_bg;
+
+        // --- Tab bar (row 0) ---
+        self.thunder_ui.tab_hits.clear();
+        let mut spans: Vec<Span> = Vec::new();
+        let mut x = area.x;
+        for (i, tab) in ThunderTab::ALL.iter().enumerate() {
+            let label = format!(" {} ", tab.label());
+            let w = label.chars().count() as u16;
+            let selected = i == self.thunder_ui.tab;
+            let (fg, bg) = if selected {
+                (NORDIC_BG, Color::White)
+            } else {
+                (Color::Rgb(220, 230, 242), Color::Rgb(46, 52, 64))
+            };
+            self.thunder_ui
+                .tab_hits
+                .push((i, area.y, x, x + w.saturating_sub(1)));
+            spans.push(Span::styled(
+                label,
+                Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
+            x += w + 1;
+            if x >= area.x + area.width {
+                break;
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(NORDIC_BG)),
+            ratatui::layout::Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: 1,
+            },
+        );
+        // --- Subtle divider (row 1) ---
+        let div_w = area.width as usize;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(div_w),
+                Style::default().fg(Color::Rgb(60, 70, 82)).bg(NORDIC_BG),
+            )))
+            .style(Style::default().bg(NORDIC_BG)),
+            ratatui::layout::Rect {
+                x: area.x,
+                y: area.y + 1,
+                width: area.width,
+                height: 1,
+            },
+        );
+
+        // --- Content rows ---
+        let rows = self.thunder_content_rows();
+        self.thunder_ui.row_hits.clear();
+        let mut y = area.y + 2;
+        let bottom = area.y + area.height;
+        // Reserve the last row for the transient status line when set.
+        let status_reserved = if self.thunder_ui.status.is_empty() {
+            0
+        } else {
+            1
+        };
+        for (action_idx, line) in rows {
+            if y + status_reserved >= bottom {
+                break;
+            }
+            if let Some(a) = action_idx {
+                self.thunder_ui.row_hits.push((a, y));
+            }
+            frame.render_widget(
+                Paragraph::new(line).style(Style::default().bg(NORDIC_BG)),
+                ratatui::layout::Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+            y += 1;
+        }
+        if !self.thunder_ui.status.is_empty() && y < bottom {
+            let msg: String = self
+                .thunder_ui
+                .status
+                .chars()
+                .take(area.width as usize)
+                .collect();
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    msg,
+                    Style::default().fg(accent).bg(NORDIC_BG),
+                )))
+                .style(Style::default().bg(NORDIC_BG)),
+                ratatui::layout::Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+        }
+    }
+
+    fn thunder_move(&mut self, dir: i32) {
+        let n = self.thunder_action_list().len();
+        if n == 0 {
+            self.thunder_ui.list_selected = 0;
+            return;
+        }
+        let cur = self.thunder_ui.list_selected.min(n - 1);
+        let next = if dir < 0 {
+            if cur == 0 { n - 1 } else { cur - 1 }
+        } else if cur + 1 >= n {
+            0
+        } else {
+            cur + 1
+        };
+        self.thunder_ui.list_selected = next;
+    }
+
+    /// Total rows of the Main AI selector (Modal tab): installed locals
+    /// plus Thunder remotes (never mixed into one artifact).
+    fn modal_list_len(&self) -> usize {
+        self.installed_models.len() + self.thunder_ui.remote_models.len()
+    }
+
+    async fn thunder_host_start(&mut self) {
+        if self.thunder_ui.host_running() {
+            return;
+        }
+        let identity = match crate::thunder::identity::ThunderIdentity::load_or_generate(
+            "Hercules".to_string(),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                self.thunder_ui.status = format!("Host start failed (identity): {e}");
+                return;
+            }
+        };
+        // Snapshot the EXACT backend/model being hosted: the single
+        // real local model becomes the single advertised model.
+        let hosted = match crate::thunder_ui::host_model_from_backend(&self.backend) {
+            Ok(h) => h,
+            Err(e) => {
+                self.thunder_ui.status = format!("Host start refused: {e}");
+                return;
+            }
+        };
+        let caps = crate::thunder_ui::build_host_caps(
+            &identity,
+            &hosted,
+            self.thunder_ui.allow_inference,
+            self.thunder_ui.max_concurrent,
+        );
+        match crate::thunder_ui::start_host_task(
+            self.backend.clone(),
+            caps,
+            identity,
+            self.thunder_ui.host_port,
+        )
+        .await
+        {
+            Ok(mut runtime) => {
+                runtime.model_name = hosted.display_name.clone();
+                runtime.backend_label = hosted.backend_label.clone();
+                let endpoint = runtime.endpoint;
+                let tcp_port = runtime.tcp_port;
+                let lan_note = if runtime.lan_available {
+                    format!("iface {}", runtime.iface_name)
+                } else {
+                    "loopback only — NOT LAN reachable".to_string()
+                };
+                self.thunder_ui.host_runtime = Some(runtime);
+                // ONE authoritative port: discovery advertises the exact
+                // bound TCP port from the next beacon on.
+                if let Some(d) = self.thunder_discovery.as_mut() {
+                    d.thunder_port = tcp_port;
+                }
+                self.thunder_broadcast_now();
+                self.thunder_ui.status = format!(
+                    "Hosting {} on {endpoint} ({lan_note}, inference-only).",
+                    hosted.display_name
+                );
+            }
+            Err(e) => {
+                self.thunder_ui.status = format!("Host start failed: {e}");
+            }
+        }
+    }
+
+    /// Broadcast our presence beacon immediately (used after host start
+    /// so the new TCP port is advertised without waiting for the
+    /// periodic tick).
+    fn thunder_broadcast_now(&mut self) {
+        self.thunder_ui.last_broadcast = None;
+        self.thunder_broadcast();
+    }
+
+    fn thunder_host_stop(&mut self) {
+        if let Some(runtime) = self.thunder_ui.host_runtime.take() {
+            runtime.stop_token.cancel();
+        }
+        self.thunder_ui.status = "Host stopped — endpoint unavailable.".to_string();
+    }
+
+    /// Refresh remote models from every trusted peer with a known
+    /// endpoint, using the existing one-shot Models exchange. Entries
+    /// keep the EXACT trusted record per peer.
+    async fn thunder_refresh_models(&mut self) {
+        let identity = match crate::thunder::identity::ThunderIdentity::load_or_generate(
+            "Hercules".to_string(),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                self.thunder_ui.status = format!("Refresh failed (identity): {e}");
+                return;
+            }
+        };
+        let store = crate::thunder::pairing::PeerStore::load();
+        let mut entries = Vec::new();
+        let mut errors = Vec::new();
+        for t in store.all() {
+            let Some(addr) = self.thunder_ui.peer_addrs.get(&t.peer_id).copied() else {
+                errors.push(format!("{}: no endpoint (discover first)", t.peer_id));
+                continue;
+            };
+            match crate::thunder_ui::fetch_remote_models(&identity, t, addr).await {
+                Ok(models) => {
+                    self.thunder_ui
+                        .peer_health
+                        .entry(t.peer_id.clone())
+                        .or_default()
+                        .record_ok();
+                    for m in models {
+                        entries.push(crate::thunder_ui::RemoteModelEntry {
+                            peer_id: t.peer_id.clone(),
+                            peer_name: t.name.clone(),
+                            address: addr,
+                            model: m,
+                            trusted: (*t).clone(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    self.thunder_ui
+                        .peer_health
+                        .entry(t.peer_id.clone())
+                        .or_default()
+                        .record_err(e.to_string());
+                    errors.push(format!("{}: {e}", t.peer_id));
+                }
+            }
+        }
+        entries.sort_by(|a, b| (&a.peer_id, &a.model.id).cmp(&(&b.peer_id, &b.model.id)));
+        self.thunder_ui.remote_models = entries;
+        self.thunder_ui.status = if errors.is_empty() {
+            format!("{} remote model(s).", self.thunder_ui.remote_models.len())
+        } else {
+            format!(
+                "{} remote model(s); {} unreachable: {}",
+                self.thunder_ui.remote_models.len(),
+                errors.len(),
+                errors.join("; ").chars().take(120).collect::<String>()
+            )
+        };
+    }
+
+    /// Select a remote entry: creates the EXACT `RemoteTarget`
+    /// (peer id + address + model + this peer's trusted record).
+    fn thunder_select_remote(&mut self, idx: usize) {
+        if let Some(entry) = self.thunder_ui.remote_models.get(idx) {
+            let target = entry.target();
+            // Sanity: the target's peer is exactly the entry's peer —
+            // never an arbitrary store peer.
+            debug_assert_eq!(target.peer_id, entry.peer_id);
+            debug_assert_eq!(target.trusted_peer.peer_id, entry.peer_id);
+            self.thunder_ui.selected_remote = Some(target);
+            self.thunder_ui.status = format!("Selected {}.", entry.selector_label());
+        }
+    }
+
+    /// Make the selected remote the Main AI backend through the
+    /// existing runtime (`SharedThunderBackend::new` with the exact
+    /// selected target — never a reconstructed peer).
+    fn thunder_set_main_ai(&mut self) {
+        let Some(target) = self.thunder_ui.selected_remote.clone() else {
+            self.thunder_ui.status = "Select a remote model first.".to_string();
+            return;
+        };
+        match crate::thunder::identity::ThunderIdentity::load_or_generate("Hercules".to_string()) {
+            Ok(id) => {
+                let label = format!(
+                    "Thunder / {} / {}",
+                    if target.trusted_peer.name.is_empty() {
+                        target.peer_id.clone()
+                    } else {
+                        target.trusted_peer.name.clone()
+                    },
+                    target.model_id
+                );
+                self.backend =
+                    AgentBackend::SharedThunder(SharedThunderBackend::new(Arc::new(id), target));
+                self.status_message = format!("Active Engine: {label}");
+                self.thunder_ui.status = format!("Main AI: {label}.");
+            }
+            Err(e) => {
+                self.thunder_ui.status = format!("Main AI switch failed (identity): {e}");
+            }
+        }
+    }
+
+    /// Activate the selected Thunder action (Enter key / row click).
+    async fn thunder_activate(&mut self) {
+        use crate::thunder_ui::{ThunderAction as A, ThunderInputMode, ThunderTab};
+        // An open editor consumes Enter as "done editing" (text kept).
+        if self.thunder_ui.input_mode != ThunderInputMode::None {
+            self.thunder_ui.input_mode = ThunderInputMode::None;
+            return;
+        }
+        let action = match self
+            .thunder_action_list()
+            .get(self.thunder_ui.list_selected)
+            .cloned()
+        {
+            Some(a) => a,
+            None => return,
+        };
+        match action {
+            A::GotoTab(t) => {
+                self.thunder_ui.set_tab(t);
+                if ThunderTab::from_index(t) == ThunderTab::Models
+                    && self.thunder_ui.remote_models.is_empty()
+                    && !self.thunder_trusted_peers().is_empty()
+                {
+                    self.thunder_refresh_models().await;
+                }
+            }
+            A::ToggleInference => {
+                self.thunder_ui.allow_inference = !self.thunder_ui.allow_inference;
+            }
+            A::CycleConcurrency => {
+                self.thunder_ui.max_concurrent = match self.thunder_ui.max_concurrent {
+                    1 => 2,
+                    2 => 4,
+                    4 => 8,
+                    8 => 16,
+                    _ => 1,
+                };
+            }
+            A::HostStart => self.thunder_host_start().await,
+            A::HostStop => self.thunder_host_stop(),
+            A::RegenCode => {
+                let Some(runtime) = self.thunder_ui.host_runtime.as_ref() else {
+                    self.thunder_ui.status =
+                        "Start the host first — the code lives in the live registry.".to_string();
+                    return;
+                };
+                let text = crate::thunder_ui::regenerate_pairing_code(runtime);
+                self.thunder_ui.status = format!("Pairing code: {text} (10 min, single secret).");
+            }
+            A::EditManual => {
+                self.thunder_ui.input_mode = ThunderInputMode::ManualEndpoint;
+            }
+            A::SubmitManual => {
+                let endpoint = self.thunder_ui.manual_endpoint.trim().to_string();
+                if endpoint.is_empty() {
+                    self.thunder_ui.status = "Enter a host:port first.".to_string();
+                    return;
+                }
+                let addr: std::net::SocketAddr = match endpoint.parse() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        self.thunder_ui.status =
+                            format!("Bad endpoint (want host:port): {endpoint}");
+                        return;
+                    }
+                };
+                // Manual entries are UNVERIFIED addresses: identity is
+                // unknown (empty peer id, zeroed key) until a beacon or
+                // a validated Pair exchange establishes it. Never
+                // presented as identity, never directly trustable.
+                let key = crate::thunder_ui::ThunderUiState::peer_key("", addr);
+                if !self.thunder_ui.manual_peers.iter().any(|m| m.addr == addr) {
+                    self.thunder_ui
+                        .manual_peers
+                        .push(crate::thunder::discovery::DiscoveredPeer {
+                            peer_id: String::new(),
+                            name: endpoint.clone(),
+                            public_key: [0u8; 32],
+                            addr,
+                            thunder_port: addr.port(),
+                            last_seen: std::time::Instant::now(),
+                            signature_valid_self: false,
+                        });
+                }
+                self.thunder_ui.peer_addrs.insert(key.clone(), addr);
+                self.thunder_ui.connect_peer = Some(key);
+                self.thunder_ui.status =
+                    "Manual endpoint added (MANUAL / UNVERIFIED — pair to establish identity)."
+                        .to_string();
+            }
+            A::SelectConnectPeer(id) => {
+                self.thunder_ui.connect_peer = Some(id);
+            }
+            A::EditCode => {
+                self.thunder_ui.input_mode = ThunderInputMode::PairingCode;
+            }
+            A::SubmitCode => {
+                // REAL pairing: the code is sent to the host over an
+                // encrypted channel; NOTHING is trusted because the user
+                // typed it. Trust requires the host's accept reply.
+                let code = self.thunder_ui.code_input.trim().to_string();
+                if code.is_empty() {
+                    self.thunder_ui.status = "Enter the host's pairing code first.".to_string();
+                    return;
+                }
+                let Some(key) = self.thunder_ui.connect_peer.clone() else {
+                    self.thunder_ui.status = "Select a peer first.".to_string();
+                    return;
+                };
+                let peer = self
+                    .thunder_ui
+                    .discovered
+                    .iter()
+                    .chain(self.thunder_ui.manual_peers.iter())
+                    .find(|p| {
+                        crate::thunder_ui::ThunderUiState::peer_key(&p.peer_id, p.addr) == key
+                    })
+                    .cloned();
+                let Some(p) = peer else {
+                    self.thunder_ui.status = "Selected peer vanished — reselect.".to_string();
+                    return;
+                };
+                let addr = crate::thunder_ui::ThunderUiState::tcp_addr(&p);
+                let identity = match crate::thunder::identity::ThunderIdentity::load_or_generate(
+                    "Hercules".to_string(),
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.thunder_ui.status = format!("Pairing failed (identity): {e}");
+                        return;
+                    }
+                };
+                match crate::thunder_ui::send_pairing_request(&identity, addr, &code).await {
+                    Ok(accepted) => {
+                        let fp = crate::thunder::identity::ThunderIdentity::fingerprint_of(
+                            &accepted.public_key,
+                        );
+                        self.thunder_ui
+                            .peer_addrs
+                            .insert(accepted.peer_id.clone(), addr);
+                        self.thunder_ui
+                            .peer_health
+                            .entry(accepted.peer_id.clone())
+                            .or_default()
+                            .record_ok();
+                        self.thunder_ui.pending_pairing = Some(crate::thunder_ui::PendingPairing {
+                            address: addr,
+                            code_entered: code,
+                            accepted: Some(accepted.clone()),
+                        });
+                        // Manual rows learn the established identity for
+                        // display (trust still requires explicit Trust).
+                        for m in self.thunder_ui.manual_peers.iter_mut() {
+                            if m.addr == addr && m.peer_id.is_empty() {
+                                m.peer_id = accepted.peer_id.clone();
+                                m.name = accepted.name.clone();
+                                m.public_key = accepted.public_key;
+                            }
+                        }
+                        self.thunder_ui.status = format!(
+                            "Host accepted pairing — fingerprint {fp}. Confirm it matches, then Trust."
+                        );
+                    }
+                    Err(e) => {
+                        self.thunder_ui
+                            .peer_health
+                            .entry(key.clone())
+                            .or_default()
+                            .record_err(e.to_string());
+                        self.thunder_ui.status = format!("Pairing rejected: {e}");
+                    }
+                }
+            }
+            A::TrustHost => {
+                // verified=true ONLY here: validated Pair exchange (host
+                // accepted our code) + fingerprint shown + explicit
+                // operator confirmation. Anything less keeps untrusted.
+                let Some(pending) = self.thunder_ui.pending_pairing.clone() else {
+                    return;
+                };
+                let Some(accepted) = pending.accepted.clone() else {
+                    self.thunder_ui.status =
+                        "No host acceptance — submit the pairing code first.".to_string();
+                    return;
+                };
+                if crate::thunder_ui::ThunderUiState::trust_peer(
+                    &accepted.peer_id,
+                    accepted.public_key,
+                    &accepted.name,
+                    true,
+                    false,
+                    true,
+                ) {
+                    self.thunder_ui.pending_pairing = None;
+                    self.thunder_ui.code_input.clear();
+                    self.thunder_ui.status =
+                        format!("Paired with {} — refreshing models…", accepted.peer_id);
+                    self.thunder_refresh_models().await;
+                } else {
+                    self.thunder_ui.status = "Trust failed.".to_string();
+                }
+            }
+            A::DiscardPending => {
+                self.thunder_ui.pending_pairing = None;
+                self.thunder_ui.status = "Pending pairing discarded.".to_string();
+            }
+            A::TrustPending(peer_id) => {
+                // Host side: trust ONLY a validated Pair request (code
+                // verified, channel-bound key). Consumed on trust.
+                let Some(runtime) = self.thunder_ui.host_runtime.as_ref() else {
+                    self.thunder_ui.status = "Host is not running.".to_string();
+                    return;
+                };
+                match runtime.registry.consume(&peer_id) {
+                    Some(req) => {
+                        if crate::thunder_ui::ThunderUiState::trust_peer(
+                            &req.peer_id,
+                            req.public_key,
+                            &req.name,
+                            true,
+                            false,
+                            true,
+                        ) {
+                            self.thunder_ui.status = format!("Trusted {peer_id} (paired).");
+                        } else {
+                            self.thunder_ui.status = "Trust failed.".to_string();
+                        }
+                    }
+                    None => {
+                        self.thunder_ui.status =
+                            "No validated pairing request — cannot Trust.".to_string();
+                    }
+                }
+            }
+            A::RejectPending(peer_id) => {
+                if let Some(runtime) = self.thunder_ui.host_runtime.as_ref() {
+                    runtime.registry.reject(&peer_id);
+                }
+                self.thunder_ui.status = format!("Rejected {peer_id} (never trusted).");
+            }
+            A::DismissInbound(peer_id) => {
+                if let Some(runtime) = self.thunder_ui.host_runtime.as_ref() {
+                    if let Ok(mut g) = runtime.inbound.lock() {
+                        g.retain(|p| p.peer_id != peer_id);
+                    }
+                }
+                self.thunder_ui.status = format!("Dismissed {peer_id}.");
+            }
+            A::PeerToggleInference(peer_id) => {
+                let store = crate::thunder::pairing::PeerStore::load();
+                if let Some(t) = store.get(&peer_id) {
+                    let _ = crate::thunder_ui::ThunderUiState::set_peer_permissions(
+                        &peer_id,
+                        !t.permissions.inference,
+                        t.permissions.forwarding,
+                    );
+                }
+            }
+            A::PeerToggleForwarding(peer_id) => {
+                let store = crate::thunder::pairing::PeerStore::load();
+                if let Some(t) = store.get(&peer_id) {
+                    let _ = crate::thunder_ui::ThunderUiState::set_peer_permissions(
+                        &peer_id,
+                        t.permissions.inference,
+                        !t.permissions.forwarding,
+                    );
+                }
+            }
+            A::PeerUntrust(peer_id) => {
+                if crate::thunder_ui::ThunderUiState::untrust_peer(&peer_id) {
+                    self.thunder_ui.status = format!("Removed trust for {peer_id}.");
+                }
+            }
+            A::ModelsRefresh => self.thunder_refresh_models().await,
+            A::SelectRemote(i) => self.thunder_select_remote(i),
+            A::SetMainAi => self.thunder_set_main_ai(),
+        }
     }
 
     fn render_code_graph(&mut self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
@@ -11465,6 +13450,7 @@ impl App {
                     | crossterm::event::KeyCode::F(5)
                     | crossterm::event::KeyCode::F(6)
                     | crossterm::event::KeyCode::F(7)
+                    | crossterm::event::KeyCode::F(8)
             )
         {
             return None;
@@ -11659,7 +13645,13 @@ impl App {
                         self.delete_confirm_model = None;
                         self.esc_hold_start = None;
                     } else if self.show_menu {
-                        if self.search_token_editing {
+                        if self.menu_section == 7
+                            && self.thunder_ui.input_mode
+                                != crate::thunder_ui::ThunderInputMode::None
+                        {
+                            self.thunder_ui.input_mode = crate::thunder_ui::ThunderInputMode::None;
+                            self.esc_hold_start = None;
+                        } else if self.search_token_editing {
                             self.search_token_editing = false;
                             self.search_token_input.clear();
                             self.status_message = "Search token editing cancelled.".to_string();
@@ -11783,6 +13775,18 @@ impl App {
                         self.krama.restart_progress("menu_fade", 0);
                     }
                 }
+                KeyCode::F(8) => {
+                    if self.show_menu && self.menu_section == 7 && !self.menu_closing {
+                        self.menu_closing = true;
+                    } else {
+                        self.menu_section = 7; // Shared Thunder
+                        self.show_menu = true;
+                        self.menu_closing = false;
+                        self.header_dropdown_open = false;
+                        self.krama.restart_progress("menu_fade", 0);
+                        self.ensure_thunder_discovery();
+                    }
+                }
                 KeyCode::Char('f') | KeyCode::Char('F')
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
@@ -11878,6 +13882,12 @@ impl App {
                             CodeGraphPane::Details => CodeGraphPane::Graph,
                             CodeGraphPane::Nodes => CodeGraphPane::Nodes,
                         };
+                    } else if self.menu_section == 7 {
+                        // Thunder: previous internal tab
+                        let n = crate::thunder_ui::ThunderTab::ALL.len();
+                        let cur = self.thunder_ui.tab;
+                        self.thunder_ui
+                            .set_tab(if cur == 0 { n - 1 } else { cur - 1 });
                     }
                 }
                 KeyCode::Char('a') if self.show_menu && self.menu_section == 3 => {
@@ -11940,6 +13950,10 @@ impl App {
                             CodeGraphPane::Graph => CodeGraphPane::Details,
                             CodeGraphPane::Details => CodeGraphPane::Details,
                         };
+                    } else if self.menu_section == 7 {
+                        // Thunder: next internal tab
+                        let n = crate::thunder_ui::ThunderTab::ALL.len();
+                        self.thunder_ui.set_tab((self.thunder_ui.tab + 1) % n);
                     }
                 }
                 KeyCode::Char('k') if self.show_menu && self.menu_section == 3 => {
@@ -12094,10 +14108,11 @@ impl App {
                         self.registry_state
                             .select(if total == 0 { None } else { Some(i) });
                     } else if self.menu_section == 2 {
+                        let total = self.modal_list_len();
                         let i = match self.installed_state.selected() {
                             Some(i) => {
                                 if i == 0 {
-                                    self.installed_models.len().saturating_sub(1)
+                                    total.saturating_sub(1)
                                 } else {
                                     i - 1
                                 }
@@ -12151,14 +14166,17 @@ impl App {
                                 }
                             }
                         }
+                    } else if self.menu_section == 7 {
+                        self.thunder_move(-1);
                     }
                 }
                 KeyCode::Char('w') if self.show_menu && self.menu_section != 1 => {
                     if self.menu_section == 2 {
+                        let total = self.modal_list_len();
                         let i = match self.installed_state.selected() {
                             Some(i) => {
                                 if i == 0 {
-                                    self.installed_models.len().saturating_sub(1)
+                                    total.saturating_sub(1)
                                 } else {
                                     i - 1
                                 }
@@ -12221,9 +14239,10 @@ impl App {
                         self.registry_state
                             .select(if total == 0 { None } else { Some(i) });
                     } else if self.menu_section == 2 {
+                        let total = self.modal_list_len();
                         let i = match self.installed_state.selected() {
                             Some(i) => {
-                                if i >= self.installed_models.len().saturating_sub(1) {
+                                if total == 0 || i + 1 >= total {
                                     0
                                 } else {
                                     i + 1
@@ -12231,7 +14250,8 @@ impl App {
                             }
                             None => 0,
                         };
-                        self.installed_state.select(Some(i));
+                        self.installed_state
+                            .select(if total == 0 { None } else { Some(i) });
                     } else if self.menu_section == 3 {
                         if !self.hf_token_editing && !self.search_token_editing {
                             if self.settings_col == 0 {
@@ -12264,13 +14284,16 @@ impl App {
                                 }
                             }
                         }
+                    } else if self.menu_section == 7 {
+                        self.thunder_move(1);
                     }
                 }
                 KeyCode::Char('s') if self.show_menu && self.menu_section != 1 => {
                     if self.menu_section == 2 {
+                        let total = self.modal_list_len();
                         let i = match self.installed_state.selected() {
                             Some(i) => {
-                                if i >= self.installed_models.len().saturating_sub(1) {
+                                if total == 0 || i + 1 >= total {
                                     0
                                 } else {
                                     i + 1
@@ -12278,7 +14301,8 @@ impl App {
                             }
                             None => 0,
                         };
-                        self.installed_state.select(Some(i));
+                        self.installed_state
+                            .select(if total == 0 { None } else { Some(i) });
                     } else if self.menu_section == 3 {
                         if !self.hf_token_editing && !self.search_token_editing {
                             if self.settings_col == 0 {
@@ -12642,7 +14666,23 @@ impl App {
                     if !key.modifiers.contains(KeyModifiers::CONTROL)
                         && !key.modifiers.contains(KeyModifiers::ALT)
                     {
-                        if self.show_menu && self.menu_section == 1 {
+                        if self.show_menu
+                            && self.menu_section == 7
+                            && self.thunder_ui.input_mode
+                                == crate::thunder_ui::ThunderInputMode::ManualEndpoint
+                        {
+                            if c != '\n' && c != '\r' {
+                                self.thunder_ui.manual_endpoint.push(c);
+                            }
+                        } else if self.show_menu
+                            && self.menu_section == 7
+                            && self.thunder_ui.input_mode
+                                == crate::thunder_ui::ThunderInputMode::PairingCode
+                        {
+                            if c != '\n' && c != '\r' {
+                                self.thunder_ui.code_input.push(c);
+                            }
+                        } else if self.show_menu && self.menu_section == 1 {
                             self.registry_search_query.push(c);
                             let query = self.registry_search_query.clone();
                             let manager = self.manager.clone();
@@ -12683,6 +14723,18 @@ impl App {
                         || key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         // handled above for word-delete
+                    } else if self.show_menu
+                        && self.menu_section == 7
+                        && self.thunder_ui.input_mode
+                            == crate::thunder_ui::ThunderInputMode::ManualEndpoint
+                    {
+                        self.thunder_ui.manual_endpoint.pop();
+                    } else if self.show_menu
+                        && self.menu_section == 7
+                        && self.thunder_ui.input_mode
+                            == crate::thunder_ui::ThunderInputMode::PairingCode
+                    {
+                        self.thunder_ui.code_input.pop();
                     } else if self.show_menu && self.menu_section == 1 {
                         self.registry_search_query.pop();
                         let query = self.registry_search_query.clone();
@@ -12769,6 +14821,9 @@ impl App {
                         if self.menu_section == 0 {
                             // Help tab: Enter closes menu
                             self.menu_closing = true;
+                        } else if self.menu_section == 7 {
+                            // Shared Thunder: activate selected action
+                            self.thunder_activate().await;
                         } else if self.menu_section == 1 {
                             // Registry tab: download selected model
                             let filtered_models = self.filtered_registry_models();
@@ -12896,7 +14951,40 @@ impl App {
                         } else if self.menu_section == 2 {
                             // Modal (Installed models) tab: activate model
                             if let Some(i) = self.installed_state.selected() {
-                                if i < self.installed_models.len() {
+                                if i >= self.installed_models.len() {
+                                    // Thunder remote row: exact RemoteTarget →
+                                    // SharedThunderBackend via the existing
+                                    // runtime (never an arbitrary peer).
+                                    let ri = i - self.installed_models.len();
+                                    if let Some(entry) =
+                                        self.thunder_ui.remote_models.get(ri).cloned()
+                                    {
+                                        let target = entry.target();
+                                        match crate::thunder::identity::ThunderIdentity::load_or_generate(
+                                            "Hercules".to_string(),
+                                        ) {
+                                            Ok(id) => {
+                                                let label = entry.selector_label();
+                                                self.backend =
+                                                    AgentBackend::SharedThunder(
+                                                        SharedThunderBackend::new(
+                                                            Arc::new(id),
+                                                            target.clone(),
+                                                        ),
+                                                    );
+                                                self.thunder_ui.selected_remote = Some(target);
+                                                self.status_message =
+                                                    format!("Active Engine: {label}");
+                                            }
+                                            Err(e) => {
+                                                self.status_message = format!(
+                                                    "Thunder activation failed (identity): {e}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    self.menu_closing = true;
+                                } else if i < self.installed_models.len() {
                                     let selected_model = self.installed_models[i].clone();
                                     if selected_model.contains("Ollama") {
                                         let model_name = selected_model
@@ -13184,6 +15272,9 @@ impl App {
                                         }
                                         AgentBackend::Transformers(_) => {
                                             "Transformers / local SafeTensors repository"
+                                        }
+                                        AgentBackend::SharedThunder(_) => {
+                                            "Shared Thunder / remote peer model"
                                         }
                                         #[cfg(feature = "gpu")]
                                         AgentBackend::BurnWgpu(_) => "WGPU repository",
@@ -14076,4 +16167,607 @@ pub fn query_active_gpu_power() -> f64 {
     }
 
     0.0
+}
+
+#[cfg(test)]
+mod ui_render_tests {
+    use super::*;
+
+    /// Offscreen render of every modal panel at the required terminal
+    /// sizes (80x24, 100x30, 120x40, and 1366x731 px ≈ 170x45 cells):
+    /// must not panic, clip the close control outside the frame, or
+    /// produce broken geometry. Hit-testing shares the rendered rects.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_modal_panels_render_all_sizes() {
+        let sizes = [(80u16, 24u16), (100, 30), (120, 40), (170, 45)];
+        for (w, h) in sizes {
+            for section in 0..=6 {
+                let mut app = App::new();
+                app.menu_section = section;
+                app.show_menu = true;
+                app.menu_anim_progress = 1.0;
+                let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+                    .expect("terminal");
+                term.draw(|f| app.draw(f)).expect("draw");
+                // Close control must be inside the frame.
+                if let Some((row, x0, x1)) = app.container_close_hit {
+                    assert!(row < h, "close row outside frame at {w}x{h}");
+                    assert!(x0 < w && x1 < w, "close cols outside frame at {w}x{h}");
+                }
+            }
+        }
+    }
+
+    /// F7 Agent Run Timeline states: empty, running, completed, failed,
+    /// long history — no panic, no generic border, no clipping.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_timeline_states_render() {
+        for (w, h) in [(80u16, 24u16), (100, 30), (120, 40)] {
+            for history in 0..12usize {
+                let mut app = App::new();
+                app.menu_section = 6;
+                app.show_menu = true;
+                app.menu_anim_progress = 1.0;
+                match history % 5 {
+                    0 => {} // empty
+                    1 => {
+                        // Active run with steps
+                        let mut run = crate::run_timeline::AgentRun::new("build the thing".into());
+                        run.start_step(
+                            crate::run_timeline::StepKind::Read,
+                            "Analyze repository".into(),
+                            None,
+                        );
+                        run.start_step(
+                            crate::run_timeline::StepKind::Write,
+                            "Implement changes".into(),
+                            None,
+                        );
+                        app.current_run = Some(run);
+                    }
+                    2 => {
+                        // Completed run
+                        let mut run = crate::run_timeline::AgentRun::new("done task".into());
+                        run.start_step(
+                            crate::run_timeline::StepKind::Run,
+                            "cargo check".into(),
+                            None,
+                        );
+                        run.finish_run(crate::run_timeline::AgentRunState::Completed);
+                        app.current_run = Some(run);
+                    }
+                    3 => {
+                        // Failed run
+                        let mut run = crate::run_timeline::AgentRun::new("bad task".into());
+                        run.start_step(
+                            crate::run_timeline::StepKind::Run,
+                            "cargo test".into(),
+                            None,
+                        );
+                        run.finish_run(crate::run_timeline::AgentRunState::Failed);
+                        app.current_run = Some(run);
+                    }
+                    _ => {
+                        // Long history only
+                        app.run_history = (0..history)
+                            .map(|i| crate::run_timeline::RunSummary {
+                                id: i as u64,
+                                prompt: format!("task {i} with a fairly long prompt text"),
+                                state: "Completed".to_string(),
+                                started_epoch_secs: 0,
+                                finished_epoch_secs: Some(1),
+                                duration_ms: Some(1500),
+                                steps_total: 4,
+                                steps_done: 4,
+                            })
+                            .collect();
+                    }
+                }
+                let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+                    .expect("terminal");
+                term.draw(|f| app.draw(f)).expect("draw");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod thunder_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn fkey(n: u8) -> KeyEvent {
+        KeyEvent::new(KeyCode::F(n), KeyModifiers::empty())
+    }
+
+    fn render_text(app: &mut App, w: u16, h: u16) -> String {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).expect("terminal");
+        term.draw(|f| app.draw(f)).expect("draw");
+        let buf = term.backend().buffer().clone();
+        buf.content.iter().map(|c| c.symbol()).collect::<String>()
+    }
+
+    fn open_thunder(app: &mut App) {
+        app.menu_section = 7;
+        app.show_menu = true;
+        app.menu_closing = false;
+        app.menu_anim_progress = 1.0;
+    }
+
+    fn fake_peer(
+        peer_id: &str,
+        name: &str,
+        key: [u8; 32],
+    ) -> crate::thunder::discovery::DiscoveredPeer {
+        crate::thunder::discovery::DiscoveredPeer {
+            peer_id: peer_id.to_string(),
+            name: name.to_string(),
+            public_key: key,
+            addr: "127.0.0.1:4317".parse().unwrap(),
+            thunder_port: 4317,
+            last_seen: std::time::Instant::now(),
+            signature_valid_self: true,
+        }
+    }
+
+    /// Isolate the persistent trust store per test (same contract as the
+    /// runtime target tests: no other thread reads XDG_DATA_HOME here).
+    fn isolate_store(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hercules-thunder-ui-{}-{}",
+            tag,
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+        }
+        dir
+    }
+
+    fn unisolate(dir: std::path::PathBuf) {
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn f8_opens_thunder() {
+        let mut app = App::new();
+        app.handle_key(fkey(8)).await;
+        assert!(app.show_menu);
+        assert_eq!(app.menu_section, 7);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn f8_closes_thunder() {
+        let mut app = App::new();
+        app.handle_key(fkey(8)).await;
+        assert_eq!(app.menu_section, 7);
+        app.handle_key(fkey(8)).await;
+        assert!(app.menu_closing, "second F8 must start close");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn header_tab_opens_thunder() {
+        let mut app = App::new();
+        app.header_dropdown_open = true;
+        app.header_anim_progress = 1.0;
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).expect("terminal");
+        term.draw(|f| app.draw(f)).expect("draw");
+        assert!(
+            app.menu_tab_hits.iter().any(|(s, _, _)| *s == 7),
+            "Thunder must be a header tab"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn f1_f7_sections_unchanged() {
+        let mut app = App::new();
+        for (n, section) in [(1u8, 0usize), (2, 1), (3, 2), (4, 3), (5, 4), (7, 6)] {
+            app.show_menu = false;
+            app.menu_closing = false;
+            app.handle_key(fkey(n)).await;
+            assert!(app.show_menu, "F{n} must open menu");
+            assert_eq!(app.menu_section, section, "F{n} must keep its section");
+            // Toggle off again (repeat suppression bypassed: fresh events).
+            app.handle_key(fkey(n)).await;
+            assert!(app.menu_closing, "F{n} must close its section");
+            app.menu_closing = false;
+            app.show_menu = false;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn overview_zero_peers_renders() {
+        let mut app = App::new();
+        open_thunder(&mut app);
+        app.thunder_ui.set_tab(0);
+        let text = render_text(&mut app, 100, 30);
+        assert!(text.contains("Shared Thunder"));
+        assert!(text.contains("Stopped"));
+        assert!(text.contains("Trusted peers:"));
+        assert!(text.contains("Main AI:"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn discovered_peer_marked_untrusted() {
+        // Hermetic: the trust store on developer machines may contain
+        // `thunder-alice` (or parallel tests may redirect XDG_DATA_HOME),
+        // so use an isolated store plus a peer id no other test trusts.
+        let dir = isolate_store("untrusted");
+        let mut app = App::new();
+        open_thunder(&mut app);
+        app.thunder_ui.set_tab(2);
+        app.thunder_ui
+            .discovered
+            .push(fake_peer("thunder-untrusted-zara", "Zara", [7u8; 32]));
+        let text = render_text(&mut app, 120, 40);
+        assert!(text.contains("thunder-untrusted-zara"), "peer id visible");
+        assert!(text.contains("unverified"), "untrusted peer visibly marked");
+        assert!(text.contains("[?]"), "untrusted marker row");
+        unisolate(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_peer_renders_permissions() {
+        let dir = isolate_store("perms");
+        let mut app = App::new();
+        assert!(crate::thunder_ui::ThunderUiState::trust_peer(
+            "thunder-alice",
+            [9u8; 32],
+            "Alice",
+            true,
+            false,
+            true,
+        ));
+        open_thunder(&mut app);
+        app.thunder_ui.set_tab(3);
+        let text = render_text(&mut app, 120, 40);
+        assert!(text.contains("thunder-alice"));
+        assert!(text.contains("inference=on"), "permissions rendered");
+        assert!(text.contains("forwarding=off"), "permissions rendered");
+        assert!(
+            crate::thunder_ui::ThunderUiState::untrust_peer("thunder-alice"),
+            "remove trust updates state"
+        );
+        assert!(!crate::thunder::pairing::PeerStore::load().is_trusted("thunder-alice"));
+        unisolate(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_stopped_and_hosting_render() {
+        let dir = isolate_store("host");
+        let mut app = App::new();
+        open_thunder(&mut app);
+        app.thunder_ui.set_tab(1);
+        let stopped = render_text(&mut app, 100, 30);
+        assert!(stopped.contains("STOPPED"));
+        app.thunder_host_start().await;
+        assert!(app.thunder_ui.host_running());
+        let (tcp_port, endpoint, lan_available, iface_name, all_contain) = {
+            let rt = app.thunder_ui.host_runtime.as_ref().expect("runtime");
+            let endpoint = app.thunder_ui.host_endpoint().expect("real endpoint");
+            (
+                rt.tcp_port,
+                endpoint,
+                rt.lan_available,
+                rt.iface_name.clone(),
+                rt.all_endpoints.contains(&endpoint),
+            )
+        };
+        // Real listener endpoint: actual bound port, never manufactured.
+        assert!(endpoint.port() != 0);
+        // ONE authoritative port: runtime == endpoint == discovery.
+        assert_eq!(tcp_port, endpoint.port(), "runtime owns the port");
+        // Endpoint IP is either a real enumerated interface address or
+        // an explicitly flagged loopback-only fallback — never a
+        // silently mislabeled LAN address.
+        if lan_available {
+            assert!(!endpoint.ip().is_loopback(), "LAN endpoint is usable");
+            assert!(!iface_name.is_empty());
+            assert!(
+                all_contain,
+                "display endpoint is one of the enumerated interfaces"
+            );
+        } else {
+            assert!(endpoint.ip().is_loopback(), "fallback is explicit loopback");
+        }
+        let hosting = render_text(&mut app, 100, 30);
+        assert!(hosting.contains("HOSTING"), "hosting state renders");
+        assert!(
+            hosting.contains(&endpoint.to_string()),
+            "real endpoint shown"
+        );
+        // Discovery advertises the exact bound TCP port (single source).
+        if let Some(d) = app.thunder_discovery.as_ref() {
+            assert_eq!(d.thunder_port, endpoint.port());
+            assert_eq!(d.thunder_port, tcp_port);
+        }
+        app.thunder_host_stop();
+        assert!(!app.thunder_ui.host_running());
+        assert!(app.thunder_ui.host_endpoint().is_none());
+        let stopped2 = render_text(&mut app, 100, 30);
+        assert!(stopped2.contains("STOPPED"));
+        unisolate(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pairing_code_and_expiry_render() {
+        let dir = isolate_store("code");
+        let mut app = App::new();
+        open_thunder(&mut app);
+        app.thunder_ui.set_tab(1);
+        app.thunder_host_start().await;
+        assert!(app.thunder_ui.host_running(), "host live for pairing");
+        // Generate via the shared action (same path as Enter).
+        let idx = app
+            .thunder_action_list()
+            .iter()
+            .position(|a| matches!(a, crate::thunder_ui::ThunderAction::RegenCode))
+            .expect("regen action present");
+        app.thunder_ui.list_selected = idx;
+        app.thunder_activate().await;
+        let code = app
+            .thunder_ui
+            .active_code()
+            .expect("code active in registry");
+        let text = render_text(&mut app, 100, 30);
+        assert!(text.contains(&code), "pairing code on screen");
+        unisolate(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn validated_pairing_trust_and_reject_update_state() {
+        let dir = isolate_store("pending");
+        let mut app = App::new();
+        open_thunder(&mut app);
+        app.thunder_host_start().await;
+        let registry = app
+            .thunder_ui
+            .host_runtime
+            .as_ref()
+            .expect("runtime")
+            .registry
+            .clone();
+        // Seed a VALIDATED pairing attempt through the real registry
+        // (code installed, then accepted with the channel key).
+        let code = crate::thunder::pairing::PairingCode::generate();
+        let code_text = code.code.clone();
+        registry.set_code(Some(code));
+        let alice = crate::thunder::identity::ThunderIdentity::generate("Alice".to_string());
+        let alice_key = alice.public_key_bytes();
+        let (host_id, _, _) = registry
+            .accept_pair(&alice.peer_id, "Alice", alice_key, &alice_key, &code_text)
+            .expect("valid code accepted");
+        assert!(!host_id.is_empty());
+        app.thunder_ui.set_tab(3);
+        // Trust via the shared action list (same indices as render/Enter).
+        let idx = app
+            .thunder_action_list()
+            .iter()
+            .position(|a| matches!(a, crate::thunder_ui::ThunderAction::TrustPending(_)))
+            .expect("trust action present");
+        app.thunder_ui.list_selected = idx;
+        app.thunder_activate().await;
+        assert!(
+            crate::thunder::pairing::PeerStore::load().is_trusted(&alice.peer_id),
+            "Trust persists a validated request"
+        );
+        assert!(
+            registry.consume(&alice.peer_id).is_none(),
+            "Trust consumes the request"
+        );
+        // Reject path drops the validated request without trusting.
+        // Single-use codes: a fresh code is required for the next peer.
+        let bob = crate::thunder::identity::ThunderIdentity::generate("Bob".to_string());
+        let bob_key = bob.public_key_bytes();
+        let bob_code = crate::thunder::pairing::PairingCode::generate();
+        let bob_code_text = bob_code.code.clone();
+        registry.set_code(Some(bob_code));
+        registry
+            .accept_pair(&bob.peer_id, "Bob", bob_key, &bob_key, &bob_code_text)
+            .expect("valid code accepted");
+        let idx = app
+            .thunder_action_list()
+            .iter()
+            .position(|a| {
+                matches!(a, crate::thunder_ui::ThunderAction::RejectPending(id) if id == &bob.peer_id)
+            })
+            .expect("reject action present");
+        app.thunder_ui.list_selected = idx;
+        app.thunder_activate().await;
+        assert!(registry.pending().is_empty(), "Reject drops the request");
+        assert!(
+            !crate::thunder::pairing::PeerStore::load().is_trusted(&bob.peer_id),
+            "Reject never trusts"
+        );
+        unisolate(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trust_without_validated_request_refused() {
+        // No Pair exchange, no pending entry: Trust/TrustHost paths
+        // must refuse rather than persist.
+        let dir = isolate_store("novalid");
+        let mut app = App::new();
+        open_thunder(&mut app);
+        let alice = crate::thunder::identity::ThunderIdentity::generate("Alice".to_string());
+        // Direct store-level call without verification still requires
+        // verified=true (callers enforce); the UI TrustPending path
+        // refuses when the registry has no entry.
+        app.thunder_host_start().await;
+        app.thunder_ui.set_tab(3);
+        assert!(
+            app.thunder_action_list()
+                .iter()
+                .all(|a| !matches!(a, crate::thunder_ui::ThunderAction::TrustPending(_))),
+            "no validated request → no Trust action"
+        );
+        assert!(
+            !crate::thunder::pairing::PeerStore::load().is_trusted(&alice.peer_id),
+            "peer stays untrusted"
+        );
+        unisolate(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_selection_binds_exact_peer_alice_not_bob() {
+        let mut app = App::new();
+        let addr_a: std::net::SocketAddr = "127.0.0.1:4317".parse().unwrap();
+        let addr_b: std::net::SocketAddr = "127.0.0.1:4318".parse().unwrap();
+        let mk =
+            |peer_id: &str, name: &str, key: [u8; 32], addr: std::net::SocketAddr, model: &str| {
+                crate::thunder_ui::RemoteModelEntry {
+                    peer_id: peer_id.to_string(),
+                    peer_name: name.to_string(),
+                    address: addr,
+                    model: crate::thunder::capabilities::ThunderModel {
+                        id: model.to_string(),
+                        name: model.to_string(),
+                        architecture: "Qwen3".to_string(),
+                        format: "SafeTensors".to_string(),
+                        backend: "Transformers".to_string(),
+                        quantization: None,
+                        context_length: 32768,
+                        streaming: true,
+                        cancellation: true,
+                    },
+                    trusted: crate::thunder::pairing::TrustedPeer {
+                        peer_id: peer_id.to_string(),
+                        public_key: key,
+                        name: name.to_string(),
+                        permissions: crate::thunder::pairing::PeerPermissions::default(),
+                        paired_at_epoch: 1,
+                    },
+                }
+            };
+        app.thunder_ui.remote_models = vec![
+            mk("thunder-alice", "Alice", [1u8; 32], addr_a, "qwen3-32b"),
+            mk("thunder-bob", "Bob", [2u8; 32], addr_b, "qwen3-8b"),
+        ];
+        // Selecting Alice binds Alice's id + address + key — never Bob's.
+        app.thunder_select_remote(0);
+        let sel = app.thunder_ui.selected_remote.clone().expect("selected");
+        assert_eq!(sel.peer_id, "thunder-alice");
+        assert_eq!(sel.address, addr_a);
+        assert_eq!(sel.model_id, "qwen3-32b");
+        assert_eq!(sel.trusted_peer.public_key, [1u8; 32]);
+        assert_ne!(sel.trusted_peer.public_key, [2u8; 32]);
+        // Refs stay distinct per peer.
+        assert_eq!(
+            app.thunder_ui.remote_models[1].model_ref(),
+            "thunder-bob::qwen3-8b@127.0.0.1:4318"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn main_ai_displays_thunder_target() {
+        let dir = isolate_store("mainai");
+        let mut app = App::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:4317".parse().unwrap();
+        let target = crate::thunder_ui::make_remote_target(
+            "thunder-alice",
+            addr,
+            "qwen3-32b",
+            crate::thunder::pairing::TrustedPeer {
+                peer_id: "thunder-alice".to_string(),
+                public_key: [1u8; 32],
+                name: "Alice".to_string(),
+                permissions: crate::thunder::pairing::PeerPermissions::default(),
+                paired_at_epoch: 1,
+            },
+        );
+        app.thunder_ui.selected_remote = Some(target);
+        app.thunder_set_main_ai();
+        match &app.backend {
+            AgentBackend::SharedThunder(b) => {
+                assert_eq!(b.target.peer_id, "thunder-alice");
+                assert_eq!(b.target.model_id, "qwen3-32b");
+            }
+            other => panic!("expected thunder backend, got {}", other.name()),
+        }
+        let label = crate::thunder_ui::main_ai_label(&app.backend);
+        assert_eq!(label, "Thunder / Alice / qwen3-32b");
+        open_thunder(&mut app);
+        app.thunder_ui.set_tab(0);
+        let text = render_text(&mut app, 100, 30);
+        assert!(
+            text.contains("Thunder / Alice / qwen3-32b"),
+            "overview shows target"
+        );
+        unisolate(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn thunder_narrow_terminals_no_panic() {
+        for (w, h) in [(80u16, 24u16), (100, 30), (60, 20)] {
+            let mut app = App::new();
+            open_thunder(&mut app);
+            for tab in 0..6usize {
+                app.thunder_ui.set_tab(tab);
+                let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+                    .expect("terminal");
+                term.draw(|f| app.draw(f)).expect("draw");
+                if let Some((row, x0, x1)) = app.container_close_hit {
+                    assert!(row < h, "close row inside {w}x{h}");
+                    assert!(x0 < w && x1 < w, "close cols inside {w}x{h}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn modal_selector_lists_thunder_remote() {
+        let mut app = App::new();
+        let addr: std::net::SocketAddr = "127.0.0.1:4317".parse().unwrap();
+        app.thunder_ui.remote_models = vec![crate::thunder_ui::RemoteModelEntry {
+            peer_id: "thunder-alice".to_string(),
+            peer_name: "Alice".to_string(),
+            address: addr,
+            model: crate::thunder::capabilities::ThunderModel {
+                id: "qwen3-32b".to_string(),
+                name: "Qwen3-32B".to_string(),
+                architecture: "Qwen3".to_string(),
+                format: "SafeTensors".to_string(),
+                backend: "Transformers".to_string(),
+                quantization: None,
+                context_length: 32768,
+                streaming: true,
+                cancellation: true,
+            },
+            trusted: crate::thunder::pairing::TrustedPeer {
+                peer_id: "thunder-alice".to_string(),
+                public_key: [1u8; 32],
+                name: "Alice".to_string(),
+                permissions: crate::thunder::pairing::PeerPermissions::default(),
+                paired_at_epoch: 1,
+            },
+        }];
+        app.menu_section = 2;
+        app.show_menu = true;
+        app.menu_anim_progress = 1.0;
+        let text = render_text(&mut app, 120, 40);
+        assert!(text.contains("REMOTE"), "remote badge distinct from local");
+        assert!(text.contains("Alice"), "remote peer listed in selector");
+        // Activate the thunder row: exact target becomes Main AI.
+        let dir = isolate_store("selector");
+        let thunder_row = app.installed_models.len();
+        app.installed_state.select(Some(thunder_row));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .await;
+        match &app.backend {
+            AgentBackend::SharedThunder(b) => {
+                assert_eq!(b.target.peer_id, "thunder-alice");
+                assert_eq!(b.target.model_id, "qwen3-32b");
+                assert_eq!(b.target.address, addr);
+            }
+            other => panic!("expected thunder backend, got {}", other.name()),
+        }
+        assert!(app.status_message.contains("Alice"));
+        unisolate(dir);
+    }
 }

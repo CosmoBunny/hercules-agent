@@ -6,7 +6,7 @@
 //! CPU-only.
 
 /// Host capabilities relevant to backend choice.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HardwareInfo {
     pub os: String,
     pub arch: String,

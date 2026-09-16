@@ -7,7 +7,9 @@ mod common;
 
 use common::*;
 use hercules_agent::llama::gguf::GgmlType;
-use hercules_agent::llama::{default_rms_norm, ComputeBackend, ComputePrefs, ParallelBackend, ScalarBackend};
+use hercules_agent::llama::{
+    ComputeBackend, ComputePrefs, ParallelBackend, ScalarBackend, default_rms_norm,
+};
 
 #[test]
 fn test_tier2_edge_shape_mismatch_x() {
@@ -18,8 +20,19 @@ fn test_tier2_edge_shape_mismatch_x() {
     let mut y = vec![0.0f32; rows];
 
     let backend = ScalarBackend::with_threads(1);
-    let err = backend.gemv_quant(GgmlType::Q8_0, &raw, rows, cols, rows * cols, &x_short, &mut y);
-    assert!(err.is_err(), "Expected shape mismatch error for short x vector");
+    let err = backend.gemv_quant(
+        GgmlType::Q8_0,
+        &raw,
+        rows,
+        cols,
+        rows * cols,
+        &x_short,
+        &mut y,
+    );
+    assert!(
+        err.is_err(),
+        "Expected shape mismatch error for short x vector"
+    );
 }
 
 #[test]
@@ -31,8 +44,19 @@ fn test_tier2_edge_shape_mismatch_y() {
     let mut y_short = vec![0.0f32; 2]; // Should be 4
 
     let backend = ScalarBackend::with_threads(1);
-    let err = backend.gemv_quant(GgmlType::Q8_0, &raw, rows, cols, rows * cols, &x, &mut y_short);
-    assert!(err.is_err(), "Expected shape mismatch error for short y vector");
+    let err = backend.gemv_quant(
+        GgmlType::Q8_0,
+        &raw,
+        rows,
+        cols,
+        rows * cols,
+        &x,
+        &mut y_short,
+    );
+    assert!(
+        err.is_err(),
+        "Expected shape mismatch error for short y vector"
+    );
 }
 
 #[test]
@@ -44,7 +68,15 @@ fn test_tier2_edge_truncated_raw_buffer_q8_0() {
     let mut y = vec![0.0f32; rows];
 
     let backend = ScalarBackend::with_threads(1);
-    let err = backend.gemv_quant(GgmlType::Q8_0, &truncated_raw, rows, cols, rows * cols, &x, &mut y);
+    let err = backend.gemv_quant(
+        GgmlType::Q8_0,
+        &truncated_raw,
+        rows,
+        cols,
+        rows * cols,
+        &x,
+        &mut y,
+    );
     assert!(err.is_err(), "Expected error on truncated raw buffer");
 }
 
@@ -57,7 +89,15 @@ fn test_tier2_edge_truncated_raw_buffer_q4_k() {
     let mut y = vec![0.0f32; rows];
 
     let backend = ScalarBackend::with_threads(1);
-    let err = backend.gemv_quant(GgmlType::Q4_K, &truncated_raw, rows, cols, rows * cols, &x, &mut y);
+    let err = backend.gemv_quant(
+        GgmlType::Q4_K,
+        &truncated_raw,
+        rows,
+        cols,
+        rows * cols,
+        &x,
+        &mut y,
+    );
     assert!(err.is_err(), "Expected error on truncated Q4_K buffer");
 }
 

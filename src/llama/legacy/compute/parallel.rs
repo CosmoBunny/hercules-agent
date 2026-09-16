@@ -13,7 +13,7 @@
 use super::scalar::ScalarBackend;
 use super::simd::{SimdBackend, SimdInstructionSet};
 use super::{ComputeBackend, ComputeError};
-use crate::llama::gguf::{dequant_buffer, GgmlType};
+use crate::llama::gguf::{GgmlType, dequant_buffer};
 use crate::llama::kernels::{gemv_quant_fused, supports_fused_gemv};
 
 /// Minimum rows to use the multi-threaded path (below this, overhead dominates).
@@ -70,7 +70,8 @@ impl ComputeBackend for ParallelBackend {
             return if let Some(ref simd) = self.simd {
                 simd.gemv_quant(quant, raw, rows, cols, n_elements, x, y)
             } else {
-                self.scalar.gemv_quant(quant, raw, rows, cols, n_elements, x, y)
+                self.scalar
+                    .gemv_quant(quant, raw, rows, cols, n_elements, x, y)
             };
         }
 
@@ -87,17 +88,11 @@ impl ComputeBackend for ParallelBackend {
 
                 // Choose block sizes based on quant type
                 let elem_per_col = n_elements / rows.max(1);
-                let bytes_per_row = if cols > 0 {
-                    raw.len() / rows.max(1)
-                } else {
-                    0
-                };
+                let bytes_per_row = if cols > 0 { raw.len() / rows.max(1) } else { 0 };
 
                 // Parallel GEMV: partition rows, each chunk gets its raw slice
-                let result: Result<(), String> = y
-                    .par_iter_mut()
-                    .enumerate()
-                    .try_for_each(|(r, yr)| {
+                let result: Result<(), String> =
+                    y.par_iter_mut().enumerate().try_for_each(|(r, yr)| {
                         // Per-row raw slice
                         let row_raw_start = r * bytes_per_row;
                         let row_raw_end = (row_raw_start + bytes_per_row).min(raw.len());
@@ -111,27 +106,45 @@ impl ComputeBackend for ParallelBackend {
                         // Run single-row SIMD GEMV
                         let mut res = unsafe {
                             match isa {
-                                SimdInstructionSet::Avx512 => {
-                                    super::simd::avx512::gemv_avx512(
-                                        quant, row_raw, 1, cols, row_n_elem, x_slice, &mut row_out,
-                                    )
-                                }
-                                SimdInstructionSet::Avx2 => {
-                                    super::simd::avx2::gemv_avx2(
-                                        quant, row_raw, 1, cols, row_n_elem, x_slice, &mut row_out,
-                                    )
-                                }
-                                SimdInstructionSet::Neon => {
-                                    super::simd::neon::gemv_neon(
-                                        quant, row_raw, 1, cols, row_n_elem, x_slice, &mut row_out,
-                                    )
-                                }
+                                SimdInstructionSet::Avx512 => super::simd::avx512::gemv_avx512(
+                                    quant,
+                                    row_raw,
+                                    1,
+                                    cols,
+                                    row_n_elem,
+                                    x_slice,
+                                    &mut row_out,
+                                ),
+                                SimdInstructionSet::Avx2 => super::simd::avx2::gemv_avx2(
+                                    quant,
+                                    row_raw,
+                                    1,
+                                    cols,
+                                    row_n_elem,
+                                    x_slice,
+                                    &mut row_out,
+                                ),
+                                SimdInstructionSet::Neon => super::simd::neon::gemv_neon(
+                                    quant,
+                                    row_raw,
+                                    1,
+                                    cols,
+                                    row_n_elem,
+                                    x_slice,
+                                    &mut row_out,
+                                ),
                                 _ => Err("unsupported SIMD".into()),
                             }
                         };
                         if res.is_err() {
                             res = gemv_quant_fused(
-                                quant, row_raw, 1, cols, row_n_elem, x_slice, &mut row_out,
+                                quant,
+                                row_raw,
+                                1,
+                                cols,
+                                row_n_elem,
+                                x_slice,
+                                &mut row_out,
                             );
                         }
                         res.map(|_| {
@@ -153,8 +166,8 @@ impl ComputeBackend for ParallelBackend {
             }
 
             // Parallel row dequant-dot for unsupported quant types
-            let data = dequant_buffer(raw, quant, n_elements)
-                .map_err(|e| ComputeError(e.to_string()))?;
+            let data =
+                dequant_buffer(raw, quant, n_elements).map_err(|e| ComputeError(e.to_string()))?;
             if data.len() < rows * cols {
                 return Err(ComputeError("dequant short".into()));
             }

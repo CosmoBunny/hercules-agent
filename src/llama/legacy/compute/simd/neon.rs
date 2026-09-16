@@ -3,7 +3,7 @@
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
-use crate::llama::gguf::{f16_to_f32, GgmlType};
+use crate::llama::gguf::{GgmlType, f16_to_f32};
 use crate::llama::kernels::gemv_quant_fused;
 
 #[allow(dead_code)]
@@ -401,8 +401,8 @@ pub unsafe fn rms_norm_neon(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]
     let mut j = 0;
     while j + 4 <= n {
         unsafe {
-            let xv  = vld1q_f32(x.as_ptr().add(j));
-            let wv  = vld1q_f32(weight.as_ptr().add(j));
+            let xv = vld1q_f32(x.as_ptr().add(j));
+            let wv = vld1q_f32(weight.as_ptr().add(j));
             let res = vmulq_f32(vmulq_f32(xv, scale_v), wv);
             vst1q_f32(out.as_mut_ptr().add(j), res);
         }

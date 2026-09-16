@@ -3,7 +3,7 @@
 //! Uses fused quant GEMV when available (no full f32 weight matrix).
 
 use super::{ComputeBackend, ComputeError};
-use crate::llama::gguf::{dequant_buffer, GgmlType};
+use crate::llama::gguf::{GgmlType, dequant_buffer};
 use crate::llama::kernels::{gemv_quant_fused, supports_fused_gemv};
 
 /// Single-thread (or thread-count reserved) pure-Rust backend.
@@ -70,8 +70,8 @@ impl ComputeBackend for ScalarBackend {
         }
 
         // Fallback: full dequant (rare types)
-        let data = dequant_buffer(raw, quant, n_elements)
-            .map_err(|e| ComputeError(e.to_string()))?;
+        let data =
+            dequant_buffer(raw, quant, n_elements).map_err(|e| ComputeError(e.to_string()))?;
         if data.len() != rows * cols {
             return Err(ComputeError(format!(
                 "dequant size {} != rows*cols {}",

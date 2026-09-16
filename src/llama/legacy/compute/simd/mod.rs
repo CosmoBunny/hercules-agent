@@ -20,8 +20,7 @@ impl SimdInstructionSet {
     pub fn detect() -> Self {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            if std::is_x86_feature_detected!("avx512f")
-                && std::is_x86_feature_detected!("avx512bw")
+            if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
             {
                 return Self::Avx512;
             }
@@ -104,20 +103,17 @@ impl ComputeBackend for SimdBackend {
     ) -> Result<(), ComputeError> {
         match self.isa {
             SimdInstructionSet::Avx512 => unsafe {
-                avx512::gemv_avx512(quant, raw, rows, cols, n_elements, x, y)
-                    .map_err(ComputeError)
+                avx512::gemv_avx512(quant, raw, rows, cols, n_elements, x, y).map_err(ComputeError)
             },
             SimdInstructionSet::Avx2 => unsafe {
-                avx2::gemv_avx2(quant, raw, rows, cols, n_elements, x, y)
-                    .map_err(ComputeError)
+                avx2::gemv_avx2(quant, raw, rows, cols, n_elements, x, y).map_err(ComputeError)
             },
             SimdInstructionSet::Neon => unsafe {
-                neon::gemv_neon(quant, raw, rows, cols, n_elements, x, y)
-                    .map_err(ComputeError)
+                neon::gemv_neon(quant, raw, rows, cols, n_elements, x, y).map_err(ComputeError)
             },
-            SimdInstructionSet::Scalar => {
-                self.scalar.gemv_quant(quant, raw, rows, cols, n_elements, x, y)
-            }
+            SimdInstructionSet::Scalar => self
+                .scalar
+                .gemv_quant(quant, raw, rows, cols, n_elements, x, y),
         }
     }
 
@@ -159,16 +155,26 @@ mod tests {
     use super::*;
     use crate::llama::gguf::dequant_buffer;
 
-    fn verify_equivalence(backend: &dyn ComputeBackend, quant: GgmlType, raw: &[u8], rows: usize, cols: usize) {
+    fn verify_equivalence(
+        backend: &dyn ComputeBackend,
+        quant: GgmlType,
+        raw: &[u8],
+        rows: usize,
+        cols: usize,
+    ) {
         let n = rows * cols;
         let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.01) + 0.5).collect();
-        
+
         let scalar_backend = ScalarBackend::new();
         let mut y_scalar = vec![0.0f32; rows];
-        scalar_backend.gemv_quant(quant, raw, rows, cols, n, &x, &mut y_scalar).unwrap();
+        scalar_backend
+            .gemv_quant(quant, raw, rows, cols, n, &x, &mut y_scalar)
+            .unwrap();
 
         let mut y_simd = vec![0.0f32; rows];
-        backend.gemv_quant(quant, raw, rows, cols, n, &x, &mut y_simd).unwrap();
+        backend
+            .gemv_quant(quant, raw, rows, cols, n, &x, &mut y_simd)
+            .unwrap();
 
         let ref_weights = dequant_buffer(raw, quant, n).expect("dequant");
         let mut y_ref = vec![0.0f32; rows];
@@ -186,12 +192,16 @@ mod tests {
             assert!(
                 err_simd < 1e-3 * (1.0 + y_scalar[r].abs()),
                 "row {r}: simd {} vs scalar {} (err {})",
-                y_simd[r], y_scalar[r], err_simd
+                y_simd[r],
+                y_scalar[r],
+                err_simd
             );
             assert!(
                 err_ref < 1e-3 * (1.0 + y_ref[r].abs()),
                 "row {r}: simd {} vs ref {} (err {})",
-                y_simd[r], y_ref[r], err_ref
+                y_simd[r],
+                y_ref[r],
+                err_ref
             );
         }
     }
@@ -216,10 +226,16 @@ mod tests {
         let rows = 1;
         let cols = 256;
         let mut raw = vec![0u8; 144];
-        raw[0] = 0x00; raw[1] = 0x3C; // d = 1.0
-        raw[2] = 0x00; raw[3] = 0x38; // dmin = 0.5
-        for i in 4..16 { raw[i] = (i * 3) as u8; }
-        for i in 16..144 { raw[i] = (i * 11) as u8; }
+        raw[0] = 0x00;
+        raw[1] = 0x3C; // d = 1.0
+        raw[2] = 0x00;
+        raw[3] = 0x38; // dmin = 0.5
+        for i in 4..16 {
+            raw[i] = (i * 3) as u8;
+        }
+        for i in 16..144 {
+            raw[i] = (i * 11) as u8;
+        }
         let backend = SimdBackend::new(1);
         verify_equivalence(&backend, GgmlType::Q4_K, &raw, rows, cols);
     }
@@ -229,11 +245,19 @@ mod tests {
         let rows = 1;
         let cols = 256;
         let mut raw = vec![0u8; 176];
-        raw[0] = 0x00; raw[1] = 0x3C; // d = 1.0
-        raw[2] = 0x00; raw[3] = 0x38; // dmin = 0.5
-        for i in 4..16 { raw[i] = (i * 7) as u8; }
-        for i in 16..48 { raw[i] = (i * 13) as u8; }
-        for i in 48..176 { raw[i] = (i * 17) as u8; }
+        raw[0] = 0x00;
+        raw[1] = 0x3C; // d = 1.0
+        raw[2] = 0x00;
+        raw[3] = 0x38; // dmin = 0.5
+        for i in 4..16 {
+            raw[i] = (i * 7) as u8;
+        }
+        for i in 16..48 {
+            raw[i] = (i * 13) as u8;
+        }
+        for i in 48..176 {
+            raw[i] = (i * 17) as u8;
+        }
         let backend = SimdBackend::new(1);
         verify_equivalence(&backend, GgmlType::Q5_K, &raw, rows, cols);
     }

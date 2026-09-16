@@ -1575,10 +1575,12 @@ fn draw() {}
         let graph = builder
             .add_file("fn foo() {}", PathBuf::from("test.rs"))
             .unwrap();
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|n| n.kind == NodeKind::Function && n.name == "foo"));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Function && n.name == "foo")
+        );
     }
 
     #[test]
@@ -1588,10 +1590,12 @@ fn draw() {}
         let graph = builder
             .add_file("struct Bar { field: i32 }", PathBuf::from("test.rs"))
             .unwrap();
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|n| n.kind == NodeKind::Struct && n.name == "Bar"));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Struct && n.name == "Bar")
+        );
     }
 
     #[test]
@@ -1601,10 +1605,12 @@ fn draw() {}
         let graph = builder
             .add_file("trait Baz { fn qux(); }", PathBuf::from("test.rs"))
             .unwrap();
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|n| n.kind == NodeKind::Trait && n.name == "Baz"));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Trait && n.name == "Baz")
+        );
     }
 
     #[test]
@@ -1614,10 +1620,12 @@ fn draw() {}
         let graph = builder
             .add_file("impl Foo { fn bar() {} }", PathBuf::from("test.rs"))
             .unwrap();
-        assert!(graph
-            .nodes
-            .iter()
-            .any(|n| n.kind == NodeKind::Impl && n.name == "Foo"));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Impl && n.name == "Foo")
+        );
     }
 
     #[test]

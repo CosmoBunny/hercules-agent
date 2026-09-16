@@ -304,11 +304,24 @@ fn slice_line_horizontal<'a>(line: Line<'a>, start_x: usize, max_len: usize) -> 
         let span_end = cur_col + span_len;
 
         if span_end > start_x && cur_col < end_x {
-            let slice_start = if cur_col < start_x { start_x - cur_col } else { 0 };
-            let slice_end = if span_end > end_x { span_len - (span_end - end_x) } else { span_len };
+            let slice_start = if cur_col < start_x {
+                start_x - cur_col
+            } else {
+                0
+            };
+            let slice_end = if span_end > end_x {
+                span_len - (span_end - end_x)
+            } else {
+                span_len
+            };
 
             if slice_end > slice_start {
-                let sliced_str: String = span.content.chars().skip(slice_start).take(slice_end - slice_start).collect();
+                let sliced_str: String = span
+                    .content
+                    .chars()
+                    .skip(slice_start)
+                    .take(slice_end - slice_start)
+                    .collect();
                 out.push(Span::styled(sliced_str, span.style));
             }
         }
@@ -364,7 +377,9 @@ pub fn render_markdown_to_lines<'a>(
         is_generating: bool,
         is_last_message: bool,
     ) {
-        if table_lines.is_empty() { return; }
+        if table_lines.is_empty() {
+            return;
+        }
 
         let mut rows: Vec<Vec<String>> = Vec::new();
         let mut sep_row_idx: Option<usize> = None;
@@ -381,9 +396,13 @@ pub fn render_markdown_to_lines<'a>(
                     parts.pop();
                 }
             }
-            if parts.is_empty() { continue; }
+            if parts.is_empty() {
+                continue;
+            }
 
-            let is_sep = parts.iter().all(|c| !c.trim().is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' '));
+            let is_sep = parts.iter().all(|c| {
+                !c.trim().is_empty() && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')
+            });
             if is_sep {
                 if sep_row_idx.is_none() {
                     sep_row_idx = Some(rows.len());
@@ -400,15 +419,23 @@ pub fn render_markdown_to_lines<'a>(
             }
         }
 
-        if rows.is_empty() { return; }
+        if rows.is_empty() {
+            return;
+        }
 
         let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-        if num_cols == 0 { return; }
+        if num_cols == 0 {
+            return;
+        }
 
         let mut col_widths = vec![0usize; num_cols];
         for row in &rows {
             for (i, cell) in row.iter().enumerate() {
-                let cell_clean = cell.replace("**", "").replace("`", "").replace("*", "").replace("~~", "");
+                let cell_clean = cell
+                    .replace("**", "")
+                    .replace("`", "")
+                    .replace("*", "")
+                    .replace("~~", "");
                 col_widths[i] = col_widths[i].max(cell_clean.chars().count());
             }
         }
@@ -426,7 +453,10 @@ pub fn render_markdown_to_lines<'a>(
             Span::styled("┌", Style::default().fg(border_fg)),
         ];
         for (i, w) in col_widths.iter().enumerate() {
-            top_spans.push(Span::styled("─".repeat(*w + 2), Style::default().fg(border_fg)));
+            top_spans.push(Span::styled(
+                "─".repeat(*w + 2),
+                Style::default().fg(border_fg),
+            ));
             if i + 1 < num_cols {
                 top_spans.push(Span::styled("┬", Style::default().fg(border_fg)));
             } else {
@@ -445,7 +475,11 @@ pub fn render_markdown_to_lines<'a>(
 
             for (c_idx, w) in col_widths.iter().enumerate() {
                 let cell_text = row.get(c_idx).map(|s| s.as_str()).unwrap_or("");
-                let cell_clean = cell_text.replace("**", "").replace("`", "").replace("*", "").replace("~~", "");
+                let cell_clean = cell_text
+                    .replace("**", "")
+                    .replace("`", "")
+                    .replace("*", "")
+                    .replace("~~", "");
                 let text_w = cell_clean.chars().count();
                 let pad_spaces = w.saturating_sub(text_w);
 
@@ -466,9 +500,14 @@ pub fn render_markdown_to_lines<'a>(
                         } else {
                             Color::Rgb(220, 235, 250)
                         };
-                        let mut style = Style::default().fg(stream_token_color(base_c, age, is_streaming));
-                        if is_header || span.bold { style = style.add_modifier(Modifier::BOLD); }
-                        if span.italic { style = style.add_modifier(Modifier::ITALIC); }
+                        let mut style =
+                            Style::default().fg(stream_token_color(base_c, age, is_streaming));
+                        if is_header || span.bold {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                        if span.italic {
+                            style = style.add_modifier(Modifier::ITALIC);
+                        }
                         row_spans.push(Span::styled(ch.to_string(), style));
                         *global_out_ch += 1;
                     }
@@ -489,7 +528,10 @@ pub fn render_markdown_to_lines<'a>(
                     Span::styled("├", Style::default().fg(border_fg)),
                 ];
                 for (i, w) in col_widths.iter().enumerate() {
-                    mid_spans.push(Span::styled("─".repeat(*w + 2), Style::default().fg(border_fg)));
+                    mid_spans.push(Span::styled(
+                        "─".repeat(*w + 2),
+                        Style::default().fg(border_fg),
+                    ));
                     if i + 1 < num_cols {
                         mid_spans.push(Span::styled("┼", Style::default().fg(border_fg)));
                     } else {
@@ -506,7 +548,10 @@ pub fn render_markdown_to_lines<'a>(
             Span::styled("└", Style::default().fg(border_fg)),
         ];
         for (i, w) in col_widths.iter().enumerate() {
-            bot_spans.push(Span::styled("─".repeat(*w + 2), Style::default().fg(border_fg)));
+            bot_spans.push(Span::styled(
+                "─".repeat(*w + 2),
+                Style::default().fg(border_fg),
+            ));
             if i + 1 < num_cols {
                 bot_spans.push(Span::styled("┴", Style::default().fg(border_fg)));
             } else {
@@ -543,7 +588,9 @@ pub fn render_markdown_to_lines<'a>(
                 let copy_btn = " Copy ";
                 let copy_w = copy_btn.chars().count();
                 let prefix_w = tag_prefix.chars().count();
-                let fill_count = target_block_width.saturating_sub(prefix_w + copy_w + 2).max(2);
+                let fill_count = target_block_width
+                    .saturating_sub(prefix_w + copy_w + 2)
+                    .max(2);
                 let copy_start_col = (prefix_w + fill_count) as u16;
                 let copy_end_col = copy_start_col + copy_w as u16;
 
@@ -551,8 +598,14 @@ pub fn render_markdown_to_lines<'a>(
                 current_copy_start = copy_start_col;
                 current_copy_end = copy_end_col;
 
-                let border_style = Style::default().fg(theme_color).bg(code_bg).add_modifier(Modifier::BOLD);
-                let copy_style = Style::default().fg(Color::Rgb(150, 200, 255)).bg(Color::Rgb(28, 44, 68)).add_modifier(Modifier::BOLD);
+                let border_style = Style::default()
+                    .fg(theme_color)
+                    .bg(code_bg)
+                    .add_modifier(Modifier::BOLD);
+                let copy_style = Style::default()
+                    .fg(Color::Rgb(150, 200, 255))
+                    .bg(Color::Rgb(28, 44, 68))
+                    .add_modifier(Modifier::BOLD);
 
                 let mut fence_spans = Vec::new();
                 fence_spans.push(Span::styled(tag_prefix, border_style));
@@ -563,7 +616,13 @@ pub fn render_markdown_to_lines<'a>(
                 lines_out.push(Line::from(fence_spans));
             } else {
                 if let Some(ref mut copies) = out_copy_buttons {
-                    copies.push((current_header_line_idx, code_block_index, current_copy_start, current_copy_end, current_code_body.clone()));
+                    copies.push((
+                        current_header_line_idx,
+                        code_block_index,
+                        current_copy_start,
+                        current_copy_end,
+                        current_code_body.clone(),
+                    ));
                 }
 
                 let is_preview = preview_blocks.contains(&code_block_index);
@@ -575,19 +634,28 @@ pub fn render_markdown_to_lines<'a>(
                 let mut preview_lines: Vec<Line<'a>> = Vec::new();
                 let mut max_diag_w: usize = 0;
                 let visible_preview_w = target_block_width.saturating_sub(6).max(20);
-                let scroll_x = scroll_offsets.and_then(|m| m.get(&code_block_index).copied()).unwrap_or(0);
+                let scroll_x = scroll_offsets
+                    .and_then(|m| m.get(&code_block_index).copied())
+                    .unwrap_or(0);
 
                 if is_previewable && !current_code_body.trim().is_empty() {
                     if current_code_lang.contains("mermaid") {
                         let natural_w = target_block_width.max(160);
-                        let plines = crate::diagram::DiagramRenderer::render_mermaid(&current_code_body, natural_w);
+                        let plines = crate::diagram::DiagramRenderer::render_mermaid(
+                            &current_code_body,
+                            natural_w,
+                        );
                         max_diag_w = plines.iter().map(|l| l.width()).max().unwrap_or(0);
                         let max_scroll = max_diag_w.saturating_sub(visible_preview_w);
                         let active_scroll = scroll_x.min(max_scroll);
 
                         for pline in plines {
-                            let sliced = slice_line_horizontal(pline, active_scroll, visible_preview_w);
-                            let mut pspans = vec![Span::styled("  │ ", Style::default().fg(theme_color).bg(code_bg))];
+                            let sliced =
+                                slice_line_horizontal(pline, active_scroll, visible_preview_w);
+                            let mut pspans = vec![Span::styled(
+                                "  │ ",
+                                Style::default().fg(theme_color).bg(code_bg),
+                            )];
                             let mut p_char_count = 4;
                             for s in sliced {
                                 p_char_count += s.content.chars().count();
@@ -595,28 +663,48 @@ pub fn render_markdown_to_lines<'a>(
                             }
                             if p_char_count < target_block_width - 1 {
                                 let pad_spaces = (target_block_width - 1) - p_char_count;
-                                pspans.push(Span::styled(" ".repeat(pad_spaces), Style::default().bg(code_bg)));
+                                pspans.push(Span::styled(
+                                    " ".repeat(pad_spaces),
+                                    Style::default().bg(code_bg),
+                                ));
                             }
-                            pspans.push(Span::styled("│", Style::default().fg(theme_color).bg(code_bg)));
+                            pspans.push(Span::styled(
+                                "│",
+                                Style::default().fg(theme_color).bg(code_bg),
+                            ));
                             preview_lines.push(Line::from(pspans));
                         }
                     } else if current_code_lang == "markdown" || current_code_lang == "md" {
                         for md_l in current_code_body.lines() {
                             let inline = parse_inline(md_l, false, false);
-                            let mut pspans = vec![Span::styled("  │ ", Style::default().fg(theme_color).bg(code_bg))];
+                            let mut pspans = vec![Span::styled(
+                                "  │ ",
+                                Style::default().fg(theme_color).bg(code_bg),
+                            )];
                             let mut p_char_count = 4;
                             for s in inline {
                                 p_char_count += s.text.chars().count();
-                                let mut st = Style::default().fg(Color::Rgb(230, 240, 255)).bg(code_bg);
-                                if s.bold { st = st.add_modifier(Modifier::BOLD); }
-                                if s.italic { st = st.add_modifier(Modifier::ITALIC); }
+                                let mut st =
+                                    Style::default().fg(Color::Rgb(230, 240, 255)).bg(code_bg);
+                                if s.bold {
+                                    st = st.add_modifier(Modifier::BOLD);
+                                }
+                                if s.italic {
+                                    st = st.add_modifier(Modifier::ITALIC);
+                                }
                                 pspans.push(Span::styled(s.text, st));
                             }
                             if p_char_count < target_block_width - 1 {
                                 let pad_spaces = (target_block_width - 1) - p_char_count;
-                                pspans.push(Span::styled(" ".repeat(pad_spaces), Style::default().bg(code_bg)));
+                                pspans.push(Span::styled(
+                                    " ".repeat(pad_spaces),
+                                    Style::default().bg(code_bg),
+                                ));
                             }
-                            pspans.push(Span::styled("│", Style::default().fg(theme_color).bg(code_bg)));
+                            pspans.push(Span::styled(
+                                "│",
+                                Style::default().fg(theme_color).bg(code_bg),
+                            ));
                             preview_lines.push(Line::from(pspans));
                         }
                     }
@@ -628,11 +716,16 @@ pub fn render_markdown_to_lines<'a>(
 
                 // Trim trailing blank lines from code block
                 while current_code_lines.len() > 1 {
-                    let is_blank = current_code_lines.last().map(|l| {
-                        let text: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
-                        let inner = text.trim_matches(|c: char| c == '│' || c == ' ' || c.is_ascii_digit());
-                        inner.is_empty()
-                    }).unwrap_or(false);
+                    let is_blank = current_code_lines
+                        .last()
+                        .map(|l| {
+                            let text: String =
+                                l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                            let inner = text
+                                .trim_matches(|c: char| c == '│' || c == ' ' || c.is_ascii_digit());
+                            inner.is_empty()
+                        })
+                        .unwrap_or(false);
                     if is_blank {
                         current_code_lines.pop();
                     } else {
@@ -657,16 +750,27 @@ pub fn render_markdown_to_lines<'a>(
                             } else {
                                 (prev_h, code_h)
                             };
-                            let target_h = ((from_h as f32 * (1.0 - ease) + to_h as f32 * ease).round() as usize).max(1);
+                            let target_h = ((from_h as f32 * (1.0 - ease) + to_h as f32 * ease)
+                                .round() as usize)
+                                .max(1);
                             if active_display_lines.len() > target_h {
                                 active_display_lines.truncate(target_h);
                             } else {
                                 while active_display_lines.len() < target_h {
                                     let pad_w = target_block_width.saturating_sub(4);
                                     active_display_lines.push(Line::from(vec![
-                                        Span::styled("  │", Style::default().fg(theme_color).bg(code_bg)),
-                                        Span::styled(" ".repeat(pad_w), Style::default().bg(code_bg)),
-                                        Span::styled("│", Style::default().fg(theme_color).bg(code_bg)),
+                                        Span::styled(
+                                            "  │",
+                                            Style::default().fg(theme_color).bg(code_bg),
+                                        ),
+                                        Span::styled(
+                                            " ".repeat(pad_w),
+                                            Style::default().bg(code_bg),
+                                        ),
+                                        Span::styled(
+                                            "│",
+                                            Style::default().fg(theme_color).bg(code_bg),
+                                        ),
                                     ]));
                                 }
                             }
@@ -696,8 +800,14 @@ pub fn render_markdown_to_lines<'a>(
                         let track_total = 10;
                         let thumb_w = 3;
                         let active_scroll = scroll_x.min(max_scroll);
-                        let thumb_pos = (active_scroll * (track_total - thumb_w)) / max_scroll.max(1);
-                        let track_str = format!(" [{}{}{}] ", "─".repeat(thumb_pos), "═".repeat(thumb_w), "─".repeat((track_total - thumb_w).saturating_sub(thumb_pos)));
+                        let thumb_pos =
+                            (active_scroll * (track_total - thumb_w)) / max_scroll.max(1);
+                        let track_str = format!(
+                            " [{}{}{}] ",
+                            "─".repeat(thumb_pos),
+                            "═".repeat(thumb_w),
+                            "─".repeat((track_total - thumb_w).saturating_sub(thumb_pos))
+                        );
                         let right_btn = " ► ";
 
                         let left_s = cur_col;
@@ -712,15 +822,30 @@ pub fn render_markdown_to_lines<'a>(
                         let right_e = right_s + right_btn.chars().count() as u16;
                         cur_col = right_e;
 
-                        let btn_style = Style::default().fg(Color::Rgb(100, 220, 255)).bg(Color::Rgb(24, 38, 58)).add_modifier(Modifier::BOLD);
-                        let track_style = Style::default().fg(Color::Rgb(140, 180, 220)).bg(Color::Rgb(16, 26, 42));
+                        let btn_style = Style::default()
+                            .fg(Color::Rgb(100, 220, 255))
+                            .bg(Color::Rgb(24, 38, 58))
+                            .add_modifier(Modifier::BOLD);
+                        let track_style = Style::default()
+                            .fg(Color::Rgb(140, 180, 220))
+                            .bg(Color::Rgb(16, 26, 42));
 
                         fence_spans.push(Span::styled(left_btn, btn_style));
                         fence_spans.push(Span::styled(track_str, track_style));
                         fence_spans.push(Span::styled(right_btn, btn_style));
 
                         if let Some(ref mut scrolls) = out_scroll_buttons {
-                            scrolls.push((lines_out.len(), code_block_index, left_s, left_e, track_s, track_e, right_s, right_e, max_scroll));
+                            scrolls.push((
+                                lines_out.len(),
+                                code_block_index,
+                                left_s,
+                                left_e,
+                                track_s,
+                                track_e,
+                                right_s,
+                                right_e,
+                                max_scroll,
+                            ));
                         }
                     }
 
@@ -737,11 +862,17 @@ pub fn render_markdown_to_lines<'a>(
                     let (normal_style, preview_style) = if is_preview {
                         (
                             Style::default().fg(Color::Rgb(140, 165, 195)).bg(code_bg),
-                            Style::default().fg(Color::Black).bg(Color::Rgb(0, 255, 120)).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Rgb(0, 255, 120))
+                                .add_modifier(Modifier::BOLD),
                         )
                     } else {
                         (
-                            Style::default().fg(Color::Black).bg(Color::Rgb(0, 255, 120)).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Rgb(0, 255, 120))
+                                .add_modifier(Modifier::BOLD),
                             Style::default().fg(Color::Rgb(140, 165, 195)).bg(code_bg),
                         )
                     };
@@ -756,7 +887,14 @@ pub fn render_markdown_to_lines<'a>(
                     fence_spans.push(Span::styled("─┘", border_style));
 
                     if let Some(ref mut toggles) = out_toggle_buttons {
-                        toggles.push((lines_out.len(), code_block_index, normal_start_col, normal_end_col, preview_start_col, preview_end_col));
+                        toggles.push((
+                            lines_out.len(),
+                            code_block_index,
+                            normal_start_col,
+                            normal_end_col,
+                            preview_start_col,
+                            preview_end_col,
+                        ));
                     }
 
                     lines_out.push(Line::from(fence_spans));
@@ -765,7 +903,10 @@ pub fn render_markdown_to_lines<'a>(
                     let fence_tag = format!("  └──{}┘", "─".repeat(fill_count));
                     let mut fence_spans = Vec::new();
                     for ch in fence_tag.chars() {
-                        fence_spans.push(Span::styled(ch.to_string(), Style::default().fg(theme_color).bg(code_bg)));
+                        fence_spans.push(Span::styled(
+                            ch.to_string(),
+                            Style::default().fg(theme_color).bg(code_bg),
+                        ));
                     }
                     lines_out.push(Line::from(fence_spans));
                 }
@@ -783,7 +924,10 @@ pub fn render_markdown_to_lines<'a>(
             let chunks: Vec<Vec<char>> = if code_chars.is_empty() {
                 vec![Vec::new()]
             } else {
-                code_chars.chunks(max_code_chars_per_line).map(|c| c.to_vec()).collect()
+                code_chars
+                    .chunks(max_code_chars_per_line)
+                    .map(|c| c.to_vec())
+                    .collect()
             };
 
             let num_digits = (code_line_num.max(1).ilog10() as usize + 1).max(2);
@@ -872,7 +1016,11 @@ pub fn render_markdown_to_lines<'a>(
                 hr_spans.push(Span::styled(ch.to_string(), style));
                 *global_out_ch += 1;
             }
-            *global_out_ch += raw_line.chars().count().saturating_sub(hr_str.chars().count()) + 1;
+            *global_out_ch += raw_line
+                .chars()
+                .count()
+                .saturating_sub(hr_str.chars().count())
+                + 1;
             lines_out.push(Line::from(hr_spans));
             continue;
         }
@@ -882,7 +1030,17 @@ pub fn render_markdown_to_lines<'a>(
             current_table_lines.push(raw_line);
             continue;
         } else if !current_table_lines.is_empty() {
-            flush_table(&mut lines_out, &current_table_lines, target_block_width, theme_color, dark_gray, available_output, global_out_ch, is_generating, is_last_message);
+            flush_table(
+                &mut lines_out,
+                &current_table_lines,
+                target_block_width,
+                theme_color,
+                dark_gray,
+                available_output,
+                global_out_ch,
+                is_generating,
+                is_last_message,
+            );
             current_table_lines.clear();
         }
 
@@ -891,10 +1049,10 @@ pub fn render_markdown_to_lines<'a>(
         if hash_count > 0 && hash_count <= 6 && trimmed[hash_count..].starts_with(' ') {
             let level = hash_count;
             let h_color = match level {
-                1 => Color::Rgb(0, 255, 0),     // green
-                2 => Color::Rgb(0, 150, 255),   // blue
-                3 => Color::Rgb(255, 255, 0),   // yellow
-                _ => Color::Rgb(255, 50, 50),   // red
+                1 => Color::Rgb(0, 255, 0),   // green
+                2 => Color::Rgb(0, 150, 255), // blue
+                3 => Color::Rgb(255, 255, 0), // yellow
+                _ => Color::Rgb(255, 50, 50), // red
             };
 
             let header_text = trimmed[hash_count..].trim();
@@ -1013,7 +1171,9 @@ pub fn render_markdown_to_lines<'a>(
             if is_task_checked {
                 line_spans.push(Span::styled(
                     "☑ ",
-                    Style::default().fg(Color::Rgb(0, 255, 120)).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Rgb(0, 255, 120))
+                        .add_modifier(Modifier::BOLD),
                 ));
             } else {
                 line_spans.push(Span::styled(
@@ -1081,9 +1241,8 @@ pub fn render_markdown_to_lines<'a>(
         }
 
         // 8. Bullets / Unordered Lists: * bullet -> ● bullet, - bullet, + bullet
-        let is_bullet = trimmed.starts_with("- ")
-            || trimmed.starts_with("* ")
-            || trimmed.starts_with("+ ");
+        let is_bullet =
+            trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ");
 
         // 9. Ordered Lists: 1. item, 2. item
         let is_ordered = !is_bullet
@@ -1112,7 +1271,9 @@ pub fn render_markdown_to_lines<'a>(
             let indent_str = format!("  {}{}", " ".repeat(leading_spaces), bullet_char);
             line_spans.push(Span::styled(
                 indent_str,
-                Style::default().fg(theme_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme_color)
+                    .add_modifier(Modifier::BOLD),
             ));
             &trimmed[2..]
         } else if is_ordered {
@@ -1121,7 +1282,9 @@ pub fn render_markdown_to_lines<'a>(
             let indent_str = format!("  {}{}", " ".repeat(leading_spaces), num_str);
             line_spans.push(Span::styled(
                 indent_str,
-                Style::default().fg(theme_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme_color)
+                    .add_modifier(Modifier::BOLD),
             ));
             &trimmed[dot_pos + 2..]
         } else {
@@ -1188,16 +1351,30 @@ pub fn render_markdown_to_lines<'a>(
     }
 
     if !current_table_lines.is_empty() {
-        flush_table(&mut lines_out, &current_table_lines, target_block_width, theme_color, dark_gray, available_output, global_out_ch, is_generating, is_last_message);
+        flush_table(
+            &mut lines_out,
+            &current_table_lines,
+            target_block_width,
+            theme_color,
+            dark_gray,
+            available_output,
+            global_out_ch,
+            is_generating,
+            is_last_message,
+        );
     }
 
     if in_code_block {
         while current_code_lines.len() > 1 {
-            let is_blank = current_code_lines.last().map(|l| {
-                let text: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
-                let inner = text.trim_matches(|c: char| c == '│' || c == ' ' || c.is_ascii_digit());
-                inner.is_empty()
-            }).unwrap_or(false);
+            let is_blank = current_code_lines
+                .last()
+                .map(|l| {
+                    let text: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                    let inner =
+                        text.trim_matches(|c: char| c == '│' || c == ' ' || c.is_ascii_digit());
+                    inner.is_empty()
+                })
+                .unwrap_or(false);
             if is_blank {
                 current_code_lines.pop();
             } else {
@@ -1208,20 +1385,35 @@ pub fn render_markdown_to_lines<'a>(
         if current_code_lines.is_empty() {
             let mut line_spans = vec![
                 Span::styled("  │", Style::default().fg(theme_color).bg(code_bg)),
-                Span::styled(format!(" {:2} │ ", 1), Style::default().fg(gutter_fg).bg(code_bg)),
+                Span::styled(
+                    format!(" {:2} │ ", 1),
+                    Style::default().fg(gutter_fg).bg(code_bg),
+                ),
             ];
             let mut cur_w = 4 + 6;
             if is_last_message && is_generating {
                 let pulse = (anim_tick as f64 * 0.4).sin() * 0.5 + 0.5;
                 let g_val = (210.0 + 45.0 * pulse) as u8;
                 let b_val = (100.0 + 80.0 * pulse) as u8;
-                line_spans.push(Span::styled(" █", Style::default().fg(Color::Rgb(0, g_val, b_val)).bg(code_bg).add_modifier(Modifier::BOLD)));
+                line_spans.push(Span::styled(
+                    " █",
+                    Style::default()
+                        .fg(Color::Rgb(0, g_val, b_val))
+                        .bg(code_bg)
+                        .add_modifier(Modifier::BOLD),
+                ));
                 cur_w += 2;
             }
             if cur_w < target_block_width.saturating_sub(1) {
-                line_spans.push(Span::styled(" ".repeat((target_block_width.saturating_sub(1)) - cur_w), Style::default().bg(code_bg)));
+                line_spans.push(Span::styled(
+                    " ".repeat((target_block_width.saturating_sub(1)) - cur_w),
+                    Style::default().bg(code_bg),
+                ));
             }
-            line_spans.push(Span::styled("│", Style::default().fg(theme_color).bg(code_bg)));
+            line_spans.push(Span::styled(
+                "│",
+                Style::default().fg(theme_color).bg(code_bg),
+            ));
             lines_out.push(Line::from(line_spans));
         } else {
             lines_out.extend(current_code_lines);
@@ -1231,7 +1423,10 @@ pub fn render_markdown_to_lines<'a>(
         let fence_tag = format!("  └──{}┘", "─".repeat(fill_count));
         let mut fence_spans = Vec::new();
         for ch in fence_tag.chars() {
-            fence_spans.push(Span::styled(ch.to_string(), Style::default().fg(theme_color).bg(code_bg)));
+            fence_spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().fg(theme_color).bg(code_bg),
+            ));
         }
         lines_out.push(Line::from(fence_spans));
     }

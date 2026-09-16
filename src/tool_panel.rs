@@ -5,11 +5,11 @@
 //! Geometry: lerp(chip_rect, dock_rect, ease(t)).
 
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, BorderType, Clear, Paragraph},
-    Frame,
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 use std::time::Instant;
 
@@ -177,8 +177,12 @@ impl ToolChip {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 self.label_text(),
-                Style::default().fg(accent).bg(bg_color).add_modifier(Modifier::BOLD),
-            ))).style(Style::default().bg(bg_color)),
+                Style::default()
+                    .fg(accent)
+                    .bg(bg_color)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .style(Style::default().bg(bg_color)),
             inner,
         );
         self.rect = Some(area);
@@ -333,7 +337,9 @@ fn line_count(body: &str) -> usize {
     if body.is_empty() {
         0
     } else {
-        body.trim_start_matches(|c| c == '\n' || c == '\r').lines().count()
+        body.trim_start_matches(|c| c == '\n' || c == '\r')
+            .lines()
+            .count()
     }
 }
 
@@ -351,8 +357,13 @@ pub fn normalize_target(kind: ToolPanelKind, target: &str) -> String {
     let t = clean_cmd(target);
     match kind {
         ToolPanelKind::Cmd => t.split_whitespace().collect::<Vec<_>>().join(" "),
-        ToolPanelKind::Write | ToolPanelKind::Read | ToolPanelKind::Mcp | ToolPanelKind::Skill | ToolPanelKind::WebSearch | ToolPanelKind::Agent => t,
-        }
+        ToolPanelKind::Write
+        | ToolPanelKind::Read
+        | ToolPanelKind::Mcp
+        | ToolPanelKind::Skill
+        | ToolPanelKind::WebSearch
+        | ToolPanelKind::Agent => t,
+    }
 }
 
 /// Same tool event? Used to upsert chips *within one stream/turn* only.
@@ -380,7 +391,10 @@ fn trunc(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", s.chars().take(max.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}...",
+            s.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 
@@ -421,7 +435,6 @@ pub struct StreamToolView {
     pub tag_closed: bool,
 }
 
-
 fn detect_mcp(text: &str) -> Vec<StreamToolView> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -429,7 +442,8 @@ fn detect_mcp(text: &str) -> Vec<StreamToolView> {
         let r = &rest[start..];
         if let Some(close_bracket) = r.find('>') {
             let header = &r[..close_bracket + 1];
-            let action = crate::agent::AgentEngine::extract_attribute(header, "action").unwrap_or_else(|| "search".to_string());
+            let action = crate::agent::AgentEngine::extract_attribute(header, "action")
+                .unwrap_or_else(|| "search".to_string());
             let end = r.find("</mcp>").unwrap_or(r.len());
             let body = r[close_bracket + 1..end].trim().to_string();
             out.push(StreamToolView {
@@ -438,7 +452,11 @@ fn detect_mcp(text: &str) -> Vec<StreamToolView> {
                 body,
                 tag_closed: r.find("</mcp>").is_some(),
             });
-            rest = if r.find("</mcp>").is_some() { &r[end + 6..] } else { "" };
+            rest = if r.find("</mcp>").is_some() {
+                &r[end + 6..]
+            } else {
+                ""
+            };
         } else {
             break;
         }
@@ -453,7 +471,8 @@ fn detect_skill(text: &str) -> Vec<StreamToolView> {
         let r = &rest[start..];
         if let Some(close_bracket) = r.find('>') {
             let header = &r[..close_bracket + 1];
-            let action = crate::agent::AgentEngine::extract_attribute(header, "action").unwrap_or_else(|| "search".to_string());
+            let action = crate::agent::AgentEngine::extract_attribute(header, "action")
+                .unwrap_or_else(|| "search".to_string());
             let end = r.find("</skill>").unwrap_or(r.len());
             let body = r[close_bracket + 1..end].trim().to_string();
             out.push(StreamToolView {
@@ -462,15 +481,17 @@ fn detect_skill(text: &str) -> Vec<StreamToolView> {
                 body,
                 tag_closed: r.find("</skill>").is_some(),
             });
-            rest = if r.find("</skill>").is_some() { &r[end + 8..] } else { "" };
+            rest = if r.find("</skill>").is_some() {
+                &r[end + 8..]
+            } else {
+                ""
+            };
         } else {
             break;
         }
     }
     out
 }
-
-
 
 fn detect_websearch(text: &str) -> Vec<StreamToolView> {
     let mut out = Vec::new();
@@ -479,7 +500,8 @@ fn detect_websearch(text: &str) -> Vec<StreamToolView> {
         let r = &rest[start..];
         if let Some(close_bracket) = r.find('>') {
             let header = &r[..close_bracket + 1];
-            let mut action = crate::agent::AgentEngine::extract_attribute(header, "query").unwrap_or_else(|| "search".to_string());
+            let mut action = crate::agent::AgentEngine::extract_attribute(header, "query")
+                .unwrap_or_else(|| "search".to_string());
             let after = &r[close_bracket + 1..];
 
             // </websearch> is optional — find explicit end tag or next tool opening tag or line boundary
@@ -492,18 +514,33 @@ fn detect_websearch(text: &str) -> Vec<StreamToolView> {
                     end_pos = Some(0);
                 } else {
                     // Check for next tool tag opening (<write, <cmd, <read, <ls, <agent, <mcp, <skill)
-                    let next_tool_pos = ["<write", "<cmd", "<read", "<ls", "<agent", "<mcp", "<skill", "<websearch"]
-                        .iter()
-                        .filter_map(|tag| after.find(tag))
-                        .min();
+                    let next_tool_pos = [
+                        "<write",
+                        "<cmd",
+                        "<read",
+                        "<ls",
+                        "<agent",
+                        "<mcp",
+                        "<skill",
+                        "<websearch",
+                    ]
+                    .iter()
+                    .filter_map(|tag| after.find(tag))
+                    .min();
                     end_pos = next_tool_pos.or_else(|| after.find('\n'));
                 }
             }
 
             let end = end_pos.unwrap_or(after.len());
             let mut body = after[..end].trim().to_string();
-            
-            for stop in ["<|im_end|>", "<|im_start|>", "<|eot_id|>", "<|endoftext|>", "</s>"] {
+
+            for stop in [
+                "<|im_end|>",
+                "<|im_start|>",
+                "<|eot_id|>",
+                "<|endoftext|>",
+                "</s>",
+            ] {
                 action = action.replace(stop, "").trim().to_string();
                 body = body.replace(stop, "").trim().to_string();
             }
@@ -512,11 +549,7 @@ fn detect_websearch(text: &str) -> Vec<StreamToolView> {
                 action = body.clone();
             }
 
-            let advance = if is_explicit_closed {
-                end + 12
-            } else {
-                end
-            };
+            let advance = if is_explicit_closed { end + 12 } else { end };
 
             out.push(StreamToolView {
                 kind: ToolPanelKind::WebSearch,
@@ -532,8 +565,6 @@ fn detect_websearch(text: &str) -> Vec<StreamToolView> {
     out
 }
 
-
-
 fn detect_agent(text: &str) -> Vec<StreamToolView> {
     let mut out = Vec::new();
     let mut rest = text;
@@ -541,11 +572,14 @@ fn detect_agent(text: &str) -> Vec<StreamToolView> {
         let r = &rest[start..];
         if let Some(close_bracket) = r.find('>') {
             let header = &r[..close_bracket + 1];
-            let action = crate::agent::AgentEngine::extract_attribute(header, "action").unwrap_or_else(|| "spawn".to_string());
-            let role = crate::agent::AgentEngine::extract_attribute(header, "role").unwrap_or_default();
+            let action = crate::agent::AgentEngine::extract_attribute(header, "action")
+                .unwrap_or_else(|| "spawn".to_string());
+            let role =
+                crate::agent::AgentEngine::extract_attribute(header, "role").unwrap_or_default();
             let to = crate::agent::AgentEngine::extract_attribute(header, "to").unwrap_or_default();
-            let model = crate::agent::AgentEngine::extract_attribute(header, "model").unwrap_or_default();
-            
+            let model =
+                crate::agent::AgentEngine::extract_attribute(header, "model").unwrap_or_default();
+
             let mut target_label = action.clone();
             if !role.is_empty() {
                 target_label.push_str(&format!(" role={role}"));
@@ -556,7 +590,7 @@ fn detect_agent(text: &str) -> Vec<StreamToolView> {
             if !to.is_empty() {
                 target_label.push_str(&format!(" to={to}"));
             }
-            
+
             let end = r.find("</agent>").unwrap_or(r.len());
             let body = r[close_bracket + 1..end].trim().to_string();
             out.push(StreamToolView {
@@ -565,7 +599,11 @@ fn detect_agent(text: &str) -> Vec<StreamToolView> {
                 body,
                 tag_closed: r.find("</agent>").is_some(),
             });
-            rest = if r.find("</agent>").is_some() { &r[end + 8..] } else { "" };
+            rest = if r.find("</agent>").is_some() {
+                &r[end + 8..]
+            } else {
+                ""
+            };
         } else {
             break;
         }
@@ -573,7 +611,14 @@ fn detect_agent(text: &str) -> Vec<StreamToolView> {
     out
 }
 
-
+/// Preview-only scan of a model stream for UI chips (open/closed tags,
+/// path-stability heuristics). This module NEVER executes anything:
+/// execution flows exclusively through
+/// `AgentEngine::parse_tool_calls` + `App::claim_tool_call` +
+/// `AgentEngine::execute_proposed`, which enforces the Ask-mode
+/// permission gate and the filesystem sandbox. If this preview and the
+/// canonical parser disagree on a malformed/chunked construct, the
+/// executor's view wins — a chip is display only, never authority.
 pub fn detect_all_stream_tools(response: &str) -> Vec<StreamToolView> {
     let text = flatten_for_tools(response);
     let mut out = Vec::new();
@@ -596,42 +641,18 @@ pub fn detect_all_stream_tools(response: &str) -> Vec<StreamToolView> {
 }
 
 fn flatten_for_tools(response: &str) -> String {
-    let outside = crate::agent::AgentEngine::strip_code_fences(
-        &crate::agent::AgentEngine::strip_think_blocks(response),
-    );
-    let mut think = crate::agent::AgentEngine::extract_think_contents(response);
-    if think.is_empty() {
-        if let Some(i) = response.find("<think>") {
-            think = response[i + 7..].to_string();
-            if let Some(j) = think.find("</think>") {
-                think = think[..j].to_string();
-            }
-        }
-    }
-    let think = crate::agent::AgentEngine::strip_code_fences(&think);
-    if outside.contains("<write")
-        || outside.contains("<cmd>")
-        || outside.contains("<read src=")
-        || outside.contains("<mcp")
-        || outside.contains("<skill")
-        || outside.contains("<websearch")
-        || outside.contains("<agent")
-    {
-        outside
-    } else {
-        format!("{outside}\n{think}")
-    }
+    // Thinking zones are NEVER executable: chips must only reflect validated
+    // tool calls from outside <think>, never model reasoning text.
+    crate::agent::AgentEngine::strip_code_fences(&crate::agent::AgentEngine::strip_think_blocks(
+        response,
+    ))
 }
 
 fn detect_ls(text: &str) -> Vec<StreamToolView> {
+    // Outside <think> only — a mention inside thinking is not an executed action.
     let outside = crate::agent::AgentEngine::strip_think_blocks(text);
-    let search_in = if outside.contains("<ls") {
-        outside.as_str()
-    } else {
-        text
-    };
     let mut out = Vec::new();
-    let mut rest = search_in;
+    let mut rest = outside.as_str();
     while let Some(start) = rest.find("<ls") {
         let r = &rest[start..];
         let Some(gt) = r.find('>') else { break };
@@ -648,14 +669,10 @@ fn detect_ls(text: &str) -> Vec<StreamToolView> {
 }
 
 fn detect_reads(text: &str) -> Vec<StreamToolView> {
+    // Outside <think> only — a mention inside thinking is not an executed action.
     let outside = crate::agent::AgentEngine::strip_think_blocks(text);
-    let search_in = if outside.contains("<read src=") {
-        outside.as_str()
-    } else {
-        text
-    };
     let mut out = Vec::new();
-    let mut rest = search_in;
+    let mut rest = outside.as_str();
     while let Some(start) = rest.find("<read src=") {
         let r = &rest[start..];
         let Some(gt) = r.find('>') else { break };
@@ -687,14 +704,10 @@ fn detect_primary_write(text: &str) -> Option<StreamToolView> {
 
 /// All `<write>` tags in order (for pending-accept multi-file).
 pub fn detect_all_writes(text: &str) -> Vec<StreamToolView> {
+    // Outside <think> only — a mention inside thinking is not an executed action.
     let outside = crate::agent::AgentEngine::strip_think_blocks(text);
-    let search_in = if outside.contains("<write") {
-        outside.as_str()
-    } else {
-        text
-    };
     let mut out = Vec::new();
-    let mut rest = search_in;
+    let mut rest = outside.as_str();
     while let Some(start) = rest.find("<write src=") {
         let r = &rest[start..];
         let Some(gt) = r.find('>') else { break };
@@ -741,15 +754,10 @@ pub fn detect_all_writes(text: &str) -> Vec<StreamToolView> {
 }
 
 fn detect_cmd(text: &str) -> Option<StreamToolView> {
-    // Prefer tools outside think (Ollama R1 dumps prose into <cmd> inside think)
+    // Outside <think> only — prose inside thinking is never an executed command.
     let outside = crate::agent::AgentEngine::strip_think_blocks(text);
-    let search_in = if outside.contains("<cmd>") {
-        outside.as_str()
-    } else {
-        text
-    };
-    let start = search_in.find("<cmd>")?;
-    let after = &search_in[start + 5..];
+    let start = outside.find("<cmd>")?;
+    let after = &outside[start + 5..];
     if let Some(end) = after.find("</cmd>") {
         let cmd = clean_cmd(&after[..end]);
         if !crate::agent::AgentEngine::looks_like_shell_cmd(&cmd) {
@@ -800,7 +808,17 @@ fn extract_attr(tag: &str, name: &str) -> Option<String> {
 
 pub fn redact_tools_for_chat(content: &str) -> String {
     let mut s = content.to_string();
-    let tags = ["<write", "<cmd", "<read", "<ls", "<mcp", "<skill", "<websearch", "<agent", "<memory"];
+    let tags = [
+        "<write",
+        "<cmd",
+        "<read",
+        "<ls",
+        "<mcp",
+        "<skill",
+        "<websearch",
+        "<agent",
+        "<memory",
+    ];
     for tag in tags {
         let close_tag = format!("</{}>", tag.trim_start_matches('<'));
         while let Some(start) = s.find(tag) {
@@ -974,7 +992,10 @@ pub fn draw_tool_panel(
         .border_style(Style::default().fg(accent))
         .title(Span::styled(
             left_title,
-            Style::default().fg(accent).bg(bg_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(accent)
+                .bg(bg_color)
+                .add_modifier(Modifier::BOLD),
         ))
         .title(
             Line::from(Span::styled(
@@ -1004,7 +1025,10 @@ pub fn draw_tool_panel(
     if is_term {
         // tmux-like terminal header
         let head = if panel.interactive {
-            format!(" $ {}  [INTERACTIVE — click outside to leave] ", panel.target)
+            format!(
+                " $ {}  [INTERACTIVE — click outside to leave] ",
+                panel.target
+            )
         } else {
             format!(" $ {}  [click to interact] ", panel.target)
         };
@@ -1050,7 +1074,7 @@ pub fn draw_tool_panel(
         let mut line_num = 1usize;
         for raw in vis.split_inclusive('\n') {
             let mut spans = Vec::new();
-            
+
             // Render line number gutter for code files
             if matches!(panel.kind, ToolPanelKind::Write | ToolPanelKind::Read) {
                 let num_str = format!("{:>3} │ ", line_num);
@@ -1075,12 +1099,12 @@ pub fn draw_tool_panel(
                     char_i += 1;
                     continue;
                 }
-                
+
                 let mut fg = panel.char_color(char_i, now);
                 if let Some(c) = line_fg {
                     fg = c;
                 }
-                
+
                 spans.push(Span::styled(
                     ch.to_string(),
                     Style::default().fg(fg).bg(bg_color),
@@ -1123,7 +1147,8 @@ pub fn draw_tool_panel(
             Paragraph::new(Span::styled(
                 format!(" {}/{} ", panel.scroll, panel.max_scroll),
                 Style::default().fg(Color::Rgb(140, 140, 160)).bg(bg_color),
-            )).style(Style::default().bg(bg_color)),
+            ))
+            .style(Style::default().bg(bg_color)),
             Rect {
                 x: rect.x.saturating_add(rect.width.saturating_sub(12)),
                 y: rect.y.saturating_add(rect.height.saturating_sub(1)),
@@ -1194,4 +1219,44 @@ pub fn hit_test_chip(chips: &[ToolChip], col: u16, row: u16) -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prose_creates_no_chips() {
+        // Natural-language intent is not an executed action: no chips.
+        assert!(detect_all_stream_tools("I should search the web.").is_empty());
+        assert!(detect_all_stream_tools("I will read foo.rs next.").is_empty());
+    }
+
+    #[test]
+    fn test_think_tools_create_no_chips() {
+        // Tool syntax inside thinking is reasoning text, never UI actions.
+        assert!(detect_all_stream_tools("<think>Let me <cmd>ls</cmd> first</think>").is_empty());
+        assert!(detect_all_stream_tools("<think>Reading <read src=\"a.rs\"></think>").is_empty());
+        assert!(
+            detect_all_stream_tools("<think>Searching <websearch>rust</websearch></think>")
+                .is_empty()
+        );
+        assert!(
+            detect_all_stream_tools(
+                "<think>Writing <write src=\"$CURRENT/a.txt\">x</write></think>"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_outside_tools_create_chips() {
+        let chips = detect_all_stream_tools("<think>hmm</think><ls path=\"$CURRENT\">");
+        assert_eq!(chips.len(), 1);
+
+        let chips =
+            detect_all_stream_tools("<think>hmm</think><websearch>rust borrow checker</websearch>");
+        assert_eq!(chips.len(), 1);
+        assert_eq!(chips[0].kind, ToolPanelKind::WebSearch);
+    }
 }

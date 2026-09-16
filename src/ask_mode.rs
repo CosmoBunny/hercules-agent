@@ -5,22 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Ask Mode element types
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AskElement {
-    Check {
-        label: String,
-        selected: bool,
-    },
-    Radio {
-        label: String,
-        selected: bool,
-    },
-    Input {
-        placeholder: String,
-        value: String,
-    },
-    Question {
-        label: String,
-        action: String,
-    },
+    Check { label: String, selected: bool },
+    Radio { label: String, selected: bool },
+    Input { placeholder: String, value: String },
 }
 
 impl AskElement {
@@ -29,7 +16,6 @@ impl AskElement {
             AskElement::Check { label, .. } => label,
             AskElement::Radio { label, .. } => label,
             AskElement::Input { placeholder, .. } => placeholder,
-            AskElement::Question { label, .. } => label,
         }
     }
 
@@ -45,16 +31,11 @@ impl AskElement {
         matches!(self, AskElement::Input { .. })
     }
 
-    pub fn is_question(&self) -> bool {
-        matches!(self, AskElement::Question { .. })
-    }
-
     pub fn selected(&self) -> bool {
         match self {
             AskElement::Check { selected, .. } => *selected,
             AskElement::Radio { selected, .. } => *selected,
             AskElement::Input { .. } => false,
-            AskElement::Question { .. } => false,
         }
     }
 
@@ -63,7 +44,6 @@ impl AskElement {
             AskElement::Check { selected: s, .. } => *s = selected,
             AskElement::Radio { selected: s, .. } => *s = selected,
             AskElement::Input { .. } => {}
-            AskElement::Question { .. } => {}
         }
     }
 
@@ -77,13 +57,6 @@ impl AskElement {
     pub fn set_value(&mut self, value: String) {
         if let AskElement::Input { value: v, .. } = self {
             *v = value;
-        }
-    }
-
-    pub fn action(&self) -> &str {
-        match self {
-            AskElement::Question { action, .. } => action,
-            _ => "",
         }
     }
 }
@@ -140,7 +113,11 @@ impl AskModeResponse {
             }
         }
 
-        Self { checks, radio, inputs }
+        Self {
+            checks,
+            radio,
+            inputs,
+        }
     }
 }
 
@@ -231,9 +208,6 @@ impl AskModeState {
             AskElement::Input { .. } => {
                 self.input_editing = true;
             }
-            AskElement::Question { .. } => {
-                // Question elements are not selectable via toggle
-            }
         }
     }
 
@@ -299,16 +273,33 @@ impl AskModeParser {
 
     /// Find opening tag and extract question attribute
     fn find_tag(text: &str, tag_name: &str) -> Result<Option<(usize, String)>, ParseError> {
-        let open_pattern = format!("<{tag_name}[ \\n/>]");
-        let Some(start) = text.find(&open_pattern) else {
-            return Ok(None);
+        // Literal prefix match: `<tagname` must be followed by a delimiter
+        // (space, newline, '/', or '>') so `<askmodeX>` does not match.
+        let open = format!("<{tag_name}");
+        let mut search_from = 0;
+        let (start, tag_end) = loop {
+            let Some(rel) = text[search_from..].find(&open) else {
+                return Ok(None);
+            };
+            let abs = search_from + rel;
+            let after = abs + open.len();
+            let Some(next) = text[after..].chars().next() else {
+                return Err(ParseError::MalformedTag(format!("<{tag_name}>")));
+            };
+            if next == ' '
+                || next == '\n'
+                || next == '\r'
+                || next == '\t'
+                || next == '/'
+                || next == '>'
+            {
+                let Some(gt) = text[abs..].find('>') else {
+                    return Err(ParseError::MalformedTag(format!("<{tag_name}>")));
+                };
+                break (abs, abs + gt + 1);
+            }
+            search_from = abs + open.len();
         };
-
-        // Find the closing '>' of the opening tag
-        let Some(tag_end) = text[start..].find('>') else {
-            return Err(ParseError::MalformedTag(format!("<{tag_name}>")));
-        };
-        let tag_end = start + tag_end + 1;
 
         // Extract the tag content
         let tag_content = &text[start..tag_end];
@@ -325,7 +316,11 @@ impl AskModeParser {
     }
 
     /// Find closing tag
-    fn find_closing_tag(text: &str, tag_name: &str, start: usize) -> Result<Option<usize>, ParseError> {
+    fn find_closing_tag(
+        text: &str,
+        tag_name: &str,
+        start: usize,
+    ) -> Result<Option<usize>, ParseError> {
         let close_pattern = format!("</{tag_name}>");
         let Some(pos) = text[start..].find(&close_pattern) else {
             return Err(ParseError::UnclosedAskMode);
@@ -333,27 +328,49 @@ impl AskModeParser {
         Ok(Some(start + pos))
     }
 
-    /// Extract attribute value from tag
+    /// Extract attribute value from tag. Requires an attribute-name
+    /// boundary (whitespace/`<`/start) and rejects hits inside quoted
+    /// values, so `src="` cannot match inside another name or value.
     fn extract_attribute(tag: &str, attr: &str) -> Option<String> {
         let pattern = format!(r#"{attr}="#);
-        let Some(attr_start) = tag.find(&pattern) else {
-            return None;
-        };
-        let attr_start = attr_start + pattern.len();
+        let mut search_from = 0;
+        while let Some(rel) = tag[search_from..].find(&pattern) {
+            let idx = search_from + rel;
+            let boundary_ok =
+                idx == 0 || matches!(tag.as_bytes()[idx - 1], b' ' | b'\t' | b'\n' | b'\r' | b'<');
+            let in_quotes = {
+                let mut in_q: Option<u8> = None;
+                for b in tag[..idx].bytes() {
+                    if b == b'"' || b == b'\'' {
+                        if in_q == Some(b) {
+                            in_q = None;
+                        } else if in_q.is_none() {
+                            in_q = Some(b);
+                        }
+                    }
+                }
+                in_q.is_some()
+            };
+            if boundary_ok && !in_quotes {
+                let attr_start = idx + pattern.len();
 
-        // Handle both single and double quotes
-        let quote_char = tag.chars().nth(attr_start)?;
-        if quote_char != '"' && quote_char != '\'' {
-            return None;
+                // Handle both single and double quotes
+                let quote_char = tag.chars().nth(attr_start)?;
+                if quote_char != '"' && quote_char != '\'' {
+                    return None;
+                }
+
+                let value_start = attr_start + 1;
+                let Some(value_end) = tag[value_start..].find(quote_char) else {
+                    return None;
+                };
+                let value_end = value_start + value_end;
+
+                return Some(tag[value_start..value_end].to_string());
+            }
+            search_from = idx + 1;
         }
-
-        let value_start = attr_start + 1;
-        let Some(value_end) = tag[value_start..].find(quote_char) else {
-            return None;
-        };
-        let value_end = value_start + value_end;
-
-        Some(tag[value_start..value_end].to_string())
+        None
     }
 
     /// Parse elements inside askmode
@@ -379,19 +396,20 @@ impl AskModeParser {
             if content[pos..].starts_with("<check") {
                 let (elem, new_pos) = Self::parse_check(&content[pos..])?;
                 elements.push(elem);
-                pos = new_pos;
+                pos += new_pos;
             } else if content[pos..].starts_with("<radio") {
                 let (elem, new_pos) = Self::parse_radio(&content[pos..])?;
                 elements.push(elem);
-                pos = new_pos;
+                pos += new_pos;
             } else if content[pos..].starts_with("<input") {
                 let (elem, new_pos) = Self::parse_input(&content[pos..])?;
                 elements.push(elem);
-                pos = new_pos;
+                pos += new_pos;
             } else {
-                // Skip unknown content until next '<'
+                // Skip unknown content until next '<'; always advance at
+                // least one byte so unknown tags can't loop forever.
                 if let Some(next_tag) = content[pos..].find('<') {
-                    pos += next_tag;
+                    pos += next_tag.max(1);
                 } else {
                     break;
                 }
@@ -423,8 +441,8 @@ impl AskModeParser {
 
         // Check for self-closing
         if content[..tag_end].ends_with("/") {
-            let placeholder = Self::extract_attribute(&content[..tag_end], "placeholder")
-                .unwrap_or_default();
+            let placeholder =
+                Self::extract_attribute(&content[..tag_end], "placeholder").unwrap_or_default();
             return Ok((
                 AskElement::Input {
                     placeholder,
@@ -469,8 +487,7 @@ impl AskModeParser {
 
         // Check for self-closing
         if content[..tag_end].ends_with("/") {
-            let label = Self::extract_attribute(&content[..tag_end], "label")
-                .unwrap_or_default();
+            let label = Self::extract_attribute(&content[..tag_end], "label").unwrap_or_default();
             return Ok((constructor(label), tag_end + 1));
         }
 
@@ -487,6 +504,38 @@ impl AskModeParser {
 
         Ok((constructor(label), total_len))
     }
+}
+
+/// Remove raw `<askmode>...</askmode>` blocks from visible chat text.
+///
+/// Once a block is parsed into `AskModeState`, the interactive widget owns
+/// the UI — the XML protocol must never render as a normal Agent message.
+/// Unclosed trailing blocks are dropped too (partial stream XML is not content).
+pub fn strip_ask_mode_blocks(text: &str) -> std::borrow::Cow<'_, str> {
+    const CLOSE: &str = "</askmode>";
+    if !text.contains("<askmode") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut changed = false;
+    while let Some(start) = rest.find("<askmode") {
+        if let Some(end_rel) = rest[start..].find(CLOSE) {
+            out.push_str(&rest[..start]);
+            rest = &rest[start + end_rel + CLOSE.len()..];
+            changed = true;
+        } else {
+            out.push_str(&rest[..start]);
+            rest = "";
+            changed = true;
+            break;
+        }
+    }
+    if !changed {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Parse errors for Ask Mode
@@ -779,8 +828,14 @@ Some text after"#;
         let ask_mode = AskMode::new(
             "Test".to_string(),
             vec![
-                AskElement::Radio { label: "A".to_string(), selected: false },
-                AskElement::Radio { label: "B".to_string(), selected: false },
+                AskElement::Radio {
+                    label: "A".to_string(),
+                    selected: false,
+                },
+                AskElement::Radio {
+                    label: "B".to_string(),
+                    selected: false,
+                },
             ],
         );
 
@@ -822,7 +877,7 @@ Some text after"#;
         assert!(result.is_ok() || result.is_err());
     }
 
-#[test]
+    #[test]
     fn test_malformed_mismatched_close() {
         // <check> with </radio> close
         let text = r#"<askmode ques="test">
@@ -846,7 +901,7 @@ Some text after"#;
         assert_eq!(result.elements[0].label(), "  A  ");
     }
 
-#[test]
+    #[test]
     fn test_malformed_tag_boundary() {
         // Various malformed tags should not crash parser
         // <askmodeX should NOT match <askmode due to boundary check
@@ -855,8 +910,36 @@ Some text after"#;
         // <check>A</radio> should return error (unclosed tag)
         let result2 = AskModeParser::parse("<askmode ques='test'><check>A</radio></askmode>");
         assert!(result2.is_err());
-        // <askmode ques="test"> with no body should not include opening/closing tags or Ok(None) depending on content
+        // Unclosed <askmode> must not hang or crash: it reports
+        // UnclosedAskMode (consistent with test_unclosed_askmode).
         let result3 = AskModeParser::parse("<askmode ques='test'>");
-        assert!(result3.is_ok());
+        assert!(matches!(result3, Err(ParseError::UnclosedAskMode)));
+    }
+
+    #[test]
+    fn test_strip_ask_mode_blocks_removes_widget_xml() {
+        // Parsed blocks must never render as chat text.
+        let text = "Here is my question:\n<askmode ques=\"Q?\"><radio>A</radio></askmode>\nDone.";
+        let stripped = super::strip_ask_mode_blocks(text);
+        assert!(!stripped.contains("<askmode"));
+        assert!(!stripped.contains("<radio>"));
+        assert!(stripped.contains("Here is my question:"));
+        assert!(stripped.contains("Done."));
+    }
+
+    #[test]
+    fn test_strip_ask_mode_blocks_drops_unclosed_tail() {
+        // Partial stream XML is not content.
+        let text = "Thinking out loud <askmode ques=\"Q?\"><radio>A";
+        let stripped = super::strip_ask_mode_blocks(text);
+        assert!(!stripped.contains("<askmode"));
+        assert!(stripped.contains("Thinking out loud"));
+    }
+
+    #[test]
+    fn test_strip_ask_mode_blocks_passthrough() {
+        let text = "Just a normal message with <read src=\"a.rs\"> inside.";
+        let stripped = super::strip_ask_mode_blocks(text);
+        assert_eq!(stripped.as_ref(), text);
     }
 }

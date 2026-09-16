@@ -8,7 +8,7 @@ mod common;
 use common::*;
 use hercules_agent::llama::gguf::GgmlType;
 use hercules_agent::llama::{
-    build_default_backend, ComputeBackend, ComputePrefs, ParallelBackend, ScalarBackend,
+    ComputeBackend, ComputePrefs, ParallelBackend, ScalarBackend, build_default_backend,
 };
 use hercules_agent::settings::PowerMode;
 use std::sync::Arc;
@@ -67,12 +67,28 @@ fn test_tier3_thread_scaling_parallel() {
     let mut y_4thread = vec![0.0f32; rows];
 
     let b1 = ParallelBackend::new(1);
-    b1.gemv_quant(GgmlType::Q4_K, &raw, rows, cols, rows * cols, &x, &mut y_1thread)
-        .unwrap();
+    b1.gemv_quant(
+        GgmlType::Q4_K,
+        &raw,
+        rows,
+        cols,
+        rows * cols,
+        &x,
+        &mut y_1thread,
+    )
+    .unwrap();
 
     let b4 = ParallelBackend::new(4);
-    b4.gemv_quant(GgmlType::Q4_K, &raw, rows, cols, rows * cols, &x, &mut y_4thread)
-        .unwrap();
+    b4.gemv_quant(
+        GgmlType::Q4_K,
+        &raw,
+        rows,
+        cols,
+        rows * cols,
+        &x,
+        &mut y_4thread,
+    )
+    .unwrap();
 
     // Verify 1 thread and 4 threads produce bitwise or within-tolerance identical outputs
     for r in 0..rows {
@@ -108,7 +124,8 @@ fn test_tier3_backend_concurrent_gemv() {
     let cols = 128;
     let raw = Arc::new(generate_synthetic_q8_0(rows, cols, 6001));
     let x = Arc::new(generate_synthetic_vector(cols, 6002));
-    let backend: Arc<Box<dyn ComputeBackend>> = Arc::new(build_default_backend(&ComputePrefs::default()));
+    let backend: Arc<Box<dyn ComputeBackend>> =
+        Arc::new(build_default_backend(&ComputePrefs::default()));
 
     let mut handles = Vec::new();
     for _ in 0..4 {
@@ -117,8 +134,16 @@ fn test_tier3_backend_concurrent_gemv() {
         let b_c = Arc::clone(&backend);
         handles.push(thread::spawn(move || {
             let mut y = vec![0.0f32; rows];
-            b_c.gemv_quant(GgmlType::Q8_0, &raw_c, rows, cols, rows * cols, &x_c, &mut y)
-                .expect("Concurrent GEMV failed");
+            b_c.gemv_quant(
+                GgmlType::Q8_0,
+                &raw_c,
+                rows,
+                cols,
+                rows * cols,
+                &x_c,
+                &mut y,
+            )
+            .expect("Concurrent GEMV failed");
             y
         }));
     }

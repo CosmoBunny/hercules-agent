@@ -4,15 +4,15 @@
 //! lifecycle handshakes (`initialize`, `notifications/initialized`), discovery (`tools/list`),
 //! and tool execution (`tools/call`).
 
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{oneshot, Mutex, mpsc};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -183,7 +183,9 @@ struct ProtocolNegotiation {
 
 /// Handlers for server-initiated messages
 type NotificationHandler = Arc<dyn Fn(Value) + Send + Sync>;
-type RequestHandler = Arc<dyn Fn(u64, String, Value, mpsc::Sender<WriterCommand>) -> Result<(), String> + Send + Sync>;
+type RequestHandler = Arc<
+    dyn Fn(u64, String, Value, mpsc::Sender<WriterCommand>) -> Result<(), String> + Send + Sync,
+>;
 
 /// Writer command for stdin writer task
 #[derive(Debug)]
@@ -240,13 +242,23 @@ impl McpSession {
             format!("Failed to spawn MCP server '{server_name}' (command: {cmd_display}): {e}")
         })?;
 
-        let stdin = child.stdin.take().ok_or_else(|| "Failed to capture stdin of MCP process".to_string())?;
-        let stdout = child.stdout.take().ok_or_else(|| "Failed to capture stdout of MCP process".to_string())?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Failed to capture stdin of MCP process".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to capture stdout of MCP process".to_string())?;
         let stderr = child.stderr.take();
 
         let stdin_arc = Arc::new(Mutex::new(stdin));
-        let pending = Arc::new(Mutex::new(HashMap::<u64, oneshot::Sender<Result<Value, String>>>::new()));
-        let notification_handlers = Arc::new(Mutex::new(HashMap::<String, NotificationHandler>::new()));
+        let pending = Arc::new(Mutex::new(HashMap::<
+            u64,
+            oneshot::Sender<Result<Value, String>>,
+        >::new()));
+        let notification_handlers =
+            Arc::new(Mutex::new(HashMap::<String, NotificationHandler>::new()));
         let request_handlers = Arc::new(Mutex::new(HashMap::<String, RequestHandler>::new()));
         let subscriptions = Arc::new(Mutex::new(HashMap::<String, String>::new()));
 
@@ -261,7 +273,9 @@ impl McpSession {
                         let mut line = match serde_json::to_string(&val) {
                             Ok(l) => l,
                             Err(e) => {
-                                eprintln!("[MCP:{s_name_writer}:writer] JSON serialization error: {e}");
+                                eprintln!(
+                                    "[MCP:{s_name_writer}:writer] JSON serialization error: {e}"
+                                );
                                 continue;
                             }
                         };
@@ -312,7 +326,10 @@ impl McpSession {
                     continue;
                 }
                 if trimmed.len() > MAX_MCP_MESSAGE_SIZE {
-                    eprintln!("[MCP:{s_name_clone}:error] Message exceeds maximum size ({} bytes)", MAX_MCP_MESSAGE_SIZE);
+                    eprintln!(
+                        "[MCP:{s_name_clone}:error] Message exceeds maximum size ({} bytes)",
+                        MAX_MCP_MESSAGE_SIZE
+                    );
                     continue;
                 }
                 if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
@@ -325,8 +342,15 @@ impl McpSession {
                                 if let Some(handler) = handlers.get(method) {
                                     // Pass writer channel to handler so it can respond
                                     let writer_tx = writer_tx_clone.clone();
-                                    if let Err(e) = handler(id, method.to_string(), params.unwrap_or(Value::Null), writer_tx) {
-                                        eprintln!("[MCP:{s_name_clone}:server_request] Handler error: {e}");
+                                    if let Err(e) = handler(
+                                        id,
+                                        method.to_string(),
+                                        params.unwrap_or(Value::Null),
+                                        writer_tx,
+                                    ) {
+                                        eprintln!(
+                                            "[MCP:{s_name_clone}:server_request] Handler error: {e}"
+                                        );
                                     }
                                 } else {
                                     // No handler - send error response
@@ -338,15 +362,22 @@ impl McpSession {
                                             "message": format!("Method not found: {method}")
                                         }
                                     });
-                                    let _ = writer_tx_clone.send(WriterCommand::Write(error_response)).await;
-                                    eprintln!("[MCP:{s_name_clone}:server_request] No handler for method: {method}");
+                                    let _ = writer_tx_clone
+                                        .send(WriterCommand::Write(error_response))
+                                        .await;
+                                    eprintln!(
+                                        "[MCP:{s_name_clone}:server_request] No handler for method: {method}"
+                                    );
                                 }
                             } else {
                                 // Response to our request (has id but no method)
                                 let mut map = pending_clone.lock().await;
                                 if let Some(tx) = map.remove(&id) {
                                     if let Some(err_obj) = val.get("error") {
-                                        let msg = err_obj.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown JSON-RPC error");
+                                        let msg = err_obj
+                                            .get("message")
+                                            .and_then(|m| m.as_str())
+                                            .unwrap_or("Unknown JSON-RPC error");
                                         let _ = tx.send(Err(msg.to_string()));
                                     } else if let Some(res) = val.get("result") {
                                         let _ = tx.send(Ok(res.clone()));
@@ -359,7 +390,7 @@ impl McpSession {
                     } else if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
                         // Notification (no id)
                         let params = val.get("params").cloned();
-                        
+
                         // Check if this is a subscription event (2026 protocol)
                         // Subscription events carry subscription ID in _meta
                         let is_subscription_event = if let Some(p) = &params {
@@ -369,21 +400,22 @@ impl McpSession {
                         } else {
                             false
                         };
-                        
+
                         if is_subscription_event {
                             // Check if we have active subscriptions (2026 protocol)
                             let has_subscriptions = {
                                 let subs = subscriptions_clone.lock().await;
                                 !subs.is_empty()
                             };
-                            
+
                             if has_subscriptions {
                                 // Extract subscriptionId from _meta (2026 namespaced key)
-                                let incoming_sub_id = params.as_ref()
+                                let incoming_sub_id = params
+                                    .as_ref()
                                     .and_then(|p| p.get("_meta"))
                                     .and_then(|m| m.get("io.modelcontextprotocol/subscriptionId"))
                                     .and_then(|v| v.as_str());
-                                
+
                                 // Validate subscriptionId against stored subscriptions with method matching
                                 let is_valid_subscription = if let Some(sub_id) = incoming_sub_id {
                                     let subs = subscriptions_clone.lock().await;
@@ -392,13 +424,16 @@ impl McpSession {
                                 } else {
                                     false
                                 };
-                                
+
                                 if is_valid_subscription {
                                     // Dispatch based on notification type
                                     match method {
                                         "notifications/tools/list_changed" => {
-                                            eprintln!("[MCP:{s_name_clone}] Received toolsListChanged subscription event");
-                                            let tools_need_refresh = tools_need_refresh_clone.clone();
+                                            eprintln!(
+                                                "[MCP:{s_name_clone}] Received toolsListChanged subscription event"
+                                            );
+                                            let tools_need_refresh =
+                                                tools_need_refresh_clone.clone();
                                             tokio::spawn(async move {
                                                 let mut flag = tools_need_refresh.lock().await;
                                                 *flag = true;
@@ -408,23 +443,33 @@ impl McpSession {
                                             }
                                         }
                                         "notifications/prompts/list_changed" => {
-                                            eprintln!("[MCP:{s_name_clone}] Received promptsListChanged subscription event");
+                                            eprintln!(
+                                                "[MCP:{s_name_clone}] Received promptsListChanged subscription event"
+                                            );
                                             // Could trigger prompt refresh if needed
                                         }
                                         "notifications/resources/list_changed" => {
-                                            eprintln!("[MCP:{s_name_clone}] Received resourcesListChanged subscription event");
+                                            eprintln!(
+                                                "[MCP:{s_name_clone}] Received resourcesListChanged subscription event"
+                                            );
                                             // Could trigger resource refresh if needed
                                         }
                                         "notifications/resources/updated" => {
-                                            eprintln!("[MCP:{s_name_clone}] Received resourceUpdated subscription event");
+                                            eprintln!(
+                                                "[MCP:{s_name_clone}] Received resourceUpdated subscription event"
+                                            );
                                             // Could trigger resource refresh if needed
                                         }
                                         _ => {
-                                            eprintln!("[MCP:{s_name_clone}] Received unknown subscription event: {method}");
+                                            eprintln!(
+                                                "[MCP:{s_name_clone}] Received unknown subscription event: {method}"
+                                            );
                                         }
                                     }
                                 } else {
-                                    eprintln!("[MCP:{s_name_clone}] Subscription event with unknown/invalid subscriptionId: {method}");
+                                    eprintln!(
+                                        "[MCP:{s_name_clone}] Subscription event with unknown/invalid subscriptionId: {method}"
+                                    );
                                 }
                             } else {
                                 // No active subscriptions, treat as regular notification
@@ -432,7 +477,9 @@ impl McpSession {
                                 if let Some(handler) = handlers.get(method) {
                                     handler(params.unwrap_or(Value::Null));
                                 } else {
-                                    eprintln!("[MCP:{s_name_clone}:notification] Unhandled notification: {method}");
+                                    eprintln!(
+                                        "[MCP:{s_name_clone}:notification] Unhandled notification: {method}"
+                                    );
                                 }
                             }
                         } else {
@@ -441,7 +488,9 @@ impl McpSession {
                             if let Some(handler) = handlers.get(method) {
                                 handler(params.unwrap_or(Value::Null));
                             } else {
-                                eprintln!("[MCP:{s_name_clone}:notification] Unhandled notification: {method}");
+                                eprintln!(
+                                    "[MCP:{s_name_clone}:notification] Unhandled notification: {method}"
+                                );
                             }
                         }
                     } else {
@@ -473,26 +522,34 @@ impl McpSession {
             let tools_changed_tx_clone = tools_changed_tx.clone();
             let tools_need_refresh_clone = session.tools_need_refresh.clone();
             let mut handlers = session.notification_handlers.lock().await;
-            handlers.insert("notifications/tools/list_changed".to_string(), Arc::new(move |_params| {
-                eprintln!("[MCP:{}] Received tools/list_changed notification", session_name);
-                // Set the flag to trigger a refresh
-                let tools_need_refresh = tools_need_refresh_clone.clone();
-                tokio::spawn(async move {
-                    let mut flag = tools_need_refresh.lock().await;
-                    *flag = true;
-                });
-                if let Some(ref tx) = tools_changed_tx_clone {
-                    // Try to send, ignore if channel is full or closed
-                    let _ = tx.try_send(session_name.clone());
-                }
-            }));
+            handlers.insert(
+                "notifications/tools/list_changed".to_string(),
+                Arc::new(move |_params| {
+                    eprintln!(
+                        "[MCP:{}] Received tools/list_changed notification",
+                        session_name
+                    );
+                    // Set the flag to trigger a refresh
+                    let tools_need_refresh = tools_need_refresh_clone.clone();
+                    tokio::spawn(async move {
+                        let mut flag = tools_need_refresh.lock().await;
+                        *flag = true;
+                    });
+                    if let Some(ref tx) = tools_changed_tx_clone {
+                        // Try to send, ignore if channel is full or closed
+                        let _ = tx.try_send(session_name.clone());
+                    }
+                }),
+            );
 
             // NOTE: subscriptions/listen handler is registered AFTER protocol negotiation
             // below, since we need to know the protocol version first.
         }
 
         // Perform protocol negotiation
-        let negotiation = session.negotiate_protocol().await
+        let negotiation = session
+            .negotiate_protocol()
+            .await
             .map_err(|e| format!("MCP '{server_name}' protocol negotiation failed: {e}"))?;
 
         session.protocol_version = negotiation.version;
@@ -502,7 +559,9 @@ impl McpSession {
         // Send `notifications/initialized` notification (no response expected)
         // Only for legacy protocol versions that require it
         if session.protocol_version != "2026-07-28" {
-            session.send_notification("notifications/initialized", json!({})).await
+            session
+                .send_notification("notifications/initialized", json!({}))
+                .await
                 .map_err(|e| format!("MCP '{server_name}' initialized notification failed: {e}"))?;
         }
 
@@ -514,30 +573,52 @@ impl McpSession {
                     "toolsListChanged": true
                 }
             });
-            match session.send_request_with_meta("subscriptions/listen", listen_params, None).await {
+            match session
+                .send_request_with_meta("subscriptions/listen", listen_params, None)
+                .await
+            {
                 Ok(res) => {
                     // Extract subscription ID from response (2026 uses namespaced key)
                     let sub_id = res
                         .get("io.modelcontextprotocol/subscriptionId")
                         .and_then(|v| v.as_str())
-                        .or_else(|| res.get("result").and_then(|r| r.get("io.modelcontextprotocol/subscriptionId")).and_then(|v| v.as_str()))
-                        .or_else(|| res.get("_meta").and_then(|m| m.get("io.modelcontextprotocol/subscriptionId")).and_then(|v| v.as_str()));
+                        .or_else(|| {
+                            res.get("result")
+                                .and_then(|r| r.get("io.modelcontextprotocol/subscriptionId"))
+                                .and_then(|v| v.as_str())
+                        })
+                        .or_else(|| {
+                            res.get("_meta")
+                                .and_then(|m| m.get("io.modelcontextprotocol/subscriptionId"))
+                                .and_then(|v| v.as_str())
+                        });
                     if let Some(sub_id) = sub_id {
                         let mut subs = session.subscriptions.lock().await;
                         subs.insert("toolsListChanged".to_string(), sub_id.to_string());
-                        eprintln!("[MCP:{}] Subscribed to toolsListChanged with ID: {}", session.server_name, sub_id);
+                        eprintln!(
+                            "[MCP:{}] Subscribed to toolsListChanged with ID: {}",
+                            session.server_name, sub_id
+                        );
                     } else {
-                        eprintln!("[MCP:{}] subscriptions/listen succeeded but no io.modelcontextprotocol/subscriptionId in response: {}", session.server_name, res);
+                        eprintln!(
+                            "[MCP:{}] subscriptions/listen succeeded but no io.modelcontextprotocol/subscriptionId in response: {}",
+                            session.server_name, res
+                        );
                     }
                 }
                 Err(e) => {
-                    eprintln!("[MCP:{}] subscriptions/listen failed: {e}", session.server_name);
+                    eprintln!(
+                        "[MCP:{}] subscriptions/listen failed: {e}",
+                        session.server_name
+                    );
                 }
             }
         }
 
         // Fetch available tools
-        session.refresh_tools().await
+        session
+            .refresh_tools()
+            .await
             .map_err(|e| format!("MCP '{server_name}' tools/list failed: {e}"))?;
 
         Ok(session)
@@ -548,26 +629,37 @@ impl McpSession {
         // First try server/discover for 2026-07-28 (stateless protocol)
         // This is the modern way to check for 2026 support
         if SUPPORTED_PROTOCOL_VERSIONS.contains(&"2026-07-28") {
-            eprintln!("[MCP:{}:info] Attempting server/discover for 2026-07-28", self.server_name);
-            
+            eprintln!(
+                "[MCP:{}:info] Attempting server/discover for 2026-07-28",
+                self.server_name
+            );
+
             // Try server/discover to check for 2026 support
-            match self.send_request_with_meta("server/discover", json!({}), None).await {
+            match self
+                .send_request_with_meta("server/discover", json!({}), None)
+                .await
+            {
                 Ok(res) => {
                     // Check if server supports 2026-07-28
-                    if let Some(versions) = res.get("supportedVersions").and_then(|v| v.as_array()) {
-                        let supports_2026 = versions.iter().any(|v| v.as_str() == Some("2026-07-28"));
+                    if let Some(versions) = res.get("supportedVersions").and_then(|v| v.as_array())
+                    {
+                        let supports_2026 =
+                            versions.iter().any(|v| v.as_str() == Some("2026-07-28"));
                         if supports_2026 {
                             eprintln!("[MCP:{}:info] Server supports 2026-07-28", self.server_name);
-                            
+
                             // For 2026, we don't need initialize handshake
                             // Just use the discovered version
-                            let server_capabilities = res.get("capabilities").cloned().unwrap_or(Value::Null);
+                            let server_capabilities =
+                                res.get("capabilities").cloned().unwrap_or(Value::Null);
                             let server_info = res
-                    .get("_meta")
-                    .and_then(|m| m.get("io.modelcontextprotocol/serverInfo"))
-                    .cloned()
-                    .unwrap_or_else(|| res.get("serverInfo").cloned().unwrap_or(Value::Null));
-                            
+                                .get("_meta")
+                                .and_then(|m| m.get("io.modelcontextprotocol/serverInfo"))
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    res.get("serverInfo").cloned().unwrap_or(Value::Null)
+                                });
+
                             return Ok(ProtocolNegotiation {
                                 version: "2026-07-28".to_string(),
                                 server_capabilities,
@@ -578,17 +670,20 @@ impl McpSession {
                 }
                 Err(e) => {
                     // server/discover failed, fall back to legacy initialize
-                    eprintln!("[MCP:{}:info] server/discover failed: {e}, trying legacy initialize", self.server_name);
+                    eprintln!(
+                        "[MCP:{}:info] server/discover failed: {e}, trying legacy initialize",
+                        self.server_name
+                    );
                 }
             }
         }
-        
+
         // Fall back to legacy initialize handshake for older versions
         for version in SUPPORTED_PROTOCOL_VERSIONS {
             if *version == "2026-07-28" {
                 continue; // Already tried above
             }
-            
+
             let init_params = json!({
                 "protocolVersion": version,
                 "capabilities": {
@@ -602,21 +697,25 @@ impl McpSession {
 
             match self.send_request("initialize", init_params).await {
                 Ok(res) => {
-                    let server_version = res.get("protocolVersion")
+                    let server_version = res
+                        .get("protocolVersion")
                         .and_then(|v| v.as_str())
                         .ok_or("Server did not return protocolVersion")?;
-                    
+
                     // Verify the server returned a version we support
                     if !SUPPORTED_PROTOCOL_VERSIONS.contains(&server_version) {
-                        return Err(format!("Server returned unsupported protocol version: {server_version}"));
+                        return Err(format!(
+                            "Server returned unsupported protocol version: {server_version}"
+                        ));
                     }
 
-                    let server_capabilities = res.get("capabilities").cloned().unwrap_or(Value::Null);
+                    let server_capabilities =
+                        res.get("capabilities").cloned().unwrap_or(Value::Null);
                     let server_info = res
-                    .get("_meta")
-                    .and_then(|m| m.get("io.modelcontextprotocol/serverInfo"))
-                    .cloned()
-                    .unwrap_or_else(|| res.get("serverInfo").cloned().unwrap_or(Value::Null));
+                        .get("_meta")
+                        .and_then(|m| m.get("io.modelcontextprotocol/serverInfo"))
+                        .cloned()
+                        .unwrap_or_else(|| res.get("serverInfo").cloned().unwrap_or(Value::Null));
 
                     return Ok(ProtocolNegotiation {
                         version: server_version.to_string(),
@@ -626,7 +725,10 @@ impl McpSession {
                 }
                 Err(e) => {
                     // Try next version
-                    eprintln!("[MCP:{}:warn] Protocol version {version} failed: {e}, trying next", self.server_name);
+                    eprintln!(
+                        "[MCP:{}:warn] Protocol version {version} failed: {e}, trying next",
+                        self.server_name
+                    );
                     continue;
                 }
             }
@@ -635,7 +737,7 @@ impl McpSession {
         Err("Failed to negotiate any supported MCP protocol version".to_string())
     }
 
-/// Send a JSON-RPC request and await matching response ID
+    /// Send a JSON-RPC request and await matching response ID
     pub async fn send_request(&self, method: &str, params: Value) -> Result<Value, String> {
         let req_id = NEXT_REQ_ID.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -664,13 +766,15 @@ impl McpSession {
                             "version": env!("CARGO_PKG_VERSION")
                         },
                         "io.modelcontextprotocol/clientCapabilities": {}
-                    })
+                    }),
                 );
             }
         }
 
         // Use writer channel instead of direct stdin write
-        self.writer_tx.send(WriterCommand::Write(body)).await
+        self.writer_tx
+            .send(WriterCommand::Write(body))
+            .await
             .map_err(|e| format!("Failed to send to writer: {e}"))?;
 
         match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
@@ -682,8 +786,8 @@ impl McpSession {
                 Err("MCP request timed out after 30s".to_string())
             }
         }
-}
-    
+    }
+
     /// Check if tools need refresh and refresh them
     pub async fn check_and_refresh_tools(&mut self) -> Result<bool, String> {
         let need_refresh = {
@@ -695,17 +799,25 @@ impl McpSession {
                 false
             }
         };
-        
+
         if need_refresh {
-            eprintln!("[MCP:{}] Refreshing tools due to list_changed notification", self.server_name);
+            eprintln!(
+                "[MCP:{}] Refreshing tools due to list_changed notification",
+                self.server_name
+            );
             self.refresh_tools().await?;
             return Ok(true);
         }
         Ok(false)
     }
-    
+
     /// Send a JSON-RPC request with optional _meta (for 2026 protocol)
-    async fn send_request_with_meta(&self, method: &str, params: Value, meta: Option<Value>) -> Result<Value, String> {
+    async fn send_request_with_meta(
+        &self,
+        method: &str,
+        params: Value,
+        meta: Option<Value>,
+    ) -> Result<Value, String> {
         let req_id = NEXT_REQ_ID.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
 
@@ -749,7 +861,9 @@ impl McpSession {
         }
 
         // Use writer channel instead of direct stdin write
-        self.writer_tx.send(WriterCommand::Write(body)).await
+        self.writer_tx
+            .send(WriterCommand::Write(body))
+            .await
             .map_err(|e| format!("Failed to send to writer: {e}"))?;
 
         match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
@@ -762,7 +876,7 @@ impl McpSession {
             }
         }
     }
-    
+
     /// Send a JSON-RPC notification (no id)
     pub async fn send_notification(&self, method: &str, params: Value) -> Result<(), String> {
         let mut body = json!({
@@ -786,7 +900,9 @@ impl McpSession {
         }
 
         // Use writer channel instead of direct stdin write
-        self.writer_tx.send(WriterCommand::Write(body)).await
+        self.writer_tx
+            .send(WriterCommand::Write(body))
+            .await
             .map_err(|e| format!("Failed to send to writer: {e}"))?;
         Ok(())
     }
@@ -808,8 +924,14 @@ impl McpSession {
             if let Some(tools_arr) = res.get("tools").and_then(|t| t.as_array()) {
                 for t in tools_arr {
                     if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
-                        let desc = t.get("description").and_then(|d| d.as_str()).map(|s| s.to_string());
-                        let schema = t.get("inputSchema").cloned().unwrap_or_else(|| json!({ "type": "object" }));
+                        let desc = t
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .map(|s| s.to_string());
+                        let schema = t
+                            .get("inputSchema")
+                            .cloned()
+                            .unwrap_or_else(|| json!({ "type": "object" }));
                         tools_out.push(McpToolDefinition {
                             name: name.to_string(),
                             description: desc,
@@ -820,7 +942,8 @@ impl McpSession {
             }
 
             // Check for next cursor
-            cursor = res.get("nextCursor")
+            cursor = res
+                .get("nextCursor")
                 .and_then(|c| c.as_str())
                 .map(|s| s.to_string());
 
@@ -847,7 +970,9 @@ impl McpSession {
         // Validate arguments against tool schema
         if let Some(tool_def) = self.tools.iter().find(|t| t.name == tool_name) {
             if let Err(e) = Self::validate_basic_arguments(&tool_def.input_schema, &arguments) {
-                return Err(format!("Argument validation failed for tool '{tool_name}': {e}"));
+                return Err(format!(
+                    "Argument validation failed for tool '{tool_name}': {e}"
+                ));
             }
         }
 
@@ -865,18 +990,28 @@ impl McpSession {
         }
 
         let res = self.send_request("tools/call", params).await?;
-        
-        // Handle 2026 MRTR: input_required resultType
-        let result_type = res.get("resultType").and_then(|r| r.as_str()).unwrap_or("complete");
 
-        let is_error = res.get("isError").and_then(|b| b.as_bool()).unwrap_or(false);
+        // Handle 2026 MRTR: input_required resultType
+        let result_type = res
+            .get("resultType")
+            .and_then(|r| r.as_str())
+            .unwrap_or("complete");
+
+        let is_error = res
+            .get("isError")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
 
         if result_type == "input_required" {
             // Elicitation/sampling needed - return input_required outcome
             // The caller will need to provide more inputResponses and retry
             let input_requests = res.get("inputRequests").cloned().unwrap_or(Value::Null);
-            let request_state = res.get("requestState").and_then(|r| r.as_str()).unwrap_or("").to_string();
-            
+            let request_state = res
+                .get("requestState")
+                .and_then(|r| r.as_str())
+                .unwrap_or("")
+                .to_string();
+
             return Ok(McpToolCallOutcome::InputRequired {
                 input_requests,
                 request_state,
@@ -902,7 +1037,9 @@ impl McpSession {
             match content_type {
                 "text" => {
                     if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
-                        return McpContent::Text { text: text.to_string() };
+                        return McpContent::Text {
+                            text: text.to_string(),
+                        };
                     }
                 }
                 "image" => {
@@ -918,7 +1055,9 @@ impl McpSession {
                 }
                 "resource" => {
                     if let Some(resource) = value.get("resource") {
-                        return McpContent::Resource { resource: resource.clone() };
+                        return McpContent::Resource {
+                            resource: resource.clone(),
+                        };
                     }
                 }
                 _ => {}
@@ -941,7 +1080,9 @@ impl McpSession {
                     }
                 }
             } else if !required.is_empty() {
-                return Err("Arguments must be an object when required fields are specified".to_string());
+                return Err(
+                    "Arguments must be an object when required fields are specified".to_string(),
+                );
             }
         }
 
@@ -964,7 +1105,10 @@ impl McpSession {
         if let Some(enum_values) = schema.get("enum").and_then(|e| e.as_array()) {
             let matches = enum_values.iter().any(|v| v == value);
             if !matches {
-                return Err(format!("Field '{field}' value must be one of: {:?}", enum_values));
+                return Err(format!(
+                    "Field '{field}' value must be one of: {:?}",
+                    enum_values
+                ));
             }
             return Ok(());
         }
@@ -988,7 +1132,10 @@ impl McpSession {
                     })
                 });
                 if !matches {
-                    return Err(format!("Field '{field}' must match one of types: {:?}", type_arr));
+                    return Err(format!(
+                        "Field '{field}' must match one of types: {:?}",
+                        type_arr
+                    ));
                 }
             }
         }
@@ -1004,7 +1151,9 @@ impl McpSession {
             } else if value != &Value::Null {
                 // Check if object type is expected
                 if let Some("object") = schema.get("type").and_then(|t| t.as_str()) {
-                    return Err(format!("Field '{field}' expects object but got different type"));
+                    return Err(format!(
+                        "Field '{field}' expects object but got different type"
+                    ));
                 }
             }
         }
@@ -1017,7 +1166,9 @@ impl McpSession {
                 }
             } else if value != &Value::Null {
                 if let Some("array") = schema.get("type").and_then(|t| t.as_str()) {
-                    return Err(format!("Field '{field}' expects array but got different type"));
+                    return Err(format!(
+                        "Field '{field}' expects array but got different type"
+                    ));
                 }
             }
         }
@@ -1026,14 +1177,18 @@ impl McpSession {
         if let Some(min_len) = schema.get("minLength").and_then(|v| v.as_u64()) {
             if let Some(s) = value.as_str() {
                 if s.len() < min_len as usize {
-                    return Err(format!("Field '{field}' must be at least {min_len} characters"));
+                    return Err(format!(
+                        "Field '{field}' must be at least {min_len} characters"
+                    ));
                 }
             }
         }
         if let Some(max_len) = schema.get("maxLength").and_then(|v| v.as_u64()) {
             if let Some(s) = value.as_str() {
                 if s.len() > max_len as usize {
-                    return Err(format!("Field '{field}' must be at most {max_len} characters"));
+                    return Err(format!(
+                        "Field '{field}' must be at most {max_len} characters"
+                    ));
                 }
             }
         }
@@ -1066,7 +1221,9 @@ impl McpSession {
             ("object", Value::Object(_)) => Ok(()),
             ("array", Value::Array(_)) => Ok(()),
             ("null", Value::Null) => Ok(()),
-            (expected, _) => Err(format!("Field '{field}' expects type '{expected}' but got different type")),
+            (expected, _) => Err(format!(
+                "Field '{field}' expects type '{expected}' but got different type"
+            )),
         }
     }
 
@@ -1074,24 +1231,30 @@ impl McpSession {
     pub async fn shutdown(&self) -> Result<(), String> {
         // Signal writer to shutdown
         let _ = self.writer_tx.send(WriterCommand::Shutdown).await;
-        
+
         // Close stdin to signal shutdown
         {
             let mut stdin = self.stdin.lock().await;
             let _ = stdin.shutdown().await;
         }
-        
+
         // Wait for process to exit with timeout
         let mut child = self.child.lock().await;
         match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
             Ok(Ok(status)) => {
-                eprintln!("[MCP:{}] Server exited with status: {}", self.server_name, status);
+                eprintln!(
+                    "[MCP:{}] Server exited with status: {}",
+                    self.server_name, status
+                );
                 Ok(())
             }
             Ok(Err(e)) => Err(format!("Failed to wait for server process: {e}")),
             Err(_) => {
                 // Force kill if timeout
-                eprintln!("[MCP:{}] Server did not shut down gracefully, forcing termination", self.server_name);
+                eprintln!(
+                    "[MCP:{}] Server did not shut down gracefully, forcing termination",
+                    self.server_name
+                );
                 let _ = child.kill().await;
                 Err("Server shutdown timed out, process killed".to_string())
             }
@@ -1133,7 +1296,8 @@ impl McpManager {
         let desired_names: Vec<String> = configs.iter().map(|c| c.name.clone()).collect();
 
         // Identify servers to remove (deleted in settings)
-        let to_remove: Vec<String> = self.sessions
+        let to_remove: Vec<String> = self
+            .sessions
             .keys()
             .filter(|name| !desired_names.contains(name))
             .cloned()
@@ -1177,9 +1341,12 @@ impl McpManager {
                     &config.args,
                     env_vars,
                     Some(self.tools_changed_tx.clone()),
-                ).await {
+                )
+                .await
+                {
                     Ok(sess) => {
-                        self.sessions.insert(config.name.clone(), Arc::new(Mutex::new(sess)));
+                        self.sessions
+                            .insert(config.name.clone(), Arc::new(Mutex::new(sess)));
                     }
                     Err(e) => {
                         eprintln!("[MCP] Failed to connect server '{}': {}", config.name, e);
@@ -1235,7 +1402,10 @@ impl McpManager {
                 for t in &sess.tools {
                     let desc = t.description.as_deref().unwrap_or("No description");
                     let schema_str = serde_json::to_string(&t.input_schema).unwrap_or_default();
-                    out.push_str(&format!("  * `{}`: {} | Schema: {}\n", t.name, desc, schema_str));
+                    out.push_str(&format!(
+                        "  * `{}`: {} | Schema: {}\n",
+                        t.name, desc, schema_str
+                    ));
                 }
             }
         }
@@ -1263,7 +1433,9 @@ impl McpManager {
         if let Some(srv) = server_hint {
             if let Some(sess) = self.sessions.get(srv) {
                 let sess = sess.lock().await;
-                return sess.call_tool(tool_name, args_val, None, None).await
+                return sess
+                    .call_tool(tool_name, args_val, None, None)
+                    .await
                     .map_err(|e| format!("MCP Error from server '{srv}': {e}"));
             }
         }
@@ -1272,12 +1444,16 @@ impl McpManager {
         for (srv_name, sess) in &self.sessions {
             let sess = sess.lock().await;
             if sess.tools.iter().any(|t| t.name == tool_name) {
-                return sess.call_tool(tool_name, args_val, None, None).await
+                return sess
+                    .call_tool(tool_name, args_val, None, None)
+                    .await
                     .map_err(|e| format!("MCP Error from server '{srv_name}': {e}"));
             }
         }
 
-        Err(format!("Error: MCP tool '{tool_name}' not found on any active MCP server."))
+        Err(format!(
+            "Error: MCP tool '{tool_name}' not found on any active MCP server."
+        ))
     }
 }
 

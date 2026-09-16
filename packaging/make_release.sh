@@ -102,6 +102,22 @@ mkdir -p "$BUNDLE_DIR/bin"
 cp "$REL_BIN_DIR/$EXE_NAME" "$BUNDLE_DIR/bin/$EXE_NAME"
 chmod +x "$BUNDLE_DIR/bin/$EXE_NAME" 2>/dev/null || true
 
+# Runtime assets live next to the executable (see splash_candidates_in /
+# resolve_worker_script): exe-dir resources/ first, then exe-dir root.
+# Copied from the canonical source-tree files at pack time — never a
+# separately maintained duplicate.
+mkdir -p "$BUNDLE_DIR/bin/resources"
+for asset in splash.txt resources/transformers_worker.py; do
+  if [[ -f "$ROOT/$asset" ]]; then
+    cp "$ROOT/$asset" "$BUNDLE_DIR/bin/resources/$(basename "$asset")"
+  else
+    echo "⚠ Missing asset (skipped): $asset" >&2
+  fi
+done
+if [[ -f "$ROOT/splash.txt" ]]; then
+  cp "$ROOT/splash.txt" "$BUNDLE_DIR/bin/splash.txt"
+fi
+
 for f in README.md LICENSE TODO.md; do
   if [[ -f "$ROOT/$f" ]]; then
     cp "$ROOT/$f" "$BUNDLE_DIR/$f"
@@ -117,11 +133,18 @@ Hercules Agent — Local AI coding agent CLI and TUI.
 Included Binary:
   bin/${EXE_NAME}
 
+Included Runtime Assets (resolved next to the executable):
+  bin/resources/splash.txt
+  bin/splash.txt
+
 Usage:
   ./bin/${EXE_NAME}
 
 Install:
-  Copy 'bin/${EXE_NAME}' to a directory in your PATH (e.g. /usr/local/bin or ~/.local/bin).
+  Copy the whole 'bin/' directory (binary + resources/) to a directory
+  in your PATH (e.g. /usr/local/bin or ~/.local/bin), OR copy just
+  'bin/${EXE_NAME}' — the splash artwork is also embedded at build time
+  from the canonical splash.txt, so a lone binary still renders it.
 README_EOF
 
 echo "▶ Creating archive …"

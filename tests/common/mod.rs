@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use hercules_agent::llama::gguf::{dequant_buffer, GgmlType};
+use hercules_agent::llama::gguf::{GgmlType, dequant_buffer};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -74,7 +74,10 @@ impl Lcg {
     }
 
     fn next_u32(&mut self) -> u32 {
-        self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.state >> 32) as u32
     }
 
@@ -234,7 +237,8 @@ pub fn f64_reference_gemv(
     x: &[f32],
 ) -> Vec<f64> {
     let n_total = rows * cols;
-    let dequant_f32 = dequant_buffer(raw, ggml_type, n_total).expect("dequant_buffer reference failed");
+    let dequant_f32 =
+        dequant_buffer(raw, ggml_type, n_total).expect("dequant_buffer reference failed");
 
     let mut y_ref = vec![0.0f64; rows];
     for r in 0..rows {
@@ -381,7 +385,12 @@ pub fn assert_metrics_within_tolerance(actual: &[f32], reference: &[f64], quant_
 // ============================================================================
 
 /// Creates a minimal valid GGUF model binary file for testing engine loading.
-pub fn create_synthetic_gguf_file(path: &Path, vocab_size: usize, hidden_dim: usize, num_layers: usize) {
+pub fn create_synthetic_gguf_file(
+    path: &Path,
+    vocab_size: usize,
+    hidden_dim: usize,
+    num_layers: usize,
+) {
     let mut file = File::create(path).expect("Failed to create synthetic GGUF file");
 
     // Header: Magic "GGUF" (0x46554747), version 3, tensor_count 0, kv_count 4

@@ -6,7 +6,7 @@
 
 use super::backend::{
     BackendKind, BackendProvider, BurnWgpuProvider, LlamaCppProvider, MlxProvider, OllamaProvider,
-    OpenAiCompatibleProvider, TransformersProvider,
+    OpenAiCompatibleProvider, SharedThunderProvider, TransformersProvider,
 };
 use super::compatibility::{Compatibility, check_compatibility};
 use super::format::{ModelFormat, ModelLayout};
@@ -41,6 +41,7 @@ impl BackendRegistry {
         r.register(TransformersProvider);
         r.register(MlxProvider);
         r.register(OpenAiCompatibleProvider);
+        r.register(SharedThunderProvider);
         r
     }
 
@@ -100,11 +101,12 @@ mod tests {
     fn test_registry_lists_all_kinds_once() {
         let r = BackendRegistry::default_registry();
         let kinds = r.kinds();
-        assert_eq!(kinds.len(), 6);
+        assert_eq!(kinds.len(), 7);
+        assert!(kinds.contains(&BackendKind::SharedThunder));
         // Re-registering replaces instead of duplicating.
         let mut r = r;
         r.register(LlamaCppProvider);
-        assert_eq!(r.kinds().len(), 6);
+        assert_eq!(r.kinds().len(), 7);
     }
 
     #[test]
@@ -149,8 +151,32 @@ mod tests {
         assert!(!avail.contains(&BackendKind::BurnWgpu));
         assert!(!avail.contains(&BackendKind::Mlx));
         assert!(!avail.contains(&BackendKind::OpenAiCompatible));
+        assert!(avail.contains(&BackendKind::SharedThunder));
         let probe_ok = super::super::transformers::probe_cached("python3").is_ok();
         assert_eq!(avail.contains(&BackendKind::Transformers), probe_ok);
+    }
+
+    #[test]
+    fn test_shared_thunder_never_auto_resolves_to_repo() {
+        // Remote: repository artifacts never decide compatibility —
+        // pairing + remote advertisement do.
+        let r = BackendRegistry::default_registry();
+        let hw = HardwareInfo::detect();
+        for format in [
+            ModelFormat::Gguf,
+            ModelFormat::SafeTensors,
+            ModelFormat::Unknown,
+        ] {
+            let found =
+                r.compatible_backends(format, ModelLayout::Unknown, Some("LlamaForCausalLM"), &hw);
+            assert!(
+                !found.iter().any(|(k, _)| *k == BackendKind::SharedThunder),
+                "SharedThunder claimed {format:?} from a repo artifact"
+            );
+        }
+        // Explicit selection of a remote entry requires no local artifact.
+        let caps = r.get(BackendKind::SharedThunder).unwrap().capabilities();
+        assert!(!caps.requires_local_artifact);
     }
 
     #[test]

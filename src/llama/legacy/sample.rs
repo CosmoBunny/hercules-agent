@@ -34,7 +34,11 @@ pub struct Rng64 {
 impl Rng64 {
     pub fn new(seed: u64) -> Self {
         Self {
-            state: if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed },
+            state: if seed == 0 {
+                0xDEAD_BEEF_CAFE_BABE
+            } else {
+                seed
+            },
         }
     }
 

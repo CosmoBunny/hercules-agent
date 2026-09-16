@@ -172,12 +172,22 @@ type FnModelLoadFromFile = unsafe extern "C" fn(*const c_char, LlamaModelParams)
 type FnModelFree = unsafe extern "C" fn(*mut LlamaModel);
 type FnModelGetVocab = unsafe extern "C" fn(*const LlamaModel) -> *const LlamaVocab;
 type FnContextDefaultParams = unsafe extern "C" fn() -> LlamaContextParams;
-type FnInitFromModel = unsafe extern "C" fn(*mut LlamaModel, LlamaContextParams) -> *mut LlamaContext;
+type FnInitFromModel =
+    unsafe extern "C" fn(*mut LlamaModel, LlamaContextParams) -> *mut LlamaContext;
 type FnContextFree = unsafe extern "C" fn(*mut LlamaContext);
 type FnNCtx = unsafe extern "C" fn(*const LlamaContext) -> u32;
 type FnNCtxTrain = unsafe extern "C" fn(*const LlamaModel) -> i32;
-type FnTokenize = unsafe extern "C" fn(*const LlamaVocab, *const c_char, c_int, *mut LlamaToken, c_int, bool, bool) -> c_int;
-type FnTokenToPiece = unsafe extern "C" fn(*const LlamaVocab, LlamaToken, *mut c_char, c_int, c_int, bool) -> c_int;
+type FnTokenize = unsafe extern "C" fn(
+    *const LlamaVocab,
+    *const c_char,
+    c_int,
+    *mut LlamaToken,
+    c_int,
+    bool,
+    bool,
+) -> c_int;
+type FnTokenToPiece =
+    unsafe extern "C" fn(*const LlamaVocab, LlamaToken, *mut c_char, c_int, c_int, bool) -> c_int;
 type FnVocabBos = unsafe extern "C" fn(*const LlamaVocab) -> LlamaToken;
 type FnVocabEos = unsafe extern "C" fn(*const LlamaVocab) -> LlamaToken;
 type FnVocabGetAddBos = unsafe extern "C" fn(*const LlamaVocab) -> bool;
@@ -194,7 +204,8 @@ type FnSamplerInitTemp = unsafe extern "C" fn(f32) -> *mut LlamaSampler;
 type FnSamplerInitTopP = unsafe extern "C" fn(f32, usize) -> *mut LlamaSampler;
 type FnSamplerInitDist = unsafe extern "C" fn(u32) -> *mut LlamaSampler;
 type FnSamplerInitGreedy = unsafe extern "C" fn() -> *mut LlamaSampler;
-type FnSamplerSample = unsafe extern "C" fn(*mut LlamaSampler, *mut LlamaContext, c_int) -> LlamaToken;
+type FnSamplerSample =
+    unsafe extern "C" fn(*mut LlamaSampler, *mut LlamaContext, c_int) -> LlamaToken;
 type FnSamplerFree = unsafe extern "C" fn(*mut LlamaSampler);
 /// Callback type for llama_log_set — (level: i32, text: *const c_char, user_data: *mut c_void)
 type FnLogSet = unsafe extern "C" fn(
@@ -215,16 +226,33 @@ type FnStateSetData = unsafe extern "C" fn(*mut LlamaContext, *const u8, usize) 
 // mtmd (Vision-Language / Multimodal) function pointers
 type FnMtmdDefaultMarker = unsafe extern "C" fn() -> *const c_char;
 type FnMtmdContextParamsDefault = unsafe extern "C" fn() -> MtmdContextParams;
-type FnMtmdInitFromFile = unsafe extern "C" fn(*const c_char, *const LlamaModel, MtmdContextParams) -> *mut MtmdContext;
+type FnMtmdInitFromFile =
+    unsafe extern "C" fn(*const c_char, *const LlamaModel, MtmdContextParams) -> *mut MtmdContext;
 type FnMtmdFree = unsafe extern "C" fn(*mut MtmdContext);
 type FnMtmdSupportVision = unsafe extern "C" fn(*const MtmdContext) -> bool;
 type FnMtmdSupportAudio = unsafe extern "C" fn(*const MtmdContext) -> bool;
-type FnMtmdHelperBitmapInitFromFile = unsafe extern "C" fn(*mut MtmdContext, *const c_char, bool) -> MtmdHelperBitmapWrapper;
+type FnMtmdHelperBitmapInitFromFile =
+    unsafe extern "C" fn(*mut MtmdContext, *const c_char, bool) -> MtmdHelperBitmapWrapper;
 type FnMtmdBitmapFree = unsafe extern "C" fn(*mut MtmdBitmap);
 type FnMtmdInputChunksInit = unsafe extern "C" fn() -> *mut MtmdInputChunks;
 type FnMtmdInputChunksFree = unsafe extern "C" fn(*mut MtmdInputChunks);
-type FnMtmdTokenize = unsafe extern "C" fn(*mut MtmdContext, *mut MtmdInputChunks, *const MtmdInputText, *const *const MtmdBitmap, usize) -> i32;
-type FnMtmdHelperEvalChunks = unsafe extern "C" fn(*mut MtmdContext, *mut LlamaContext, *const MtmdInputChunks, LlamaPos, LlamaSeqId, i32, bool, *mut LlamaPos) -> i32;
+type FnMtmdTokenize = unsafe extern "C" fn(
+    *mut MtmdContext,
+    *mut MtmdInputChunks,
+    *const MtmdInputText,
+    *const *const MtmdBitmap,
+    usize,
+) -> i32;
+type FnMtmdHelperEvalChunks = unsafe extern "C" fn(
+    *mut MtmdContext,
+    *mut LlamaContext,
+    *const MtmdInputChunks,
+    LlamaPos,
+    LlamaSeqId,
+    i32,
+    bool,
+    *mut LlamaPos,
+) -> i32;
 
 // ---------------------------------------------------------------------------
 // LlamaLib
@@ -306,21 +334,34 @@ unsafe extern "C" {
     fn llama_backend_init();
     fn llama_backend_free();
     fn llama_model_default_params() -> LlamaModelParams;
-    fn llama_model_load_from_file(path: *const c_char, params: LlamaModelParams) -> *mut LlamaModel;
+    fn llama_model_load_from_file(path: *const c_char, params: LlamaModelParams)
+    -> *mut LlamaModel;
     fn llama_model_free(model: *mut LlamaModel);
     fn llama_model_get_vocab(model: *const LlamaModel) -> *const LlamaVocab;
     fn llama_context_default_params() -> LlamaContextParams;
-    fn llama_init_from_model(model: *mut LlamaModel, params: LlamaContextParams) -> *mut LlamaContext;
+    fn llama_init_from_model(
+        model: *mut LlamaModel,
+        params: LlamaContextParams,
+    ) -> *mut LlamaContext;
     fn llama_free(ctx: *mut LlamaContext);
     fn llama_n_ctx(ctx: *const LlamaContext) -> u32;
     fn llama_model_n_ctx_train(model: *const LlamaModel) -> i32;
     fn llama_tokenize(
-        vocab: *const LlamaVocab, text: *const c_char, text_len: c_int,
-        tokens: *mut LlamaToken, n_tokens_max: c_int, add_special: bool, parse_special: bool,
+        vocab: *const LlamaVocab,
+        text: *const c_char,
+        text_len: c_int,
+        tokens: *mut LlamaToken,
+        n_tokens_max: c_int,
+        add_special: bool,
+        parse_special: bool,
     ) -> c_int;
     fn llama_token_to_piece(
-        vocab: *const LlamaVocab, token: LlamaToken, buf: *mut c_char,
-        length: c_int, lstrip: c_int, special: bool,
+        vocab: *const LlamaVocab,
+        token: LlamaToken,
+        buf: *mut c_char,
+        length: c_int,
+        lstrip: c_int,
+        special: bool,
     ) -> c_int;
     fn llama_vocab_bos(vocab: *const LlamaVocab) -> LlamaToken;
     fn llama_vocab_eos(vocab: *const LlamaVocab) -> LlamaToken;
@@ -338,7 +379,11 @@ unsafe extern "C" {
     fn llama_sampler_init_top_p(p: f32, min_keep: usize) -> *mut LlamaSampler;
     fn llama_sampler_init_dist(seed: u32) -> *mut LlamaSampler;
     fn llama_sampler_init_greedy() -> *mut LlamaSampler;
-    fn llama_sampler_sample(sampler: *mut LlamaSampler, ctx: *mut LlamaContext, idx: c_int) -> LlamaToken;
+    fn llama_sampler_sample(
+        sampler: *mut LlamaSampler,
+        ctx: *mut LlamaContext,
+        idx: c_int,
+    ) -> LlamaToken;
     fn llama_sampler_free(sampler: *mut LlamaSampler);
     fn llama_log_set(
         callback: Option<unsafe extern "C" fn(i32, *const c_char, *mut c_void)>,
@@ -356,16 +401,39 @@ unsafe extern "C" {
     // mtmd symbols
     fn mtmd_default_marker() -> *const c_char;
     fn mtmd_context_params_default() -> MtmdContextParams;
-    fn mtmd_init_from_file(mmproj_fname: *const c_char, text_model: *const LlamaModel, ctx_params: MtmdContextParams) -> *mut MtmdContext;
+    fn mtmd_init_from_file(
+        mmproj_fname: *const c_char,
+        text_model: *const LlamaModel,
+        ctx_params: MtmdContextParams,
+    ) -> *mut MtmdContext;
     fn mtmd_free(ctx: *mut MtmdContext);
     fn mtmd_support_vision(ctx: *const MtmdContext) -> bool;
     fn mtmd_support_audio(ctx: *const MtmdContext) -> bool;
-    fn mtmd_helper_bitmap_init_from_file(ctx: *mut MtmdContext, fname: *const c_char, placeholder: bool) -> MtmdHelperBitmapWrapper;
+    fn mtmd_helper_bitmap_init_from_file(
+        ctx: *mut MtmdContext,
+        fname: *const c_char,
+        placeholder: bool,
+    ) -> MtmdHelperBitmapWrapper;
     fn mtmd_bitmap_free(bitmap: *mut MtmdBitmap);
     fn mtmd_input_chunks_init() -> *mut MtmdInputChunks;
     fn mtmd_input_chunks_free(chunks: *mut MtmdInputChunks);
-    fn mtmd_tokenize(ctx: *mut MtmdContext, output: *mut MtmdInputChunks, text: *const MtmdInputText, bitmaps: *const *const MtmdBitmap, n_bitmaps: usize) -> i32;
-    fn mtmd_helper_eval_chunks(ctx: *mut MtmdContext, lctx: *mut LlamaContext, chunks: *const MtmdInputChunks, n_past: LlamaPos, seq_id: LlamaSeqId, n_batch: i32, logits_last: bool, new_n_past: *mut LlamaPos) -> i32;
+    fn mtmd_tokenize(
+        ctx: *mut MtmdContext,
+        output: *mut MtmdInputChunks,
+        text: *const MtmdInputText,
+        bitmaps: *const *const MtmdBitmap,
+        n_bitmaps: usize,
+    ) -> i32;
+    fn mtmd_helper_eval_chunks(
+        ctx: *mut MtmdContext,
+        lctx: *mut LlamaContext,
+        chunks: *const MtmdInputChunks,
+        n_past: LlamaPos,
+        seq_id: LlamaSeqId,
+        n_batch: i32,
+        logits_last: bool,
+        new_n_past: *mut LlamaPos,
+    ) -> i32;
 }
 
 #[cfg(feature = "llama-cpp-static")]
@@ -373,58 +441,58 @@ impl LlamaLib {
     /// Construct a `LlamaLib` that calls statically-linked symbols directly.
     pub fn load_static() -> Self {
         Self {
-            backend_init:                  llama_backend_init,
-            backend_free:                  llama_backend_free,
-            model_default_params:          llama_model_default_params,
-            model_load_from_file:          llama_model_load_from_file,
-            model_free:                    llama_model_free,
-            model_get_vocab:               llama_model_get_vocab,
-            context_default_params:        llama_context_default_params,
-            init_from_model:               llama_init_from_model,
-            context_free:                  llama_free,
-            n_ctx:                         llama_n_ctx,
-            n_ctx_train:                   llama_model_n_ctx_train,
-            tokenize:                      llama_tokenize,
-            token_to_piece:                llama_token_to_piece,
-            vocab_bos:                     llama_vocab_bos,
-            vocab_eos:                     llama_vocab_eos,
-            vocab_get_add_bos:             llama_vocab_get_add_bos,
-            token_is_eog:                  llama_vocab_is_eog,
-            batch_get_one:                 llama_batch_get_one,
-            batch_init:                    llama_batch_init,
-            batch_free:                    llama_batch_free,
-            decode:                        llama_decode,
-            get_logits_ith:                llama_get_logits_ith,
-            sampler_chain_default_params:  llama_sampler_chain_default_params,
-            sampler_chain_init:            llama_sampler_chain_init,
-            sampler_chain_add:             llama_sampler_chain_add,
-            sampler_init_temp:             llama_sampler_init_temp,
-            sampler_init_top_p:            llama_sampler_init_top_p,
-            sampler_init_dist:             llama_sampler_init_dist,
-            sampler_init_greedy:           llama_sampler_init_greedy,
-            sampler_sample:                llama_sampler_sample,
-            sampler_free:                  llama_sampler_free,
-            log_set:                       llama_log_set,
-            get_memory:                    Some(llama_get_memory),
-            memory_clear:                  Some(llama_memory_clear),
-            memory_seq_rm:                 Some(llama_memory_seq_rm),
-            memory_seq_pos_max:            Some(llama_memory_seq_pos_max),
-            state_get_size:                Some(llama_state_get_size),
-            state_get_data:                Some(llama_state_get_data),
-            state_set_data:                Some(llama_state_set_data),
+            backend_init: llama_backend_init,
+            backend_free: llama_backend_free,
+            model_default_params: llama_model_default_params,
+            model_load_from_file: llama_model_load_from_file,
+            model_free: llama_model_free,
+            model_get_vocab: llama_model_get_vocab,
+            context_default_params: llama_context_default_params,
+            init_from_model: llama_init_from_model,
+            context_free: llama_free,
+            n_ctx: llama_n_ctx,
+            n_ctx_train: llama_model_n_ctx_train,
+            tokenize: llama_tokenize,
+            token_to_piece: llama_token_to_piece,
+            vocab_bos: llama_vocab_bos,
+            vocab_eos: llama_vocab_eos,
+            vocab_get_add_bos: llama_vocab_get_add_bos,
+            token_is_eog: llama_vocab_is_eog,
+            batch_get_one: llama_batch_get_one,
+            batch_init: llama_batch_init,
+            batch_free: llama_batch_free,
+            decode: llama_decode,
+            get_logits_ith: llama_get_logits_ith,
+            sampler_chain_default_params: llama_sampler_chain_default_params,
+            sampler_chain_init: llama_sampler_chain_init,
+            sampler_chain_add: llama_sampler_chain_add,
+            sampler_init_temp: llama_sampler_init_temp,
+            sampler_init_top_p: llama_sampler_init_top_p,
+            sampler_init_dist: llama_sampler_init_dist,
+            sampler_init_greedy: llama_sampler_init_greedy,
+            sampler_sample: llama_sampler_sample,
+            sampler_free: llama_sampler_free,
+            log_set: llama_log_set,
+            get_memory: Some(llama_get_memory),
+            memory_clear: Some(llama_memory_clear),
+            memory_seq_rm: Some(llama_memory_seq_rm),
+            memory_seq_pos_max: Some(llama_memory_seq_pos_max),
+            state_get_size: Some(llama_state_get_size),
+            state_get_data: Some(llama_state_get_data),
+            state_set_data: Some(llama_state_set_data),
 
-            mtmd_default_marker:           Some(mtmd_default_marker),
-            mtmd_context_params_default:   Some(mtmd_context_params_default),
-            mtmd_init_from_file:           Some(mtmd_init_from_file),
-            mtmd_free:                     Some(mtmd_free),
-            mtmd_support_vision:           Some(mtmd_support_vision),
-            mtmd_support_audio:            Some(mtmd_support_audio),
+            mtmd_default_marker: Some(mtmd_default_marker),
+            mtmd_context_params_default: Some(mtmd_context_params_default),
+            mtmd_init_from_file: Some(mtmd_init_from_file),
+            mtmd_free: Some(mtmd_free),
+            mtmd_support_vision: Some(mtmd_support_vision),
+            mtmd_support_audio: Some(mtmd_support_audio),
             mtmd_helper_bitmap_init_from_file: Some(mtmd_helper_bitmap_init_from_file),
-            mtmd_bitmap_free:              Some(mtmd_bitmap_free),
-            mtmd_input_chunks_init:        Some(mtmd_input_chunks_init),
-            mtmd_input_chunks_free:        Some(mtmd_input_chunks_free),
-            mtmd_tokenize:                 Some(mtmd_tokenize),
-            mtmd_helper_eval_chunks:       Some(mtmd_helper_eval_chunks),
+            mtmd_bitmap_free: Some(mtmd_bitmap_free),
+            mtmd_input_chunks_init: Some(mtmd_input_chunks_init),
+            mtmd_input_chunks_free: Some(mtmd_input_chunks_free),
+            mtmd_tokenize: Some(mtmd_tokenize),
+            mtmd_helper_eval_chunks: Some(mtmd_helper_eval_chunks),
         }
     }
 }
@@ -443,9 +511,8 @@ impl LlamaLib {
             use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
             let flags = RTLD_NOW | RTLD_GLOBAL;
             // SAFETY: caller of open_global is already unsafe; path is a valid CString path.
-            let unix_lib = unsafe { UnixLibrary::open(Some(path), flags) }.map_err(|e| {
-                format!("Failed to dlopen {:?}: {}", path, e)
-            })?;
+            let unix_lib = unsafe { UnixLibrary::open(Some(path), flags) }
+                .map_err(|e| format!("Failed to dlopen {:?}: {}", path, e))?;
             Ok(unix_lib.into())
         }
         #[cfg(windows)]
@@ -453,15 +520,12 @@ impl LlamaLib {
             // LoadLibraryW uses the directory of the DLL for its dependencies when
             // the path is absolute (with LOAD_WITH_ALTERED_SEARCH_PATH behavior
             // via full path). Preloading from the same dir is still best.
-            libloading::Library::new(path).map_err(|e| {
-                format!("Failed to LoadLibrary {:?}: {}", path, e)
-            })
+            libloading::Library::new(path)
+                .map_err(|e| format!("Failed to LoadLibrary {:?}: {}", path, e))
         }
         #[cfg(not(any(unix, windows)))]
         {
-            libloading::Library::new(path).map_err(|e| {
-                format!("Failed to load {:?}: {}", path, e)
-            })
+            libloading::Library::new(path).map_err(|e| format!("Failed to load {:?}: {}", path, e))
         }
     }
 
@@ -471,11 +535,7 @@ impl LlamaLib {
         // Order matters: base → backends → ggml meta → llama
         // Versioned sonames first (what libllama NEEDED entries use), then unversioned.
         #[cfg(target_os = "windows")]
-        let candidates: &[&[&str]] = &[
-            &["ggml-base.dll"],
-            &["ggml-cpu.dll"],
-            &["ggml.dll"],
-        ];
+        let candidates: &[&[&str]] = &[&["ggml-base.dll"], &["ggml-cpu.dll"], &["ggml.dll"]];
         #[cfg(target_os = "macos")]
         let candidates: &[&[&str]] = &[
             &["libggml-base.0.dylib", "libggml-base.dylib"],
@@ -531,19 +591,26 @@ impl LlamaLib {
         }
 
         let lib = unsafe {
-            Self::open_global(&path).map_err(|e| format!(
-                "{}\nFix: install libllama{} next to its ggml deps (e.g. ~/.local/lib), \
+            Self::open_global(&path).map_err(|e| {
+                format!(
+                    "{}\nFix: install libllama{} next to its ggml deps (e.g. ~/.local/lib), \
                  or set LIBLLAMA_PATH=/path/to/libllama{}.",
-                e, Self::lib_ext(), Self::lib_ext()
-            ))?
+                    e,
+                    Self::lib_ext(),
+                    Self::lib_ext()
+                )
+            })?
         };
 
         macro_rules! sym {
             ($name:expr) => {{
                 let s: libloading::Symbol<_> = unsafe {
                     lib.get($name).map_err(|e| {
-                        format!("libllama: missing symbol '{}': {}",
-                            std::str::from_utf8($name).unwrap_or("?"), e)
+                        format!(
+                            "libllama: missing symbol '{}': {}",
+                            std::str::from_utf8($name).unwrap_or("?"),
+                            e
+                        )
                     })?
                 };
                 *s
@@ -555,13 +622,17 @@ impl LlamaLib {
             lib.get(b"llama_vocab_is_eog")
                 .or_else(|_| lib.get(b"llama_token_is_eog"))
                 .map(|s: libloading::Symbol<FnTokenIsEog>| *s)
-                .map_err(|e| format!("libllama: missing llama_vocab_is_eog / llama_token_is_eog: {e}"))?
+                .map_err(|e| {
+                    format!("libllama: missing llama_vocab_is_eog / llama_token_is_eog: {e}")
+                })?
         };
         let n_ctx_train: FnNCtxTrain = unsafe {
             lib.get(b"llama_model_n_ctx_train")
                 .or_else(|_| lib.get(b"llama_n_ctx_train"))
                 .map(|s: libloading::Symbol<FnNCtxTrain>| *s)
-                .map_err(|e| format!("libllama: missing llama_model_n_ctx_train / llama_n_ctx_train: {e}"))?
+                .map_err(|e| {
+                    format!("libllama: missing llama_model_n_ctx_train / llama_n_ctx_train: {e}")
+                })?
         };
 
         Ok(Self {
@@ -726,16 +797,34 @@ impl LlamaLib {
 
     /// Platform-specific shared library file extension.
     fn lib_ext() -> &'static str {
-        #[cfg(target_os = "windows")]  { ".dll" }
-        #[cfg(target_os = "macos")]    { ".dylib" }
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))] { ".so" }
+        #[cfg(target_os = "windows")]
+        {
+            ".dll"
+        }
+        #[cfg(target_os = "macos")]
+        {
+            ".dylib"
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            ".so"
+        }
     }
 
     /// Platform-specific library filename (no directory).
     fn lib_name() -> &'static str {
-        #[cfg(target_os = "windows")]  { "llama.dll" }
-        #[cfg(target_os = "macos")]    { "libllama.dylib" }
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))] { "libllama.so" }
+        #[cfg(target_os = "windows")]
+        {
+            "llama.dll"
+        }
+        #[cfg(target_os = "macos")]
+        {
+            "libllama.dylib"
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            "libllama.so"
+        }
     }
 
     fn resolve_path() -> PathBuf {

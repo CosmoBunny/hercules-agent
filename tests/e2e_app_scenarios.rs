@@ -7,7 +7,7 @@ mod common;
 
 use common::*;
 use hercules_agent::llama::{
-    ensure_warm_rs_engine, shutdown_warm_rs_engine, LlamaRsEngine, ParallelBackend,
+    LlamaRsEngine, ParallelBackend, ensure_warm_rs_engine, shutdown_warm_rs_engine,
 };
 use std::sync::Arc;
 
