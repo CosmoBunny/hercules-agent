@@ -1737,6 +1737,16 @@ impl App {
         self.input_focused = false; // so Y/N aren't typed into the prompt
     }
 
+    /// Claim-release policy for scheduler read outcomes. A failed claim is
+    /// released ONLY when a terminal scheduler outcome was observed for it:
+    /// a locally-recorded timeout (no receipt) means the worker may still
+    /// own the action, so the claim is withheld until the turn ends rather
+    /// than risk a same-turn duplicate execution. Timeout-withheld claims
+    /// die with the turn via `dispatch_registry.reset_turn()`.
+    fn release_read_claim(had_terminal_outcome: bool, result: &str) -> bool {
+        had_terminal_outcome && result.trim_start().starts_with("Error:")
+    }
+
     fn accept_pending_actions(&mut self) {
         if self.pending_actions.is_empty() {
             return;
@@ -1822,39 +1832,98 @@ impl App {
             // canonical gate (order of claims is deterministic).
             let claimed: Vec<&crate::agent::ProposedAction> =
                 mcps.iter().filter(|a| self.claim_tool_call(a)).collect();
-            // Phase 2 — independent Read/Ls executions run CONCURRENTLY
-            // (pure filesystem + global registries only). Spawns, smart
-            // writes and runtime-bound calls stay sequential below.
-            // Results are re-associated by index so Phase 3 stays ordered.
+            // Phase 2 — explicit Read/Ls enter the scheduler's SHARED
+            // queue as Explicit jobs (same worker pool as speculation,
+            // genuinely outranking it). Claims already happened in Phase 1
+            // through the canonical gate; workers execute via the
+            // canonical `execute_proposed` and deliver outcomes bound to
+            // call_id. Collection is in submission order → deterministic.
+            let sched = crate::agent_io::AgentIoScheduler::global();
+            let batch_run_id = self.current_run.as_ref().map(|r| r.id).unwrap_or(0);
+            let mut batch_idx: Vec<usize> = Vec::new();
+            let mut batch_actions: Vec<crate::agent::ProposedAction> = Vec::new();
+            for (idx, a) in claimed.iter().enumerate() {
+                if matches!(
+                    a.kind,
+                    crate::agent::ProposedKind::Read | crate::agent::ProposedKind::Ls
+                ) {
+                    batch_idx.push(idx);
+                    batch_actions.push((*a).clone());
+                }
+            }
+            let receipts = sched.submit_explicit_batch(batch_run_id, batch_actions);
             let mut read_results: std::collections::HashMap<usize, String> =
-                std::thread::scope(|s| {
-                    let handles: Vec<(usize, std::thread::ScopedJoinHandle<'_, String>)> = claimed
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, a)| {
-                            matches!(
-                                a.kind,
-                                crate::agent::ProposedKind::Read | crate::agent::ProposedKind::Ls
-                            )
-                        })
-                        .map(|(i, a)| {
-                            (
-                                i,
-                                s.spawn(move || crate::agent::AgentEngine::execute_proposed(a)),
-                            )
-                        })
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|(i, h)| {
-                            (
-                                i,
-                                h.join()
-                                    .unwrap_or_else(|_| "Error: read task panicked".to_string()),
-                            )
-                        })
-                        .collect()
-                });
+                std::collections::HashMap::new();
+            let mut read_promoted: std::collections::HashMap<usize, bool> =
+                std::collections::HashMap::new();
+            // Indices whose outcome arrived through a receipt (terminal
+            // scheduler state observed). ONLY these may release a claim on
+            // error: a locally-recorded timeout means the worker may still
+            // own the action, and the claim must survive until the turn
+            // ends rather than risk a same-turn duplicate execution.
+            let mut read_terminal: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            for (pos, receipt) in receipts.into_iter().enumerate() {
+                let idx = batch_idx[pos];
+                // Workers deliver exactly once on every path; the timeout
+                // below does NOT create a second owner: on expiry the job
+                // is cancelled and only its terminal outcome (or a short
+                // grace wait for it) is observed — this code NEVER executes
+                // a claimed action itself.
+                match receipt
+                    .outcome
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                {
+                    Ok(out) => {
+                        read_results.insert(idx, out.result);
+                        read_promoted.insert(idx, out.served_from_cache);
+                        read_terminal.insert(idx);
+                    }
+                    Err(_) => {
+                        // Timeout: cancel the scheduler job and observe ONLY
+                        // its terminal outcome (or a short grace for it).
+                        // This code NEVER executes a claimed action itself,
+                        // so no second execution owner can exist: the worker
+                        // stays the sole owner and any late result lands on
+                        // the dropped receiver below.
+                        let cancel_outcome = sched.cancel_job(receipt.job_id);
+                        if let Ok(mut l) = self.activity_logs.lock() {
+                            l.push(format!(
+                                "[IO] explicit read #{} timed out — cancel: {:?}",
+                                receipt.call_id, cancel_outcome
+                            ));
+                        }
+                        match receipt
+                            .outcome
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                        {
+                            Ok(out) => {
+                                read_results.insert(idx, out.result);
+                                read_promoted.insert(idx, out.served_from_cache);
+                                read_terminal.insert(idx);
+                            }
+                            Err(_) => {
+                                // Worker lost (defensive: it always sends).
+                                // Record a timeout error; the claim is
+                                // released in Phase 3 and any late worker
+                                // result lands on this dropped receiver —
+                                // never a duplicate execution.
+                                read_results.insert(
+                                    idx,
+                                    "Error: scheduler: explicit read timed out (job cancelled)"
+                                        .to_string(),
+                                );
+                                if let Ok(mut l) = self.activity_logs.lock() {
+                                    l.push(format!(
+                                        "[IO] explicit read #{} timed out — job cancelled, no duplicate execution",
+                                        receipt.call_id
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // Phase 3 — UI + context updates strictly in original order, so
             // the next generation sees a deterministic tool-result sequence.
             for (idx, a) in claimed.iter().enumerate() {
@@ -1926,12 +1995,29 @@ impl App {
                     a.kind,
                     crate::agent::ProposedKind::Read | crate::agent::ProposedKind::Ls
                 ) {
-                    // Served from the Phase-2 concurrent execution (which
-                    // went through the same canonical `execute_proposed`,
-                    // including sandbox checks and prefetch warm-up).
-                    read_results
-                        .remove(&idx)
-                        .unwrap_or_else(|| crate::agent::AgentEngine::execute_proposed(a))
+                    // Served from the Phase-2 scheduler batch (same
+                    // canonical `execute_proposed`, sandbox + promotion
+                    // included). Failed reads hold no claim: nothing with
+                    // side effects ran, so a later retry of the same
+                    // logical action can still claim + execute (dispatch
+                    // registry contract). Missing outcomes also surface as
+                    // errors — this path NEVER executes a claimed action
+                    // itself, so a timeout/cancel can never create a
+                    // second execution owner.
+                    let result = read_results.remove(&idx).unwrap_or_else(|| {
+                        "Error: scheduler: missing outcome for claimed read".to_string()
+                    });
+                    if Self::release_read_claim(read_terminal.contains(&idx), &result) {
+                        self.dispatch_registry.release(a);
+                    } else if read_promoted.get(&idx) == Some(&true) {
+                        if let Ok(mut l) = self.activity_logs.lock() {
+                            l.push(format!(
+                                "[IO] read {} served from speculative cache (promotion)",
+                                a.target.chars().take(80).collect::<String>()
+                            ));
+                        }
+                    }
+                    result
                 } else {
                     crate::agent::AgentEngine::execute_proposed(a)
                 };
@@ -2070,6 +2156,11 @@ impl App {
                 run.finish_run(state);
             }
         }
+        // Scheduler handoff: the run is terminal — retire its admission
+        // state (cancellation flags stay for stragglers via sweep).
+        if let Some(run) = self.current_run.as_ref() {
+            crate::agent_io::AgentIoScheduler::global().end_run(run.id);
+        }
     }
 
     /// Open a new run for a fresh prompt. The previous run is never
@@ -2080,6 +2171,7 @@ impl App {
         if let Some(tok) = self.run_cancel_token.take() {
             tok.cancel();
         }
+        let old_run_id = self.current_run.as_ref().map(|r| r.id);
         if let Some(run) = self.current_run.as_mut() {
             if !run.is_terminal() {
                 run.cancel();
@@ -2093,6 +2185,20 @@ impl App {
         self.current_run = Some(crate::run_timeline::AgentRun::new(prompt));
         self.run_cancel_token = Some(tokio_util::sync::CancellationToken::new());
         self.gen_run_id = None;
+        // Scheduler handoff: drop the old run's speculation (queue prune +
+        // metrics) and link the fresh run token so worker cancellation
+        // follows the same semantics as the rest of the run.
+        let sched = crate::agent_io::AgentIoScheduler::global();
+        if let Some(old) = old_run_id {
+            sched.cancel_run(old);
+            // Terminal supersede: admission state retires now; flags stay
+            // for stragglers via the reachability sweep.
+            sched.end_run(old);
+        }
+        if let (Some(run), Some(tok)) = (self.current_run.as_ref(), self.run_cancel_token.as_ref())
+        {
+            sched.link_run_token(run.id, tok.clone());
+        }
     }
 
     /// Cancel only the in-flight generation future (stall/reject paths).
@@ -2118,6 +2224,15 @@ impl App {
     fn cancel_active_run(&mut self, reason: &str, kill_tasks: bool) {
         if let Some(tok) = self.run_cancel_token.as_ref() {
             tok.cancel();
+        }
+        // Scheduler handoff: queued speculative jobs drop; queued
+        // explicit jobs complete immediately with a cancellation error,
+        // and Phase 3 releases those claims (nothing ran, so a retry may
+        // claim again). Running jobs finish cooperatively and their
+        // outcomes bind normally. Contract: cancel → error outcome →
+        // claim release → reclaim allowed (tested invariant).
+        if let Some(run) = self.current_run.as_ref() {
+            crate::agent_io::AgentIoScheduler::global().cancel_run(run.id);
         }
         self.user_cancelled_gen = true;
         self.auto_tool_turns = 0;
@@ -4279,6 +4394,17 @@ impl App {
 
                 // Chips only while streaming (panel opens from chip click)
                 self.sync_tool_chips(&current_stream);
+
+                // Speculative intent: throttled inside the scheduler
+                // (predicts only on material stream growth), read-only and
+                // budgeted. Streaming/thinking text is a retrieval SIGNAL
+                // here, never a ToolCall — execution still goes only
+                // through the canonical parser → dispatch → executor.
+                {
+                    let run_id = self.current_run.as_ref().map(|r| r.id).unwrap_or(0);
+                    crate::agent_io::AgentIoScheduler::global()
+                        .note_stream_progress(run_id, &current_stream);
+                }
 
                 // ── Furious AlwaysAllow: execute complete writes the instant their
                 //    closing tag arrives, without interrupting the AI stream. ──────
@@ -15505,6 +15631,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn release_read_claim_only_after_terminal_outcome() {
+        // Claim-release policy: a failed read releases its dispatch claim
+        // ONLY when a terminal scheduler outcome was observed. A locally
+        // recorded timeout (worker may still own the action) withholds the
+        // claim until the turn ends — never release merely for stopping
+        // to wait.
+        // Terminal error outcomes → release.
+        assert!(App::release_read_claim(
+            true,
+            "Error: scheduler: job cancelled"
+        ));
+        assert!(App::release_read_claim(
+            true,
+            "Error: File 'x' doesn't exist"
+        ));
+        // Terminal success → keep (exactly-once for successes).
+        assert!(!App::release_read_claim(true, "file contents here"));
+        // No terminal outcome (timeout/give-up) → withhold even for
+        // error text: the worker may still own the action.
+        assert!(!App::release_read_claim(
+            false,
+            "Error: scheduler: explicit read timed out (job cancelled)"
+        ));
+        assert!(!App::release_read_claim(false, "Error: anything"));
+        assert!(!App::release_read_claim(false, "contents"));
+    }
+
+    #[test]
     fn test_collapse_and_expand_exact_flow() {
         let mut k: KramaFrame<BTclasslist, BTframelist<TRES16Bits, i16>> = KramaFrame::default();
         k.extend_iter_classlist([(
@@ -16395,6 +16549,7 @@ mod thunder_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn discovered_peer_marked_untrusted() {
+        let _store_guard = crate::thunder::pairing::store_test_guard();
         // Hermetic: the trust store on developer machines may contain
         // `thunder-alice` (or parallel tests may redirect XDG_DATA_HOME),
         // so use an isolated store plus a peer id no other test trusts.
@@ -16414,6 +16569,7 @@ mod thunder_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn trusted_peer_renders_permissions() {
+        let _store_guard = crate::thunder::pairing::store_test_guard();
         let dir = isolate_store("perms");
         let mut app = App::new();
         assert!(crate::thunder_ui::ThunderUiState::trust_peer(
@@ -16440,6 +16596,7 @@ mod thunder_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn host_stopped_and_hosting_render() {
+        let _store_guard = crate::thunder::pairing::store_test_guard();
         let dir = isolate_store("host");
         let mut app = App::new();
         open_thunder(&mut app);
@@ -16497,6 +16654,7 @@ mod thunder_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn pairing_code_and_expiry_render() {
+        let _store_guard = crate::thunder::pairing::store_test_guard();
         let dir = isolate_store("code");
         let mut app = App::new();
         open_thunder(&mut app);
@@ -16522,6 +16680,7 @@ mod thunder_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn validated_pairing_trust_and_reject_update_state() {
+        let _store_guard = crate::thunder::pairing::store_test_guard();
         let dir = isolate_store("pending");
         let mut app = App::new();
         open_thunder(&mut app);
@@ -16590,6 +16749,7 @@ mod thunder_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn trust_without_validated_request_refused() {
+        let _store_guard = crate::thunder::pairing::store_test_guard();
         // No Pair exchange, no pending entry: Trust/TrustHost paths
         // must refuse rather than persist.
         let dir = isolate_store("novalid");
@@ -16666,6 +16826,7 @@ mod thunder_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn main_ai_displays_thunder_target() {
+        let _store_guard = crate::thunder::pairing::store_test_guard();
         let dir = isolate_store("mainai");
         let mut app = App::new();
         let addr: std::net::SocketAddr = "127.0.0.1:4317".parse().unwrap();
@@ -16722,6 +16883,7 @@ mod thunder_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn modal_selector_lists_thunder_remote() {
+        let _store_guard = crate::thunder::pairing::store_test_guard();
         let mut app = App::new();
         let addr: std::net::SocketAddr = "127.0.0.1:4317".parse().unwrap();
         app.thunder_ui.remote_models = vec![crate::thunder_ui::RemoteModelEntry {

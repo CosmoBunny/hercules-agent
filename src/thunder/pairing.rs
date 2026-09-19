@@ -12,6 +12,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::error::ThunderError;
 
+#[cfg(test)]
+static STORE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialize tests that redirect process-global `XDG_DATA_HOME` for the
+/// trust store. Shared across test modules (`app::thunder_tests`,
+/// `thunder::runtime::tests`) so no two tests swap the variable
+/// concurrently. Hold for the whole test body, starting BEFORE any
+/// `set_var` call.
+#[cfg(test)]
+pub(crate) fn store_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    STORE_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// A peer this installation trusts, with explicit permissions.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrustedPeer {
@@ -78,6 +91,11 @@ impl PairingCode {
 }
 
 /// Persistent trusted-peer store (`peers.json`).
+///
+/// Test isolation note: the store path derives from process-global
+/// `XDG_DATA_HOME`, so tests that redirect it MUST serialize through
+/// [`store_test_guard`]. Without the guard, parallel tests swap the
+/// variable mid-render and read each other's trust stores (flake).
 #[derive(Debug, Default, Clone)]
 pub struct PeerStore {
     peers: HashMap<String, TrustedPeer>,

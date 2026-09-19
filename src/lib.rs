@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod agent;
+pub mod agent_io;
 pub mod ask_mode;
 pub mod backend;
 pub mod clipboard;
@@ -26,6 +27,7 @@ pub mod model;
 pub mod ocr;
 pub mod prefetch;
 pub mod run_timeline;
+pub mod secure_fs;
 pub mod session;
 pub mod settings;
 pub mod smart_system;

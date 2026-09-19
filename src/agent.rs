@@ -1,5 +1,8 @@
-use std::fs;
 use std::path::{Path, PathBuf};
+// `fs` survives only for the non-Unix directory-listing fallback;
+// Unix file and directory I/O goes through handle-anchored primitives.
+#[cfg(not(unix))]
+use std::fs;
 use std::process::Command;
 use std::sync::Mutex;
 
@@ -63,7 +66,7 @@ impl ToolPermissions {
     }
 }
 
-static TOOL_PERMS: Mutex<ToolPermissions> = Mutex::new(ToolPermissions {
+pub(crate) static TOOL_PERMS: Mutex<ToolPermissions> = Mutex::new(ToolPermissions {
     mode: PermissionMode::Ask,
     folder_scope: FolderScope::CurrentDir,
     session_allow: false,
@@ -71,6 +74,17 @@ static TOOL_PERMS: Mutex<ToolPermissions> = Mutex::new(ToolPermissions {
 
 pub fn get_tool_permissions() -> ToolPermissions {
     *TOOL_PERMS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+static PERM_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialize tests that mutate global TOOL_PERMS. Shared across test
+/// modules (`agent`, `agent_io`) so a scope/mode flip in one can never
+/// interleave with another's assertions.
+#[cfg(test)]
+pub(crate) fn perm_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    PERM_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn set_permission_mode(mode: PermissionMode) {
@@ -113,8 +127,15 @@ fn tools_allowed_for_write_cmd() -> Result<(), String> {
 }
 
 pub(crate) fn path_allowed(path: &Path) -> Result<(), String> {
-    let p = get_tool_permissions();
-    match p.folder_scope {
+    path_allowed_with(path, get_tool_permissions().folder_scope)
+}
+
+/// Sandbox check against a caller-captured scope. Prefer this when one
+/// authorization decision must span several steps (gate → open → serve):
+/// sampling `TOOL_PERMS` once prevents a concurrent `set_folder_scope()`
+/// from changing the rules mid-flight.
+pub(crate) fn path_allowed_with(path: &Path, scope: FolderScope) -> Result<(), String> {
+    match scope {
         FolderScope::AllDirs => Ok(()),
         FolderScope::CurrentDir => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -2628,14 +2649,37 @@ Common Tasks:
     }
 
     pub fn execute_write(path_str: &str, line_attr: Option<&str>, body: &str) -> String {
+        use crate::secure_fs::{SecureOpenError, WriteOpenMode, secure_open_write};
+        use std::io::{Read, Seek, SeekFrom, Write};
         if let Err(e) = tools_allowed_for_write_cmd() {
             return format!("Error: {}", e);
         }
         let path_str = Self::normalize_write_path(path_str, body);
         let path = Self::expand_path(&path_str);
-        if let Err(e) = path_allowed(&path) {
+        // ONE permission sample spans authorize → open → mutate: capturing
+        // the scope prevents set_folder_scope() from changing the rules
+        // mid-operation.
+        let scope = get_tool_permissions().folder_scope;
+        if let Err(e) = path_allowed_with(&path, scope) {
             return format!("Error: {}", e);
         }
+        let sandbox_root = match scope {
+            FolderScope::CurrentDir => {
+                match std::env::current_dir()
+                    .ok()
+                    .and_then(|c| c.canonicalize().ok())
+                {
+                    Some(root) => Some(root),
+                    None => {
+                        return format!(
+                            "Error: Safefolder cannot resolve current dir for '{}'",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            FolderScope::AllDirs => None,
+        };
         // Writing a directory path is never valid
         if path.exists() && path.is_dir() {
             return format!(
@@ -2658,12 +2702,30 @@ Common Tasks:
                 return "Error: Wrong range".to_string();
             }
 
-            let file_content = match fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(e) => {
-                    return format!("Error writing '{}': {}", path.display(), e);
+            // Handle-bound read-modify-write: the bytes below come from
+            // the SAME verified object that gets truncated + rewritten —
+            // a symlink swapped after authorization cannot redirect
+            // either the read or the mutation.
+            let mut wf = match secure_open_write(
+                &path,
+                sandbox_root.as_deref(),
+                WriteOpenMode::OpenExisting,
+            ) {
+                Ok(wf) => wf,
+                Err(SecureOpenError::NotFound) => {
+                    return format!("Error: File '{}' doesn't exist", path.display());
+                }
+                Err(SecureOpenError::SandboxDenied(msg)) => {
+                    return format!("Error: {}", msg);
+                }
+                Err(_) => {
+                    return format!("Error: Permission error writing '{}'", path.display());
                 }
             };
+            let mut file_content = String::new();
+            if let Err(e) = wf.file.read_to_string(&mut file_content) {
+                return format!("Error writing '{}': {}", path.display(), e);
+            }
 
             let mut lines: Vec<String> = file_content.lines().map(|s| s.to_string()).collect();
 
@@ -2688,7 +2750,13 @@ Common Tasks:
             }
 
             let new_content = lines.join("\n") + "\n";
-            if fs::write(&path, new_content).is_err() {
+            // Truncate + rewrite through the verified handle: even if the
+            // name now resolves elsewhere, these bytes land in the
+            // authorized object.
+            if wf.file.set_len(0).is_err()
+                || wf.file.seek(SeekFrom::Start(0)).is_err()
+                || wf.file.write_all(new_content.as_bytes()).is_err()
+            {
                 return format!("Error: Permission error writing '{}'", path.display());
             }
             // A write supersedes any speculatively cached bytes.
@@ -2706,29 +2774,62 @@ Common Tasks:
             }
             diff.trim_end().to_string()
         } else {
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-
+            // Parent directories are created INSIDE secure_open_write
+            // (anchored to the verified sandbox root on Unix) — never as
+            // a raw pathname mutation after authorization.
             let clean_body = body.trim_start_matches('\n');
-            if let Some(parent) = path.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    return format!("Error creating parent dir '{}': {}", parent.display(), e);
+            // Read-then-replace through ONE verified handle: the old bytes
+            // (for the diff) and the new bytes address the same object.
+            let mut wf = match secure_open_write(
+                &path,
+                sandbox_root.as_deref(),
+                WriteOpenMode::OpenOrCreate,
+            ) {
+                Ok(wf) => wf,
+                Err(SecureOpenError::NotFound) => {
+                    return format!(
+                        "Error writing '{}': file vanished during open",
+                        path.display()
+                    );
                 }
+                Err(SecureOpenError::SandboxDenied(msg)) => {
+                    return format!("Error: {}", msg);
+                }
+                Err(SecureOpenError::Io(e)) => {
+                    return format!("Error writing '{}': {}", path.display(), e);
+                }
+                Err(SecureOpenError::MkdirFailed(detail)) => {
+                    let parent = path
+                        .parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    return format!("Error creating parent dir '{parent}': {detail}");
+                }
+                Err(SecureOpenError::SwappedDuringOpen) => {
+                    return format!(
+                        "Error writing '{}': target changed during open",
+                        path.display()
+                    );
+                }
+            };
+            let mut old_content = String::new();
+            // A fresh file reads as empty (matches the old unwrap_or_default).
+            // A read failure here is non-fatal for the same reason.
+            let _ = wf.file.read_to_string(&mut old_content);
+            if wf.file.set_len(0).is_err()
+                || wf.file.seek(SeekFrom::Start(0)).is_err()
+                || wf.file.write_all(clean_body.as_bytes()).is_err()
+            {
+                return format!("Error writing '{}': Permission error", path.display());
             }
-            let old_content = fs::read_to_string(&path).unwrap_or_default();
-            match fs::write(&path, clean_body) {
-                Ok(()) => {
-                    // A write supersedes any speculatively cached bytes.
-                    crate::prefetch::invalidate(&path);
-                    let diff = Self::compute_diff(&old_content, clean_body);
-                    if diff.trim().is_empty() {
-                        "No changes.".to_string()
-                    } else {
-                        diff
-                    }
+            crate::prefetch::invalidate(&path);
+            {
+                let diff = Self::compute_diff(&old_content, clean_body);
+                if diff.trim().is_empty() {
+                    "No changes.".to_string()
+                } else {
+                    diff
                 }
-                Err(e) => format!("Error writing '{}': {}", path.display(), e),
             }
         }
     }
@@ -2741,6 +2842,22 @@ Common Tasks:
     /// Public preview for cmd panels.
     pub fn execute_cmd_preview(cmd_str: &str) -> String {
         Self::execute_cmd(cmd_str)
+    }
+
+    /// Map unified stable-read failures to the long-standing user-facing
+    /// read errors (contracts unchanged: sandbox message, missing-file
+    /// message, or generic permission error).
+    pub(crate) fn stable_read_error(
+        path: &std::path::Path,
+        e: crate::agent_io::StableReadError,
+    ) -> String {
+        match e {
+            crate::agent_io::StableReadError::SandboxDenied(msg) => format!("Error: {}", msg),
+            crate::agent_io::StableReadError::NotFound => {
+                format!("Error: File '{}' doesn't exist", path.display())
+            }
+            _ => format!("Error: Permission error reading '{}'", path.display()),
+        }
     }
 
     fn execute_read(path_str: &str, line_attr: Option<&str>) -> String {
@@ -2756,13 +2873,26 @@ Common Tasks:
         // Speculative read-ahead: serve fresh cache entries so a file the
         // background prefetcher already warmed costs no disk wait. The
         // sandbox gate above still runs on every call — the cache never
-        // bypasses it.
+        // bypasses it. Misses go through the ONE unified stable-read
+        // primitive (same sandbox → snapshot → generation protocol as the
+        // scheduler workers), with one retry on a mid-read race.
         let content = match crate::prefetch::get(&path) {
             Some(cached) => cached,
-            None => match fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => return format!("Error: Permission error reading '{}'", path.display()),
-            },
+            None => {
+                let sched = crate::agent_io::AgentIoScheduler::global();
+                let stable = match sched.read_through(&path) {
+                    Ok(content) => content,
+                    Err(crate::agent_io::StableReadError::UnstableReread)
+                    | Err(crate::agent_io::StableReadError::GenerationChanged) => {
+                        match sched.read_through(&path) {
+                            Ok(content) => content,
+                            Err(e) => return Self::stable_read_error(&path, e),
+                        }
+                    }
+                    Err(e) => return Self::stable_read_error(&path, e),
+                };
+                stable
+            }
         };
 
         if let Some(range_str) = line_attr {
@@ -2785,7 +2915,9 @@ Common Tasks:
 
     fn execute_ls(path_str: &str) -> String {
         let path = Self::expand_path(path_str);
-        if let Err(e) = path_allowed(&path) {
+        // ONE permission sample spans authorize → open → enumerate.
+        let scope = get_tool_permissions().folder_scope;
+        if let Err(e) = path_allowed_with(&path, scope) {
             return format!("Error: {}", e);
         }
 
@@ -2793,6 +2925,57 @@ Common Tasks:
             return format!("Error: Path '{}' doesn't exist", path.display());
         }
 
+        // Unix: enumerate anchored to the verified directory OBJECT
+        // (open → handle-verify → fdopendir → fstatat). A symlink/parent
+        // swap after authorization cannot redirect the listing: names
+        // resolve against the verified dirfd.
+        #[cfg(unix)]
+        {
+            use crate::secure_fs::SecureOpenError;
+            let root = match scope {
+                FolderScope::CurrentDir => std::env::current_dir()
+                    .ok()
+                    .and_then(|c| c.canonicalize().ok()),
+                FolderScope::AllDirs => None,
+            };
+            // CurrentDir with an unresolvable cwd fails closed.
+            let root = match (scope, root) {
+                (FolderScope::CurrentDir, None) => {
+                    return format!(
+                        "Error: Safefolder cannot resolve current dir for '{}'",
+                        path.display()
+                    );
+                }
+                (_, r) => r,
+            };
+            match crate::secure_fs::list_dir_anchored(&path, root.as_deref()) {
+                Ok(entries) => {
+                    let mut files: Vec<String> = entries
+                        .into_iter()
+                        .map(|e| {
+                            if e.is_dir {
+                                format!("  {}/", e.name)
+                            } else {
+                                format!("  {} ({} B)", e.name, e.size)
+                            }
+                        })
+                        .collect();
+                    files.sort();
+                    return format!("Directory: {}\n{}", path.display(), files.join("\n"));
+                }
+                Err(SecureOpenError::NotFound) => {
+                    return format!("Error: Path '{}' doesn't exist", path.display());
+                }
+                Err(SecureOpenError::SandboxDenied(msg)) => {
+                    return format!("Error: {}", msg);
+                }
+                Err(_) => {
+                    return format!("Error: Permission error listing '{}'", path.display());
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
         match fs::read_dir(&path) {
             Ok(entries) => {
                 let mut files = Vec::new();
@@ -2806,6 +2989,17 @@ Common Tasks:
                     }
                 }
                 files.sort();
+                // Best-effort post-listing re-verification: a symlink swap
+                // DURING the listing could have exposed another directory.
+                // This narrows (not closes) the window — fd-based readdir
+                // is deferred work — but a mid-listing escape is refused
+                // rather than served.
+                if path_allowed(&path).is_err() {
+                    return format!(
+                        "Error: Safefolder blocked path '{}' (changed during listing)",
+                        path.display()
+                    );
+                }
                 format!("Directory: {}\n{}", path.display(), files.join("\n"))
             }
             Err(_) => format!("Error: Permission error listing '{}'", path.display()),
@@ -2933,7 +3127,6 @@ mod tests {
     /// restore). Folder scope stays CurrentDir in every mutation so
     /// read-only perm consumers are unaffected; the mode flip is what
     /// must not interleave.
-    static PERM_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_expand_path() {
@@ -3013,7 +3206,7 @@ mod tests {
         // Tags quoted inside a <write> file body are content, never actions.
         // Guarded: asserts Ask-mode inertia, which a concurrent
         // perm-mutating test must not disturb mid-flight.
-        let _perm_guard = PERM_TEST_GUARD.lock().unwrap();
+        let _perm_guard = crate::agent::perm_test_guard();
         let sample = "<write src=\"$CURRENT/probe.html\">\n<html>\n<read src=\"$CURRENT/other\">\n<cmd>rm -rf /tmp/probe</cmd>\n<mcp server=\"s\" tool=\"t\">{}</mcp>\n<websearch>docs</websearch>\n</write>";
         let actions = AgentEngine::extract_proposed_actions(sample);
         assert_eq!(actions.len(), 1);
@@ -3571,7 +3764,7 @@ mod tests {
         // Single test owns the global perm state end-to-end (save /
         // mutate / restore synchronously) so parallel tests are
         // unaffected.
-        let _perm_guard = PERM_TEST_GUARD.lock().unwrap();
+        let _perm_guard = crate::agent::perm_test_guard();
         let saved = *crate::agent::TOOL_PERMS.lock().unwrap();
 
         // Ask mode without /allow: write denied, nothing written.
@@ -3612,7 +3805,7 @@ mod tests {
         // End-to-end through the canonical paths: prefetch warms the file,
         // `execute_read` serves identical bytes, and `execute_write`
         // invalidates so the next read sees fresh content.
-        let _perm_guard = PERM_TEST_GUARD.lock().unwrap();
+        let _perm_guard = crate::agent::perm_test_guard();
         let saved = *crate::agent::TOOL_PERMS.lock().unwrap();
         *crate::agent::TOOL_PERMS.lock().unwrap() = crate::agent::ToolPermissions {
             mode: crate::agent::PermissionMode::AlwaysAllow,
@@ -3698,5 +3891,322 @@ mod tests {
         let actions = AgentEngine::extract_proposed_actions("<think>hmm</think><cmd>ls</cmd>");
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0].kind, ProposedKind::Cmd));
+    }
+
+    fn write_test_perms() -> crate::agent::ToolPermissions {
+        let saved = *crate::agent::TOOL_PERMS.lock().unwrap();
+        *crate::agent::TOOL_PERMS.lock().unwrap() = crate::agent::ToolPermissions {
+            mode: crate::agent::PermissionMode::AlwaysAllow,
+            folder_scope: crate::agent::FolderScope::CurrentDir,
+            session_allow: false,
+        };
+        saved
+    }
+
+    fn write_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::current_dir().unwrap().join(format!(
+            "target/hercules-write-test-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_write_range_replace_roundtrip() {
+        // Handle-bound range replacement preserves exact legacy semantics:
+        // splice lines, diff output, invalidate cache.
+        let _perm_guard = crate::agent::perm_test_guard();
+        let saved = write_test_perms();
+        let dir = write_test_dir("range");
+        let target = format!(
+            "$CURRENT/target/hercules-write-test-range-{}/f.txt",
+            std::process::id()
+        );
+        assert!(
+            !AgentEngine::execute_write(&target, None, "l1\nl2\nl3\n")
+                .trim_start()
+                .starts_with("Error:")
+        );
+        let out = AgentEngine::execute_write(&target, Some("2..=2"), "CHANGED\n");
+        assert!(
+            out.contains("+") && out.contains("CHANGED"),
+            "diff output, got: {out}"
+        );
+        let expanded = AgentEngine::expand_path(&target);
+        assert_eq!(
+            std::fs::read_to_string(&expanded).unwrap(),
+            "l1\nCHANGED\nl3\n"
+        );
+        // Bad ranges keep legacy messages.
+        assert_eq!(
+            AgentEngine::execute_write(&target, Some("9..=9"), "x"),
+            "Error: Wrong range"
+        );
+        assert_eq!(
+            AgentEngine::execute_write(&target, Some("0..=1"), "x"),
+            "Error: Wrong range"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+    }
+
+    #[test]
+    fn test_write_static_out_of_tree_symlink_denied() {
+        // A symlink pointing outside the sandbox must be denied for
+        // WRITES (not just reads): no bytes may land out-of-tree.
+        let _perm_guard = crate::agent::perm_test_guard();
+        let saved = write_test_perms();
+        #[cfg(not(unix))]
+        {
+            *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let dir = write_test_dir("wlStatic");
+            let outside_dir =
+                std::env::temp_dir().join(format!("hercules-write-outside-{}", std::process::id()));
+            std::fs::create_dir_all(&outside_dir).unwrap();
+            let secret = outside_dir.join("secret.txt");
+            std::fs::write(&secret, "SECRET\n").unwrap();
+            let link = dir.join("link.txt");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            let target = format!(
+                "$CURRENT/target/hercules-write-test-wlStatic-{}/link.txt",
+                std::process::id()
+            );
+            let out = AgentEngine::execute_write(&target, None, "pwned\n");
+            assert!(
+                out.trim_start().starts_with("Error:"),
+                "out-of-tree write denied, got: {out}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&secret).unwrap(),
+                "SECRET\n",
+                "outside file untouched"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&outside_dir);
+        }
+        *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+    }
+
+    #[test]
+    fn test_write_nested_create_anchored() {
+        // Deep nonexistent chains are created through the anchored walk:
+        // every component stays beneath the sandbox root.
+        let _perm_guard = crate::agent::perm_test_guard();
+        let saved = write_test_perms();
+        let dir = write_test_dir("nested");
+        let target = format!(
+            "$CURRENT/target/hercules-write-test-nested-{}/new/a/b/file.txt",
+            std::process::id()
+        );
+        let out = AgentEngine::execute_write(&target, None, "deep\n");
+        assert!(
+            !out.trim_start().starts_with("Error:"),
+            "nested create failed: {out}"
+        );
+        let expanded = AgentEngine::expand_path(&target);
+        assert_eq!(std::fs::read_to_string(&expanded).unwrap(), "deep\n");
+        assert!(expanded.starts_with(std::env::current_dir().unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+        *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+    }
+
+    #[test]
+    fn test_write_parent_escape_denied() {
+        // A parent component pointing outside the sandbox denies the
+        // write: the anchored walk verifies every component, and nothing
+        // is created or modified outside.
+        let _perm_guard = crate::agent::perm_test_guard();
+        let saved = write_test_perms();
+        #[cfg(not(unix))]
+        {
+            *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let dir = write_test_dir("parentEsc");
+            let outside_dir = std::env::temp_dir()
+                .join(format!("hercules-write-parentout-{}", std::process::id()));
+            std::fs::create_dir_all(&outside_dir).unwrap();
+            let link = dir.join("linkdir");
+            std::os::unix::fs::symlink(&outside_dir, &link).unwrap();
+            let target = format!(
+                "$CURRENT/target/hercules-write-test-parentEsc-{}/linkdir/sub/file.txt",
+                std::process::id()
+            );
+            let out = AgentEngine::execute_write(&target, None, "pwned\n");
+            assert!(
+                out.contains("Safefolder") || out.contains("outside"),
+                "parent escape denied at the anchored walk, got: {out}"
+            );
+            // Nothing created outside: no new entries under outside_dir.
+            let entries: Vec<_> = std::fs::read_dir(&outside_dir).unwrap().flatten().collect();
+            assert!(
+                entries.is_empty(),
+                "outside dir must stay untouched: {entries:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&outside_dir);
+        }
+        *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+    }
+
+    #[test]
+    fn test_write_symlink_swap_hammer() {
+        // Hammer a symlink between an in-tree file and an out-of-tree
+        // file while writing through it. Deterministic invariant: the
+        // out-of-tree file is NEVER modified (in-tree writes or denials
+        // are both safe outcomes).
+        let _perm_guard = crate::agent::perm_test_guard();
+        let saved = write_test_perms();
+        #[cfg(not(unix))]
+        {
+            *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let dir = write_test_dir("wlHammer");
+            let real = dir.join("real.txt");
+            std::fs::write(&real, "start\n").unwrap();
+            let outside_dir = std::env::temp_dir()
+                .join(format!("hercules-write-hammerout-{}", std::process::id()));
+            std::fs::create_dir_all(&outside_dir).unwrap();
+            let secret = outside_dir.join("secret.txt");
+            std::fs::write(&secret, "SECRET\n").unwrap();
+            let link = dir.join("link.txt");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let target = format!(
+                "$CURRENT/target/hercules-write-test-wlHammer-{}/link.txt",
+                std::process::id()
+            );
+
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let stopper = stop.clone();
+            let (link_c, real_c, secret_c) = (link.clone(), real.clone(), secret.clone());
+            let swapper = std::thread::spawn(move || {
+                let mut to_secret = true;
+                while !stopper.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&link_c);
+                    let t = if to_secret { &secret_c } else { &real_c };
+                    let _ = std::os::unix::fs::symlink(t, &link_c);
+                    to_secret = !to_secret;
+                }
+            });
+            for i in 0..500 {
+                let _ = AgentEngine::execute_write(&target, None, &format!("v{i}\n"));
+            }
+            stop.store(true, Ordering::Relaxed);
+            swapper.join().unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&secret).unwrap(),
+                "SECRET\n",
+                "sandbox escape: out-of-tree file modified"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&outside_dir);
+        }
+        *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+    }
+
+    #[test]
+    fn test_ls_static_out_of_tree_dirlink_denied() {
+        // Directory listings through an out-of-tree symlink are denied.
+        let _perm_guard = crate::agent::perm_test_guard();
+        let saved = write_test_perms();
+        #[cfg(not(unix))]
+        {
+            *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let dir = write_test_dir("lsStatic");
+            let outside_dir =
+                std::env::temp_dir().join(format!("hercules-ls-outside-{}", std::process::id()));
+            std::fs::create_dir_all(&outside_dir).unwrap();
+            std::fs::write(outside_dir.join("marker.txt"), "x\n").unwrap();
+            let link = dir.join("dirlink");
+            std::os::unix::fs::symlink(&outside_dir, &link).unwrap();
+            let target = format!(
+                "$CURRENT/target/hercules-write-test-lsStatic-{}/dirlink",
+                std::process::id()
+            );
+            let out = AgentEngine::execute_ls(&target);
+            assert!(
+                out.trim_start().starts_with("Error:"),
+                "out-of-tree listing denied, got: {out}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&outside_dir);
+        }
+        *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+    }
+
+    #[test]
+    fn test_ls_symlink_swap_hammer() {
+        // Hammer a dir symlink in-tree ↔ out-of-tree while listing.
+        // The outside marker must NEVER appear in any listing.
+        let _perm_guard = crate::agent::perm_test_guard();
+        let saved = write_test_perms();
+        #[cfg(not(unix))]
+        {
+            *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let dir = write_test_dir("lsHammer");
+            let indir = dir.join("indir");
+            std::fs::create_dir_all(&indir).unwrap();
+            std::fs::write(indir.join("inner.txt"), "x\n").unwrap();
+            let outside_dir =
+                std::env::temp_dir().join(format!("hercules-ls-hammerout-{}", std::process::id()));
+            std::fs::create_dir_all(&outside_dir).unwrap();
+            std::fs::write(outside_dir.join("OUTMARKER.txt"), "x\n").unwrap();
+            let link = dir.join("dirlink");
+            std::os::unix::fs::symlink(&indir, &link).unwrap();
+            let target = format!(
+                "$CURRENT/target/hercules-write-test-lsHammer-{}/dirlink",
+                std::process::id()
+            );
+
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let stopper = stop.clone();
+            let (link_c, in_c, out_c) = (link.clone(), indir.clone(), outside_dir.clone());
+            let swapper = std::thread::spawn(move || {
+                let mut to_out = true;
+                while !stopper.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&link_c);
+                    let t = if to_out { &out_c } else { &in_c };
+                    let _ = std::os::unix::fs::symlink(t, &link_c);
+                    to_out = !to_out;
+                }
+            });
+            let mut saw_inner = false;
+            for _ in 0..500 {
+                let out = AgentEngine::execute_ls(&target);
+                assert!(
+                    !out.contains("OUTMARKER"),
+                    "sandbox escape: outside listing served: {out}"
+                );
+                if out.contains("inner.txt") {
+                    saw_inner = true;
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            swapper.join().unwrap();
+            assert!(saw_inner, "hammer must include successful in-tree listings");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&outside_dir);
+        }
+        *crate::agent::TOOL_PERMS.lock().unwrap() = saved;
     }
 }

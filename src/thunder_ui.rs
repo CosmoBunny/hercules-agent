@@ -696,6 +696,7 @@ pub struct IfaceAddr {
 /// Enumerate local interface addresses via `getifaddrs`, excluding
 /// loopback interfaces/addresses and unspecified addresses. Order is
 /// the OS order (callers sort deterministically).
+#[cfg(unix)]
 pub fn local_interface_addrs() -> Vec<IfaceAddr> {
     let mut out = Vec::new();
     // SAFETY: getifaddrs/freeifaddrs pairing; we only read fields.
@@ -742,6 +743,15 @@ pub fn local_interface_addrs() -> Vec<IfaceAddr> {
         libc::freeifaddrs(head);
     }
     out
+}
+
+/// Non-Unix fallback: no `getifaddrs` available. Returns no addresses
+/// rather than fabricating any — callers already handle the empty case
+/// (no LAN row shown). A GetAdaptersAddresses implementation can replace
+/// this when Windows CI exists to verify it.
+#[cfg(not(unix))]
+pub fn local_interface_addrs() -> Vec<IfaceAddr> {
+    Vec::new()
 }
 
 /// Rank for deterministic preference: private LAN IPv4 first, then

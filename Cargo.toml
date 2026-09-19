@@ -87,6 +87,11 @@ tree-sitter-python = "0.23"
 tree-sitter-javascript = "0.23"
 tree-sitter-typescript = "0.23"
 
+# Windows handle→path verification for the sandbox (secure_fs):
+# CreateFileW + GetFinalPathNameByHandleW. Linux/macOS need no extra dep.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = "3.10"
 

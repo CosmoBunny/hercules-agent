@@ -1,49 +1,27 @@
-//! Speculative read-ahead cache: latency hiding for the agent loop.
+//! Deterministic read predictor + canonical-path shims.
 //!
-//! The canonical tool pipeline (`AgentEngine::parse_tool_calls` →
-//! `App::claim_tool_call` → `AgentEngine::execute_proposed`) stays the ONLY
-//! authority that executes model tool calls. This module never executes
-//! anything on the model's behalf and never produces [`ProposedAction`]s.
-//! It only keeps recently-likely file contents warm so that when the model
-//! issues its next `<read>`, the bytes are already in memory while the LLM
-//! was busy reasoning.
+//! The [`crate::agent_io::AgentIoScheduler`] owns workers, the
+//! generation-versioned cache, budgets, metrics and cancellation. This
+//! module owns *prediction* (which files will the model read next?) and
+//! keeps the original thin shims (`get`, `invalidate`, `fetch_one`,
+//! `speculate_from_read`) so the canonical `execute_read` /
+//! `execute_write` / `execute_proposed` call sites — and their permission
+//! gates — are unchanged.
 //!
-//! Safety contract (read-only speculation):
-//! - Only file READS are ever prefetched. Writes, commands, MCP, skills,
-//!   agents and memory are never speculated — speculation has no side
-//!   effects by construction.
-//! - Every candidate still passes the SAME `path_allowed()` sandbox gate as
-//!   a real read, both when cached (fetch time) and when served (the
-//!   canonical `execute_read` checks before consulting the cache).
-//! - Freshness is enforced three ways: the canonical `execute_write`
-//!   invalidates the written path, cache hits revalidate mtime+length
-//!   against the filesystem, and entries expire after [`CACHE_TTL`].
-//! - Bounded by construction: entry/file/total caps plus a limit on
-//!   concurrent background threads, so a hostile model output cannot turn
-//!   speculation into a disk/memory DoS.
+//! Safety contract (unchanged): only file READS are ever predicted.
+//! Every candidate passes the scheduler's `path_allowed()` gate at fetch
+//! time, and the canonical `execute_read` re-checks it at serve time.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Instant, SystemTime};
 
-/// Maximum cached files.
-const MAX_ENTRIES: usize = 64;
-/// Maximum total cached bytes (8 MiB).
-const MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-/// Files larger than this are never cached (256 KiB).
-const MAX_FILE_BYTES: u64 = 256 * 1024;
-/// Cache entry lifetime.
-const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
-/// Upper bound on candidates per speculation pass.
-const MAX_CANDIDATES: usize = 8;
+use crate::agent_io::{RetrievalCandidate, RetrievalConfig, RetrievalReason};
+
+/// Re-exported for tests; authoritative value lives in `agent_io`.
+pub(crate) const MAX_FILE_BYTES: u64 = crate::agent_io::MAX_FILE_BYTES;
 /// Upper bound on same-directory sibling candidates.
 const MAX_SIBLINGS: usize = 6;
 /// Only the first N bytes of a read result are scanned for candidates.
 const MAX_SCAN_BYTES: usize = 200 * 1024;
-/// Maximum concurrent background prefetch threads.
-const MAX_PREFETCH_THREADS: usize = 2;
 
 /// File extensions that may be treated as path mentions when quoted.
 const PATHLIKE_EXTENSIONS: &[&str] = &[
@@ -51,172 +29,83 @@ const PATHLIKE_EXTENSIONS: &[&str] = &[
     "toml", "json", "yaml", "yml", "md", "html", "css", "sh", "txt",
 ];
 
-struct CacheEntry {
-    content: String,
-    /// Filesystem mtime when cached (staleness check).
-    mtime: SystemTime,
-    /// File length when cached (mtime-granularity backstop).
-    len: u64,
-    inserted: Instant,
-}
+/// Ambient run id for static call sites without run context
+/// (`execute_proposed` is `&self`-free). Never cancelled by App hooks;
+/// App-integrated paths use real run ids.
+pub const AMBIENT_RUN_ID: u64 = 0;
 
-struct PrefetchCache {
-    entries: HashMap<PathBuf, CacheEntry>,
-    total_bytes: usize,
-}
-
-impl PrefetchCache {
-    fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            total_bytes: 0,
-        }
-    }
-
-    /// Insert under the canonical path, evicting oldest-first on overflow.
-    /// Oversized single files are refused.
-    fn put(&mut self, canonical: PathBuf, content: String, mtime: SystemTime, len: u64) {
-        if content.len() as u64 > MAX_FILE_BYTES {
-            return;
-        }
-        if let Some(old) = self.entries.remove(&canonical) {
-            self.total_bytes = self.total_bytes.saturating_sub(old.content.len());
-        }
-        while (self.entries.len() >= MAX_ENTRIES
-            || self.total_bytes + content.len() > MAX_TOTAL_BYTES)
-            && !self.entries.is_empty()
-        {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.inserted)
-                .map(|(k, _)| k.clone());
-            match oldest {
-                Some(k) => {
-                    if let Some(old) = self.entries.remove(&k) {
-                        self.total_bytes = self.total_bytes.saturating_sub(old.content.len());
-                    }
-                }
-                None => break,
-            }
-        }
-        self.total_bytes += content.len();
-        self.entries.insert(
-            canonical,
-            CacheEntry {
-                content,
-                mtime,
-                len,
-                inserted: Instant::now(),
-            },
-        );
-    }
-
-    fn invalidate(&mut self, canonical: &Path) {
-        if let Some(old) = self.entries.remove(canonical) {
-            self.total_bytes = self.total_bytes.saturating_sub(old.content.len());
-        }
-    }
-}
-
-static CACHE: std::sync::OnceLock<Mutex<PrefetchCache>> = std::sync::OnceLock::new();
-
-fn cache_lock() -> std::sync::MutexGuard<'static, PrefetchCache> {
-    CACHE
-        .get_or_init(|| Mutex::new(PrefetchCache::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
-
-static INFLIGHT_THREADS: AtomicUsize = AtomicUsize::new(0);
-
-fn canonical_of(path: &Path) -> Option<PathBuf> {
-    path.canonicalize().ok()
-}
-
-/// Serve a cached read if fresh: TTL valid AND current mtime+length match
-/// what was cached. Stale entries are dropped. Permission is NOT checked
-/// here — the canonical `execute_read` enforces `path_allowed()` before
-/// calling this, so the sandbox has exactly one choke point.
+/// Serve a cached read if fresh (generation + mtime + length + TTL),
+/// through the authorization-aware wrapper (sandbox enforced inside).
+/// `execute_read` additionally checks `path_allowed()` first for its
+/// user-facing error strings; defense in depth, one gate implementation.
 pub fn get(path: &Path) -> Option<String> {
-    let canonical = canonical_of(path)?;
-    let mut cache = cache_lock();
-    let entry = cache.entries.get(&canonical)?;
-    if entry.inserted.elapsed() > CACHE_TTL {
-        cache.invalidate(&canonical);
-        return None;
-    }
-    let meta = std::fs::metadata(&canonical).ok()?;
-    let fresh_mtime = meta.modified().ok()?;
-    if fresh_mtime != entry.mtime || meta.len() != entry.len {
-        cache.invalidate(&canonical);
-        return None;
-    }
-    Some(entry.content.clone())
+    crate::agent_io::AgentIoScheduler::global()
+        .serve_authorized(path)
+        .map(|hit| hit.content)
 }
 
-/// Drop a path from the cache (called by the canonical write path).
+/// Drop a path from the cache + bump its generation (canonical write path).
 pub fn invalidate(path: &Path) {
-    if let Some(canonical) = canonical_of(path) {
-        cache_lock().invalidate(&canonical);
-    } else {
-        // Path no longer exists (deleted): drop by raw key as fallback.
-        cache_lock().invalidate(path);
-    }
+    crate::agent_io::AgentIoScheduler::global().notify_write(path);
 }
 
-/// Fetch one file into the cache. Returns true when the file is cached
-/// afterwards (already-fresh counts). Enforces the sandbox gate.
+/// Fetch one file into the cache synchronously. Returns true when the
+/// file is cached afterwards (already-fresh counts). Goes through the
+/// ONE unified stable-read primitive (sandbox → stable identity →
+/// snapshot validation), so warm-ups carry the same guarantees as
+/// worker fetches. Used by tests and one-shot warm-ups; the background
+/// path goes through the scheduler workers instead.
 fn fetch_one(abs: &Path) -> bool {
-    if crate::agent::path_allowed(abs).is_err() {
-        return false;
-    }
-    let canonical = match canonical_of(abs) {
-        Some(c) => c,
-        None => return false,
-    };
-    if get(&canonical).is_some() {
+    let sched = crate::agent_io::AgentIoScheduler::global();
+    if sched.serve_authorized(abs).is_some() {
         return true;
     }
-    let meta = match std::fs::metadata(&canonical) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-        return false;
-    }
-    let content = match std::fs::read_to_string(&canonical) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let mtime = meta.modified().unwrap_or_else(|_| SystemTime::now());
-    let len = meta.len();
-    cache_lock().put(canonical, content, mtime, len);
-    true
+    sched.read_through(abs).is_ok()
 }
 
 /// Suggest likely-next reads given the file just read and its content.
 /// Pure candidate extraction + existence checks; no global state, no
-/// permission checks (those happen in [`fetch_one`]).
+/// permission checks (those happen in the scheduler workers).
 /// Order: explicit mentions first (strongest signal), siblings after.
 /// Deterministic for identical directory state.
 pub fn suggest_next_reads(read_path: &Path, content: &str, max: usize) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
+    let config = RetrievalConfig::default();
+    suggest_candidates(read_path, content, &config)
+        .into_iter()
+        .take(max)
+        .map(|c| c.path)
+        .collect()
+}
+
+/// Reason-tagged, confidence-scored version of [`suggest_next_reads`]
+/// for the scheduler. Confidence comes from [`RetrievalConfig`];
+/// candidates are capped per event and carry estimated byte sizes for
+/// budget accounting.
+pub fn suggest_candidates(
+    read_path: &Path,
+    content: &str,
+    config: &RetrievalConfig,
+) -> Vec<RetrievalCandidate> {
+    let mut out: Vec<(PathBuf, RetrievalReason)> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    let try_push =
-        |out: &mut Vec<PathBuf>, seen: &mut std::collections::HashSet<PathBuf>, p: PathBuf| {
-            if out.len() >= max || !seen.insert(p.clone()) {
-                return;
-            }
-            out.push(p);
-        };
+    let max = config.max_candidates_per_event;
+    let mut try_push = |out: &mut Vec<(PathBuf, RetrievalReason)>,
+                        seen: &mut std::collections::HashSet<PathBuf>,
+                        p: PathBuf,
+                        reason: RetrievalReason| {
+        if out.len() >= max || !seen.insert(p.clone()) {
+            return;
+        }
+        out.push((p, reason));
+    };
 
     let Some(base_dir) = read_path.parent() else {
-        return out;
+        return Vec::new();
     };
     let self_name = read_path
         .file_name()
         .map(|s| s.to_string_lossy().to_string());
+    let read_ext = read_path.extension().and_then(|e| e.to_str());
 
     let scanned = if content.len() > MAX_SCAN_BYTES {
         &content[..MAX_SCAN_BYTES]
@@ -244,7 +133,7 @@ pub fn suggest_next_reads(read_path: &Path, content: &str, max: usize) -> Vec<Pa
                     base_dir.join(name).join("mod.rs"),
                 ] {
                     if is_plain_file(&cand) {
-                        try_push(&mut out, &mut seen, cand);
+                        try_push(&mut out, &mut seen, cand, RetrievalReason::RustModule);
                     }
                 }
             }
@@ -260,9 +149,9 @@ pub fn suggest_next_reads(read_path: &Path, content: &str, max: usize) -> Vec<Pa
             if lit.contains("://") || lit.is_empty() {
                 continue;
             }
-            for cand in resolve_literal(base_dir, &lit) {
+            for (cand, reason) in resolve_literal_reasoned(base_dir, read_ext, line, &lit) {
                 if is_plain_file(&cand) {
-                    try_push(&mut out, &mut seen, cand);
+                    try_push(&mut out, &mut seen, cand, reason);
                 }
             }
         }
@@ -270,7 +159,7 @@ pub fn suggest_next_reads(read_path: &Path, content: &str, max: usize) -> Vec<Pa
 
     // Same-directory siblings with the same extension (bounded, sorted).
     if out.len() < max {
-        let wanted_ext = read_path.extension().and_then(|e| e.to_str());
+        let wanted_ext = read_ext;
         if let Ok(rd) = std::fs::read_dir(base_dir) {
             let mut sibs: Vec<PathBuf> = rd
                 .flatten()
@@ -300,12 +189,28 @@ pub fn suggest_next_reads(read_path: &Path, content: &str, max: usize) -> Vec<Pa
                 if out.len() >= max {
                     break;
                 }
-                try_push(&mut out, &mut seen, s);
+                try_push(
+                    &mut out,
+                    &mut seen,
+                    s,
+                    RetrievalReason::SameDirectorySibling,
+                );
             }
         }
     }
 
-    out
+    out.into_iter()
+        .map(|(path, reason)| {
+            let estimated_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+            let confidence = config.confidence_for(reason);
+            RetrievalCandidate {
+                path,
+                confidence,
+                reason,
+                estimated_bytes,
+            }
+        })
+        .collect()
 }
 
 fn is_module_name(name: &str) -> bool {
@@ -319,7 +224,7 @@ fn is_plain_file(p: &Path) -> bool {
     p.is_file()
 }
 
-fn quoted_literals(line: &str) -> Vec<String> {
+pub(crate) fn quoted_literals(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let bytes = line.as_bytes();
     let mut i = 0;
@@ -348,18 +253,40 @@ fn quoted_literals(line: &str) -> Vec<String> {
 /// Resolve a quoted literal against the read file's directory.
 /// Returns candidates in preference order; existence is checked by the
 /// caller. Extensionless relatives get JS/TS-style probing.
-fn resolve_literal(base_dir: &Path, lit: &str) -> Vec<PathBuf> {
-    // Python `from .foo import` / `from . import` handled by caller? No —
-    // keep it here: leading dots denote same-dir modules.
-    let mut rel = lit.trim().to_string();
+pub(crate) fn resolve_literal(base_dir: &Path, lit: &str) -> Vec<PathBuf> {
+    resolve_literal_reasoned(base_dir, None, "", lit)
+        .into_iter()
+        .map(|(p, _)| p)
+        .collect()
+}
+
+fn is_js_family(ext: Option<&str>) -> bool {
+    matches!(ext, Some("js" | "ts" | "tsx" | "jsx" | "mjs" | "cjs"))
+}
+
+/// Reason-tagged literal resolution: same candidates as
+/// [`resolve_literal`], each labeled with *why* it was predicted.
+fn resolve_literal_reasoned(
+    base_dir: &Path,
+    read_ext: Option<&str>,
+    line: &str,
+    lit: &str,
+) -> Vec<(PathBuf, RetrievalReason)> {
     // Python `from .foo import` style: dots DIRECTLY attached to a module
     // name. `./x` / `../x` are filesystem relatives, not Python imports.
+    let mut rel = lit.trim().to_string();
     let dots = rel.chars().take_while(|&c| c == '.').count();
     if dots > 0 && rel[dots..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
         let mod_path = rel[dots..].replace('.', "/");
         return vec![
-            base_dir.join(format!("{mod_path}.py")),
-            base_dir.join(&mod_path).join("__init__.py"),
+            (
+                base_dir.join(format!("{mod_path}.py")),
+                RetrievalReason::PythonImport,
+            ),
+            (
+                base_dir.join(&mod_path).join("__init__.py"),
+                RetrievalReason::PythonImport,
+            ),
         ];
     }
     // Filesystem-relative (`./x`, `../x`, `x/y`): resolve against the read
@@ -381,6 +308,11 @@ fn resolve_literal(base_dir: &Path, lit: &str) -> Vec<PathBuf> {
     if !looks_like_file && Path::new(&rel).extension().is_none() {
         // Extensionless relative (JS/TS import): probe candidates.
         let base = base_dir.join(&rel);
+        let reason = if is_js_family(read_ext) {
+            RetrievalReason::JsImport
+        } else {
+            RetrievalReason::QuotedPath
+        };
         return vec![
             base.clone(),
             base.with_extension("ts"),
@@ -389,47 +321,47 @@ fn resolve_literal(base_dir: &Path, lit: &str) -> Vec<PathBuf> {
             base.with_extension("jsx"),
             base.join("index.ts"),
             base.join("index.js"),
-        ];
+        ]
+        .into_iter()
+        .map(|p| (p, reason))
+        .collect();
     }
     if !looks_like_file {
         return Vec::new();
     }
-    vec![base_dir.join(&rel)]
+    let reason = if line.contains("#include") || line.contains("include!") {
+        RetrievalReason::IncludeDirective
+    } else if read_ext == Some("md") {
+        RetrievalReason::MarkdownLink
+    } else if is_js_family(read_ext) {
+        RetrievalReason::JsImport
+    } else if read_ext == Some("py") {
+        RetrievalReason::PythonImport
+    } else {
+        RetrievalReason::QuotedPath
+    };
+    vec![(base_dir.join(&rel), reason)]
 }
 
 /// Entry point from the canonical read path: after a successful read,
-/// warm the cache in the background while the LLM keeps reasoning.
-/// Returns immediately (spawns at most one detached thread; bounded by
-/// [`MAX_PREFETCH_THREADS`]. Never speculates from error outputs.
+/// submit predictions to the scheduler workers while the LLM keeps
+/// reasoning. Returns immediately. Never speculates from error outputs.
+/// Static call sites without run context use [`AMBIENT_RUN_ID`].
 pub fn speculate_from_read(read_path: PathBuf, output: String) {
     if output.trim_start().starts_with("Error:") {
         return;
     }
-    let inflight = INFLIGHT_THREADS.fetch_add(1, Ordering::SeqCst);
-    if inflight >= MAX_PREFETCH_THREADS {
-        INFLIGHT_THREADS.fetch_sub(1, Ordering::SeqCst);
-        return;
-    }
-    let _ = std::thread::Builder::new()
-        .name("hercules-prefetch".to_string())
-        .spawn(move || {
-            struct Guard;
-            impl Drop for Guard {
-                fn drop(&mut self) {
-                    INFLIGHT_THREADS.fetch_sub(1, Ordering::SeqCst);
-                }
-            }
-            let _guard = Guard;
-            for cand in suggest_next_reads(&read_path, &output, MAX_CANDIDATES) {
-                fetch_one(&cand);
-            }
-        });
+    crate::agent_io::AgentIoScheduler::global().notify_explicit_read(
+        AMBIENT_RUN_ID,
+        &read_path,
+        &output,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -455,9 +387,11 @@ mod tests {
     }
 
     fn clear_cache() {
-        let mut c = cache_lock();
-        c.entries.clear();
-        c.total_bytes = 0;
+        crate::agent_io::AgentIoScheduler::global().reset_for_test();
+    }
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        crate::agent_io::test_serial_guard()
     }
 
     #[test]
@@ -559,6 +493,7 @@ mod tests {
 
     #[test]
     fn cache_serve_invalidate_and_stale_mtime() {
+        let _g = serial();
         clear_cache();
         let dir = test_dir("cache");
         let f = write(&dir, "f.txt", "version-one-content-here\n");
@@ -589,6 +524,7 @@ mod tests {
 
     #[test]
     fn sandbox_is_respected_by_fetch() {
+        let _g = serial();
         clear_cache();
         // Outside the current-dir safefolder (default FolderScope): refused.
         let outside = PathBuf::from("/definitely-not-hercules-prefetch-xyz/file.txt");
@@ -599,6 +535,7 @@ mod tests {
 
     #[test]
     fn oversized_files_refused() {
+        let _g = serial();
         clear_cache();
         let dir = test_dir("big");
         let big = dir.join("big.bin");
@@ -612,7 +549,8 @@ mod tests {
 
     #[test]
     fn error_outputs_never_speculate() {
-        // No thread, no cache entries, no panic on error text.
+        // No submission, no cache entries, no panic on error text.
+        let _g = serial();
         clear_cache();
         let dir = test_dir("err");
         let f = write(&dir, "real.rs", "mod sib;\n");

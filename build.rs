@@ -24,7 +24,8 @@
 //        # existing source checkout
 //        LLAMA_CPP_SRC=~/src/llama.cpp cargo build --release --features llama-cpp-static
 //
-//        # auto-clone (needs internet on first build)
+//        # auto-clone (needs internet on first build; pins an immutable
+//        # commit by default, override with LLAMA_CPP_REV=<sha|tag>)
 //        cargo build --release --features llama-cpp-static
 //
 // The feature flag `llama-cpp-static` must be enabled; without it the runtime
@@ -72,6 +73,16 @@ fn main() {
 // Mode A — pre-built install
 // ===========================================================================
 
+/// Link target triple components for THIS build. build.rs executes on the
+/// HOST, so `cfg!(target_os)` would be wrong under cross-compilation —
+/// always use these (cargo sets CARGO_CFG_* for the target).
+fn target_os() -> String {
+    std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| std::env::consts::OS.to_string())
+}
+fn target_env() -> String {
+    std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default()
+}
+
 fn link_from_install_dir(dir: &Path) {
     // llama.cpp core libraries we care about (ignores openvino, tbb, hwloc…)
     let core_names = [
@@ -89,100 +100,278 @@ fn link_from_install_dir(dir: &Path) {
 
     println!("cargo:rustc-link-search=native={}", dir.display());
 
-    // Collect static archives: .a (Unix/MinGW) or .lib (MSVC)
-    let mut archives = collect_libs(dir, "a");
-    archives.extend(collect_libs(dir, "lib")); // MSVC static libs
-
-    // Collect shared libs: .so (Linux) / .dylib (macOS) / .dll.lib or .dll (Windows)
-    let shared = collect_libs(dir, shared_ext());
-
-    if !archives.is_empty() {
-        eprintln!(
-            "[build.rs] {} static archive(s) in {} — static linking",
-            archives.len(),
-            dir.display()
-        );
-        for path in sort_libs(archives) {
-            let stem = lib_stem(&path);
-            if core_names.iter().any(|n| stem == *n) {
-                println!("cargo:rustc-link-lib=static={stem}");
+    let files: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_file())
+                .map(|e| e.file_name().to_string_lossy().to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    match plan_prebuilt_links(&target_os(), &target_env(), &files, &core_names) {
+        Ok(plan) => {
+            for w in &plan.warnings {
+                eprintln!("[build.rs] warning: {w}");
+            }
+            if plan.static_mode {
+                eprintln!(
+                    "[build.rs] {} static archive(s) in {} — static linking",
+                    plan.libs.len(),
+                    dir.display()
+                );
+                for lib in &plan.libs {
+                    println!("cargo:rustc-link-lib=static={}", lib.name);
+                }
+            } else {
+                eprintln!(
+                    "[build.rs] No static archives in {} — dynamic linking with baked rpath",
+                    dir.display()
+                );
+                // Bake the directory so the binary finds the libs without PATH/LD_LIBRARY_PATH.
+                bake_rpath(dir);
+                for lib in &plan.libs {
+                    println!("cargo:rustc-link-lib=dylib={}", lib.name);
+                }
             }
         }
-    } else if !shared.is_empty() {
-        eprintln!(
-            "[build.rs] No static archives in {} — dynamic linking with baked rpath",
-            dir.display()
-        );
-        // Bake the directory so the binary finds the libs without PATH/LD_LIBRARY_PATH.
-        bake_rpath(dir);
-
-        for path in sort_libs(shared) {
-            let stem = lib_stem(&path);
-            if core_names.iter().any(|n| stem == *n) {
-                println!("cargo:rustc-link-lib=dylib={stem}");
-            }
-        }
-    } else {
-        panic!(
-            "\nLLAMA_INSTALL_DIR={} has no libllama.{{a,so,dylib,lib,dll}} files.\n\
+        Err(msg) => panic!(
+            "\nLLAMA_INSTALL_DIR={} unusable: {msg}\n\
              Is this the correct directory?\n",
             dir.display()
-        );
+        ),
     }
 
     link_system_libs();
+}
+
+/// One rustc link directive from the planner.
+#[derive(Debug, PartialEq)]
+struct PlannedLib {
+    kind: LinkKind,
+    /// rustc-link-lib stem (e.g. `llama`, `ggml-cpu`).
+    name: String,
+}
+
+#[derive(Debug, PartialEq)]
+enum LinkKind {
+    Static,
+    Dylib,
+}
+
+#[derive(Debug)]
+struct PrebuiltPlan {
+    static_mode: bool,
+    libs: Vec<PlannedLib>,
+    warnings: Vec<String>,
+}
+
+/// Pure link planner for a prebuilt install directory: given the TARGET
+/// platform and the directory's filenames, decide static vs dynamic and
+/// the exact rustc directives — or fail with an actionable message.
+///
+/// Toolchain rules encoded here (verified against linker requirements):
+/// - MSVC links NEVER consume a bare `.dll`: it needs the import library
+///   (`<stem>.lib`, CMake also accepts `<stem>.dll.lib` via rustc's
+///   search). A `X.lib` next to `X.dll` is an IMPORT lib, not a static
+///   archive — linking it as `static=` would silently link the DLL while
+///   reporting "static linking".
+/// - MinGW ld links `lib<stem>.dll.a` preferably, else a bare `<stem>.dll`
+///   directly (documented ld auto-import search); plain `.a` without a
+///   same-stem `.dll` is static.
+/// - Unix/macOS: `.a` static, versioned `.so` / `.dylib` dynamic (stem
+///   mapping handles `libllama.so.0.0.1` → `llama`).
+/// Static archives win whenever present (previous behavior preserved).
+fn plan_prebuilt_links(
+    target_os: &str,
+    target_env: &str,
+    files: &[String],
+    core_names: &[&str],
+) -> Result<PrebuiltPlan, String> {
+    fn has(files: &[String], name: &str) -> bool {
+        files.iter().any(|f| f == name)
+    }
+    // Link order rank (dependents before dependencies).
+    fn rank(stem: &str) -> u8 {
+        if stem == "mtmd" {
+            0
+        } else if stem == "llama" {
+            1
+        } else if stem.starts_with("ggml-") {
+            3
+        } else if stem == "ggml" {
+            4
+        } else {
+            2
+        }
+    }
+    let mut warnings: Vec<String> = Vec::new();
+
+    if target_os == "windows" {
+        let msvc = target_env != "gnu";
+        // Per-stem file inventory (lowercased names).
+        let mut statik: Vec<String> = Vec::new();
+        let mut shared: Vec<String> = Vec::new();
+        for core in core_names {
+            if msvc {
+                // A `X.lib` next to `X.dll` is an IMPORT lib, not a static
+                // archive; a bare `X.lib` with no `X.dll` is static.
+                let has_lib = has(files, &format!("{core}.lib"));
+                let has_dll = has(files, &format!("{core}.dll"));
+                let has_dll_lib = has(files, &format!("{core}.dll.lib"));
+                if has_lib && !has_dll {
+                    statik.push(core.to_string());
+                } else if has_lib || has_dll_lib {
+                    shared.push(core.to_string());
+                } else if has_dll {
+                    return Err(format!(
+                        "`{core}.dll` found but no `{core}.lib` import library beside it — \
+                         MSVC cannot link a bare .dll. Install the import library \
+                         (CMake shared builds emit it next to the .dll)."
+                    ));
+                }
+            } else {
+                // MinGW: `libX.dll.a` preferred, bare `X.dll` via auto-import.
+                let dll_a = files
+                    .iter()
+                    .any(|f| f == &format!("lib{core}.dll.a") || f == &format!("{core}.dll.a"));
+                let bare_dll = has(files, &format!("{core}.dll"));
+                let bare_a = (has(files, &format!("lib{core}.a"))
+                    || has(files, &format!("{core}.a")))
+                    && !bare_dll;
+                if bare_a {
+                    statik.push(core.to_string());
+                } else if dll_a || bare_dll {
+                    if bare_dll && !dll_a {
+                        warnings.push(format!(
+                            "`{core}.dll` without `lib{core}.dll.a`: relying on MinGW ld \
+                             direct-DLL auto-import; prefer the import library."
+                        ));
+                    }
+                    shared.push(core.to_string());
+                }
+            }
+        }
+        if !statik.is_empty() {
+            statik.sort_by_key(|s| rank(s));
+            return Ok(PrebuiltPlan {
+                static_mode: true,
+                libs: statik
+                    .into_iter()
+                    .map(|name| PlannedLib {
+                        kind: LinkKind::Static,
+                        name,
+                    })
+                    .collect(),
+                warnings,
+            });
+        }
+        if !shared.is_empty() {
+            shared.sort_by_key(|s| rank(s));
+            return Ok(PrebuiltPlan {
+                static_mode: false,
+                libs: shared
+                    .into_iter()
+                    .map(|name| PlannedLib {
+                        kind: LinkKind::Dylib,
+                        name,
+                    })
+                    .collect(),
+                warnings,
+            });
+        }
+        return Err(
+            "has no linkable llama/ggml libraries (.lib with .dll, or static .lib/.a)".to_string(),
+        );
+    }
+
+    // Unix/macOS: previous behavior (static .a wins; else versioned .so/.dylib).
+    // Candidate filter mirrors the old collect_libs (lib*/llama*/ggml*).
+    let is_candidate =
+        |f: &String| f.starts_with("lib") || f.starts_with("llama") || f.starts_with("ggml");
+    let mut archives: Vec<String> = files
+        .iter()
+        .filter(|f| f.ends_with(".a") && is_candidate(f))
+        .cloned()
+        .collect();
+    archives.sort_by_key(|f| rank(&lib_stem(&PathBuf::from(f))));
+    archives.dedup_by_key(|f| lib_stem(Path::new(f)));
+    let shared_ext = shared_ext_for(target_os);
+    let mut shared: Vec<String> = files
+        .iter()
+        .filter(|f| {
+            is_candidate(f)
+                && (f.ends_with(&format!(".{shared_ext}"))
+                    || f.contains(&format!(".{shared_ext}.")))
+        })
+        .cloned()
+        .collect();
+    shared.sort_by_key(|f| rank(&lib_stem(&PathBuf::from(f))));
+    shared.dedup_by_key(|f| lib_stem(Path::new(f)));
+    // Core-name filtering happens BEFORE the emptiness decision: a
+    // directory containing only unrelated archives (e.g. libunrelated.a)
+    // must error, never produce a successful plan with zero libraries.
+    let archives: Vec<PlannedLib> = archives
+        .into_iter()
+        .filter_map(|f| {
+            let stem = lib_stem(&PathBuf::from(&f));
+            core_names.contains(&stem.as_str()).then(|| PlannedLib {
+                kind: LinkKind::Static,
+                name: stem,
+            })
+        })
+        .collect();
+    let shared: Vec<PlannedLib> = shared
+        .into_iter()
+        .filter_map(|f| {
+            let stem = lib_stem(&PathBuf::from(&f));
+            core_names.contains(&stem.as_str()).then(|| PlannedLib {
+                kind: LinkKind::Dylib,
+                name: stem,
+            })
+        })
+        .collect();
+    if !archives.is_empty() {
+        return Ok(PrebuiltPlan {
+            static_mode: true,
+            libs: archives,
+            warnings,
+        });
+    }
+    if !shared.is_empty() {
+        return Ok(PrebuiltPlan {
+            static_mode: false,
+            libs: shared,
+            warnings,
+        });
+    }
+    Err("has no libllama.{a,so,dylib,lib,dll} files".to_string())
 }
 
 /// Bake the library directory into the binary so it is found at runtime
 /// without the user setting LD_LIBRARY_PATH / DYLD_LIBRARY_PATH.
 fn bake_rpath(dir: &Path) {
     let d = dir.to_string_lossy();
-    #[cfg(target_os = "linux")]
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{d}");
-    #[cfg(target_os = "macos")]
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{d}");
-    // Windows uses PATH; there's no ELF rpath equivalent.
-    // The DLLs must be alongside the .exe or in a directory on PATH.
-    // We emit a warning so the packager knows.
-    #[cfg(target_os = "windows")]
-    eprintln!(
-        "[build.rs] Windows: DLLs from {d} must be in the same directory as hercules.exe \
-         or on the system PATH at runtime."
-    );
-}
-
-fn collect_libs(dir: &Path, ext: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if !p.is_file() {
-            continue;
-        }
-        let ext_matches = p.extension().map(|e| e == ext).unwrap_or(false);
-        if !ext_matches {
-            continue;
-        }
-        let fname = p
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_lowercase();
-        // Unix: name starts with "lib". Windows MSVC: just "llama.lib" etc.
-        if fname.starts_with("lib") || fname.starts_with("llama") || fname.starts_with("ggml") {
-            out.push(p);
-        }
+    // NOTE: target-gated at RUNTIME (build.rs runs on the host).
+    if target_os() == "linux" || target_os() == "macos" {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{d}");
+    } else {
+        // Windows uses PATH; there's no ELF rpath equivalent.
+        // The DLLs must be alongside the .exe or in a directory on PATH.
+        // We emit a warning so the packager knows.
+        eprintln!(
+            "[build.rs] Windows: DLLs from {d} must be in the same directory as hercules.exe \
+             or on the system PATH at runtime."
+        );
     }
-    out
 }
 
-/// Platform-specific shared library extension.
-fn shared_ext() -> &'static str {
-    if cfg!(target_os = "windows") {
+/// Shared library extension for a TARGET platform (pure function so the
+/// link matrix stays unit-testable; never `cfg!`, which answers for the
+/// host).
+fn shared_ext_for(target_os: &str) -> &'static str {
+    if target_os == "windows" {
         "dll"
-    } else if cfg!(target_os = "macos") {
+    } else if target_os == "macos" {
         "dylib"
     } else {
         "so"
@@ -288,22 +477,55 @@ fn locate_or_fetch_source(out_dir: &Path) -> PathBuf {
     }
 
     // 3. Auto-clone into OUT_DIR (works in CI without pre-cloning).
+    // Reproducible: checks out an IMMUTABLE revision, never a moving
+    // branch. Override with LLAMA_CPP_REV=<full-sha|tag>; the default is
+    // pinned (master as of 2026-09-17) so clean builds are deterministic.
+    const DEFAULT_LLAMA_CPP_REV: &str = "7f6f0c2a9dab36fdb1f6e00e2037c030974e0e5c";
+    let rev = std::env::var("LLAMA_CPP_REV").unwrap_or_else(|_| DEFAULT_LLAMA_CPP_REV.to_string());
+    println!("cargo:rerun-if-env-changed=LLAMA_CPP_REV");
     let clone_target = out_dir.join("llama.cpp-src");
     if !clone_target.join("CMakeLists.txt").exists() {
-        eprintln!("[build.rs] No local llama.cpp source — cloning from GitHub …");
+        eprintln!("[build.rs] No local llama.cpp source — cloning {rev} from GitHub …");
         eprintln!("[build.rs] Tip: set LLAMA_INSTALL_DIR if you have a pre-built install.");
+        let target_str = clone_target.to_str().expect("non-UTF8 OUT_DIR");
         let status = Command::new("git")
             .args([
                 "clone",
-                "--depth=1",
-                "--branch",
-                "master",
                 "https://github.com/ggerganov/llama.cpp.git",
-                clone_target.to_str().expect("non-UTF8 OUT_DIR"),
+                target_str,
             ])
             .status()
             .expect("git clone failed — ensure git is in PATH");
         assert!(status.success(), "git clone llama.cpp failed");
+        let status = Command::new("git")
+            .args(["-C", target_str, "checkout", rev.as_str()])
+            .status()
+            .expect("git checkout failed");
+        assert!(
+            status.success(),
+            "git checkout {rev} failed (set LLAMA_CPP_REV to a valid SHA/tag)"
+        );
+    }
+    // Verify the tree is at the requested revision (strict for SHAs).
+    let head_out = Command::new("git")
+        .args([
+            "-C",
+            clone_target.to_str().expect("non-UTF8 OUT_DIR"),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output();
+    if let Ok(out) = head_out {
+        let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        eprintln!("[build.rs] llama.cpp source @ {head} (requested {rev})");
+        let looks_like_sha = rev.len() >= 7 && rev.chars().all(|c| c.is_ascii_hexdigit());
+        if looks_like_sha {
+            assert!(
+                head.starts_with(&rev),
+                "llama.cpp tree is at {head}, expected {rev} — delete {} and rebuild",
+                clone_target.display()
+            );
+        }
     }
     clone_target
 }
@@ -325,10 +547,10 @@ fn cmake_configure(src: &Path, build: &Path) {
     let cuda = std::env::var("LLAMA_CUDA")
         .unwrap_or_else(|_| std::env::var("CARGO_FEATURE_CUDA").unwrap_or_default());
 
-    // Generator selection:
+    // Generator selection (target-aware: build.rs runs on the host).
     let cmake_gen: &str = if cmd_exists("ninja") {
         "Ninja"
-    } else if cfg!(windows) {
+    } else if target_os() == "windows" {
         ""
     } else {
         "Unix Makefiles"
@@ -354,8 +576,10 @@ fn cmake_configure(src: &Path, build: &Path) {
         .arg("-DLLAMA_STANDALONE=OFF");
 
     // PIC: needed on Unix for linking into a Rust binary; harmless on Windows.
-    #[cfg(unix)]
-    cmd.arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON");
+    // Target-gated (build.rs runs on the host).
+    if target_os() != "windows" {
+        cmd.arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON");
+    }
 
     if cuda == "1" || cuda.eq_ignore_ascii_case("on") {
         cmd.arg("-DGGML_CUDA=ON");
@@ -486,24 +710,32 @@ fn find_static_archives(dir: &Path) -> Vec<PathBuf> {
 // ===========================================================================
 
 fn link_system_libs() {
+    // All branches below are TARGET-gated at runtime (build.rs runs on
+    // the host; `cfg!` would answer for the wrong platform when
+    // cross-compiling).
+    let os = target_os();
+    let env = target_env();
     // ── C++ standard library ─────────────────────────────────────────────────
     // MSVC: auto-linked via #pragma comment(lib, ...) in the CRT headers.
     // MinGW / Linux: must be explicit.
-    #[cfg(target_os = "macos")]
-    println!("cargo:rustc-link-lib=c++");
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    println!("cargo:rustc-link-lib=stdc++");
+    if os == "macos" {
+        println!("cargo:rustc-link-lib=c++");
+    }
+    if os != "macos" && os != "windows" {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
     // MinGW on Windows also needs stdc++ (MSVC links it automatically)
-    #[cfg(all(target_os = "windows", target_env = "gnu"))]
-    println!("cargo:rustc-link-lib=stdc++");
+    if os == "windows" && env == "gnu" {
+        println!("cargo:rustc-link-lib=stdc++");
+    }
 
     // ── POSIX threading ───────────────────────────────────────────────────────
-    #[cfg(unix)]
-    println!("cargo:rustc-link-lib=pthread");
+    if os != "windows" {
+        println!("cargo:rustc-link-lib=pthread");
+    }
 
     // ── Math / DL ─────────────────────────────────────────────────────────────
-    #[cfg(target_os = "linux")]
-    {
+    if os == "linux" {
         println!("cargo:rustc-link-lib=m");
         println!("cargo:rustc-link-lib=dl");
     }
@@ -513,10 +745,9 @@ fn link_system_libs() {
         .unwrap_or_else(|_| std::env::var("CARGO_FEATURE_CUDA").unwrap_or_default());
     if cuda == "1" || cuda.eq_ignore_ascii_case("on") {
         if let Ok(cuda_path) = std::env::var("CUDA_PATH").or_else(|_| std::env::var("CUDA_HOME")) {
-            #[cfg(target_os = "windows")]
-            println!("cargo:rustc-link-search=native={}/lib/x64", cuda_path);
-            #[cfg(not(target_os = "windows"))]
-            {
+            if os == "windows" {
+                println!("cargo:rustc-link-search=native={}/lib/x64", cuda_path);
+            } else {
                 println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
                 println!("cargo:rustc-link-search=native={}/lib64/stubs", cuda_path);
             }
@@ -533,16 +764,18 @@ fn link_system_libs() {
     if vulkan == "1" || vulkan.eq_ignore_ascii_case("on") {
         // We might also need a search path for VULKAN_SDK, if it's set
         if let Ok(vk_sdk) = std::env::var("VULKAN_SDK") {
-            #[cfg(target_os = "windows")]
-            println!("cargo:rustc-link-search=native={}/Lib", vk_sdk);
-            #[cfg(not(target_os = "windows"))]
-            println!("cargo:rustc-link-search=native={}/lib", vk_sdk);
+            if os == "windows" {
+                println!("cargo:rustc-link-search=native={}/Lib", vk_sdk);
+            } else {
+                println!("cargo:rustc-link-search=native={}/lib", vk_sdk);
+            }
         }
 
-        #[cfg(target_os = "windows")]
-        println!("cargo:rustc-link-lib=vulkan-1");
-        #[cfg(not(target_os = "windows"))]
-        println!("cargo:rustc-link-lib=vulkan");
+        if os == "windows" {
+            println!("cargo:rustc-link-lib=vulkan-1");
+        } else {
+            println!("cargo:rustc-link-lib=vulkan");
+        }
     }
 
     // ── OpenMP runtime ────────────────────────────────────────────────────────
@@ -552,11 +785,11 @@ fn link_system_libs() {
     //  Linux / MinGW:  libgomp  (GCC's OpenMP runtime, ships with gcc)
     //  macOS:          omp      (llvm-openmp from Homebrew: brew install libomp)
     //  Windows MSVC:   vcomp    (Visual C++ OpenMP runtime, part of MSVC)
-    #[cfg(target_os = "linux")]
-    println!("cargo:rustc-link-lib=gomp");
+    if os == "linux" {
+        println!("cargo:rustc-link-lib=gomp");
+    }
 
-    #[cfg(target_os = "macos")]
-    {
+    if os == "macos" {
         println!("cargo:rustc-link-search=native=/opt/homebrew/opt/libomp/lib");
         println!("cargo:rustc-link-lib=omp");
         // Metal backend requirements
@@ -565,11 +798,13 @@ fn link_system_libs() {
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }
 
-    #[cfg(all(target_os = "windows", not(target_env = "gnu")))]
-    println!("cargo:rustc-link-lib=vcomp"); // MSVC OpenMP
+    if os == "windows" && env != "gnu" {
+        println!("cargo:rustc-link-lib=vcomp"); // MSVC OpenMP
+    }
 
-    #[cfg(all(target_os = "windows", target_env = "gnu"))]
-    println!("cargo:rustc-link-lib=gomp"); // MinGW OpenMP
+    if os == "windows" && env == "gnu" {
+        println!("cargo:rustc-link-lib=gomp"); // MinGW OpenMP
+    }
 }
 
 // ===========================================================================
@@ -585,4 +820,185 @@ fn cmd_exists(bin: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+// ===========================================================================
+// Prebuilt link matrix tests (run: rustc --test build.rs -o /tmp/brs && /tmp/brs)
+// ===========================================================================
+
+#[cfg(test)]
+mod prebuilt_matrix_tests {
+    use super::*;
+
+    const CORE: &[&str] = &["llama", "ggml", "ggml-base", "ggml-cpu"];
+
+    fn names(files: &[&str]) -> Vec<String> {
+        files.iter().map(|s| s.to_ascii_lowercase()).collect()
+    }
+
+    fn kinds(plan: &PrebuiltPlan) -> Vec<(&str, &LinkKind)> {
+        plan.libs
+            .iter()
+            .map(|l| (l.name.as_str(), &l.kind))
+            .collect()
+    }
+
+    #[test]
+    fn msvc_static_lib_preferred() {
+        // llama.lib + ggml.lib, no DLLs → static mode.
+        let plan = plan_prebuilt_links(
+            "windows",
+            "msvc",
+            &names(&["llama.lib", "ggml.lib", "ggml-cpu.lib", "readme.txt"]),
+            CORE,
+        )
+        .expect("static plan");
+        assert!(plan.static_mode);
+        assert!(kinds(&plan).contains(&("llama", &LinkKind::Static)));
+    }
+
+    #[test]
+    fn msvc_import_lib_means_shared() {
+        // llama.lib NEXT TO llama.dll is an import lib, not static:
+        // must plan dynamic, never claim "static linking".
+        let plan = plan_prebuilt_links(
+            "windows",
+            "msvc",
+            &names(&["llama.lib", "llama.dll", "ggml.lib", "ggml.dll"]),
+            CORE,
+        )
+        .expect("shared plan");
+        assert!(!plan.static_mode);
+        assert!(kinds(&plan).contains(&("llama", &LinkKind::Dylib)));
+    }
+
+    #[test]
+    fn msvc_bare_dll_is_actionable_error() {
+        // A bare .dll cannot satisfy MSVC link.exe: fail with guidance,
+        // never emit a doomed dylib= directive.
+        let err = plan_prebuilt_links("windows", "msvc", &names(&["llama.dll"]), CORE)
+            .expect_err("must refuse bare dll");
+        assert!(err.contains("import library"), "got: {err}");
+    }
+
+    #[test]
+    fn msvc_dll_dot_lib_variant_accepted() {
+        // CMake-style `llama.dll.lib` import library satisfies the link.
+        let plan = plan_prebuilt_links(
+            "windows",
+            "msvc",
+            &names(&["llama.dll.lib", "llama.dll"]),
+            CORE,
+        )
+        .expect("shared plan");
+        assert!(!plan.static_mode);
+    }
+
+    #[test]
+    fn mingw_dll_import_lib_preferred() {
+        let plan = plan_prebuilt_links(
+            "windows",
+            "gnu",
+            &names(&["libllama.dll.a", "libggml.dll.a"]),
+            CORE,
+        )
+        .expect("shared plan");
+        assert!(!plan.static_mode);
+        assert!(kinds(&plan).contains(&("llama", &LinkKind::Dylib)));
+    }
+
+    #[test]
+    fn mingw_static_wins_when_both_present() {
+        // A real static archive alongside an import lib keeps the
+        // historical static-first precedence.
+        let plan = plan_prebuilt_links(
+            "windows",
+            "gnu",
+            &names(&["libllama.a", "libllama.dll.a"]),
+            CORE,
+        )
+        .expect("static plan");
+        assert!(plan.static_mode);
+    }
+
+    #[test]
+    fn mingw_bare_dll_links_with_warning() {
+        // MinGW ld auto-import can consume a bare .dll directly.
+        let plan = plan_prebuilt_links("windows", "gnu", &names(&["llama.dll"]), CORE)
+            .expect("shared plan");
+        assert!(!plan.static_mode);
+        assert!(!plan.warnings.is_empty(), "must warn about auto-import");
+    }
+
+    #[test]
+    fn mingw_static_without_dll() {
+        let plan = plan_prebuilt_links("windows", "gnu", &names(&["libllama.a"]), CORE)
+            .expect("static plan");
+        assert!(plan.static_mode);
+    }
+
+    #[test]
+    fn linux_versioned_so_dynamic() {
+        let plan = plan_prebuilt_links(
+            "linux",
+            "",
+            &names(&["libllama.so.0.0.1", "libggml.so.0"]),
+            CORE,
+        )
+        .expect("shared plan");
+        assert!(!plan.static_mode);
+        assert!(kinds(&plan).contains(&("llama", &LinkKind::Dylib)));
+    }
+
+    #[test]
+    fn linux_static_wins() {
+        let plan = plan_prebuilt_links("linux", "", &names(&["libllama.a", "libllama.so"]), CORE)
+            .expect("static plan");
+        assert!(plan.static_mode);
+    }
+
+    #[test]
+    fn macos_dylib() {
+        let plan = plan_prebuilt_links("macos", "", &names(&["libllama.dylib"]), CORE)
+            .expect("shared plan");
+        assert!(!plan.static_mode);
+    }
+
+    #[test]
+    fn empty_dir_is_actionable_error() {
+        let err = plan_prebuilt_links("linux", "", &[], CORE).expect_err("must refuse");
+        assert!(err.contains("libllama"), "got: {err}");
+    }
+
+    #[test]
+    fn linux_unrelated_archive_is_rejected() {
+        // Unrelated archives satisfy the broad candidate predicate but
+        // must not produce a successful plan with zero libraries.
+        let err = plan_prebuilt_links("linux", "", &names(&["libunrelated.a"]), CORE)
+            .expect_err("unrelated archive must not produce empty successful plan");
+        assert!(err.contains("llama"), "got: {err}");
+    }
+
+    #[test]
+    fn linux_unrelated_shared_library_is_rejected() {
+        let err = plan_prebuilt_links("linux", "", &names(&["libunrelated.so"]), CORE)
+            .expect_err("unrelated shared lib must not produce empty successful plan");
+        assert!(err.contains("llama"), "got: {err}");
+    }
+
+    #[test]
+    fn link_order_llama_before_ggml() {
+        // Dependents precede dependencies for static archives.
+        let plan = plan_prebuilt_links(
+            "linux",
+            "",
+            &names(&["libggml.a", "libllama.a", "libggml-cpu.a"]),
+            CORE,
+        )
+        .expect("static plan");
+        let order: Vec<&str> = plan.libs.iter().map(|l| l.name.as_str()).collect();
+        let llama = order.iter().position(|n| *n == "llama").unwrap();
+        let ggml = order.iter().position(|n| *n == "ggml").unwrap();
+        assert!(llama < ggml, "order: {order:?}");
+    }
 }

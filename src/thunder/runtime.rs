@@ -398,6 +398,7 @@ mod tests {
     fn test_from_ref_resolves_the_selected_peer_not_the_first() {
         // Persisted store: alice at :1, bob at :2. Selecting bob must
         // bind BOB's trusted record — never alice (the first peer).
+        let _store_guard = crate::thunder::pairing::store_test_guard();
         let dir =
             std::env::temp_dir().join(format!("hercules-thunder-target-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
