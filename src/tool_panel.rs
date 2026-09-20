@@ -172,6 +172,7 @@ impl ToolChip {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(accent));
+        let block = crate::app_chrome::frame_container(block);
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(
@@ -1007,6 +1008,7 @@ pub fn draw_tool_panel(
             ))
             .right_aligned(),
         );
+    let block = crate::app_chrome::frame_container(block);
 
     // Nearly closed / minimized: morph border only
     if t < 0.12 || rect.height <= 3 || panel.minimized {

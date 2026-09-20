@@ -242,4 +242,146 @@ mod tests {
         assert!(store.get("x").unwrap().permissions.inference);
         assert!(!store.get("x").unwrap().permissions.forwarding);
     }
+
+    fn trusted(id: &str, name: &str, key: u8) -> (String, String, [u8; 32]) {
+        (id.to_string(), name.to_string(), [key; 32])
+    }
+
+    #[test]
+    fn peer_store_starts_empty_no_seeded_peers() {
+        // A fresh store contains zero peers: nothing (startup, defaults)
+        // may seed dummy/demo entries.
+        let store = PeerStore::default();
+        assert_eq!(store.peers_len(), 0);
+        assert!(store.all().is_empty());
+    }
+
+    #[test]
+    fn same_peer_id_repeated_trust_stays_one_peer() {
+        // Reconnect / repeated discovery / refresh of the SAME identity
+        // updates in place instead of appending another row.
+        let mut store = PeerStore::default();
+        let (id, name, key) = trusted("thunder-a", "Alice", 1);
+        assert!(store.trust(
+            id.clone(),
+            key,
+            name.clone(),
+            PeerPermissions::default(),
+            true
+        ));
+        assert!(store.trust(
+            id.clone(),
+            [2u8; 32],
+            name.clone(),
+            PeerPermissions::default(),
+            true
+        ));
+        assert!(store.trust(id.clone(), key, name, PeerPermissions::default(), true));
+        assert_eq!(store.peers_len(), 1, "same peer_id must never duplicate");
+        assert!(store.is_trusted("thunder-a"));
+    }
+
+    #[test]
+    fn same_name_different_ids_stay_separate_peers() {
+        // Identity is peer_id (never display name): two Alices are two peers.
+        let mut store = PeerStore::default();
+        let (ida, na, ka) = trusted("thunder-a", "Alice", 1);
+        let (idb, nb, kb) = trusted("thunder-b", "Alice", 2);
+        assert!(store.trust(ida, ka, na, PeerPermissions::default(), true));
+        assert!(store.trust(idb, kb, nb, PeerPermissions::default(), true));
+        assert_eq!(store.peers_len(), 2);
+        assert_eq!(store.get("thunder-a").unwrap().public_key, [1u8; 32]);
+        assert_eq!(store.get("thunder-b").unwrap().public_key, [2u8; 32]);
+    }
+
+    #[test]
+    fn re_pairing_same_identity_updates_in_place() {
+        // Pairing the same identity twice (key rotation / rename) keeps
+        // one row holding the LATEST record.
+        let mut store = PeerStore::default();
+        assert!(store.trust(
+            "thunder-a".into(),
+            [1u8; 32],
+            "Alice".into(),
+            PeerPermissions::default(),
+            true
+        ));
+        assert!(store.trust(
+            "thunder-a".into(),
+            [9u8; 32],
+            "Alice-PC".into(),
+            PeerPermissions::default(),
+            true
+        ));
+        assert_eq!(store.peers_len(), 1);
+        let got = store.get("thunder-a").unwrap();
+        assert_eq!(got.public_key, [9u8; 32]);
+        assert_eq!(got.name, "Alice-PC");
+    }
+
+    #[test]
+    fn refresh_re_registration_never_duplicates() {
+        // A refresh that re-registers every known peer keeps the count.
+        let mut store = PeerStore::default();
+        for i in 0..5u8 {
+            let id = format!("thunder-{i}");
+            assert!(store.trust(id, [i; 32], "N".into(), PeerPermissions::default(), true));
+        }
+        assert_eq!(store.peers_len(), 5);
+        for i in 0..5u8 {
+            let id = format!("thunder-{i}");
+            assert!(store.trust(id, [i; 32], "N".into(), PeerPermissions::default(), true));
+        }
+        assert_eq!(store.peers_len(), 5, "refresh must not duplicate");
+    }
+
+    #[test]
+    fn persisted_and_rediscovered_peer_stays_one() {
+        // Save → load → trust the same identity again: still one row.
+        // Uses an isolated XDG dir (serial-guarded) — never the real store.
+        let _guard = super::store_test_guard();
+        let dir = std::env::temp_dir().join(format!(
+            "hercules-peer-roundtrip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // PeerStore::save does not create dirs (callers do); mirror it.
+        std::fs::create_dir_all(dir.join("hercules").join("thunder")).unwrap();
+        let real_xdg = std::env::var_os("XDG_DATA_HOME");
+        // SAFETY: test-only, serial-guarded env override.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &dir);
+        }
+        let mut store = PeerStore::load();
+        assert!(store.trust(
+            "thunder-a".into(),
+            [1u8; 32],
+            "Alice".into(),
+            PeerPermissions::default(),
+            true
+        ));
+        store.save().expect("persist");
+        let reloaded = PeerStore::load();
+        assert_eq!(reloaded.peers_len(), 1);
+        let mut reloaded = reloaded;
+        assert!(reloaded.trust(
+            "thunder-a".into(),
+            [1u8; 32],
+            "Alice".into(),
+            PeerPermissions::default(),
+            true
+        ));
+        assert_eq!(reloaded.peers_len(), 1, "persist + rediscover = one row");
+        unsafe {
+            match real_xdg {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

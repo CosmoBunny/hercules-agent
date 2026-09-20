@@ -11,6 +11,8 @@
 
 pub mod agent;
 pub mod agent_io;
+pub mod app_chrome;
+pub mod app_palette;
 pub mod ask_mode;
 pub mod backend;
 pub mod clipboard;

@@ -320,8 +320,9 @@ pub struct RuntimeSettings {
     /// Enable focused/bounce graph for AI write responses.
     #[serde(default = "default_true")]
     pub code_graph_bounce_response_write: bool,
-    /// Master switch for the F6 Code Graph panel (default: off).
-    #[serde(default)]
+    /// Master switch for the F6 Code Graph panel (default: on; F6 also
+    /// enables it on demand).
+    #[serde(default = "default_true")]
     pub code_graph_enabled: bool,
     /// Show LSP diagnostics (errors/warnings) in the code graph panel.
     #[serde(default = "default_true")]
@@ -335,10 +336,28 @@ pub struct RuntimeSettings {
     /// Show LSP info/hints in the code graph panel.
     #[serde(default = "default_false")]
     pub lsp_show_info: bool,
+    /// Application chrome style (top bar, menu frame, badges).
+    #[serde(default = "default_app_chrome_style")]
+    pub app_chrome_style: crate::app_chrome::AppChromeStyle,
+    /// Application color palette (independent from the chrome style).
+    #[serde(default = "default_color_palette")]
+    pub color_palette: crate::app_palette::AppPaletteStyle,
+    /// User-edited colors used when `color_palette == Custom`.
+    #[serde(default = "default_custom_palette")]
+    pub custom_palette: crate::app_palette::AppPalette,
 }
 
 fn default_target_fps() -> u32 {
     60
+}
+fn default_app_chrome_style() -> crate::app_chrome::AppChromeStyle {
+    crate::app_chrome::AppChromeStyle::Modern
+}
+fn default_color_palette() -> crate::app_palette::AppPaletteStyle {
+    crate::app_palette::AppPaletteStyle::RosePine
+}
+fn default_custom_palette() -> crate::app_palette::AppPalette {
+    crate::app_palette::AppPalette::custom_default()
 }
 fn default_media_storage_location() -> MediaStorageLocation {
     MediaStorageLocation::Local
@@ -428,11 +447,14 @@ impl Default for RuntimeSettings {
             mcp_tools: Vec::new(),
             code_graph_include_comments: true,
             code_graph_bounce_response_write: true,
-            code_graph_enabled: false,
+            code_graph_enabled: true,
             lsp_diagnostics_enabled: true,
             lsp_show_errors: true,
             lsp_show_warnings: true,
             lsp_show_info: false,
+            app_chrome_style: crate::app_chrome::AppChromeStyle::Modern,
+            color_palette: crate::app_palette::AppPaletteStyle::RosePine,
+            custom_palette: crate::app_palette::AppPalette::custom_default(),
         }
     }
 }
@@ -1525,6 +1547,82 @@ pub fn set_lsp_show_info(val: bool) {
     }
 }
 
+pub fn get_app_chrome_style() -> crate::app_chrome::AppChromeStyle {
+    get_settings().app_chrome_style
+}
+
+pub fn set_app_chrome_style(style: crate::app_chrome::AppChromeStyle) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.app_chrome_style = style;
+        save_settings_to_disk(s);
+    }
+}
+
+/// Cycle the app chrome style forward (`dir > 0`), backward (`dir < 0`),
+/// or forward on `dir == 0` (Enter). Persists via `set_app_chrome_style`.
+pub fn cycle_app_chrome_style(dir: i32) -> crate::app_chrome::AppChromeStyle {
+    let current = get_app_chrome_style();
+    let next = if dir < 0 {
+        current.cycle_prev()
+    } else {
+        current.cycle_next()
+    };
+    set_app_chrome_style(next);
+    next
+}
+
+pub fn get_color_palette() -> crate::app_palette::AppPaletteStyle {
+    get_settings().color_palette
+}
+
+pub fn set_color_palette(style: crate::app_palette::AppPaletteStyle) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.color_palette = style;
+        save_settings_to_disk(s);
+    }
+}
+
+/// Cycle the color palette forward (`dir > 0`), backward (`dir < 0`),
+/// or forward on `dir == 0` (Enter). Never touches the chrome style.
+pub fn cycle_color_palette(dir: i32) -> crate::app_palette::AppPaletteStyle {
+    let current = get_color_palette();
+    let next = if dir < 0 {
+        current.cycle_prev()
+    } else {
+        current.cycle_next()
+    };
+    set_color_palette(next);
+    next
+}
+
+pub fn get_custom_palette() -> crate::app_palette::AppPalette {
+    get_settings().custom_palette
+}
+
+pub fn set_custom_palette(p: crate::app_palette::AppPalette) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.custom_palette = p;
+        save_settings_to_disk(s);
+    }
+}
+
+/// Set one Custom slot from `#RRGGBB` text. Invalid input is rejected
+/// with an error string — the stored palette is untouched, so bad input
+/// can never crash or corrupt. Persists on success (live immediately).
+pub fn set_custom_color(
+    field: crate::app_palette::CustomField,
+    hex: &str,
+) -> Result<crate::app_palette::AppPalette, String> {
+    let rgb = crate::app_palette::parse_hex_color(hex).map_err(|e| e.to_string())?;
+    let mut p = get_custom_palette();
+    p.set_field(field, rgb);
+    set_custom_palette(p);
+    Ok(p)
+}
+
 pub fn detect_project_languages() -> Vec<crate::code_graph::GraphLanguage> {
     use std::collections::HashSet;
     let mut languages = HashSet::new();
@@ -1568,6 +1666,19 @@ pub fn detect_project_languages() -> Vec<crate::code_graph::GraphLanguage> {
         crate::code_graph::GraphLanguage::TypeScript => 3,
     });
     result
+}
+
+/// Serialize tests that mutate HOME or the settings global (both
+/// process-global). Shared across test modules so style tests can never
+/// interleave with each other.
+#[cfg(test)]
+static APP_STYLE_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn app_style_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    APP_STYLE_TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -1633,7 +1744,11 @@ mod tests {
         assert_eq!(crate::app::SETTINGS_OCR_ENGINE, 10);
         assert_eq!(crate::app::SETTINGS_CODE_GRAPH, 11);
         assert_eq!(crate::app::SETTINGS_LSP_DIAGNOSTICS, 12);
-        assert_eq!(crate::app::SETTINGS_TAB_NAMES.len(), 13);
+        assert_eq!(crate::app::SETTINGS_APP_STYLE, 13);
+        assert_eq!(crate::app::SETTINGS_COLOR_PALETTE, 14);
+        assert_eq!(crate::app::SETTINGS_TAB_NAMES.len(), 15);
+        assert_eq!(crate::app::SETTINGS_TAB_NAMES[13], "App Style");
+        assert_eq!(crate::app::SETTINGS_TAB_NAMES[14], "Color Palette");
     }
 
     #[test]
@@ -1679,5 +1794,76 @@ mod tests {
             LspConfigSource::Builtin => 0,
         });
         assert_eq!(best, Some(LspConfigSource::Project));
+    }
+
+    #[test]
+    fn app_chrome_style_defaults_to_modern() {
+        // Fresh (never-persisted) settings default to Modern. The live
+        // global is NOT asserted — it reflects the developer's real file.
+        assert_eq!(
+            RuntimeSettings::default().app_chrome_style,
+            crate::app_chrome::AppChromeStyle::Modern
+        );
+        assert_eq!(
+            crate::app_chrome::AppChromeStyle::default(),
+            crate::app_chrome::AppChromeStyle::Modern
+        );
+    }
+
+    #[test]
+    fn app_chrome_style_serde_roundtrip_in_settings() {
+        for style in crate::app_chrome::AppChromeStyle::all() {
+            let mut s = RuntimeSettings::default();
+            s.app_chrome_style = style;
+            let text = toml::to_string_pretty(&s).expect("serialize settings");
+            assert!(
+                text.contains("app_chrome_style"),
+                "key present for {style:?}"
+            );
+            let back: RuntimeSettings = toml::from_str(&text).expect("deserialize settings");
+            assert_eq!(back.app_chrome_style, style);
+        }
+        // Missing key (pre-feature files) defaults to Modern.
+        let back: RuntimeSettings = toml::from_str("power_mode = \"Normal\"\n").unwrap_or_default();
+        assert_eq!(
+            back.app_chrome_style,
+            crate::app_chrome::AppChromeStyle::Modern
+        );
+    }
+
+    #[test]
+    fn app_chrome_style_cycle_and_switch_persist() {
+        use crate::app_chrome::AppChromeStyle;
+        let _guard = app_style_test_guard();
+        let real_home = std::env::var_os("HOME");
+        let tmp =
+            std::env::temp_dir().join(format!("hercules-appstyle-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: test-only, serial-guarded env override.
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+        let saved_settings = SETTINGS.lock().unwrap().take();
+
+        set_app_chrome_style(AppChromeStyle::Modern);
+        assert_eq!(get_app_chrome_style(), AppChromeStyle::Modern);
+        assert_eq!(cycle_app_chrome_style(1), AppChromeStyle::BorderLine);
+        assert_eq!(get_app_chrome_style(), AppChromeStyle::BorderLine);
+        assert_eq!(cycle_app_chrome_style(1), AppChromeStyle::None);
+        assert_eq!(cycle_app_chrome_style(-1), AppChromeStyle::BorderLine);
+        assert_eq!(cycle_app_chrome_style(0), AppChromeStyle::None);
+        set_app_chrome_style(AppChromeStyle::BorderLine);
+
+        let on_disk = load_settings_from_disk();
+        assert_eq!(on_disk.app_chrome_style, AppChromeStyle::BorderLine);
+
+        *SETTINGS.lock().unwrap() = saved_settings;
+        unsafe {
+            match real_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

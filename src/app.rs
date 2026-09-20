@@ -73,6 +73,33 @@ pub const NORDIC_TEXT: Color = Color::Rgb(236, 239, 244); // #ECEFF4 Snow Storm
 pub const NORDIC_MUTED: Color = Color::Rgb(129, 161, 193); // #81A1C1 Frost Blue
 pub const NORDIC_ACCENT: Color = Color::Rgb(136, 192, 208); // #88C0D0 Frost Cyan
 
+/// Live application canvas background: the active palette's background,
+/// read fresh every call so palette switches re-render immediately.
+/// Chrome renderers use this instead of `NORDIC_BG` for canvas-role
+/// backgrounds. Content foregrounds (AI text, code, terminal output)
+/// are never routed through here.
+pub fn pal_bg() -> Color {
+    crate::app_palette::current_palette().background_c()
+}
+
+/// Live popup/modal surface color from the active palette.
+pub fn pal_surface() -> Color {
+    crate::app_palette::current_palette().surface_c()
+}
+
+/// Menu modal body background: the modal is frameless in `None`, so it
+/// takes the surface tone there to stay readable as its own layer instead
+/// of melting into the canvas. Modern/BorderLine keep the canvas because
+/// their frame already separates the layer. Color only — geometry never
+/// depends on this.
+pub fn modal_bg() -> Color {
+    if crate::settings::get_app_chrome_style() == crate::app_chrome::AppChromeStyle::None {
+        crate::app_palette::current_palette().surface_c()
+    } else {
+        pal_bg()
+    }
+}
+
 /// Semantic colors for toggle states
 pub const TOGGLE_ON_GREEN: Color = Color::Rgb(163, 190, 140); // #A3BE8C - Nord green
 pub const TOGGLE_OFF_RED: Color = Color::Rgb(191, 97, 106); // #BF616A - Nord red
@@ -122,8 +149,8 @@ pub fn render_toggle<'a>(label: &'a str, enabled: bool, focused: bool) -> Line<'
                 })
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(label, Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG)),
-        Span::styled(" ", Style::default().bg(NORDIC_BG)),
+        Span::styled(label, Style::default().fg(NORDIC_TEXT).bg(modal_bg())),
+        Span::styled(" ", Style::default().bg(modal_bg())),
         // I cell (no brackets)
         Span::styled(
             " I ",
@@ -250,6 +277,8 @@ pub const SETTINGS_TAB_NAMES: &[&str] = &[
     "OCR Engine",
     "Code Graph",
     "LSP Diagnostics",
+    "App Style",
+    "Color Palette",
 ];
 
 pub const SETTINGS_POWER_MODE: usize = 0;
@@ -265,6 +294,8 @@ pub const SETTINGS_HF_TOKEN: usize = 9;
 pub const SETTINGS_OCR_ENGINE: usize = 10;
 pub const SETTINGS_CODE_GRAPH: usize = 11;
 pub const SETTINGS_LSP_DIAGNOSTICS: usize = 12;
+pub const SETTINGS_APP_STYLE: usize = 13;
+pub const SETTINGS_COLOR_PALETTE: usize = 14;
 
 /// Code Graph pane selection (three-pane layout)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,14 +337,21 @@ pub struct App {
     pub header_bar_hit: Option<(u16, u16, u16)>, // (row, start_col, end_col)
     pub menu_tab_hits: Vec<(usize, u16, u16)>, // (section_idx, start_col, end_col) on row 0
     pub container_close_hit: Option<(u16, u16, u16)>, // (row, start_col, end_col) for " x " close button
-    pub settings_col: usize,                          // 0 = left category tabs, 1 = right values
+    /// Rendered menu container box (x, y, w, h). Recorded every frame the
+    /// menu draws so tests can assert the ACTUAL on-screen height — not just
+    /// the close-button hitbox — is identical across all menu sections.
+    pub container_rect: Option<(u16, u16, u16, u16)>,
+    pub settings_col: usize,    // 0 = left category tabs, 1 = right values
     pub settings_tab: usize, // 0: Power, 1: Stall, 2: Repeat, 3: Context, 4: Permissions, 5: HF Token
     pub settings_option: usize, // selected option index within settings_tab (for multi-option tabs)
     pub hf_token_input: String,
     pub hf_token_editing: bool,
     pub search_token_input: String,
     pub search_token_editing: bool,
-    pub registry_tab: usize, // 0: HuggingFace, 1: Ollama
+    pub custom_color_input: String,
+    pub custom_color_editing: bool,
+    pub custom_color_field: usize, // index into CustomField::all()
+    pub registry_tab: usize,       // 0: HuggingFace, 1: Ollama
     pub config_state: ListState,
 
     // Installed Models state
@@ -387,6 +425,10 @@ pub struct App {
     pub hf_models: Vec<String>,
     pub registry_search_query: String,
     pub search_results: Arc<Mutex<Option<Vec<String>>>>,
+    /// Keystroke generation for registry search: each edit bumps it, so
+    /// only the latest query's fetch may publish (stale "deep" results
+    /// can never overwrite fresh "deepseek" ones).
+    pub registry_search_gen: Arc<std::sync::atomic::AtomicU64>,
 
     // Multimodal attachments & Path Autocomplete
     pub attachments: Vec<crate::media::MediaAttachment>,
@@ -412,6 +454,10 @@ pub struct App {
     // Download progress
     pub download_progress: Arc<Mutex<Option<f64>>>,
     pub download_complete: Arc<Mutex<bool>>,
+    /// Resolve/download failure text from the spawned installer task.
+    /// Polled per frame like `download_complete` so failures announce in
+    /// chat instead of dying silently in the activity logs.
+    pub download_error: Arc<Mutex<Option<String>>>,
 
     // Streaming response state
     pub streaming_response: Arc<Mutex<String>>,
@@ -578,6 +624,7 @@ impl App {
             header_bar_hit: None,
             menu_tab_hits: Vec::new(),
             container_close_hit: None,
+            container_rect: None,
             settings_col: 0,
             settings_tab: 0,
             settings_option: 0,
@@ -585,6 +632,9 @@ impl App {
             hf_token_editing: false,
             search_token_input: String::new(),
             search_token_editing: false,
+            custom_color_input: String::new(),
+            custom_color_editing: false,
+            custom_color_field: 0,
             registry_tab: 0,
             config_state: {
                 let mut st = ListState::default();
@@ -630,6 +680,7 @@ impl App {
             hf_models: Vec::new(),
             registry_search_query: String::new(),
             search_results: Arc::new(Mutex::new(None)),
+            registry_search_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             attachments: Vec::new(),
             next_attachment_id: 1,
             path_suggestions: Vec::new(),
@@ -691,6 +742,7 @@ impl App {
             current_log_pane_pct: 32.0,
             download_progress: Arc::new(Mutex::new(None)),
             download_complete: Arc::new(Mutex::new(false)),
+            download_error: Arc::new(Mutex::new(None)),
             streaming_response: Arc::new(Mutex::new(String::new())),
             is_generating: Arc::new(Mutex::new(false)),
             was_generating: false,
@@ -1132,33 +1184,13 @@ impl App {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     visible,
-                    Style::default().fg(color).bg(NORDIC_BG),
+                    Style::default().fg(color).bg(pal_bg()),
                 )))
-                .style(Style::default().bg(NORDIC_BG)),
+                .style(Style::default().bg(pal_bg())),
                 ratatui::layout::Rect {
                     x,
                     y,
                     width: area.width.saturating_sub((x - area.x)),
-                    height: 1,
-                },
-            );
-        }
-        // Subtitle rendered separately below the artwork (splash.txt
-        // stays artwork-only), in the existing muted style.
-        let sub_y = top + art_h + 1;
-        if sub_y < area.y + area.height {
-            let msg = "Ask me anything.";
-            let x = area.x + area.width.saturating_sub(msg.chars().count() as u16) / 2;
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    msg,
-                    Style::default().fg(Color::Rgb(120, 135, 155)).bg(NORDIC_BG),
-                )))
-                .style(Style::default().bg(NORDIC_BG)),
-                ratatui::layout::Rect {
-                    x,
-                    y: sub_y,
-                    width: area.width.saturating_sub(x - area.x),
                     height: 1,
                 },
             );
@@ -2798,6 +2830,7 @@ impl App {
             || t.contains("Unknown command")
             || t.contains("Pulling Ollama")
             || t.contains("Resolving model weights")
+            || t.contains("Resolving GGUF weights")
             || t.contains("Switched active engine")
             || t.contains("Backend switched")
             || t.contains("Permissions →")
@@ -3820,10 +3853,157 @@ impl App {
                     self.status_message.split(": ").nth(1).unwrap_or("")
                 );
             }
+            13 => {
+                // App Style — application chrome: single option, cycles
+                // Modern → Border Line → None in either direction
+                // (Enter = next). Persists via settings; chrome reads live
+                // settings per frame, so the UI updates immediately.
+                let next = crate::settings::cycle_app_chrome_style(if dir != 0 { dir } else { 1 });
+                self.status_message = format!("App Style: {}", next.label());
+            }
+            14 => {
+                // Color Palette — application colors: cycles the five
+                // palettes in either direction (Enter = next). Persists
+                // via settings; renderers read the live palette per
+                // frame, so the UI updates immediately. Never touches
+                // the chrome style.
+                let next = crate::settings::cycle_color_palette(if dir != 0 { dir } else { 1 });
+                self.status_message = format!("Color Palette: {}", next.label());
+            }
             _ => {}
         }
     }
 
+    /// Row count of the Color Palette value panel: 5 presets, plus the 12
+    /// Custom color rows when Custom is active.
+    fn palette_row_count() -> usize {
+        if crate::settings::get_color_palette() == crate::app_palette::AppPaletteStyle::Custom {
+            6 + crate::app_palette::CustomField::all().len()
+        } else {
+            6
+        }
+    }
+
+    /// Clamp the option cursor into the palette rows (row count shrinks
+    /// when leaving Custom).
+    fn palette_clamp_row(&mut self) {
+        let n = Self::palette_row_count();
+        if self.settings_option >= n {
+            self.settings_option = n.saturating_sub(1);
+        }
+    }
+
+    /// Enter/Right on a palette row: presets select immediately, custom
+    /// color rows open the hex editor (Custom only).
+    fn palette_activate_row(&mut self) {
+        self.palette_clamp_row();
+        let opt = self.settings_option;
+        if opt < 6 {
+            let style = crate::app_palette::AppPaletteStyle::all()[opt];
+            crate::settings::set_color_palette(style);
+            self.custom_color_editing = false;
+            self.custom_color_input.clear();
+            self.status_message = format!("Color Palette: {}", style.label());
+        } else if crate::settings::get_color_palette()
+            == crate::app_palette::AppPaletteStyle::Custom
+        {
+            let fi = (opt - 6).min(crate::app_palette::CustomField::all().len() - 1);
+            let field = crate::app_palette::CustomField::all()[fi];
+            self.custom_color_field = fi;
+            self.custom_color_input = crate::app_palette::to_hex_color(
+                crate::settings::get_custom_palette().get_field(field),
+            );
+            self.custom_color_editing = true;
+            self.status_message = format!(
+                "Edit {}: type #RRGGBB, Enter saves, Esc cancels.",
+                field.label()
+            );
+        } else {
+            self.status_message = "Select Custom to edit colors.".to_string();
+        }
+    }
+
+    /// Push a typed char into the Custom hex buffer. Returns true when the
+    /// keystroke was consumed by the editor (all keys are swallowed while
+    /// editing so typing a color never triggers navigation).
+    fn custom_hex_push(&mut self, c: char) -> bool {
+        if !self.custom_color_editing {
+            return false;
+        }
+        if c == '#' {
+            if !self.custom_color_input.contains('#') {
+                self.custom_color_input.insert(0, '#');
+            }
+        } else if c.is_ascii_hexdigit() && self.custom_color_input.len() < 7 {
+            self.custom_color_input.push(c.to_ascii_uppercase());
+        }
+        true
+    }
+
+    /// Commit the hex buffer to the Custom palette. Invalid input is
+    /// rejected with a status message — never a crash, never a partial
+    /// write — and the editor stays open for correction.
+    fn custom_commit_editing(&mut self) {
+        let field = crate::app_palette::CustomField::all()[self
+            .custom_color_field
+            .min(crate::app_palette::CustomField::all().len() - 1)];
+        match crate::settings::set_custom_color(field, &self.custom_color_input) {
+            Ok(_) => {
+                self.custom_color_editing = false;
+                self.custom_color_input.clear();
+                self.status_message = format!(
+                    "{} saved ({}).",
+                    field.label(),
+                    crate::app_palette::to_hex_color(
+                        crate::settings::get_custom_palette().get_field(field)
+                    )
+                );
+            }
+            Err(e) => {
+                self.status_message = format!("Invalid color {}: {}", field.label(), e);
+            }
+        }
+    }
+
+    fn custom_cancel_editing(&mut self) {
+        self.custom_color_editing = false;
+        self.custom_color_input.clear();
+        self.status_message = "Custom color editing cancelled.".to_string();
+    }
+
+    /// Registry search with debounce + staleness guard. Keystrokes wait
+    /// ~450ms of quiet before touching the network (no fetch per letter),
+    /// and only the latest query's completion may publish results — older
+    /// in-flight fetches are discarded instead of flickering the list.
+    /// `immediate` skips the wait (registry open), but still tags the
+    /// generation so later keystrokes invalidate it.
+    fn registry_fire_search(&mut self, immediate: bool) {
+        use std::sync::atomic::Ordering;
+        let tag = self
+            .registry_search_gen
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        let query = if self.registry_search_query.trim().is_empty() {
+            "gguf".to_string()
+        } else {
+            self.registry_search_query.clone()
+        };
+        let manager = self.manager.clone();
+        let results = self.search_results.clone();
+        let gen_shared = self.registry_search_gen.clone();
+        tokio::spawn(async move {
+            if !immediate {
+                tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+                if gen_shared.load(Ordering::SeqCst) != tag {
+                    return; // superseded while waiting
+                }
+            }
+            let matches = manager.search_all_models(&query).await;
+            if gen_shared.load(Ordering::SeqCst) == tag {
+                *results.lock().unwrap() = Some(matches);
+            }
+        });
+    }
     fn input_insert_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -5209,6 +5389,22 @@ impl App {
             }
         }
 
+        // Failed installs announce in chat (resolve errors, network
+        // failures). Without this the "Resolving…" message is followed by
+        // silence and /download-status correctly — but confusingly — shows
+        // no lock, because nothing ever started downloading.
+        if let Some(err) = self.download_error.lock().unwrap().take() {
+            self.status_message = "Download failed — see chat for details.".to_string();
+            self.messages
+                .push(format!("System: Download failed: {}", err));
+            if let Ok(mut l) = self.activity_logs.lock() {
+                l.push(format!(
+                    "[SYSTEM] Surfaced download failure to chat: {}",
+                    err
+                ));
+            }
+        }
+
         // Check hold-to-exit (1s duration)
         let _esc_hold_progress = if let Some(start) = self.esc_hold_start {
             let elapsed = start.elapsed().as_secs_f32();
@@ -5819,6 +6015,14 @@ impl App {
                         && self.hf_token_editing
                     {
                         self.hf_token_input.push_str(text.trim());
+                    } else if self.show_menu
+                        && self.menu_section == 3
+                        && self.settings_tab == SETTINGS_COLOR_PALETTE
+                        && self.custom_color_editing
+                    {
+                        for c in text.trim().chars() {
+                            self.custom_hex_push(c);
+                        }
                     } else if self.input_focused && !self.show_menu {
                         self.input_insert_text(&text);
                     }
@@ -5871,7 +6075,7 @@ impl App {
         let area = frame.area();
 
         // 1. Fill entire screen background with Nordic Gray
-        frame.render_widget(Block::default().style(Style::default().bg(NORDIC_BG)), area);
+        frame.render_widget(Block::default().style(Style::default().bg(pal_bg())), area);
 
         let is_gen = *self.is_generating.lock().unwrap();
         let is_thinking = if is_gen {
@@ -5983,9 +6187,11 @@ impl App {
                 ctx_str
             }
         };
-        let right_trans = "🭧🭓";
-        let right_len = 2 + right_ctx_str.chars().count() + 2; // 🭧🭓 + " " + text + " "
-
+        let chrome_bar = crate::app_chrome::current_chrome();
+        let right_trans = chrome_bar.bar_right_trans;
+        let right_len = chrome_bar.bar_trans_w() as usize
+            + right_ctx_str.chars().count()
+            + chrome_bar.bar_trans_w() as usize;
         // Left side: Model name (or " HERCULES ") + "🭞🭜"
         let brand_text = if let Some(ref lock) = active_download_lock {
             let display_name = if !lock.filename.is_empty() && lock.filename != lock.model_name {
@@ -6014,8 +6220,8 @@ impl App {
         } else {
             " HERCULES ".to_string()
         };
-        let left_trans = "🭞🭜";
-        let left_brand_w = brand_text.chars().count() + 2;
+        let left_trans = chrome_bar.bar_left_trans;
+        let left_brand_w = brand_text.chars().count() + chrome_bar.bar_trans_w() as usize;
 
         let mid_bar_w = full_top_w.saturating_sub(left_brand_w + right_len);
 
@@ -6030,7 +6236,9 @@ impl App {
                 };
                 multi_stop_gradient(st, wave)
             } else {
-                Color::Rgb(236, 239, 244)
+                // Idle bar color from the palette (status animations above
+                // take over while generating/thinking/exiting).
+                crate::app_palette::current_palette().accent_c()
             }
         };
 
@@ -6065,7 +6273,7 @@ impl App {
         ));
         top_spans.push(Span::styled(
             left_trans,
-            Style::default().fg(brand_bg).bg(NORDIC_BG),
+            Style::default().fg(brand_bg).bg(pal_bg()),
         ));
         cur_top_col += left_brand_w;
 
@@ -6080,13 +6288,13 @@ impl App {
                     let g = (60.0 * (1.0 - norm) + 40.0 * norm) as u8;
                     let b = (60.0 * (1.0 - norm) + 80.0 * norm) as u8;
                     top_spans.push(Span::styled(
-                        "🬂",
-                        Style::default().fg(Color::Rgb(r, g, b)).bg(NORDIC_BG),
+                        chrome_bar.bar_fill,
+                        Style::default().fg(Color::Rgb(r, g, b)).bg(pal_bg()),
                     ));
                 } else {
                     top_spans.push(Span::styled(
-                        "🬂",
-                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG),
+                        chrome_bar.bar_fill,
+                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(pal_bg()),
                     ));
                 }
                 cur_top_col += 1;
@@ -6102,13 +6310,13 @@ impl App {
                     let g = (220.0 * (1.0 - norm) + 140.0 * norm) as u8;
                     let b = (255.0 * (1.0 - norm) + 255.0 * norm) as u8;
                     top_spans.push(Span::styled(
-                        "🬂",
-                        Style::default().fg(Color::Rgb(r, g, b)).bg(NORDIC_BG),
+                        chrome_bar.bar_fill,
+                        Style::default().fg(Color::Rgb(r, g, b)).bg(pal_bg()),
                     ));
                 } else {
                     top_spans.push(Span::styled(
-                        "🬂",
-                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG),
+                        chrome_bar.bar_fill,
+                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(pal_bg()),
                     ));
                 }
                 cur_top_col += 1;
@@ -6117,7 +6325,10 @@ impl App {
             // Normal mode: identical smooth gradient to prompt bar
             for _ in 0..mid_bar_w {
                 let col_c = get_bar_color(cur_top_col, full_top_w);
-                top_spans.push(Span::styled("🬂", Style::default().fg(col_c).bg(NORDIC_BG)));
+                top_spans.push(Span::styled(
+                    chrome_bar.bar_fill,
+                    Style::default().fg(col_c).bg(pal_bg()),
+                ));
                 cur_top_col += 1;
             }
         }
@@ -6127,7 +6338,7 @@ impl App {
         let ctx_fg = get_contrast_text_color(ctx_bg);
         top_spans.push(Span::styled(
             right_trans,
-            Style::default().fg(ctx_bg).bg(NORDIC_BG),
+            Style::default().fg(ctx_bg).bg(pal_bg()),
         ));
         top_spans.push(Span::styled(
             format!(" {} ", right_ctx_str),
@@ -6157,16 +6368,25 @@ impl App {
                 (7, " Thunder "),
             ];
 
-            menu_spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
+            menu_spans.push(Span::styled(
+                " ",
+                Style::default().bg(crate::app_palette::current_palette().menu_bg_c()),
+            ));
             col_ptr += 1;
 
             for (sec_idx, label) in tabs {
                 let label_len = label.chars().count() as u16;
                 let is_active = self.show_menu && self.menu_section == sec_idx;
+                // Menu layer colors from the palette: normal items use the
+                // theme foreground on the dark menu background, the active
+                // item gets the distinct selected background, inactive
+                // items a muted foreground. Same cells, same widths —
+                // purely visual, geometry untouched.
+                let pal = crate::app_palette::current_palette();
                 let (tab_fg, tab_bg) = if is_active {
-                    (NORDIC_BG, Color::White)
+                    (pal.selection_fg_c(), pal.menu_selected_bg_c())
                 } else {
-                    (Color::Rgb(220, 230, 242), Color::Rgb(46, 52, 64))
+                    (pal.muted_c(), pal.menu_bg_c())
                 };
                 let x0 = col_ptr;
                 let x1 = col_ptr + label_len - 1;
@@ -6181,12 +6401,16 @@ impl App {
                 ));
                 col_ptr += label_len;
 
-                menu_spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
+                menu_spans.push(Span::styled(
+                    " ",
+                    Style::default().bg(crate::app_palette::current_palette().menu_bg_c()),
+                ));
                 col_ptr += 1;
             }
 
             frame.render_widget(
-                Paragraph::new(Line::from(menu_spans)).style(Style::default().bg(NORDIC_BG)),
+                Paragraph::new(Line::from(menu_spans))
+                    .style(Style::default().bg(crate::app_palette::current_palette().menu_bg_c())),
                 Rect {
                     x: top_area.x,
                     y: 0,
@@ -6206,7 +6430,7 @@ impl App {
             top_area.x + top_area.width.saturating_sub(1),
         ));
         frame.render_widget(
-            Paragraph::new(Line::from(top_spans)).style(Style::default().bg(NORDIC_BG)),
+            Paragraph::new(Line::from(top_spans)).style(Style::default().bg(pal_bg())),
             Rect {
                 x: top_area.x,
                 y: header_y,
@@ -6287,14 +6511,14 @@ impl App {
                     let needed_w = if cur_line_w > 0 { badge_w + 1 } else { badge_w };
                     if cur_line_w + needed_w > max_w && cur_line_w > 0 {
                         // Flush current line
-                        push_full_shaded!(lines, cur_line_spans, cur_line_w, max_w, NORDIC_BG);
+                        push_full_shaded!(lines, cur_line_spans, cur_line_w, max_w, pal_bg());
                         cur_line_spans = Vec::new();
                         cur_line_w = 0;
                         cur_line_idx = lines.len();
                     }
 
                     if cur_line_w > 0 {
-                        cur_line_spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
+                        cur_line_spans.push(Span::styled(" ", Style::default().bg(pal_bg())));
                         cur_line_w += 1;
                     }
 
@@ -6308,7 +6532,7 @@ impl App {
                 }
 
                 if cur_line_w > 0 {
-                    push_full_shaded!(lines, cur_line_spans, cur_line_w, max_w, NORDIC_BG);
+                    push_full_shaded!(lines, cur_line_spans, cur_line_w, max_w, pal_bg());
                 }
                 lines.push(Line::from(""));
             };
@@ -6373,7 +6597,7 @@ impl App {
                     let title_line_idx = chat_lines.len();
                     all_section_hits_unmapped.push((title_line_idx, 0, 5, SectionKind::You(m_idx)));
                     section_headers.push((title_line_idx, "You".to_string(), user_bg));
-                    let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
+                    let row_bg = if is_collapsed { pal_bg() } else { content_bg };
                     push_full_shaded!(
                         &mut chat_lines,
                         vec![badge_span],
@@ -6582,7 +6806,7 @@ impl App {
                                 think_tag.trim().to_string(),
                                 think_bg,
                             ));
-                            let header_row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
+                            let header_row_bg = if is_collapsed { pal_bg() } else { content_bg };
                             push_full_shaded!(
                                 &mut chat_lines,
                                 vec![badge_span],
@@ -6810,7 +7034,7 @@ impl App {
                                 agent_label.trim().to_string(),
                                 agent_bg,
                             ));
-                            let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
+                            let row_bg = if is_collapsed { pal_bg() } else { content_bg };
                             push_full_shaded!(
                                 &mut chat_lines,
                                 vec![badge_span],
@@ -7055,7 +7279,7 @@ impl App {
                         let chip_start = chat_lines.len();
                         chip_line_starts.push((chip.id, chip_start));
 
-                        let action_row_bg = if is_open { content_bg } else { NORDIC_BG };
+                        let action_row_bg = if is_open { content_bg } else { pal_bg() };
                         section_headers.push((
                             chip_start,
                             format!(
@@ -7260,7 +7484,7 @@ impl App {
                         SectionKind::System(m_idx),
                     ));
                     section_headers.push((title_line_idx, "System".to_string(), sys_bg));
-                    let row_bg = if is_collapsed { NORDIC_BG } else { content_bg };
+                    let row_bg = if is_collapsed { pal_bg() } else { content_bg };
                     push_full_shaded!(
                         &mut chat_lines,
                         vec![badge_span],
@@ -7403,7 +7627,7 @@ impl App {
                     let chip_start = chat_lines.len();
                     chip_line_starts.push((chip.id, chip_start));
 
-                    let action_row_bg = if is_open { content_bg } else { NORDIC_BG };
+                    let action_row_bg = if is_open { content_bg } else { pal_bg() };
                     section_headers.push((
                         chip_start,
                         format!(
@@ -7696,7 +7920,7 @@ impl App {
             self.last_chat_area = Some(chat_area);
         } else {
             let chat_box = Paragraph::new(chat_lines)
-                .style(Style::default().bg(NORDIC_BG))
+                .style(Style::default().bg(pal_bg()))
                 .scroll((self.scroll_offset, 0))
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .block(Block::default().borders(Borders::NONE));
@@ -7800,13 +8024,14 @@ impl App {
         // Extra spaces on both sides: "  {MODEL NAME}  "
         let badge_text = format!("  {}  ", model_clean);
         let badge_len = badge_text.chars().count();
-        let right_trans = "🭆🭂"; // 2 transition characters
-        let right_trans_len = 2;
+        let chrome_in = crate::app_chrome::current_chrome();
+        let right_trans = chrome_in.input_trans;
+        let right_trans_len = chrome_in.input_trans_w() as usize;
 
         let main_badge_text = " Main ";
         let main_badge_len = main_badge_text.chars().count();
-        let main_trans = "🭍🭑";
-        let main_trans_len = 2;
+        let main_trans = chrome_in.input_main_trans;
+        let main_trans_len = chrome_in.input_trans_w() as usize;
         let left_main_total = main_badge_len + main_trans_len;
 
         let total_right_badge_w = right_trans_len + badge_len;
@@ -7814,7 +8039,7 @@ impl App {
             .saturating_sub(left_main_total + total_right_badge_w)
             .max(1);
 
-        let white_c = Color::Rgb(236, 239, 244); // #ECEFF4 Snow White
+        let white_c = crate::app_palette::current_palette().accent_c(); // idle input-bar color
 
         let get_bar_color = |col_idx: usize, bar_width: usize| -> Color {
             if let Some(ref st) = stops {
@@ -7860,7 +8085,7 @@ impl App {
         ));
         bar_spans.push(Span::styled(
             main_trans,
-            Style::default().fg(main_bg).bg(NORDIC_BG),
+            Style::default().fg(main_bg).bg(pal_bg()),
         ));
         cur_col_idx += left_main_total;
 
@@ -7888,7 +8113,10 @@ impl App {
                         .bg(bg_c)
                         .add_modifier(Modifier::BOLD),
                 ));
-                bar_spans.push(Span::styled("🭍🭑", Style::default().fg(bg_c).bg(NORDIC_BG)));
+                bar_spans.push(Span::styled(
+                    chrome_in.input_main_trans,
+                    Style::default().fg(bg_c).bg(pal_bg()),
+                ));
                 cur_col_idx += tag_len + 2;
             }
         }
@@ -7901,7 +8129,10 @@ impl App {
         // Fill middle with gradient (no duration here — shown on chip labels)
         for _ in 0..mid_bar_w {
             let col_c = get_bar_color(cur_col_idx, bar_w);
-            bar_spans.push(Span::styled("🬭", Style::default().fg(col_c).bg(NORDIC_BG)));
+            bar_spans.push(Span::styled(
+                chrome_in.input_fill,
+                Style::default().fg(col_c).bg(pal_bg()),
+            ));
             cur_col_idx += 1;
         }
 
@@ -7911,7 +8142,7 @@ impl App {
 
         bar_spans.push(Span::styled(
             right_trans,
-            Style::default().fg(c_badge_bg).bg(NORDIC_BG),
+            Style::default().fg(c_badge_bg).bg(pal_bg()),
         ));
         cur_col_idx += right_trans_len;
 
@@ -7953,7 +8184,7 @@ impl App {
                 input_ui_lines.push(Line::from(vec![
                     Span::styled(
                         " $ ",
-                        Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG),
+                        Style::default().fg(Color::Rgb(163, 190, 140)).bg(pal_bg()),
                     ),
                     Span::styled(
                         if self.term_input.is_empty() {
@@ -7967,17 +8198,17 @@ impl App {
                             } else {
                                 Color::Rgb(163, 190, 140)
                             })
-                            .bg(NORDIC_BG),
+                            .bg(pal_bg()),
                     ),
                     Span::styled(
                         "█",
-                        Style::default().fg(Color::Rgb(163, 190, 140)).bg(NORDIC_BG),
+                        Style::default().fg(Color::Rgb(163, 190, 140)).bg(pal_bg()),
                     ),
                 ]));
             } else if self.input.is_empty() {
                 input_ui_lines.push(Line::from(Span::styled(
                     " Type a prompt...",
-                    Style::default().fg(NORDIC_MUTED).bg(NORDIC_BG),
+                    Style::default().fg(NORDIC_MUTED).bg(pal_bg()),
                 )));
             } else {
                 let total_lines = wrapped_prompt_lines.len();
@@ -8027,7 +8258,7 @@ impl App {
                                 if actual_open > cur_pos {
                                     row_spans.push(Span::styled(
                                         line_chars[cur_pos..actual_open].to_string(),
-                                        Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                        Style::default().fg(NORDIC_TEXT).bg(pal_bg()),
                                     ));
                                 }
 
@@ -8057,7 +8288,7 @@ impl App {
                     if cur_pos < line_chars.len() {
                         row_spans.push(Span::styled(
                             line_chars[cur_pos..].to_string(),
-                            Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                            Style::default().fg(NORDIC_TEXT).bg(pal_bg()),
                         ));
                     }
 
@@ -8067,7 +8298,7 @@ impl App {
                         if pad_spaces > 0 {
                             row_spans.push(Span::styled(
                                 " ".repeat(pad_spaces),
-                                Style::default().bg(NORDIC_BG),
+                                Style::default().bg(pal_bg()),
                             ));
                         }
                         let is_thumb = r >= thumb_start && r < thumb_start + thumb_height;
@@ -8079,7 +8310,7 @@ impl App {
                         };
                         row_spans.push(Span::styled(
                             sb_char,
-                            Style::default().fg(sb_color).bg(NORDIC_BG),
+                            Style::default().fg(sb_color).bg(pal_bg()),
                         ));
                     }
 
@@ -8088,7 +8319,7 @@ impl App {
             }
         }
 
-        let input_box = Paragraph::new(input_ui_lines).style(Style::default().bg(NORDIC_BG));
+        let input_box = Paragraph::new(input_ui_lines).style(Style::default().bg(pal_bg()));
         frame.render_widget(input_box, input_area);
 
         // Path Autocomplete Popup floating above input
@@ -8110,8 +8341,11 @@ impl App {
                 let is_sel = idx == self.path_suggestion_index;
                 let style = if is_sel {
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Rgb(143, 218, 255))
+                        .fg(crate::app_palette::contrasting_text_on(
+                            crate::app_palette::current_palette().accent,
+                            &crate::app_palette::current_palette(),
+                        ))
+                        .bg(crate::app_palette::current_palette().accent_c())
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White).bg(Color::Rgb(46, 52, 64))
@@ -8129,6 +8363,7 @@ impl App {
                 .title(" Suggestions (Tab/Enter: select) ")
                 .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
                 .style(Style::default().bg(Color::Rgb(46, 52, 64)));
+            let block = crate::app_chrome::frame_container(block);
             let list_widget = List::new(list_items).block(block);
             frame.render_widget(list_widget, pop_area);
         }
@@ -8156,29 +8391,23 @@ impl App {
             // Menu visibility must never depend on animation progress: render
             // immediately on open (anim_p only scales the intro size/fade).
             {
-                let full_w = area.width;
-                let full_h = area.height;
-
-                // Content-aware target size (max ~90% width, ~86% height);
-                // the Krama animation interpolates from closed to THIS size,
-                // never to an oversized fixed rectangle.
-                let (target_w, target_h) = self.modal_target_size(area);
-                let modal_w = ((target_w as f32 * (0.6 + 0.4 * anim_p)).round() as u16).max(36);
-                let modal_h = ((target_h as f32 * (0.6 + 0.4 * anim_p)).round() as u16).max(14);
-
-                let modal_x = area.x + (full_w.saturating_sub(modal_w)) / 2;
-                let modal_y = area.y + (full_h.saturating_sub(modal_h)) / 2;
-                let container_rect = Rect {
-                    x: modal_x,
-                    y: modal_y,
-                    width: modal_w,
-                    height: modal_h,
-                };
+                // Shared menu geometry: every section animates toward the
+                // SAME target box; only content inside differs. The Krama
+                // animation interpolates from closed to THIS size — the
+                // shared target, never a per-menu rectangle.
+                let layout = crate::app::calculate_app_menu_layout(area, anim_p);
+                let (modal_x, modal_y, modal_w, modal_h) = (
+                    layout.outer.x,
+                    layout.outer.y,
+                    layout.outer.width,
+                    layout.outer.height,
+                );
+                let container_rect = layout.outer;
 
                 // Clear container background with exact screen background
                 frame.render_widget(Clear, container_rect);
                 frame.render_widget(
-                    Block::default().style(Style::default().bg(NORDIC_BG)),
+                    Block::default().style(Style::default().bg(modal_bg())),
                     container_rect,
                 );
 
@@ -8200,48 +8429,56 @@ impl App {
                 let close_btn_str = " x ";
                 let close_btn_len = close_btn_str.chars().count() as u16;
 
-                // Top Left: 🭈🭆🭂{ menu }🭞🭜
-                // Top Right: 🭧🭓 x 🭍🭑🬽
-                let tl_badge_w = 3 + menu_title_str.chars().count() as u16 + 2; // "🭈🭆🭂" + title + "🭞🭜"
-                let tr_badge_w = 2 + close_btn_len + 3; // "🭧🭓" + " x " + "🭍🭑🬽"
+                // Top Left: chrome.tl + { menu } + chrome.title_right
+                // Top Right: chrome.tr_mid + " x " + chrome.tr_end.
+                // Widths derive from the runs (style-invariant by test).
+                let chrome = crate::app_chrome::current_chrome();
+                let tl_badge_w = chrome.modal_tl_w()
+                    + menu_title_str.chars().count() as u16
+                    + chrome.modal_title_right_w();
+                let tr_badge_w = chrome.modal_tr_mid_w() + close_btn_len + chrome.modal_tr_end_w();
                 let top_bar_fill_w = modal_w.saturating_sub(tl_badge_w + tr_badge_w) as usize;
 
                 // Record close button hit
                 let close_btn_x0 = modal_x + modal_w.saturating_sub(tr_badge_w) + 2;
                 let close_btn_x1 = close_btn_x0 + close_btn_len.saturating_sub(1);
                 self.container_close_hit = Some((modal_y, close_btn_x0, close_btn_x1));
+                // Record the ACTUAL rendered container box (x, y, w, h) so
+                // tests assert on-screen height equality across sections.
+                self.container_rect = Some((modal_x, modal_y, modal_w, modal_h));
 
                 // --- Row 0 (Top line) ---
                 let mut row0_spans: Vec<Span> = Vec::new();
-                // 🭈🭆🭂
                 row0_spans.push(Span::styled(
-                    "🭈🭆🭂",
-                    Style::default().fg(border_color).bg(NORDIC_BG),
+                    chrome.modal_tl,
+                    Style::default().fg(border_color).bg(modal_bg()),
                 ));
-                // { menu } with white background and base text
+                // { menu } title badge in the palette accent so the menu
+                // title carries the theme color in every style.
                 row0_spans.push(Span::styled(
                     menu_title_str,
                     Style::default()
-                        .fg(NORDIC_BG)
-                        .bg(border_color)
+                        .fg(crate::app_palette::contrasting_text_on(
+                            crate::app_palette::current_palette().accent,
+                            &crate::app_palette::current_palette(),
+                        ))
+                        .bg(crate::app_palette::current_palette().accent_c())
                         .add_modifier(Modifier::BOLD),
                 ));
-                // 🭞🭜
                 row0_spans.push(Span::styled(
-                    "🭞🭜",
-                    Style::default().fg(border_color).bg(NORDIC_BG),
+                    chrome.modal_title_right,
+                    Style::default().fg(border_color).bg(modal_bg()),
                 ));
-                // Top border fill 🬂
+                // Top border fill
                 for _ in 0..top_bar_fill_w {
                     row0_spans.push(Span::styled(
-                        "🬂",
-                        Style::default().fg(border_color).bg(NORDIC_BG),
+                        chrome.modal_fill,
+                        Style::default().fg(border_color).bg(modal_bg()),
                     ));
                 }
-                // 🭧🭓
                 row0_spans.push(Span::styled(
-                    "🭧🭓",
-                    Style::default().fg(border_color).bg(NORDIC_BG),
+                    chrome.modal_tr_mid,
+                    Style::default().fg(border_color).bg(modal_bg()),
                 ));
                 // " x " close button
                 row0_spans.push(Span::styled(
@@ -8251,13 +8488,12 @@ impl App {
                         .bg(border_color)
                         .add_modifier(Modifier::BOLD),
                 ));
-                // 🭍🭑🬽
                 row0_spans.push(Span::styled(
-                    "🭍🭑🬽",
-                    Style::default().fg(border_color).bg(NORDIC_BG),
+                    chrome.modal_tr_end,
+                    Style::default().fg(border_color).bg(modal_bg()),
                 ));
                 frame.render_widget(
-                    Paragraph::new(Line::from(row0_spans)).style(Style::default().bg(NORDIC_BG)),
+                    Paragraph::new(Line::from(row0_spans)).style(Style::default().bg(modal_bg())),
                     Rect {
                         x: modal_x,
                         y: modal_y,
@@ -8267,24 +8503,23 @@ impl App {
                 );
 
                 // --- Row 1 (Top sub-corners) ---
-                // Left: 🭝🭜🭘  Right: 🭣🭧🭒
                 if modal_h >= 4 {
                     let mut row1_spans: Vec<Span> = Vec::new();
                     row1_spans.push(Span::styled(
-                        "🭝🭜🭘",
-                        Style::default().fg(border_color).bg(NORDIC_BG),
+                        chrome.modal_sub_l,
+                        Style::default().fg(border_color).bg(modal_bg()),
                     ));
-                    let middle_spaces = modal_w.saturating_sub(6) as usize;
+                    let middle_spaces = modal_w.saturating_sub(chrome.modal_sub_w() * 2) as usize;
                     if middle_spaces > 0 {
                         row1_spans.push(Span::raw(" ".repeat(middle_spaces)));
                     }
                     row1_spans.push(Span::styled(
-                        "🭣🭧🭒",
-                        Style::default().fg(border_color).bg(NORDIC_BG),
+                        chrome.modal_sub_r,
+                        Style::default().fg(border_color).bg(modal_bg()),
                     ));
                     frame.render_widget(
                         Paragraph::new(Line::from(row1_spans))
-                            .style(Style::default().bg(NORDIC_BG)),
+                            .style(Style::default().bg(modal_bg())),
                         Rect {
                             x: modal_x,
                             y: modal_y + 1,
@@ -8294,10 +8529,12 @@ impl App {
                     );
                 }
 
-                // --- Middle Rows (Left ▌ and Right ▐) ---
+                // --- Middle Rows (side edges) ---
                 for r in 2..modal_h.saturating_sub(2) {
-                    let left_span =
-                        Span::styled("▌", Style::default().fg(border_color).bg(NORDIC_BG));
+                    let left_span = Span::styled(
+                        chrome.modal_side_l,
+                        Style::default().fg(border_color).bg(modal_bg()),
+                    );
                     frame.render_widget(
                         Paragraph::new(Line::from(left_span)),
                         Rect {
@@ -8307,8 +8544,10 @@ impl App {
                             height: 1,
                         },
                     );
-                    let right_span =
-                        Span::styled("▐", Style::default().fg(border_color).bg(NORDIC_BG));
+                    let right_span = Span::styled(
+                        chrome.modal_side_r,
+                        Style::default().fg(border_color).bg(modal_bg()),
+                    );
                     frame.render_widget(
                         Paragraph::new(Line::from(right_span)),
                         Rect {
@@ -8321,24 +8560,23 @@ impl App {
                 }
 
                 // --- Row H-2 (Bottom sub-corners) ---
-                // Left: 🭌🭑🬽  Right: 🭈🭆🭁
                 if modal_h >= 4 {
                     let mut row_sub_b_spans: Vec<Span> = Vec::new();
                     row_sub_b_spans.push(Span::styled(
-                        "🭌🭑🬽",
-                        Style::default().fg(border_color).bg(NORDIC_BG),
+                        chrome.modal_bot_l,
+                        Style::default().fg(border_color).bg(modal_bg()),
                     ));
-                    let middle_spaces = modal_w.saturating_sub(6) as usize;
+                    let middle_spaces = modal_w.saturating_sub(chrome.modal_sub_w() * 2) as usize;
                     if middle_spaces > 0 {
                         row_sub_b_spans.push(Span::raw(" ".repeat(middle_spaces)));
                     }
                     row_sub_b_spans.push(Span::styled(
-                        "🭈🭆🭁",
-                        Style::default().fg(border_color).bg(NORDIC_BG),
+                        chrome.modal_bot_r,
+                        Style::default().fg(border_color).bg(modal_bg()),
                     ));
                     frame.render_widget(
                         Paragraph::new(Line::from(row_sub_b_spans))
-                            .style(Style::default().bg(NORDIC_BG)),
+                            .style(Style::default().bg(modal_bg())),
                         Rect {
                             x: modal_x,
                             y: modal_y + modal_h.saturating_sub(2),
@@ -8349,27 +8587,27 @@ impl App {
                 }
 
                 // --- Row H-1 (Bottom line) ---
-                // Left: 🭣🭧🭓🭍🭑  Bottom line: 🬭  Right: 🭆🭂🭞🭜🭘
-                let bl_w = 5u16; // "🭣🭧🭓🭍🭑"
-                let br_w = 5u16; // "🭆🭂🭞🭜🭘"
+                let bl_w = chrome.modal_foot_w();
+                let br_w = chrome.modal_foot_w();
                 let bot_fill_w = modal_w.saturating_sub(bl_w + br_w) as usize;
                 let mut row_bot_spans: Vec<Span> = Vec::new();
                 row_bot_spans.push(Span::styled(
-                    "🭣🭧🭓🭍🭑",
-                    Style::default().fg(border_color).bg(NORDIC_BG),
+                    chrome.modal_foot_l,
+                    Style::default().fg(border_color).bg(modal_bg()),
                 ));
                 for _ in 0..bot_fill_w {
                     row_bot_spans.push(Span::styled(
-                        "🬭",
-                        Style::default().fg(border_color).bg(NORDIC_BG),
+                        chrome.modal_foot_fill,
+                        Style::default().fg(border_color).bg(modal_bg()),
                     ));
                 }
                 row_bot_spans.push(Span::styled(
-                    "🭆🭂🭞🭜🭘",
-                    Style::default().fg(border_color).bg(NORDIC_BG),
+                    chrome.modal_foot_r,
+                    Style::default().fg(border_color).bg(modal_bg()),
                 ));
                 frame.render_widget(
-                    Paragraph::new(Line::from(row_bot_spans)).style(Style::default().bg(NORDIC_BG)),
+                    Paragraph::new(Line::from(row_bot_spans))
+                        .style(Style::default().bg(modal_bg())),
                     Rect {
                         x: modal_x,
                         y: modal_y + modal_h.saturating_sub(1),
@@ -8379,23 +8617,11 @@ impl App {
                 );
 
                 // --- Inner Container Content Area ---
-                // One row reserved at the bottom for the shared keyboard
+                // Shared geometry (same struct the layout API returns):
+                // one row reserved at the bottom for the shared keyboard
                 // footer; content sections get the rows above it.
-                let content_full = Rect {
-                    x: modal_x + 3,
-                    y: modal_y + 2,
-                    width: modal_w.saturating_sub(6),
-                    height: modal_h.saturating_sub(4),
-                };
-                let content_inner = Rect {
-                    height: content_full.height.saturating_sub(1),
-                    ..content_full
-                };
-                let modal_footer_area = Rect {
-                    y: content_full.y + content_full.height.saturating_sub(1),
-                    height: 1,
-                    ..content_full
-                };
+                let content_inner = layout.content;
+                let modal_footer_area = layout.footer;
 
                 match self.menu_section {
                     0 => {
@@ -8405,10 +8631,10 @@ impl App {
                                 " Hercules Keyboard Navigation & Quick Reference ",
                                 Style::default()
                                     .fg(Color::White)
-                                    .bg(NORDIC_BG)
+                                    .bg(modal_bg())
                                     .add_modifier(Modifier::BOLD),
                             )),
-                            Line::from(Span::styled("", Style::default().bg(NORDIC_BG))),
+                            Line::from(Span::styled("", Style::default().bg(modal_bg()))),
                             Line::from(vec![
                                 Span::styled(
                                     " F1 ",
@@ -8419,7 +8645,7 @@ impl App {
                                 ),
                                 Span::styled(
                                     "          Help & Keybindings guide",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8432,7 +8658,7 @@ impl App {
                                 ),
                                 Span::styled(
                                     "          Model Registry (Download from HuggingFace & Ollama)",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8445,7 +8671,7 @@ impl App {
                                 ),
                                 Span::styled(
                                     "          Modal (Choose & activate installed local models)",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8458,7 +8684,7 @@ impl App {
                                 ),
                                 Span::styled(
                                     "          Settings (Power mode, stall watchdog, permissions)",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8471,7 +8697,7 @@ impl App {
                                 ),
                                 Span::styled(
                                     "          Session Info (Context budget, hardware load, power, chips)",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8484,7 +8710,7 @@ impl App {
                                 ),
                                 Span::styled(
                                     "          Code Graph (Tree-sitter + LSP: nodes, edges, call hierarchy)",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8497,7 +8723,7 @@ impl App {
                                 ),
                                 Span::styled(
                                     "          Agent Run Timeline (steps, progress, run history)",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8510,21 +8736,21 @@ impl App {
                                 ),
                                 Span::styled(
                                     "          Shared Thunder (P2P inference: host, pair, remotes)",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
-                            Line::from(Span::styled("", Style::default().bg(NORDIC_BG))),
+                            Line::from(Span::styled("", Style::default().bg(modal_bg()))),
                             Line::from(vec![
                                 Span::styled(
                                     " Esc ",
                                     Style::default()
                                         .fg(Color::Rgb(255, 180, 180))
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
                                     "         Close menu / (Hold 1s) Quit application",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8532,12 +8758,12 @@ impl App {
                                     " Ctrl+Esc ",
                                     Style::default()
                                         .fg(Color::Rgb(255, 120, 120))
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
                                     "    Exit immediately",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8545,12 +8771,12 @@ impl App {
                                     " Ctrl+F ",
                                     Style::default()
                                         .fg(Color::Rgb(143, 218, 255))
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
                                     "      Focus / Unfocus user prompt bar",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8558,12 +8784,12 @@ impl App {
                                     " Ctrl+C ",
                                     Style::default()
                                         .fg(Color::Rgb(255, 200, 100))
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
                                     "      Interrupt streaming response or tool execution",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8571,12 +8797,12 @@ impl App {
                                     " Ctrl+T ",
                                     Style::default()
                                         .fg(Color::Rgb(163, 190, 140))
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
                                     "      Collapse all sections before current response",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8584,12 +8810,12 @@ impl App {
                                     " Ctrl+O ",
                                     Style::default()
                                         .fg(Color::Rgb(143, 218, 255))
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
                                     "      Open / expand all sections and labels",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                             Line::from(vec![
@@ -8597,17 +8823,17 @@ impl App {
                                     " PgUp / PgDn ",
                                     Style::default()
                                         .fg(Color::Rgb(180, 160, 255))
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
                                     " Scroll conversation history",
-                                    Style::default().fg(NORDIC_TEXT).bg(NORDIC_BG),
+                                    Style::default().fg(NORDIC_TEXT).bg(modal_bg()),
                                 ),
                             ]),
                         ];
                         frame.render_widget(
-                            Paragraph::new(help_lines).style(Style::default().bg(NORDIC_BG)),
+                            Paragraph::new(help_lines).style(Style::default().bg(modal_bg())),
                             content_inner,
                         );
                     }
@@ -8631,7 +8857,9 @@ impl App {
                                 .bg(Color::White)
                                 .add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG)
+                            Style::default()
+                                .fg(Color::Rgb(160, 180, 200))
+                                .bg(modal_bg())
                         };
                         let ol_style = if self.registry_tab == 1 {
                             Style::default()
@@ -8639,39 +8867,45 @@ impl App {
                                 .bg(Color::White)
                                 .add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG)
+                            Style::default()
+                                .fg(Color::Rgb(160, 180, 200))
+                                .bg(modal_bg())
                         };
 
                         let tab_bar = Paragraph::new(Line::from(vec![
                             Span::styled(" [ HuggingFace Models ] ", hf_style),
-                            Span::styled("  ", Style::default().bg(NORDIC_BG)),
+                            Span::styled("  ", Style::default().bg(modal_bg())),
                             Span::styled(" [ Ollama Models ] ", ol_style),
                             Span::styled(
                                 "   (Left/Right to switch tab | Enter to download)",
-                                Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                Style::default()
+                                    .fg(Color::Rgb(120, 140, 160))
+                                    .bg(modal_bg()),
                             ),
                         ]))
-                        .style(Style::default().bg(NORDIC_BG));
+                        .style(Style::default().bg(modal_bg()));
                         frame.render_widget(tab_bar, chunks[0]);
 
                         // Search Bar
                         let search_text = if self.registry_search_query.is_empty() {
                             Span::styled(
                                 " Search models (type to filter query)...",
-                                Style::default().fg(Color::Rgb(100, 120, 140)).bg(NORDIC_BG),
+                                Style::default()
+                                    .fg(Color::Rgb(100, 120, 140))
+                                    .bg(modal_bg()),
                             )
                         } else {
                             Span::styled(
                                 format!(" Search: {}", self.registry_search_query),
                                 Style::default()
                                     .fg(Color::White)
-                                    .bg(NORDIC_BG)
+                                    .bg(modal_bg())
                                     .add_modifier(Modifier::BOLD),
                             )
                         };
                         frame.render_widget(
                             Paragraph::new(Line::from(vec![search_text]))
-                                .style(Style::default().bg(NORDIC_BG)),
+                                .style(Style::default().bg(modal_bg())),
                             chunks[1],
                         );
 
@@ -8749,9 +8983,9 @@ impl App {
                                 .map(|(row_idx, m)| {
                                     let is_selected = selected_idx == Some(row_idx);
                                     let row_bg = if is_selected {
-                                        Color::Rgb(59, 66, 82)
+                                        crate::app_palette::current_palette().selection_bg_c()
                                     } else {
-                                        NORDIC_BG
+                                        modal_bg()
                                     };
 
                                     // Split org/repo [size] into columns: Org │ Model │ Size
@@ -8878,9 +9112,9 @@ impl App {
                                 .map(|(row_idx, m)| {
                                     let is_selected = selected_idx == Some(row_idx);
                                     let row_bg = if is_selected {
-                                        Color::Rgb(59, 66, 82)
+                                        crate::app_palette::current_palette().selection_bg_c()
                                     } else {
-                                        NORDIC_BG
+                                        modal_bg()
                                     };
 
                                     let (name_part, size_part) = if let Some(idx) = m.find('(') {
@@ -9010,12 +9244,14 @@ impl App {
                             };
                             let p = Paragraph::new(Line::from(vec![Span::styled(
                                 format!("  {}", empty_msg),
-                                Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG),
+                                Style::default()
+                                    .fg(Color::Rgb(160, 180, 200))
+                                    .bg(modal_bg()),
                             )]))
-                            .style(Style::default().bg(NORDIC_BG));
+                            .style(Style::default().bg(modal_bg()));
                             frame.render_widget(p, chunks[2]);
                         } else {
-                            let list = List::new(items).style(Style::default().bg(NORDIC_BG));
+                            let list = List::new(items).style(Style::default().bg(modal_bg()));
                             frame.render_stateful_widget(list, chunks[2], &mut self.registry_state);
                         }
                     }
@@ -9031,15 +9267,17 @@ impl App {
                                 " Installed Models ",
                                 Style::default()
                                     .fg(Color::White)
-                                    .bg(NORDIC_BG)
+                                    .bg(modal_bg())
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
                                 " (Up/Down or W/S to navigate | Enter to activate model)",
-                                Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                Style::default()
+                                    .fg(Color::Rgb(120, 140, 160))
+                                    .bg(modal_bg()),
                             ),
                         ]))
-                        .style(Style::default().bg(NORDIC_BG));
+                        .style(Style::default().bg(modal_bg()));
                         frame.render_widget(info, chunks[0]);
 
                         let total_rows =
@@ -9067,9 +9305,9 @@ impl App {
                                 let row_bg = if is_being_deleted {
                                     Color::Rgb(75, 45, 45)
                                 } else if is_selected {
-                                    Color::Rgb(59, 66, 82)
+                                    crate::app_palette::current_palette().selection_bg_c()
                                 } else {
-                                    NORDIC_BG
+                                    modal_bg()
                                 };
 
                                 let is_active = self.backend.name().contains(m)
@@ -9288,7 +9526,7 @@ impl App {
                             }
                         }
 
-                        let list = List::new(items).style(Style::default().bg(NORDIC_BG));
+                        let list = List::new(items).style(Style::default().bg(modal_bg()));
                         frame.render_stateful_widget(list, chunks[1], &mut self.installed_state);
                     }
                     3 => {
@@ -9311,19 +9549,27 @@ impl App {
                             .split(content_inner);
 
                         // Column 1: Tabs (w/Up to go up, s/Down to go down)
+                        // Rows are padded to the full 22-cell column width
+                        // with the row background so the column reads as one
+                        // solid layer instead of floating pills. Colors come
+                        // from the palette: selected rows use the selection
+                        // pair, the rest use muted text on the canvas.
+                        let spal = crate::app_palette::current_palette();
                         let mut tab_items: Vec<ListItem> = Vec::new();
                         for (idx, name) in SETTINGS_TAB_NAMES.iter().enumerate() {
                             let is_selected = self.settings_tab == idx;
                             let is_focused_col = self.settings_col == 0;
-                            let (fg, bg) = if is_selected && is_focused_col {
-                                (NORDIC_BG, Color::White)
-                            } else if is_selected {
-                                (Color::White, Color::Rgb(59, 66, 82))
+                            let (fg, bg) = if is_selected {
+                                (spal.selection_fg_c(), spal.selection_bg_c())
+                            } else if is_focused_col {
+                                (spal.foreground_c(), modal_bg())
                             } else {
-                                (Color::Rgb(160, 175, 195), NORDIC_BG)
+                                (spal.muted_c(), modal_bg())
                             };
 
                             let symbol = if is_selected { "● " } else { "  " };
+                            let used = 2 + name.chars().count();
+                            let pad = " ".repeat(22usize.saturating_sub(used));
                             tab_items.push(ListItem::new(Line::from(vec![
                                 Span::styled(
                                     symbol,
@@ -9337,10 +9583,11 @@ impl App {
                                         Modifier::empty()
                                     }),
                                 ),
+                                Span::styled(pad, Style::default().fg(fg).bg(bg)),
                             ])));
                         }
 
-                        let col1_list = List::new(tab_items).style(Style::default().bg(NORDIC_BG));
+                        let col1_list = List::new(tab_items).style(Style::default().bg(modal_bg()));
                         frame.render_widget(col1_list, cols[0]);
 
                         // Column separator
@@ -9348,7 +9595,7 @@ impl App {
                             .map(|_| {
                                 Line::from(Span::styled(
                                     "│",
-                                    Style::default().fg(Color::Rgb(76, 86, 106)).bg(NORDIC_BG),
+                                    Style::default().fg(Color::Rgb(76, 86, 106)).bg(modal_bg()),
                                 ))
                             })
                             .collect();
@@ -9361,22 +9608,30 @@ impl App {
                                 Span::styled(
                                     " [EDITING: Type API Key / URL | Enter=Save | Esc=Cancel] ",
                                     Style::default()
-                                        .fg(NORDIC_BG)
-                                        .bg(Color::Rgb(163, 190, 140))
+                                        .fg(crate::app_palette::contrasting_text_on(
+                                            crate::app_palette::current_palette().success,
+                                            &crate::app_palette::current_palette(),
+                                        ))
+                                        .bg(crate::app_palette::current_palette().success_c())
                                         .add_modifier(Modifier::BOLD),
                                 )
                             } else if col2_focus {
                                 Span::styled(
                                     " [FOCUSED: A/D or Left/Right to Cycle | K=Edit Key | Del=Clear Key] ",
                                     Style::default()
-                                        .fg(NORDIC_BG)
-                                        .bg(Color::Rgb(143, 218, 255))
+                                        .fg(crate::app_palette::contrasting_text_on(
+                                            crate::app_palette::current_palette().accent,
+                                            &crate::app_palette::current_palette(),
+                                        ))
+                                        .bg(crate::app_palette::current_palette().accent_c())
                                         .add_modifier(Modifier::BOLD),
                                 )
                             } else {
                                 Span::styled(
                                     " [Press Enter to Configure Web Search] ",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )
                             }
                         } else if self.settings_tab == SETTINGS_HF_TOKEN {
@@ -9384,22 +9639,30 @@ impl App {
                                 Span::styled(
                                     " [EDITING: Type token | Enter=Save | Esc=Cancel] ",
                                     Style::default()
-                                        .fg(NORDIC_BG)
-                                        .bg(Color::Rgb(163, 190, 140))
+                                        .fg(crate::app_palette::contrasting_text_on(
+                                            crate::app_palette::current_palette().success,
+                                            &crate::app_palette::current_palette(),
+                                        ))
+                                        .bg(crate::app_palette::current_palette().success_c())
                                         .add_modifier(Modifier::BOLD),
                                 )
                             } else if col2_focus {
                                 Span::styled(
                                     " [FOCUSED: Enter=Edit/Add | D/Delete=Remove] ",
                                     Style::default()
-                                        .fg(NORDIC_BG)
-                                        .bg(Color::Rgb(143, 218, 255))
+                                        .fg(crate::app_palette::contrasting_text_on(
+                                            crate::app_palette::current_palette().accent,
+                                            &crate::app_palette::current_palette(),
+                                        ))
+                                        .bg(crate::app_palette::current_palette().accent_c())
                                         .add_modifier(Modifier::BOLD),
                                 )
                             } else {
                                 Span::styled(
                                     " [Press Enter to Configure Token] ",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )
                             }
                         } else if self.settings_tab == SETTINGS_CODE_GRAPH {
@@ -9407,14 +9670,19 @@ impl App {
                                 Span::styled(
                                     " [FOCUSED: Up/Down Select | A/Left OFF | D/Right ON | Enter Toggle] ",
                                     Style::default()
-                                        .fg(NORDIC_BG)
-                                        .bg(Color::Rgb(143, 218, 255))
+                                        .fg(crate::app_palette::contrasting_text_on(
+                                            crate::app_palette::current_palette().accent,
+                                            &crate::app_palette::current_palette(),
+                                        ))
+                                        .bg(crate::app_palette::current_palette().accent_c())
                                         .add_modifier(Modifier::BOLD),
                                 )
                             } else {
                                 Span::styled(
                                     " [Enter/Right: Open | Up/Down: Navigate | Esc: Back] ",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )
                             }
                         } else if self.settings_tab == SETTINGS_LSP_DIAGNOSTICS {
@@ -9422,35 +9690,48 @@ impl App {
                                 Span::styled(
                                     " [FOCUSED: Up/Down Select | A/Left OFF | D/Right ON | Enter Toggle] ",
                                     Style::default()
-                                        .fg(NORDIC_BG)
-                                        .bg(Color::Rgb(143, 218, 255))
+                                        .fg(crate::app_palette::contrasting_text_on(
+                                            crate::app_palette::current_palette().accent,
+                                            &crate::app_palette::current_palette(),
+                                        ))
+                                        .bg(crate::app_palette::current_palette().accent_c())
                                         .add_modifier(Modifier::BOLD),
                                 )
                             } else {
                                 Span::styled(
                                     " [Enter/Right: Open | Up/Down: Navigate | Esc: Back] ",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )
                             }
                         } else if col2_focus {
                             Span::styled(
                                 " [FOCUSED: A/D or Left/Right to change] ",
                                 Style::default()
-                                    .fg(NORDIC_BG)
-                                    .bg(Color::Rgb(143, 218, 255))
+                                    .fg(crate::app_palette::contrasting_text_on(
+                                        crate::app_palette::current_palette().accent,
+                                        &crate::app_palette::current_palette(),
+                                    ))
+                                    .bg(crate::app_palette::current_palette().accent_c())
                                     .add_modifier(Modifier::BOLD),
                             )
                         } else {
                             Span::styled(
                                 " [Press Enter to Edit Value] ",
-                                Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                Style::default()
+                                    .fg(Color::Rgb(120, 140, 160))
+                                    .bg(modal_bg()),
                             )
                         };
 
                         let mut val_lines: Vec<Line> = vec![
                             Line::from(focus_badge),
-                            Line::from(Span::styled("", Style::default().bg(NORDIC_BG))),
+                            Line::from(Span::styled("", Style::default().bg(modal_bg()))),
                         ];
+                        // Value-panel scroll (palette tab uses it to keep the
+                        // focused row visible; every other tab fits).
+                        let mut val_scroll: u16 = 0;
 
                         match self.settings_tab {
                             0 => {
@@ -9482,14 +9763,14 @@ impl App {
                                             sym,
                                             Style::default()
                                                 .fg(color)
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                         Span::styled(
                                             desc,
                                             Style::default()
                                                 .fg(if active { Color::White } else { color })
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(if active {
                                                     Modifier::BOLD
                                                 } else {
@@ -9536,14 +9817,14 @@ impl App {
                                             sym,
                                             Style::default()
                                                 .fg(color)
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                         Span::styled(
                                             desc,
                                             Style::default()
                                                 .fg(if active { Color::White } else { color })
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(if active {
                                                     Modifier::BOLD
                                                 } else {
@@ -9579,14 +9860,14 @@ impl App {
                                             sym,
                                             Style::default()
                                                 .fg(color)
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                         Span::styled(
                                             desc,
                                             Style::default()
                                                 .fg(if active { Color::White } else { color })
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(if active {
                                                     Modifier::BOLD
                                                 } else {
@@ -9595,7 +9876,7 @@ impl App {
                                         ),
                                     ]));
                                 }
-                                val_lines.push(Line::from(Span::styled("When enabled, previous turn's you/system/agent/action chips smoothly collapse into badge bars.", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled("When enabled, previous turn's you/system/agent/action chips smoothly collapse into badge bars.", Style::default().fg(Color::Rgb(120, 140, 160)).bg(modal_bg()))));
                             }
                             3 => {
                                 // Target FPS
@@ -9619,14 +9900,14 @@ impl App {
                                             sym,
                                             Style::default()
                                                 .fg(color)
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                         Span::styled(
                                             desc,
                                             Style::default()
                                                 .fg(if active { Color::White } else { color })
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(if active {
                                                     Modifier::BOLD
                                                 } else {
@@ -9635,7 +9916,7 @@ impl App {
                                         ),
                                     ]));
                                 }
-                                val_lines.push(Line::from(Span::styled("Controls the live UI frame polling rate and metrics refresh rate.", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled("Controls the live UI frame polling rate and metrics refresh rate.", Style::default().fg(Color::Rgb(120, 140, 160)).bg(modal_bg()))));
                             }
                             4 => {
                                 // Stall watchdog options
@@ -9644,20 +9925,22 @@ impl App {
                                         "Watchdog Timeout: ",
                                         Style::default()
                                             .fg(Color::White)
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                     Span::styled(
                                         crate::settings::format_stall_timeout(s.stall_timeout_secs),
                                         Style::default()
                                             .fg(Color::Rgb(235, 203, 139))
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                 ]));
                                 val_lines.push(Line::from(Span::styled(
                                     "Cycles: 5 min → 10 min → 20 min → Unlimited",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )));
                             }
                             5 => {
@@ -9667,14 +9950,14 @@ impl App {
                                         "Repeat Threshold: ",
                                         Style::default()
                                             .fg(Color::White)
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                     Span::styled(
                                         format!("{} consecutive outputs", s.repeat_threshold),
                                         Style::default()
                                             .fg(Color::Rgb(143, 218, 255))
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                 ]));
@@ -9683,7 +9966,7 @@ impl App {
                                         "Detect on Thinking: ",
                                         Style::default()
                                             .fg(Color::White)
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                     Span::styled(
@@ -9698,7 +9981,7 @@ impl App {
                                             } else {
                                                 Color::Rgb(255, 120, 120)
                                             })
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                 ]));
@@ -9710,20 +9993,22 @@ impl App {
                                         "Context Window Limit: ",
                                         Style::default()
                                             .fg(Color::White)
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                     Span::styled(
                                         format!("{} ({} tokens)", ctx_label, ctx_n),
                                         Style::default()
                                             .fg(Color::Rgb(180, 160, 255))
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                 ]));
                                 val_lines.push(Line::from(Span::styled(
                                     "Cycles: 4K → 8K → 16K → 32K → 64K → 128K → 250K → 1M",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )));
                             }
                             7 => {
@@ -9732,7 +10017,7 @@ impl App {
                                     "Action Permission Mode:",
                                     Style::default()
                                         .fg(Color::White)
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 )]));
                                 let perms_modes = [
@@ -9758,14 +10043,14 @@ impl App {
                                             sym,
                                             Style::default()
                                                 .fg(color)
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                         Span::styled(
                                             desc,
                                             Style::default()
                                                 .fg(if active { Color::White } else { color })
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(if active {
                                                     Modifier::BOLD
                                                 } else {
@@ -9776,13 +10061,13 @@ impl App {
                                 }
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
                                 val_lines.push(Line::from(vec![Span::styled(
                                     "Directory Access Scope:",
                                     Style::default()
                                         .fg(Color::White)
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 )]));
                                 let scopes = [
@@ -9808,14 +10093,14 @@ impl App {
                                             sym,
                                             Style::default()
                                                 .fg(color)
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                         Span::styled(
                                             desc,
                                             Style::default()
                                                 .fg(if active { Color::White } else { color })
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(if active {
                                                     Modifier::BOLD
                                                 } else {
@@ -9826,9 +10111,9 @@ impl App {
                                 }
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
-                                val_lines.push(Line::from(Span::styled("Press Enter or Left/Right to toggle Mode | Press S/D to toggle Directory Scope.", Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG))));
+                                val_lines.push(Line::from(Span::styled("Press Enter or Left/Right to toggle Mode | Press S/D to toggle Directory Scope.", Style::default().fg(Color::Rgb(120, 140, 160)).bg(modal_bg()))));
                             }
                             8 => {
                                 // Web Search Provider
@@ -9871,14 +10156,14 @@ impl App {
                                             sym,
                                             Style::default()
                                                 .fg(color)
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                         Span::styled(
                                             desc,
                                             Style::default()
                                                 .fg(if active { Color::White } else { color })
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(if active {
                                                     Modifier::BOLD
                                                 } else {
@@ -9890,7 +10175,7 @@ impl App {
 
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
                                 let current_token_opt =
                                     crate::settings::get_search_token(s.web_search_provider);
@@ -9930,7 +10215,7 @@ impl App {
                                             key_label,
                                             Style::default()
                                                 .fg(Color::White)
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                         Span::styled(
@@ -9941,7 +10226,7 @@ impl App {
                                                 } else {
                                                     Color::Rgb(235, 203, 139)
                                                 })
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                     ]));
@@ -9952,7 +10237,7 @@ impl App {
                                                 "New Key/URL: ",
                                                 Style::default()
                                                     .fg(Color::Rgb(143, 218, 255))
-                                                    .bg(NORDIC_BG)
+                                                    .bg(modal_bg())
                                                     .add_modifier(Modifier::BOLD),
                                             ),
                                             Span::styled(
@@ -9968,14 +10253,14 @@ impl App {
                                                     .bg(Color::Rgb(46, 52, 64)),
                                             ),
                                         ]));
-                                        val_lines.push(Line::from(Span::styled("Type or paste key, then press Enter to save. Esc to cancel.", Style::default().fg(Color::Rgb(160, 175, 195)).bg(NORDIC_BG))));
+                                        val_lines.push(Line::from(Span::styled("Type or paste key, then press Enter to save. Esc to cancel.", Style::default().fg(Color::Rgb(160, 175, 195)).bg(modal_bg()))));
                                     } else {
                                         val_lines.push(Line::from(vec![
                                             Span::styled(
                                                 "[ K ] ",
                                                 Style::default()
                                                     .fg(Color::Rgb(143, 218, 255))
-                                                    .bg(NORDIC_BG)
+                                                    .bg(modal_bg())
                                                     .add_modifier(Modifier::BOLD),
                                             ),
                                             Span::styled(
@@ -9984,18 +10269,18 @@ impl App {
                                                 } else {
                                                     "Set Custom Key"
                                                 },
-                                                Style::default().fg(Color::White).bg(NORDIC_BG),
+                                                Style::default().fg(Color::White).bg(modal_bg()),
                                             ),
                                             Span::styled(
                                                 "   [ D / Del ] ",
                                                 Style::default()
                                                     .fg(Color::Rgb(255, 120, 120))
-                                                    .bg(NORDIC_BG)
+                                                    .bg(modal_bg())
                                                     .add_modifier(Modifier::BOLD),
                                             ),
                                             Span::styled(
                                                 "Clear Key",
-                                                Style::default().fg(Color::White).bg(NORDIC_BG),
+                                                Style::default().fg(Color::White).bg(modal_bg()),
                                             ),
                                         ]));
                                     }
@@ -10004,12 +10289,14 @@ impl App {
                                         "No API key required for this search provider.",
                                         Style::default()
                                             .fg(Color::Rgb(163, 190, 140))
-                                            .bg(NORDIC_BG),
+                                            .bg(modal_bg()),
                                     )));
                                 }
                                 val_lines.push(Line::from(Span::styled(
                                     "Left/Right/A/D: Cycle Provider | Enter: Edit | Esc: Back",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )));
                             }
                             9 => {
@@ -10031,7 +10318,7 @@ impl App {
                                         "Current Token: ",
                                         Style::default()
                                             .fg(Color::White)
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                     Span::styled(
@@ -10042,17 +10329,17 @@ impl App {
                                             } else {
                                                 Color::Rgb(235, 203, 139)
                                             })
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                 ]));
                                 val_lines.push(Line::from(Span::styled(
                                     "Used for Hugging Face model registry searches and GGUF downloads.",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(modal_bg()),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
 
                                 if self.hf_token_editing {
@@ -10061,7 +10348,7 @@ impl App {
                                             "New Token: ",
                                             Style::default()
                                                 .fg(Color::Rgb(143, 218, 255))
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                         Span::styled(
@@ -10079,7 +10366,7 @@ impl App {
                                     ]));
                                     val_lines.push(Line::from(Span::styled(
                                         "Paste or type token (starts with 'hf_...'), then press Enter to save.",
-                                        Style::default().fg(Color::Rgb(160, 175, 195)).bg(NORDIC_BG),
+                                        Style::default().fg(Color::Rgb(160, 175, 195)).bg(modal_bg()),
                                     )));
                                 } else {
                                     val_lines.push(Line::from(vec![
@@ -10087,7 +10374,7 @@ impl App {
                                             "[ Enter ] ",
                                             Style::default()
                                                 .fg(Color::Rgb(143, 218, 255))
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                         Span::styled(
@@ -10096,7 +10383,7 @@ impl App {
                                             } else {
                                                 "Add HF Token"
                                             },
-                                            Style::default().fg(Color::White).bg(NORDIC_BG),
+                                            Style::default().fg(Color::White).bg(modal_bg()),
                                         ),
                                     ]));
                                     if has_token {
@@ -10105,12 +10392,12 @@ impl App {
                                                 "[ D / Del ] ",
                                                 Style::default()
                                                     .fg(Color::Rgb(255, 120, 120))
-                                                    .bg(NORDIC_BG)
+                                                    .bg(modal_bg())
                                                     .add_modifier(Modifier::BOLD),
                                             ),
                                             Span::styled(
                                                 "Remove / Clear Saved Token",
-                                                Style::default().fg(Color::White).bg(NORDIC_BG),
+                                                Style::default().fg(Color::White).bg(modal_bg()),
                                             ),
                                         ]));
                                     }
@@ -10124,24 +10411,24 @@ impl App {
                                         "Active OCR Backend: ",
                                         Style::default()
                                             .fg(Color::White)
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                     Span::styled(
                                         ocr_mode.label(),
                                         Style::default()
                                             .fg(Color::Rgb(163, 190, 140))
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     ),
                                 ]));
                                 val_lines.push(Line::from(Span::styled(
                                     "Used for extracting text from pasted images, PDFs, screenshots, and video keyframes.",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(modal_bg()),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
 
                                 let modes = [
@@ -10176,14 +10463,14 @@ impl App {
                                             sym,
                                             Style::default()
                                                 .fg(color)
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(Modifier::BOLD),
                                         ),
                                         Span::styled(
                                             desc,
                                             Style::default()
                                                 .fg(if active { Color::White } else { color })
-                                                .bg(NORDIC_BG)
+                                                .bg(modal_bg())
                                                 .add_modifier(if active {
                                                     Modifier::BOLD
                                                 } else {
@@ -10195,11 +10482,13 @@ impl App {
 
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Left/Right/A/D or Enter: Cycle OCR Engine | Esc: Back",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )));
                             }
                             11 => {
@@ -10213,16 +10502,18 @@ impl App {
                                     "Code Graph",
                                     Style::default()
                                         .fg(Color::White)
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Master toggle for the F6 Code Graph panel.",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
 
                                 val_lines.push(crate::app::render_toggle(
@@ -10232,19 +10523,21 @@ impl App {
                                 ));
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
 
                                 val_lines.push(Line::from(Span::styled(
                                     "Include Comments",
                                     Style::default()
                                         .fg(Color::White)
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Include comments/docstrings in code graph nodes.",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )));
                                 val_lines.push(crate::app::render_toggle(
                                     "Include Comments",
@@ -10253,19 +10546,21 @@ impl App {
                                 ));
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
 
                                 val_lines.push(Line::from(Span::styled(
                                     "Bounce Response Write",
                                     Style::default()
                                         .fg(Color::White)
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Enable focused/bounce graph for AI write responses.",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )));
                                 val_lines.push(crate::app::render_toggle(
                                     "Bounce Response Write",
@@ -10274,7 +10569,7 @@ impl App {
                                 ));
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
                             }
                             12 => {
@@ -10292,16 +10587,18 @@ impl App {
                                     "LSP Diagnostics",
                                     Style::default()
                                         .fg(Color::White)
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Master switch for showing LSP diagnostics in code graph.",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
 
                                 // LSP Configuration Source
@@ -10309,7 +10606,7 @@ impl App {
                                     "LSP Configuration",
                                     Style::default()
                                         .fg(Color::White)
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 )));
                                 if let Some((name, command, source, status)) = lsp_config_info {
@@ -10328,19 +10625,19 @@ impl App {
                                         format!("  Source: {}", source_str),
                                         Style::default()
                                             .fg(Color::Rgb(220, 230, 242))
-                                            .bg(NORDIC_BG),
+                                            .bg(modal_bg()),
                                     )));
                                     val_lines.push(Line::from(Span::styled(
                                         format!("  Server: {} ({})", name, command),
                                         Style::default()
                                             .fg(Color::Rgb(220, 230, 242))
-                                            .bg(NORDIC_BG),
+                                            .bg(modal_bg()),
                                     )));
                                     val_lines.push(Line::from(Span::styled(
                                         format!("  Status: {} ●", status),
                                         Style::default()
                                             .fg(status_color)
-                                            .bg(NORDIC_BG)
+                                            .bg(modal_bg())
                                             .add_modifier(Modifier::BOLD),
                                     )));
                                 } else {
@@ -10348,18 +10645,18 @@ impl App {
                                         "  No editor LSP configuration found.",
                                         Style::default()
                                             .fg(Color::Rgb(255, 120, 120))
-                                            .bg(NORDIC_BG),
+                                            .bg(modal_bg()),
                                     )));
                                     val_lines.push(Line::from(Span::styled(
                                         "  Checked: Helix, Neovim, VS Code, VSCodium, Zed",
                                         Style::default()
                                             .fg(Color::Rgb(160, 175, 195))
-                                            .bg(NORDIC_BG),
+                                            .bg(modal_bg()),
                                     )));
                                 }
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
 
                                 val_lines.push(crate::app::render_toggle(
@@ -10369,19 +10666,21 @@ impl App {
                                 ));
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
 
                                 val_lines.push(Line::from(Span::styled(
                                     "Show Errors",
                                     Style::default()
                                         .fg(Color::White)
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Display LSP error diagnostics (red).",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )));
                                 val_lines.push(crate::app::render_toggle(
                                     "Show Errors",
@@ -10390,19 +10689,21 @@ impl App {
                                 ));
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
 
                                 val_lines.push(Line::from(Span::styled(
                                     "Show Warnings",
                                     Style::default()
                                         .fg(Color::White)
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Display LSP warning diagnostics (yellow).",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )));
                                 val_lines.push(crate::app::render_toggle(
                                     "Show Warnings",
@@ -10411,19 +10712,21 @@ impl App {
                                 ));
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
 
                                 val_lines.push(Line::from(Span::styled(
                                     "Show Info/Hints",
                                     Style::default()
                                         .fg(Color::White)
-                                        .bg(NORDIC_BG)
+                                        .bg(modal_bg())
                                         .add_modifier(Modifier::BOLD),
                                 )));
                                 val_lines.push(Line::from(Span::styled(
                                     "Display LSP info/hint diagnostics (blue).",
-                                    Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
                                 )));
                                 val_lines.push(crate::app::render_toggle(
                                     "Show Info/Hints",
@@ -10432,14 +10735,236 @@ impl App {
                                 ));
                                 val_lines.push(Line::from(Span::styled(
                                     "",
-                                    Style::default().bg(NORDIC_BG),
+                                    Style::default().bg(modal_bg()),
                                 )));
+                            }
+                            13 => {
+                                // App Style — application chrome radio list.
+                                // Canvas panel like every other settings tab;
+                                // selection/accent colors carry the palette.
+                                use crate::app_chrome::AppChromeStyle;
+                                let current = crate::settings::get_app_chrome_style();
+                                let spal = crate::app_palette::current_palette();
+                                let sbg = modal_bg();
+                                let sfg = spal.foreground_c();
+                                let smut = spal.muted_c();
+                                let sacc = spal.accent_c();
+                                val_lines.push(Line::from(Span::styled(
+                                    "App Style",
+                                    Style::default()
+                                        .fg(sfg)
+                                        .bg(sbg)
+                                        .add_modifier(Modifier::BOLD),
+                                )));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Application chrome only (bars, badges, menu frame). \
+                                     AI output is never restyled. Left/Right/Enter: switch.",
+                                    Style::default().fg(smut).bg(sbg),
+                                )));
+                                val_lines
+                                    .push(Line::from(Span::styled("", Style::default().bg(sbg))));
+                                for style in AppChromeStyle::all() {
+                                    let active = current == style;
+                                    let sym = if active { "● " } else { "○ " };
+                                    let color = if active { sacc } else { smut };
+                                    val_lines.push(Line::from(vec![
+                                        Span::styled(
+                                            sym,
+                                            Style::default()
+                                                .fg(color)
+                                                .bg(sbg)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            format!("{} — {}", style.label(), style.description()),
+                                            Style::default()
+                                                .fg(if active { sfg } else { color })
+                                                .bg(sbg)
+                                                .add_modifier(if active {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
+                                    ]));
+                                }
+                                val_lines
+                                    .push(Line::from(Span::styled("", Style::default().bg(sbg))));
+                                // Live preview of the CURRENT style in the
+                                // CURRENT palette, sized to the value column
+                                // (narrow-safe: the builder clamps to a
+                                // 20-cell minimum).
+                                let preview_width = cols[2].width as usize;
+                                let preview_pal = crate::app_palette::current_palette();
+                                for line in crate::app_chrome::style_preview_lines(
+                                    current,
+                                    &preview_pal,
+                                    preview_width,
+                                ) {
+                                    val_lines.push(line);
+                                }
+                            }
+                            14 => {
+                                // Color Palette — independent from App Style:
+                                // palettes change COLORS, styles change glyphs.
+                                use crate::app_palette::{AppPaletteStyle, CustomField};
+                                let pal = crate::app_palette::current_palette();
+                                let current = crate::settings::get_color_palette();
+                                let pbg = modal_bg();
+                                let pfg = pal.foreground_c();
+                                let pmut = pal.muted_c();
+                                let pacc = pal.accent_c();
+                                let psel_bg = pal.selection_bg_c();
+                                let psel_fg = pal.selection_fg_c();
+                                // Line index of every option row, for scroll.
+                                let mut opt_lines: Vec<usize> = Vec::new();
+                                val_lines.push(Line::from(Span::styled(
+                                    "Color Palette",
+                                    Style::default()
+                                        .fg(pfg)
+                                        .bg(pbg)
+                                        .add_modifier(Modifier::BOLD),
+                                )));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Application colors only. Styles change frames, \
+                                     palettes change colors. Up/Down: row, \
+                                     Left/Right/Enter: select or edit.",
+                                    Style::default().fg(pmut).bg(pbg),
+                                )));
+                                val_lines
+                                    .push(Line::from(Span::styled("", Style::default().bg(pbg))));
+                                for (i, style) in AppPaletteStyle::all().iter().enumerate() {
+                                    let active = current == *style;
+                                    let focused =
+                                        self.settings_col == 1 && self.settings_option == i;
+                                    let sym = if active { "● " } else { "○ " };
+                                    // Focused row: selection pair so the cursor
+                                    // is always visible. Otherwise active rows
+                                    // use the accent, the rest muted.
+                                    let (row_fg, row_bg) = if focused {
+                                        (psel_fg, psel_bg)
+                                    } else if active {
+                                        (pfg, pbg)
+                                    } else {
+                                        (pmut, pbg)
+                                    };
+                                    let dot = if active { pacc } else { pmut };
+                                    let (dot_fg, dot_bg) = if focused {
+                                        (psel_fg, psel_bg)
+                                    } else {
+                                        (dot, pbg)
+                                    };
+                                    opt_lines.push(val_lines.len());
+                                    val_lines.push(Line::from(vec![
+                                        Span::styled(
+                                            sym,
+                                            Style::default()
+                                                .fg(dot_fg)
+                                                .bg(dot_bg)
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            format!("{} — {}", style.label(), style.description()),
+                                            Style::default().fg(row_fg).bg(row_bg).add_modifier(
+                                                if active || focused {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                },
+                                            ),
+                                        ),
+                                    ]));
+                                }
+                                if current == AppPaletteStyle::Custom {
+                                    val_lines.push(Line::from(Span::styled(
+                                        "",
+                                        Style::default().bg(pbg),
+                                    )));
+                                    val_lines.push(Line::from(Span::styled(
+                                        "Custom colors (Enter a row to edit, type #RRGGBB, \
+                                         Enter saves, Esc cancels, R resets all):",
+                                        Style::default().fg(pmut).bg(pbg),
+                                    )));
+                                    let custom = crate::settings::get_custom_palette();
+                                    for (fi, field) in CustomField::all().iter().enumerate() {
+                                        let row = 6 + fi;
+                                        let focused =
+                                            self.settings_col == 1 && self.settings_option == row;
+                                        let rgb = custom.get_field(*field);
+                                        let editing = self.custom_color_editing
+                                            && self.custom_color_field == fi;
+                                        let shown = if editing {
+                                            format!("{}▌", self.custom_color_input)
+                                        } else {
+                                            crate::app_palette::to_hex_color(rgb)
+                                        };
+                                        let marker = if focused { "› " } else { "  " };
+                                        let (row_fg, row_bg) = if focused {
+                                            (psel_fg, psel_bg)
+                                        } else {
+                                            (pmut, pbg)
+                                        };
+                                        let hex_fg = if editing {
+                                            pfg
+                                        } else if focused {
+                                            psel_fg
+                                        } else {
+                                            pacc
+                                        };
+                                        let hex_bg = if focused { psel_bg } else { pbg };
+                                        opt_lines.push(val_lines.len());
+                                        val_lines.push(Line::from(vec![
+                                            Span::styled(
+                                                marker,
+                                                Style::default()
+                                                    .fg(if focused { psel_fg } else { pmut })
+                                                    .bg(row_bg)
+                                                    .add_modifier(Modifier::BOLD),
+                                            ),
+                                            Span::styled(
+                                                format!("{:<24}", field.label()),
+                                                Style::default().fg(row_fg).bg(row_bg),
+                                            ),
+                                            // Live swatch in the actual color.
+                                            Span::styled(
+                                                "  ",
+                                                Style::default()
+                                                    .fg(Color::Rgb(rgb[0], rgb[1], rgb[2]))
+                                                    .bg(Color::Rgb(rgb[0], rgb[1], rgb[2])),
+                                            ),
+                                            Span::styled(" ", Style::default().bg(hex_bg)),
+                                            Span::styled(
+                                                shown,
+                                                Style::default()
+                                                    .fg(hex_fg)
+                                                    .bg(hex_bg)
+                                                    .add_modifier(if focused || editing {
+                                                        Modifier::BOLD
+                                                    } else {
+                                                        Modifier::empty()
+                                                    }),
+                                            ),
+                                        ]));
+                                    }
+                                }
+                                // Keep the focused option row on screen.
+                                if !opt_lines.is_empty() {
+                                    let opt =
+                                        self.settings_option.min(opt_lines.len().saturating_sub(1));
+                                    let h = cols[2].height as usize;
+                                    val_scroll =
+                                        (opt_lines[opt] + 1).saturating_sub(h.max(1)) as u16;
+                                }
                             }
                             _ => {}
                         }
 
+                        // Every tab sits on the canvas: one uniform layer,
+                        // no per-tab background boxes.
                         frame.render_widget(
-                            Paragraph::new(val_lines).style(Style::default().bg(NORDIC_BG)),
+                            Paragraph::new(val_lines)
+                                .style(Style::default().bg(modal_bg()))
+                                .scroll((val_scroll, 0)),
                             cols[2],
                         );
                     }
@@ -10461,15 +10986,17 @@ impl App {
                                 " Session Information ",
                                 Style::default()
                                     .fg(Color::White)
-                                    .bg(NORDIC_BG)
+                                    .bg(modal_bg())
                                     .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
                                 " (live diagnostics)",
-                                Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
+                                Style::default()
+                                    .fg(Color::Rgb(120, 140, 160))
+                                    .bg(modal_bg()),
                             ),
                         ]))
-                        .style(Style::default().bg(NORDIC_BG));
+                        .style(Style::default().bg(modal_bg()));
                         frame.render_widget(title_bar, chunks[0]);
 
                         // 2 Columns layout with 2-character middle gutter: Left | Gap | Right
@@ -10636,7 +11163,7 @@ impl App {
                                 lines.push(Line::from(bottom_spans));
 
                                 frame.render_widget(
-                                    Paragraph::new(lines).style(Style::default().bg(NORDIC_BG)),
+                                    Paragraph::new(lines).style(Style::default().bg(modal_bg())),
                                     area,
                                 );
                             };
@@ -10915,7 +11442,10 @@ impl App {
         let mut lsp_manager = crate::lsp::LspManager::new(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         );
-        if lsp_manager.start().await.is_err() {
+        // Honor the LSP switch: when the user turned LSP diagnostics off,
+        // do not spawn language servers at all — Tree-sitter alone builds
+        // the graph (same fallback as a failed start).
+        if crate::settings::get_lsp_diagnostics_enabled() && lsp_manager.start().await.is_err() {
             // LSP failed, but we can still use Tree-sitter
         }
 
@@ -11076,80 +11606,6 @@ impl App {
         }
     }
 
-    /// Render Code Graph three-pane layout: Nodes | Graph | Details
-    /// Render Code Graph three-pane layout: Nodes | Graph | Details
-    /// Content-aware modal target size: max ~90% of terminal width,
-    /// max ~86% of terminal height, never larger than the content
-    /// needs for sparse panels. The Krama animation interpolates from
-    /// closed to THIS size — never to an oversized fixed rectangle.
-    fn modal_target_size(&self, area: ratatui::layout::Rect) -> (u16, u16) {
-        let full_w = area.width;
-        let full_h = area.height;
-        let target_w = (full_w.saturating_sub(10))
-            .min(120)
-            .max(70.min(full_w))
-            .min(full_w.saturating_sub(2));
-        let max_h = ((full_h as f32 * 0.86).round() as u16)
-            .max(12)
-            .min(full_h.saturating_sub(2));
-        let default_h = (full_h.saturating_sub(6)).min(32).max(20.min(full_h));
-        let target_h = match self.menu_section {
-            6 => {
-                // Agent Run: compact when empty, grows with steps and
-                // history — never a huge empty rectangle.
-                let mut content = match &self.current_run {
-                    Some(run) => {
-                        let mut c = 2 + run.steps.len().min(24) + 1; // header rows + steps + progress bar
-                        if run.steps.is_empty() {
-                            c += 2; // deliberate empty state
-                        }
-                        c
-                    }
-                    None => 4, // title + centered empty state + spacing
-                };
-                let history = self.run_history.len().min(8);
-                if history > 0 {
-                    content += history + 2; // section header + entries + gap
-                }
-                content += 1; // footer hints
-                (content as u16 + 4).clamp(11, max_h)
-            }
-            4 => {
-                // Session Info: fixed two-column card grid (degrades to
-                // one column on narrow terminals inside the renderer).
-                let content: u16 = 2 + (5 + 1 + 4 + 1 + 4 + 1 + 4) + 1; // title + cards + gaps + footer
-                (content + 4).clamp(14, max_h)
-            }
-            7 => {
-                // Thunder: tab bar + content rows + footer. Content rows
-                // scale with the active tab's list, capped so the modal
-                // never exceeds the terminal.
-                let rows = match crate::thunder_ui::ThunderTab::from_index(self.thunder_ui.tab) {
-                    crate::thunder_ui::ThunderTab::Overview => 12,
-                    // Host tab: status + single hosted model + policy + code.
-                    crate::thunder_ui::ThunderTab::Host => 14,
-                    crate::thunder_ui::ThunderTab::Connect => {
-                        6 + (self.thunder_ui.discovered.len()
-                            + usize::from(!self.thunder_ui.manual_endpoint.is_empty()))
-                        .min(10)
-                    }
-                    crate::thunder_ui::ThunderTab::Peers => {
-                        4 + (crate::thunder::pairing::PeerStore::load().peers_len()
-                            + self.thunder_ui.inbound_peers().len())
-                        .min(12)
-                    }
-                    crate::thunder_ui::ThunderTab::Models => {
-                        4 + self.thunder_ui.remote_models.len().min(12)
-                    }
-                    crate::thunder_ui::ThunderTab::Settings => 8,
-                };
-                ((rows + 2 + 1 + 4) as u16).clamp(12, max_h)
-            }
-            _ => default_h.min(max_h),
-        };
-        (target_w, target_h)
-    }
-
     /// Shared modal footer: one consistent keyboard-hint row rendered at
     /// the bottom of the modal content area. Only controls that work in
     /// the active panel are shown.
@@ -11192,28 +11648,30 @@ impl App {
             _ => &[("Esc", " Close ")],
         };
         let mut spans: Vec<Span> = Vec::new();
+        let fpal = crate::app_palette::current_palette();
+        let chip_fg = crate::app_palette::contrasting_text_on(fpal.accent, &fpal);
         for (i, (key, label)) in hints.iter().enumerate() {
             if i > 0 {
                 spans.push(Span::styled(
                     "  ",
-                    Style::default().fg(Color::Rgb(90, 100, 110)).bg(NORDIC_BG),
+                    Style::default().fg(fpal.muted_c()).bg(modal_bg()),
                 ));
             }
             spans.push(Span::styled(
                 format!(" {key} "),
                 Style::default()
-                    .fg(NORDIC_BG)
-                    .bg(Color::Rgb(120, 140, 160))
+                    .fg(chip_fg)
+                    .bg(fpal.accent_c())
                     .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::styled(
                 *label,
-                Style::default().fg(Color::Rgb(140, 155, 170)).bg(NORDIC_BG),
+                Style::default().fg(fpal.muted_c()).bg(modal_bg()),
             ));
         }
         frame.render_widget(
             ratatui::widgets::Paragraph::new(Line::from(spans))
-                .style(Style::default().bg(NORDIC_BG)),
+                .style(Style::default().bg(modal_bg())),
             area,
         );
     }
@@ -11241,10 +11699,10 @@ impl App {
             if bold {
                 Style::default()
                     .fg(fg)
-                    .bg(NORDIC_BG)
+                    .bg(modal_bg())
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(fg).bg(NORDIC_BG)
+                Style::default().fg(fg).bg(modal_bg())
             }
         };
         // Right-aligned helper: pad a left span so a right span ends at
@@ -11259,7 +11717,7 @@ impl App {
             let gap = width.saturating_sub(left_w + right_w);
             Line::from(vec![
                 left,
-                Span::styled(" ".repeat(gap), Style::default().bg(NORDIC_BG)),
+                Span::styled(" ".repeat(gap), Style::default().bg(modal_bg())),
                 right,
             ])
         };
@@ -11300,7 +11758,10 @@ impl App {
                     format!("{done} / {total}").chars().count(),
                     area.width,
                 ));
-                lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                lines.push(Line::from(Span::styled(
+                    "",
+                    Style::default().bg(modal_bg()),
+                )));
                 // BODY: steps
                 for s in run
                     .steps
@@ -11355,7 +11816,10 @@ impl App {
                         "█".repeat(filled),
                         "░".repeat(bar_w.saturating_sub(filled))
                     );
-                    lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                    lines.push(Line::from(Span::styled(
+                        "",
+                        Style::default().bg(modal_bg()),
+                    )));
                     lines.push(Line::from(vec![
                         Span::styled("Progress  ", style(dim, false)),
                         Span::styled(
@@ -11367,7 +11831,10 @@ impl App {
                 }
                 // HISTORY
                 if !self.run_history.is_empty() {
-                    lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                    lines.push(Line::from(Span::styled(
+                        "",
+                        Style::default().bg(modal_bg()),
+                    )));
                     lines.push(Line::from(Span::styled(
                         "— Run history —",
                         style(dim, false),
@@ -11410,7 +11877,10 @@ impl App {
                 // Deliberate, vertically balanced empty state.
                 let pad = (area.height.saturating_sub(4)) / 2;
                 for _ in 0..pad {
-                    lines.push(Line::from(Span::styled("", Style::default().bg(NORDIC_BG))));
+                    lines.push(Line::from(Span::styled(
+                        "",
+                        Style::default().bg(modal_bg()),
+                    )));
                 }
                 let msg = "No active agent run";
                 let lead = (area.width as usize).saturating_sub(msg.chars().count()) / 2;
@@ -11613,25 +12083,29 @@ impl App {
     }
 
     fn thunder_info_rows(&self) -> Vec<ratatui::text::Line<'static>> {
-        use ratatui::style::{Color, Modifier, Style};
+        use ratatui::style::{Modifier, Style};
         use ratatui::text::{Line, Span};
-        let dim = Color::Rgb(120, 140, 160);
+        let ipal = crate::app_palette::current_palette();
+        let dim = ipal.muted_c();
         let info = |label: &str, value: String| {
             Line::from(vec![
-                Span::styled(format!("{label} "), Style::default().fg(dim).bg(NORDIC_BG)),
-                Span::styled(value, Style::default().fg(Color::White).bg(NORDIC_BG)),
+                Span::styled(format!("{label} "), Style::default().fg(dim).bg(modal_bg())),
+                Span::styled(
+                    value,
+                    Style::default().fg(ipal.foreground_c()).bg(modal_bg()),
+                ),
             ])
         };
         let head = |text: &str| {
             Line::from(Span::styled(
                 text.to_string(),
                 Style::default()
-                    .fg(Color::White)
-                    .bg(NORDIC_BG)
+                    .fg(ipal.foreground_c())
+                    .bg(modal_bg())
                     .add_modifier(Modifier::BOLD),
             ))
         };
-        let blank = || Line::from(Span::styled("", Style::default().bg(NORDIC_BG)));
+        let blank = || Line::from(Span::styled("", Style::default().bg(modal_bg())));
         match self.thunder_ui.tab() {
             crate::thunder_ui::ThunderTab::Overview => {
                 let (name, peer_id, fp) = crate::thunder_ui::ThunderUiState::local_identity();
@@ -12052,22 +12526,32 @@ impl App {
             }
             A::SetMainAi => ("› ", "Set selected as Main AI".to_string()),
         };
+        let apal = crate::app_palette::current_palette();
         let bg = if selected {
-            Color::Rgb(59, 66, 82)
+            apal.selection_bg_c()
         } else {
-            NORDIC_BG
+            apal.background_c()
         };
         let fg = if selected {
-            Color::White
+            apal.selection_fg_c()
         } else {
-            Color::Rgb(180, 160, 255)
+            apal.accent_c()
         };
         Line::from(vec![
             Span::styled(
                 prefix,
                 Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(text, Style::default().fg(Color::Rgb(220, 230, 242)).bg(bg)),
+            Span::styled(
+                text,
+                Style::default()
+                    .fg(if selected {
+                        apal.selection_fg_c()
+                    } else {
+                        apal.foreground_c()
+                    })
+                    .bg(bg),
+            ),
         ])
     }
 
@@ -12081,11 +12565,10 @@ impl App {
         if area.height < 4 || area.width < 24 {
             return;
         }
-        let accent = Color::Rgb(180, 160, 255);
-        let sel_bg = Color::Rgb(59, 66, 82);
-        let _ = sel_bg;
+        let tpal = crate::app_palette::current_palette();
 
-        // --- Tab bar (row 0) ---
+        // --- Tab bar (row 0): palette menu layer, selected tab distinct.
+        // Same cells/widths as before — purely visual.
         self.thunder_ui.tab_hits.clear();
         let mut spans: Vec<Span> = Vec::new();
         let mut x = area.x;
@@ -12094,9 +12577,9 @@ impl App {
             let w = label.chars().count() as u16;
             let selected = i == self.thunder_ui.tab;
             let (fg, bg) = if selected {
-                (NORDIC_BG, Color::White)
+                (tpal.selection_fg_c(), tpal.menu_selected_bg_c())
             } else {
-                (Color::Rgb(220, 230, 242), Color::Rgb(46, 52, 64))
+                (tpal.muted_c(), tpal.menu_bg_c())
             };
             self.thunder_ui
                 .tab_hits
@@ -12105,14 +12588,14 @@ impl App {
                 label,
                 Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::styled(" ", Style::default().bg(NORDIC_BG)));
+            spans.push(Span::styled(" ", Style::default().bg(tpal.menu_bg_c())));
             x += w + 1;
             if x >= area.x + area.width {
                 break;
             }
         }
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(NORDIC_BG)),
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(tpal.menu_bg_c())),
             ratatui::layout::Rect {
                 x: area.x,
                 y: area.y,
@@ -12125,9 +12608,9 @@ impl App {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "─".repeat(div_w),
-                Style::default().fg(Color::Rgb(60, 70, 82)).bg(NORDIC_BG),
+                Style::default().fg(tpal.separator_c()).bg(modal_bg()),
             )))
-            .style(Style::default().bg(NORDIC_BG)),
+            .style(Style::default().bg(modal_bg())),
             ratatui::layout::Rect {
                 x: area.x,
                 y: area.y + 1,
@@ -12155,7 +12638,7 @@ impl App {
                 self.thunder_ui.row_hits.push((a, y));
             }
             frame.render_widget(
-                Paragraph::new(line).style(Style::default().bg(NORDIC_BG)),
+                Paragraph::new(line).style(Style::default().bg(modal_bg())),
                 ratatui::layout::Rect {
                     x: area.x,
                     y,
@@ -12175,9 +12658,9 @@ impl App {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     msg,
-                    Style::default().fg(accent).bg(NORDIC_BG),
+                    Style::default().fg(tpal.info_c()).bg(modal_bg()),
                 )))
-                .style(Style::default().bg(NORDIC_BG)),
+                .style(Style::default().bg(modal_bg())),
                 ratatui::layout::Rect {
                     x: area.x,
                     y,
@@ -12680,66 +13163,86 @@ impl App {
         use ratatui::text::{Line, Span};
         use ratatui::widgets::{Block, Borders, Paragraph};
 
+        // No inner box: the menu modal already frames this panel, so a
+        // second bordered box would be a border inside a border. Plain
+        // header + message in palette colors on the modal background.
         if self.code_graph_loading {
-            let loading = Paragraph::new(Line::from(Span::styled(
-                " Loading project graph… Running Tree-sitter + LSP ",
-                Style::default()
-                    .fg(Color::Rgb(143, 218, 255))
-                    .bg(NORDIC_BG)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Code Graph ")
-                    .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
-                    .style(Style::default().bg(NORDIC_BG)),
-            );
+            let cpal = crate::app_palette::current_palette();
+            let msg = if crate::settings::get_lsp_diagnostics_enabled() {
+                " Loading project graph… Running Tree-sitter + LSP "
+            } else {
+                " Loading project graph… Running Tree-sitter "
+            };
+            let loading = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    " Code Graph ",
+                    Style::default()
+                        .fg(cpal.foreground_c())
+                        .bg(modal_bg())
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    msg,
+                    Style::default()
+                        .fg(cpal.accent_c())
+                        .bg(modal_bg())
+                        .add_modifier(Modifier::BOLD),
+                )),
+            ])
+            .style(Style::default().bg(modal_bg()));
             frame.render_widget(loading, area);
             return;
         }
 
         if let Some(err) = &self.code_graph_error {
-            let error = Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " Error: ",
+            let cpal = crate::app_palette::current_palette();
+            let error = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    " Code Graph ",
                     Style::default()
-                        .fg(Color::Rgb(255, 120, 120))
-                        .bg(NORDIC_BG)
+                        .fg(cpal.foreground_c())
+                        .bg(modal_bg())
                         .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    err.as_str(),
-                    Style::default().fg(Color::Rgb(255, 120, 120)).bg(NORDIC_BG),
-                ),
-                Span::styled(
+                )),
+                Line::from(vec![
+                    Span::styled(
+                        " Error: ",
+                        Style::default()
+                            .fg(cpal.error_c())
+                            .bg(modal_bg())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        err.as_str(),
+                        Style::default().fg(cpal.error_c()).bg(modal_bg()),
+                    ),
+                ]),
+                Line::from(Span::styled(
                     "  [R] Retry   [Esc] Close",
-                    Style::default().fg(Color::Rgb(200, 200, 210)).bg(NORDIC_BG),
-                ),
-            ]))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Code Graph ")
-                    .border_style(Style::default().fg(Color::Rgb(255, 120, 120)))
-                    .style(Style::default().bg(NORDIC_BG)),
-            );
+                    Style::default().fg(cpal.muted_c()).bg(modal_bg()),
+                )),
+            ])
+            .style(Style::default().bg(modal_bg()));
             frame.render_widget(error, area);
             return;
         }
 
         let Some(graph) = &self.code_graph else {
-            let empty = Paragraph::new(vec![Line::from(Span::styled(
-                " No code graph data available. Press R to rebuild. ",
-                Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG),
-            ))])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Code Graph ")
-                    .border_style(Style::default().fg(Color::Rgb(120, 140, 160)))
-                    .style(Style::default().bg(NORDIC_BG)),
-            );
+            let cpal = crate::app_palette::current_palette();
+            let empty = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    " Code Graph ",
+                    Style::default()
+                        .fg(cpal.foreground_c())
+                        .bg(modal_bg())
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    " No code graph data available. Press R to rebuild. ",
+                    Style::default().fg(cpal.muted_c()).bg(modal_bg()),
+                )),
+            ])
+            .style(Style::default().bg(modal_bg()));
             frame.render_widget(empty, area);
             return;
         };
@@ -12790,14 +13293,21 @@ impl App {
             .collect();
 
         let list = List::new(items)
-            .block(
+            .block(crate::app_chrome::frame_container(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Nodes ")
-                    .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
-                    .style(Style::default().bg(NORDIC_BG)),
-            )
-            .style(Style::default().bg(NORDIC_BG));
+                    .title(Span::styled(
+                        " Nodes ",
+                        Style::default()
+                            .fg(crate::app_palette::current_palette().foreground_c())
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .border_style(
+                        Style::default().fg(crate::app_palette::current_palette().separator_c()),
+                    )
+                    .style(Style::default().bg(modal_bg())),
+            ))
+            .style(Style::default().bg(modal_bg()));
 
         let mut list_state = ListState::default();
         list_state.select(Some(
@@ -12855,7 +13365,7 @@ impl App {
         // Cell buffer: (char, style); rendered after edges/nodes are painted
         let w = area.width.saturating_sub(2) as usize;
         let h = area.height.saturating_sub(2) as usize;
-        let base = Style::default().bg(NORDIC_BG);
+        let base = Style::default().bg(modal_bg());
         let mut grid = vec![vec![(char::from(' '), base); w.max(1)]; h.max(1)];
         let inner = ratatui::layout::Rect {
             x: area.x + 1,
@@ -12872,7 +13382,7 @@ impl App {
                 }
             };
 
-        let dim_style = Style::default().fg(Color::Rgb(90, 100, 115)).bg(NORDIC_BG);
+        let dim_style = Style::default().fg(Color::Rgb(90, 100, 115)).bg(modal_bg());
 
         // NodeId → displayed index, built once per frame (O(n)) so the edge
         // pass never scans the node list per endpoint (O(edges × nodes)).
@@ -12894,10 +13404,10 @@ impl App {
             let (h_ch, v_ch, color) = Self::code_graph_edge_connector(edge.kind);
             let style = match &related {
                 Some(rel) if rel.contains(&edge.from) && rel.contains(&edge.to) => {
-                    Style::default().fg(color).bg(NORDIC_BG)
+                    Style::default().fg(color).bg(modal_bg())
                 }
                 Some(_) => dim_style,
-                None => Style::default().fg(color).bg(NORDIC_BG),
+                None => Style::default().fg(color).bg(modal_bg()),
             };
             let label = Self::code_graph_edge_label(edge.kind);
 
@@ -13008,7 +13518,7 @@ impl App {
             .collect();
 
         let title_style = Style::default()
-            .fg(Color::Rgb(143, 218, 255))
+            .fg(crate::app_palette::current_palette().foreground_c())
             .add_modifier(Modifier::BOLD);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -13021,8 +13531,9 @@ impl App {
                 ),
                 title_style,
             ))
-            .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
-            .style(Style::default().bg(NORDIC_BG));
+            .border_style(Style::default().fg(crate::app_palette::current_palette().separator_c()))
+            .style(Style::default().bg(modal_bg()));
+        let block = crate::app_chrome::frame_container(block);
         frame.render_widget(block, area);
         let lines_area = ratatui::layout::Rect {
             x: inner.x,
@@ -13030,7 +13541,7 @@ impl App {
             width: inner.width,
             height: inner.height,
         };
-        let para = ratatui::widgets::Paragraph::new(lines).style(Style::default().bg(NORDIC_BG));
+        let para = ratatui::widgets::Paragraph::new(lines).style(Style::default().bg(modal_bg()));
         frame.render_widget(para, lines_area);
     }
 
@@ -13053,8 +13564,10 @@ impl App {
         let selected_node = visible_nodes.get(self.code_graph_selected);
 
         let mut lines: Vec<Line> = Vec::new();
-        let label_style = Style::default().fg(Color::Rgb(120, 140, 160)).bg(NORDIC_BG);
-        let value_style = Style::default().fg(Color::White).bg(NORDIC_BG);
+        let label_style = Style::default()
+            .fg(Color::Rgb(120, 140, 160))
+            .bg(modal_bg());
+        let value_style = Style::default().fg(Color::White).bg(modal_bg());
 
         if let Some(node) = selected_node {
             let out = self
@@ -13074,7 +13587,7 @@ impl App {
                 format!(" {} {}", Self::node_kind_prefix(node.kind), node.name),
                 Style::default()
                     .fg(Self::node_kind_color(node.kind))
-                    .bg(NORDIC_BG)
+                    .bg(modal_bg())
                     .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::from(""));
@@ -13162,7 +13675,9 @@ impl App {
         } else {
             lines.push(Line::from(Span::styled(
                 " No node selected ",
-                Style::default().fg(Color::Rgb(160, 180, 200)).bg(NORDIC_BG),
+                Style::default()
+                    .fg(Color::Rgb(160, 180, 200))
+                    .bg(modal_bg()),
             )));
         }
 
@@ -13171,16 +13686,23 @@ impl App {
         let scroll = self.code_graph_detail_scroll.min(max_scroll);
 
         let paragraph = Paragraph::new(lines)
-            .block(
+            .block(crate::app_chrome::frame_container(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Details ")
-                    .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
-                    .style(Style::default().bg(NORDIC_BG)),
-            )
+                    .title(Span::styled(
+                        " Details ",
+                        Style::default()
+                            .fg(crate::app_palette::current_palette().foreground_c())
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .border_style(
+                        Style::default().fg(crate::app_palette::current_palette().separator_c()),
+                    )
+                    .style(Style::default().bg(modal_bg())),
+            ))
             .wrap(Wrap { trim: true })
             .scroll((scroll as u16, 0))
-            .style(Style::default().bg(NORDIC_BG));
+            .style(Style::default().bg(modal_bg()));
 
         frame.render_widget(paragraph, area);
     }
@@ -13262,11 +13784,11 @@ impl App {
                 .bg(Color::Rgb(94, 129, 172))
                 .add_modifier(Modifier::BOLD)
         } else if dimmed {
-            Style::default().fg(Color::Rgb(90, 100, 115)).bg(NORDIC_BG)
+            Style::default().fg(Color::Rgb(90, 100, 115)).bg(modal_bg())
         } else {
             Style::default()
                 .fg(Self::node_kind_color(kind))
-                .bg(NORDIC_BG)
+                .bg(modal_bg())
         }
     }
 
@@ -13484,8 +14006,11 @@ impl App {
                 let prefix = if is_editing { " ▏ " } else { " ▎ " };
                 let s = if is_focused && is_editing {
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Rgb(143, 218, 255))
+                        .fg(crate::app_palette::contrasting_text_on(
+                            crate::app_palette::current_palette().accent,
+                            &crate::app_palette::current_palette(),
+                        ))
+                        .bg(crate::app_palette::current_palette().accent_c())
                         .add_modifier(Modifier::BOLD)
                 } else if is_focused {
                     Style::default()
@@ -13524,13 +14049,13 @@ impl App {
         }
 
         let list = List::new(items)
-            .block(
+            .block(crate::app_chrome::frame_container(
                 Block::default()
                     .borders(Borders::ALL)
                     .title(" Options ")
                     .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
                     .style(Style::default().bg(Color::Rgb(30, 35, 45))),
-            )
+            ))
             .style(Style::default().bg(Color::Rgb(30, 35, 45)))
             .highlight_style(
                 Style::default()
@@ -13554,12 +14079,12 @@ impl App {
                     .fg(Color::Rgb(120, 140, 160))
                     .bg(Color::Rgb(30, 35, 45)),
             )
-            .block(
+            .block(crate::app_chrome::frame_container(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Rgb(76, 86, 106)))
                     .style(Style::default().bg(Color::Rgb(30, 35, 45))),
-            );
+            ));
         frame.render_widget(hints_para, chunks[2]);
     }
     /// Handle a single key event. Returns Some(should_return_true_from_handle_events) when the event loop must return Ok(b).
@@ -13785,6 +14310,8 @@ impl App {
                             self.hf_token_editing = false;
                             self.hf_token_input.clear();
                             self.status_message = "Token editing cancelled.".to_string();
+                        } else if self.custom_color_editing {
+                            self.custom_cancel_editing();
                         } else if self.settings_col == 1 {
                             // Exit second column back to tab column
                             self.settings_col = 0;
@@ -13826,14 +14353,9 @@ impl App {
                         self.header_dropdown_open = false;
                         self.krama.restart_progress("menu_fade", 0);
                         self.krama.restart_progress("list_fade", 0);
-                        let q = self.registry_search_query.clone();
-                        let manager_clone = self.manager.clone();
-                        let search_results_clone = self.search_results.clone();
-                        tokio::spawn(async move {
-                            let query_str = if q.trim().is_empty() { "gguf" } else { &q };
-                            let results = manager_clone.search_all_models(query_str).await;
-                            *search_results_clone.lock().unwrap() = Some(results);
-                        });
+                        // Immediate initial load (still generation-tagged so
+                        // the first keystroke invalidates it if it lags).
+                        self.registry_fire_search(true);
                     }
                 }
                 KeyCode::F(3) => {
@@ -13872,10 +14394,12 @@ impl App {
                     }
                 }
                 KeyCode::F(6) => {
+                    // F6 is an explicit open request: enable the panel on
+                    // demand so the key works out of the box. The Settings
+                    // toggle can still turn it back off afterwards.
                     if !crate::settings::get_code_graph_enabled() {
-                        self.status_message =
-                            "Code Graph Panel is disabled in Settings.".to_string();
-                        return None;
+                        crate::settings::set_code_graph_enabled(true);
+                        self.status_message = "Code Graph panel enabled.".to_string();
                     }
                     if self.show_menu && self.menu_section == 5 && !self.menu_closing {
                         self.menu_closing = true;
@@ -13934,10 +14458,17 @@ impl App {
                         self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
                         self.registry_state.select(Some(0));
                     } else if self.menu_section == 3 {
-                        if !self.hf_token_editing && !self.search_token_editing {
+                        if !self.hf_token_editing
+                            && !self.search_token_editing
+                            && !self.custom_color_editing
+                        {
                             if self.settings_col == 1 {
-                                // Left in value column: for Code Graph/LSP set OFF, else adjust
+                                // Left in value column: for Code Graph/LSP set OFF,
+                                // for Color Palette activate the row, else adjust
                                 match self.settings_tab {
+                                    SETTINGS_COLOR_PALETTE => {
+                                        self.palette_activate_row();
+                                    }
                                     SETTINGS_CODE_GRAPH => {
                                         // Set OFF for Code Graph
                                         match self.settings_option {
@@ -14017,9 +14548,16 @@ impl App {
                     }
                 }
                 KeyCode::Char('a') if self.show_menu && self.menu_section == 3 => {
-                    if !self.hf_token_editing && !self.search_token_editing {
+                    if !self.hf_token_editing
+                        && !self.search_token_editing
+                        && !self.custom_color_editing
+                    {
                         if self.settings_col == 1 {
-                            self.adjust_setting_value(-1);
+                            if self.settings_tab == SETTINGS_COLOR_PALETTE {
+                                self.palette_activate_row();
+                            } else {
+                                self.adjust_setting_value(-1);
+                            }
                         } else {
                             let num_tabs = SETTINGS_TAB_NAMES.len();
                             self.settings_tab = if self.settings_tab == 0 {
@@ -14028,6 +14566,8 @@ impl App {
                                 self.settings_tab - 1
                             };
                         }
+                    } else if self.custom_color_editing {
+                        self.custom_hex_push('a');
                     } else if self.search_token_editing {
                         self.search_token_input.push('a');
                     } else if self.hf_token_editing {
@@ -14040,10 +14580,17 @@ impl App {
                         self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
                         self.registry_state.select(Some(0));
                     } else if self.menu_section == 3 {
-                        if !self.hf_token_editing && !self.search_token_editing {
+                        if !self.hf_token_editing
+                            && !self.search_token_editing
+                            && !self.custom_color_editing
+                        {
                             if self.settings_col == 1 {
-                                // Right in value column: for Code Graph/LSP set ON, else adjust
+                                // Right in value column: for Code Graph/LSP set ON,
+                                // for Color Palette activate the row, else adjust
                                 match self.settings_tab {
+                                    SETTINGS_COLOR_PALETTE => {
+                                        self.palette_activate_row();
+                                    }
                                     SETTINGS_CODE_GRAPH => match self.settings_option {
                                         0 => crate::settings::set_code_graph_enabled(true),
                                         1 => crate::settings::set_code_graph_include_comments(true),
@@ -14097,10 +14644,15 @@ impl App {
                         self.search_token_input.push('k');
                     } else if self.settings_tab == 9 && self.hf_token_editing {
                         self.hf_token_input.push('k');
+                    } else if self.custom_color_editing {
+                        self.custom_hex_push('k');
                     }
                 }
                 KeyCode::Char('d') if self.show_menu && self.menu_section == 3 => {
-                    if !self.hf_token_editing && !self.search_token_editing {
+                    if !self.hf_token_editing
+                        && !self.search_token_editing
+                        && !self.custom_color_editing
+                    {
                         if self.settings_col == 1 {
                             if self.settings_tab == 8 {
                                 let s = crate::settings::get_settings();
@@ -14112,12 +14664,16 @@ impl App {
                             } else if self.settings_tab == 9 {
                                 crate::settings::clear_hf_token();
                                 self.status_message = "HuggingFace token removed.".to_string();
+                            } else if self.settings_tab == SETTINGS_COLOR_PALETTE {
+                                self.palette_activate_row();
                             } else {
                                 self.adjust_setting_value(1);
                             }
                         } else {
                             self.settings_tab = (self.settings_tab + 1) % SETTINGS_TAB_NAMES.len();
                         }
+                    } else if self.custom_color_editing {
+                        self.custom_hex_push('d');
                     } else if self.search_token_editing {
                         self.search_token_input.push('d');
                     } else if self.hf_token_editing {
@@ -14125,7 +14681,9 @@ impl App {
                     }
                 }
                 KeyCode::Char('l') if self.show_menu && self.menu_section == 3 => {
-                    if self.search_token_editing {
+                    if self.custom_color_editing {
+                        self.custom_hex_push('l');
+                    } else if self.search_token_editing {
                         self.search_token_input.push('l');
                     } else if self.hf_token_editing {
                         self.hf_token_input.push('l');
@@ -14136,7 +14694,10 @@ impl App {
                         && self.menu_section == 3
                         && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
-                    if !self.hf_token_editing && !self.search_token_editing {
+                    if !self.hf_token_editing
+                        && !self.search_token_editing
+                        && !self.custom_color_editing
+                    {
                         if self.settings_col == 1 && self.settings_tab == 11 {
                             // Code Graph: Toggle Include Comments
                             let s = crate::settings::get_settings();
@@ -14147,6 +14708,8 @@ impl App {
                                 if new_val { "ENABLED" } else { "DISABLED" }
                             );
                         }
+                    } else if self.custom_color_editing {
+                        self.custom_hex_push('c');
                     } else if self.search_token_editing {
                         self.search_token_input.push('c');
                     } else if self.hf_token_editing {
@@ -14154,7 +14717,10 @@ impl App {
                     }
                 }
                 KeyCode::Char('b') if self.show_menu && self.menu_section == 3 => {
-                    if !self.hf_token_editing && !self.search_token_editing {
+                    if !self.hf_token_editing
+                        && !self.search_token_editing
+                        && !self.custom_color_editing
+                    {
                         if self.settings_col == 1 && self.settings_tab == 11 {
                             // Code Graph: Toggle Bounce Response Write
                             let s = crate::settings::get_settings();
@@ -14165,11 +14731,28 @@ impl App {
                                 if new_val { "ENABLED" } else { "DISABLED" }
                             );
                         }
+                    } else if self.custom_color_editing {
+                        self.custom_hex_push('b');
                     } else if self.search_token_editing {
                         self.search_token_input.push('b');
                     } else if self.hf_token_editing {
                         self.hf_token_input.push('b');
                     }
+                }
+                KeyCode::Char('r') | KeyCode::Char('R')
+                    if self.show_menu
+                        && self.menu_section == 3
+                        && self.settings_tab == SETTINGS_COLOR_PALETTE
+                        && !self.custom_color_editing
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    // Reset the Custom palette to its defaults (applies
+                    // live + persists). Works from any palette tab row.
+                    crate::settings::set_custom_palette(
+                        crate::app_palette::AppPalette::custom_default(),
+                    );
+                    self.status_message = "Custom colors reset to defaults.".to_string();
                 }
                 KeyCode::Left => {
                     if self.input_focused {
@@ -14247,7 +14830,10 @@ impl App {
                         };
                         self.installed_state.select(Some(i));
                     } else if self.menu_section == 3 {
-                        if !self.hf_token_editing && !self.search_token_editing {
+                        if !self.hf_token_editing
+                            && !self.search_token_editing
+                            && !self.custom_color_editing
+                        {
                             if self.settings_col == 0 {
                                 let num_tabs = SETTINGS_TAB_NAMES.len();
                                 self.settings_tab = if self.settings_tab == 0 {
@@ -14257,8 +14843,18 @@ impl App {
                                 };
                                 self.settings_option = 0;
                             } else {
-                                // Up in value column: navigate options for Code Graph / LSP, else adjust
+                                // Up in value column: navigate options for Code Graph / LSP /
+                                // Color Palette, else adjust
                                 match self.settings_tab {
+                                    SETTINGS_COLOR_PALETTE => {
+                                        self.palette_clamp_row();
+                                        let n = Self::palette_row_count();
+                                        self.settings_option = if self.settings_option == 0 {
+                                            n - 1
+                                        } else {
+                                            self.settings_option - 1
+                                        };
+                                    }
                                     SETTINGS_CODE_GRAPH => {
                                         // 3 options
                                         self.settings_option = if self.settings_option == 0 {
@@ -14311,7 +14907,10 @@ impl App {
                         };
                         self.installed_state.select(Some(i));
                     } else if self.menu_section == 3 {
-                        if !self.hf_token_editing && !self.search_token_editing {
+                        if !self.hf_token_editing
+                            && !self.search_token_editing
+                            && !self.custom_color_editing
+                        {
                             if self.settings_col == 0 {
                                 let num_tabs = SETTINGS_TAB_NAMES.len();
                                 self.settings_tab = if self.settings_tab == 0 {
@@ -14321,6 +14920,15 @@ impl App {
                                 };
                             } else {
                                 match self.settings_tab {
+                                    SETTINGS_COLOR_PALETTE => {
+                                        self.palette_clamp_row();
+                                        let n = Self::palette_row_count();
+                                        self.settings_option = if self.settings_option == 0 {
+                                            n - 1
+                                        } else {
+                                            self.settings_option - 1
+                                        };
+                                    }
                                     SETTINGS_CODE_GRAPH => {
                                         self.settings_option = if self.settings_option == 0 {
                                             2
@@ -14342,6 +14950,8 @@ impl App {
                             }
                         } else if self.search_token_editing {
                             self.search_token_input.push('w');
+                        } else if self.custom_color_editing {
+                            self.custom_hex_push('w');
                         } else {
                             self.hf_token_input.push('w');
                         }
@@ -14379,14 +14989,23 @@ impl App {
                         self.installed_state
                             .select(if total == 0 { None } else { Some(i) });
                     } else if self.menu_section == 3 {
-                        if !self.hf_token_editing && !self.search_token_editing {
+                        if !self.hf_token_editing
+                            && !self.search_token_editing
+                            && !self.custom_color_editing
+                        {
                             if self.settings_col == 0 {
                                 self.settings_tab =
                                     (self.settings_tab + 1) % SETTINGS_TAB_NAMES.len();
                                 self.settings_option = 0;
                             } else {
-                                // Down in value column: navigate options for Code Graph / LSP, else adjust
+                                // Down in value column: navigate options for Code Graph / LSP /
+                                // Color Palette, else adjust
                                 match self.settings_tab {
+                                    SETTINGS_COLOR_PALETTE => {
+                                        self.palette_clamp_row();
+                                        let n = Self::palette_row_count();
+                                        self.settings_option = (self.settings_option + 1) % n;
+                                    }
                                     SETTINGS_CODE_GRAPH => {
                                         self.settings_option = (self.settings_option + 1) % 3;
                                     }
@@ -14430,13 +15049,21 @@ impl App {
                         self.installed_state
                             .select(if total == 0 { None } else { Some(i) });
                     } else if self.menu_section == 3 {
-                        if !self.hf_token_editing && !self.search_token_editing {
+                        if !self.hf_token_editing
+                            && !self.search_token_editing
+                            && !self.custom_color_editing
+                        {
                             if self.settings_col == 0 {
                                 self.settings_tab =
                                     (self.settings_tab + 1) % SETTINGS_TAB_NAMES.len();
                                 self.settings_option = 0;
                             } else {
                                 match self.settings_tab {
+                                    SETTINGS_COLOR_PALETTE => {
+                                        self.palette_clamp_row();
+                                        let n = Self::palette_row_count();
+                                        self.settings_option = (self.settings_option + 1) % n;
+                                    }
                                     SETTINGS_CODE_GRAPH => {
                                         self.settings_option = (self.settings_option + 1) % 3;
                                     }
@@ -14450,6 +15077,8 @@ impl App {
                             }
                         } else if self.search_token_editing {
                             self.search_token_input.push('s');
+                        } else if self.custom_color_editing {
+                            self.custom_hex_push('s');
                         } else {
                             self.hf_token_input.push('s');
                         }
@@ -14810,13 +15439,7 @@ impl App {
                             }
                         } else if self.show_menu && self.menu_section == 1 {
                             self.registry_search_query.push(c);
-                            let query = self.registry_search_query.clone();
-                            let manager = self.manager.clone();
-                            let results = self.search_results.clone();
-                            tokio::spawn(async move {
-                                let matches = manager.search_all_models(&query).await;
-                                *results.lock().unwrap() = Some(matches);
-                            });
+                            self.registry_fire_search(false);
                         } else if self.show_menu
                             && self.menu_section == 3
                             && self.settings_tab == 8
@@ -14832,6 +15455,14 @@ impl App {
                         {
                             if c != '\n' && c != '\r' {
                                 self.hf_token_input.push(c);
+                            }
+                        } else if self.show_menu
+                            && self.menu_section == 3
+                            && self.settings_tab == SETTINGS_COLOR_PALETTE
+                            && self.custom_color_editing
+                        {
+                            if c != '\n' && c != '\r' {
+                                self.custom_hex_push(c);
                             }
                         } else if self.input_focused && !self.show_menu {
                             // Paste / typed text may include newlines
@@ -14863,13 +15494,7 @@ impl App {
                         self.thunder_ui.code_input.pop();
                     } else if self.show_menu && self.menu_section == 1 {
                         self.registry_search_query.pop();
-                        let query = self.registry_search_query.clone();
-                        let manager = self.manager.clone();
-                        let results = self.search_results.clone();
-                        tokio::spawn(async move {
-                            let matches = manager.search_all_models(&query).await;
-                            *results.lock().unwrap() = Some(matches);
-                        });
+                        self.registry_fire_search(false);
                     } else if self.show_menu
                         && self.menu_section == 3
                         && self.settings_tab == 8
@@ -14882,6 +15507,12 @@ impl App {
                         && self.hf_token_editing
                     {
                         self.hf_token_input.pop();
+                    } else if self.show_menu
+                        && self.menu_section == 3
+                        && self.settings_tab == SETTINGS_COLOR_PALETTE
+                        && self.custom_color_editing
+                    {
+                        self.custom_color_input.pop();
                     } else if self.input_focused && !self.show_menu {
                         if self.input_cursor_position > 0 && !self.input.is_empty() {
                             self.push_input_undo();
@@ -14987,6 +15618,7 @@ impl App {
                                         *self.download_progress.lock().unwrap() = Some(0.0);
                                         let progress_clone = self.download_progress.clone();
                                         let complete_clone = self.download_complete.clone();
+                                        let error_clone = self.download_error.clone();
                                         let logs_clone = self.activity_logs.clone();
                                         let manager_clone = self.manager.clone();
 
@@ -15002,6 +15634,11 @@ impl App {
                                                 *complete_clone.lock().unwrap() = true;
                                             } else {
                                                 *complete_clone.lock().unwrap() = false;
+                                                *error_clone.lock().unwrap() = Some(format!(
+                                                    "Ollama pull failed for '{}': {}",
+                                                    ollama_name,
+                                                    res.err().unwrap_or_default()
+                                                ));
                                             }
                                         });
                                     } else {
@@ -15016,7 +15653,7 @@ impl App {
 
                                         self.status_message =
                                             format!("Resolving weights for {}", repo_id);
-                                        self.messages.push(format!("System: Resolving model weights and initiating download for: {}", repo_id));
+                                        self.messages.push(format!("System: Resolving GGUF weights for: {} (download starts once weights are found; failures report here).", repo_id));
                                         if let Ok(mut l) = self.activity_logs.lock() {
                                             l.push(format!("[USER] Initiated download for HuggingFace model: {}", repo_id));
                                         }
@@ -15024,6 +15661,7 @@ impl App {
                                         *self.download_progress.lock().unwrap() = Some(0.0);
                                         let progress_clone = self.download_progress.clone();
                                         let complete_clone = self.download_complete.clone();
+                                        let error_clone = self.download_error.clone();
                                         let logs_clone = self.activity_logs.clone();
                                         let manager_clone = self.manager.clone();
 
@@ -15058,6 +15696,11 @@ impl App {
                                                             }
                                                             *complete_clone.lock().unwrap() = false;
                                                             *progress_clone.lock().unwrap() = None;
+                                                            *error_clone.lock().unwrap() =
+                                                                Some(format!(
+                                                                    "Download failed for '{}': {}",
+                                                                    repo_id, e
+                                                                ));
                                                         }
                                                     }
                                                 }
@@ -15067,6 +15710,7 @@ impl App {
                                                     }
                                                     *complete_clone.lock().unwrap() = false;
                                                     *progress_clone.lock().unwrap() = None;
+                                                    *error_clone.lock().unwrap() = Some(e);
                                                 }
                                             }
                                         });
@@ -15259,6 +15903,15 @@ impl App {
                             } else if self.settings_tab == SETTINGS_CODE_GRAPH {
                                 if self.settings_col == 1 {
                                     self.adjust_setting_value(0); // toggle selected option
+                                } else {
+                                    self.settings_col = 1;
+                                }
+                            } else if self.settings_tab == SETTINGS_COLOR_PALETTE {
+                                if self.custom_color_editing {
+                                    // Commit the hex buffer (stays open on error).
+                                    self.custom_commit_editing();
+                                } else if self.settings_col == 1 {
+                                    self.palette_activate_row();
                                 } else {
                                     self.settings_col = 1;
                                 }
@@ -15525,6 +16178,81 @@ impl App {
             }
         } // end if !pending_consumed
         None
+    }
+}
+
+/// Shared application-menu geometry: one calculation for every menu
+/// (Help … Thunder). Outer box, content origin and footer position are
+/// identical for a given terminal area + animation progress, so hitboxes
+/// and keyboard navigation never move between menus. Styles may change
+/// glyphs but never these rects (see width-invariance tests).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AppMenuLayout {
+    /// Full modal box (modal_x/y/w/h), including chrome rows.
+    pub outer: ratatui::layout::Rect,
+    /// Content origin for section renderers (inside chrome + footer).
+    pub content: ratatui::layout::Rect,
+    /// Shared keyboard-hint footer row.
+    pub footer: ratatui::layout::Rect,
+    /// Clamped animation progress this layout was built for.
+    pub anim_p: f32,
+}
+
+/// Centralized menu geometry + preserved open/close animation:
+///
+/// ```text
+/// closed → animated expansion → STANDARD full height → animated collapse → closed
+/// ```
+///
+/// `animated = target * (0.6 + 0.4 * progress)` is unchanged; only the
+/// target is now shared. Minimum floors (36x14) keep tiny terminals safe.
+pub fn calculate_app_menu_layout(area: ratatui::layout::Rect, anim_p: f32) -> AppMenuLayout {
+    let anim_p = anim_p.clamp(0.0, 1.0);
+    let full_w = area.width;
+    let full_h = area.height;
+    let target_w = (full_w.saturating_sub(10))
+        .min(120)
+        .max(70.min(full_w))
+        .min(full_w.saturating_sub(2));
+    let max_h = ((full_h as f32 * 0.86).round() as u16)
+        .max(12)
+        .min(full_h.saturating_sub(2));
+    let target_h = (full_h.saturating_sub(6))
+        .min(32)
+        .max(20.min(full_h))
+        .min(max_h);
+    let modal_w = ((target_w as f32 * (0.6 + 0.4 * anim_p)).round() as u16).max(36);
+    let modal_h = ((target_h as f32 * (0.6 + 0.4 * anim_p)).round() as u16).max(14);
+    let modal_x = area.x + (full_w.saturating_sub(modal_w)) / 2;
+    let modal_y = area.y + (full_h.saturating_sub(modal_h)) / 2;
+    let outer = ratatui::layout::Rect {
+        x: modal_x,
+        y: modal_y,
+        width: modal_w,
+        height: modal_h,
+    };
+    // One row reserved at the bottom for the shared keyboard footer;
+    // content sections get the rows above it. (Mirrors the render site.)
+    let content_full = ratatui::layout::Rect {
+        x: modal_x + 3,
+        y: modal_y + 2,
+        width: modal_w.saturating_sub(6),
+        height: modal_h.saturating_sub(4),
+    };
+    let content = ratatui::layout::Rect {
+        height: content_full.height.saturating_sub(1),
+        ..content_full
+    };
+    let footer = ratatui::layout::Rect {
+        y: content_full.y + content_full.height.saturating_sub(1),
+        height: 1,
+        ..content_full
+    };
+    AppMenuLayout {
+        outer,
+        content,
+        footer,
+        anim_p,
     }
 }
 
@@ -16931,5 +17659,448 @@ mod thunder_tests {
         }
         assert!(app.status_message.contains("Alice"));
         unisolate(dir);
+    }
+
+    /// Redirect HOME + snapshot the live chrome style; restores both.
+    /// Serializes HOME/global mutation with the settings persistence test
+    /// via a shared guard discipline (unique temp dirs per process).
+    fn isolate_chrome() -> (
+        std::sync::MutexGuard<'static, ()>,
+        Option<std::ffi::OsString>,
+        std::path::PathBuf,
+        crate::app_chrome::AppChromeStyle,
+    ) {
+        let guard = crate::settings::app_style_test_guard();
+        let real_home = std::env::var_os("HOME");
+        let tmp = std::env::temp_dir().join(format!("hercules-chrome-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // SAFETY: test-only, serial-guarded env override.
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+        let saved = crate::settings::get_app_chrome_style();
+        (guard, real_home, tmp, saved)
+    }
+
+    fn unisolate_chrome(
+        _guard: std::sync::MutexGuard<'static, ()>,
+        real_home: Option<std::ffi::OsString>,
+        tmp: std::path::PathBuf,
+        saved: crate::app_chrome::AppChromeStyle,
+    ) {
+        crate::settings::set_app_chrome_style(saved);
+        unsafe {
+            match real_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn open_app_style(app: &mut App) {
+        app.menu_section = 3;
+        app.show_menu = true;
+        app.menu_closing = false;
+        app.menu_anim_progress = 1.0;
+        app.settings_tab = crate::app::SETTINGS_APP_STYLE;
+        app.settings_col = 1;
+        app.settings_option = 0;
+    }
+
+    fn chrome_text(
+        app: &mut App,
+        style: crate::app_chrome::AppChromeStyle,
+        w: u16,
+        h: u16,
+    ) -> String {
+        crate::settings::set_app_chrome_style(style);
+        open_app_style(app);
+        render_text(app, w, h)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_style_nav_cycles_and_persists() {
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        // Hermetic precondition: the cycle assertions below are relative
+        // to Modern, so establish it explicitly instead of assuming the
+        // ambient process-global style (other tests share this global).
+        crate::settings::set_app_chrome_style(crate::app_chrome::AppChromeStyle::Modern);
+        let mut app = App::new();
+        open_app_style(&mut app);
+        assert_eq!(app.settings_tab, crate::app::SETTINGS_APP_STYLE);
+
+        app.adjust_setting_value(1);
+        assert_eq!(
+            crate::settings::get_app_chrome_style(),
+            crate::app_chrome::AppChromeStyle::BorderLine
+        );
+        assert!(app.status_message.contains("Border Line"));
+        app.adjust_setting_value(1);
+        assert_eq!(
+            crate::settings::get_app_chrome_style(),
+            crate::app_chrome::AppChromeStyle::None
+        );
+        app.adjust_setting_value(-1);
+        assert_eq!(
+            crate::settings::get_app_chrome_style(),
+            crate::app_chrome::AppChromeStyle::BorderLine
+        );
+        app.adjust_setting_value(0);
+        assert_eq!(
+            crate::settings::get_app_chrome_style(),
+            crate::app_chrome::AppChromeStyle::None
+        );
+
+        let on_disk = crate::settings::load_settings_from_disk();
+        assert_eq!(
+            on_disk.app_chrome_style,
+            crate::app_chrome::AppChromeStyle::None
+        );
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_style_snapshot_per_style() {
+        // Each style renders visibly distinct chrome in the settings modal.
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mut app = App::new();
+        let modern = chrome_text(&mut app, crate::app_chrome::AppChromeStyle::Modern, 100, 30);
+        assert!(modern.contains("App Style"), "option row present");
+        assert!(modern.contains('🭈'), "modern diagonal clusters");
+        let border = chrome_text(
+            &mut app,
+            crate::app_chrome::AppChromeStyle::BorderLine,
+            100,
+            30,
+        );
+        assert!(border.contains('┌'), "border-line corners");
+        assert!(!border.contains('🭈'), "no diagonal decoration");
+        assert_ne!(modern, border, "styles differ visibly");
+        let none = chrome_text(&mut app, crate::app_chrome::AppChromeStyle::None, 100, 30);
+        assert!(
+            none.contains("App Style"),
+            "hierarchy preserved without frames"
+        );
+        assert!(!none.contains('🭈'), "no diagonal decoration");
+        assert!(!none.contains('┌'), "no box corners");
+        assert!(!none.contains('┏'), "no heavy corners");
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_style_hitboxes_style_invariant() {
+        // Geometry contract: close hitbox identical across styles.
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mut hits = Vec::new();
+        for style in crate::app_chrome::AppChromeStyle::all() {
+            let mut app = App::new();
+            chrome_text(&mut app, style, 100, 30);
+            hits.push(app.container_close_hit);
+        }
+        assert_eq!(hits[0], hits[1], "modern vs border-line hitbox");
+        assert_eq!(hits[1], hits[2], "border-line vs none hitbox");
+        assert!(hits[0].is_some(), "close hit recorded");
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_style_selection_survives_switch() {
+        // Switching styles never moves navigation state.
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mut app = App::new();
+        open_app_style(&mut app);
+        for style in crate::app_chrome::AppChromeStyle::all() {
+            crate::settings::set_app_chrome_style(style);
+            assert_eq!(app.settings_tab, crate::app::SETTINGS_APP_STYLE);
+            assert_eq!(app.settings_option, 0);
+            assert_eq!(app.settings_col, 1);
+        }
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    fn menu_area(w: u16, h: u16) -> ratatui::layout::Rect {
+        ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn menu_geometry_shared_across_sections() {
+        // Help == Settings == Thunder == Registry == every other menu:
+        // one shared FULL/TARGET geometry per area+progress.
+        use crate::app::calculate_app_menu_layout;
+        for (w, h) in [(100u16, 30u16), (80, 24), (60, 16), (170, 45)] {
+            let reference = calculate_app_menu_layout(menu_area(w, h), 1.0);
+            // All 8 menu sections share it (geometry no longer depends on
+            // section content at all — the function takes no section).
+            let again = calculate_app_menu_layout(menu_area(w, h), 1.0);
+            assert_eq!(reference, again, "deterministic at {w}x{h}");
+            // Content origin + footer identical (hitboxes/keyboard stable).
+            assert_eq!(reference.content.x, again.content.x);
+            assert_eq!(reference.footer.y, again.footer.y);
+        }
+    }
+
+    #[test]
+    fn menu_animation_converges_to_shared_target() {
+        // Animation preserved: progress scales toward the shared target,
+        // never to per-menu sizes. Closed < open, and full height is the
+        // same regardless of progress path.
+        use crate::app::calculate_app_menu_layout;
+        let area = menu_area(100, 30);
+        let closed = calculate_app_menu_layout(area, 0.0);
+        let mid = calculate_app_menu_layout(area, 0.5);
+        let full = calculate_app_menu_layout(area, 1.0);
+        assert!(
+            closed.outer.height < full.outer.height,
+            "animation expands toward target"
+        );
+        assert!(
+            mid.outer.height > closed.outer.height && mid.outer.height < full.outer.height,
+            "mid-animation is strictly between"
+        );
+        assert_eq!(full.outer.width, full.outer.width);
+        // Floors hold without panic on tiny terminals (pure saturating
+        // math; pre-existing floors may exceed the area — renderers clip).
+        for p in [0.0, 0.5, 1.0] {
+            let tiny = calculate_app_menu_layout(menu_area(40, 10), p);
+            assert!(tiny.outer.width <= 40);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn menu_geometry_style_invariant_rendered() {
+        // Rendered modal hitbox + text length identical across styles:
+        // styles change glyphs, never geometry.
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mut hits = Vec::new();
+        let mut lens = Vec::new();
+        for style in crate::app_chrome::AppChromeStyle::all() {
+            let mut app = App::new();
+            chrome_text(&mut app, style, 100, 30);
+            hits.push(app.container_close_hit);
+            // Re-render for length (chrome_text borrows mutably twice ok).
+            // Char (not byte) count: every frame glyph is single-cell, so
+            // equal char counts prove identical cell geometry.
+            let mut app2 = App::new();
+            lens.push(chrome_text(&mut app2, style, 100, 30).chars().count());
+        }
+        assert_eq!(hits[0], hits[1]);
+        assert_eq!(hits[1], hits[2]);
+        assert!(hits[0].is_some());
+        assert_eq!(lens[0], lens[1], "same cell counts modern/borderline");
+        assert_eq!(lens[1], lens[2], "same cell counts borderline/none");
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn menu_keyboard_nav_intact() {
+        // Keyboard navigation unaffected by the geometry work: Right in
+        // the tab column advances tabs; settings options still cycle.
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mut app = App::new();
+        open_app_style(&mut app);
+        app.settings_col = 0;
+        app.settings_tab = 3;
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .await;
+        assert_eq!(app.settings_tab, 4, "right advances settings tab");
+        // Left returns (wrap-aware): from 4, left goes to tab column nav.
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .await;
+        assert_eq!(app.settings_tab, 3, "left returns to previous tab");
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn menu_all_sections_render_shared_geometry() {
+        // Every menu section renders at the shared geometry. This asserts
+        // the ACTUAL on-screen container box — x, y, width AND height — not
+        // just the close-button hitbox. The height must equal the shared
+        // target from calculate_app_menu_layout for the same area.
+        use crate::app::calculate_app_menu_layout;
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        crate::settings::set_app_chrome_style(crate::app_chrome::AppChromeStyle::BorderLine);
+        let area = menu_area(100, 30);
+        let shared = calculate_app_menu_layout(area, 1.0);
+        let mut hits = Vec::new();
+        let mut rects = Vec::new();
+        for section in 0..=7usize {
+            let mut app = App::new();
+            app.menu_section = section;
+            app.show_menu = true;
+            app.menu_closing = false;
+            app.menu_anim_progress = 1.0;
+            let text = render_text(&mut app, 100, 30);
+            assert!(!text.is_empty(), "section {section} renders");
+            hits.push(app.container_close_hit);
+            let rect = app
+                .container_rect
+                .expect("menu records its rendered container box");
+            rects.push(rect);
+            assert_eq!(
+                (rect.2, rect.3),
+                (shared.outer.width, shared.outer.height),
+                "section {section} renders at the shared target size"
+            );
+        }
+        for (i, h) in hits.iter().enumerate() {
+            assert_eq!(*h, hits[0], "section {i} shares menu hitbox");
+        }
+        // Same container HEIGHT on screen for every section — the property
+        // the bug report was about (tall Thunder vs short menus).
+        let heights: Vec<u16> = rects.iter().map(|r| r.3).collect();
+        assert!(
+            heights.iter().all(|h| *h == heights[0]),
+            "all menus must share the same rendered height: {heights:?}"
+        );
+        let widths: Vec<u16> = rects.iter().map(|r| r.2).collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "all menus must share the same rendered width: {widths:?}"
+        );
+        // Narrow terminals: no panic, geometry still shared.
+        for section in [0usize, 3, 7] {
+            let mut app = App::new();
+            app.menu_section = section;
+            app.show_menu = true;
+            app.menu_closing = false;
+            app.menu_anim_progress = 1.0;
+            let text = render_text(&mut app, 60, 16);
+            assert!(!text.is_empty(), "section {section} narrow renders");
+        }
+        let narrow: Vec<(u16, u16, u16, u16)> = [0usize, 3, 7]
+            .iter()
+            .map(|section| {
+                let mut app = App::new();
+                app.menu_section = *section;
+                app.show_menu = true;
+                app.menu_closing = false;
+                app.menu_anim_progress = 1.0;
+                let _ = render_text(&mut app, 60, 16);
+                app.container_rect.expect("narrow records container box")
+            })
+            .collect();
+        assert!(
+            narrow.iter().all(|r| *r == narrow[0]),
+            "narrow terminals share one container box: {narrow:?}"
+        );
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn menu_animation_progresses_per_section_to_shared_target() {
+        // Animation is preserved AND converges per section: for EVERY menu,
+        // progress 0.0 renders collapsed, 0.5 renders strictly between, and
+        // 1.0 renders exactly the shared target height. The animation is
+        // never replaced by a constant — heights must differ by progress
+        // but agree across sections at each progress.
+        use crate::app::calculate_app_menu_layout;
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        crate::settings::set_app_chrome_style(crate::app_chrome::AppChromeStyle::Modern);
+        let area = menu_area(100, 30);
+        let expected = |p: f32| calculate_app_menu_layout(area, p).outer.height;
+        let rendered_height = |section: usize, progress: f32| {
+            let mut app = App::new();
+            app.menu_section = section;
+            app.show_menu = true;
+            app.menu_closing = false;
+            app.menu_anim_progress = progress;
+            let _ = render_text(&mut app, 100, 30);
+            app.container_rect.expect("menu records container box").3
+        };
+        for section in 0..=7usize {
+            let collapsed = rendered_height(section, 0.0);
+            let mid = rendered_height(section, 0.5);
+            let full = rendered_height(section, 1.0);
+            assert_eq!(collapsed, expected(0.0), "section {section} collapsed");
+            assert_eq!(mid, expected(0.5), "section {section} mid-animation");
+            assert_eq!(
+                full,
+                expected(1.0),
+                "section {section} full == shared target"
+            );
+            assert!(
+                collapsed < full,
+                "section {section} animation expands toward target"
+            );
+            assert!(
+                mid > collapsed && mid < full,
+                "section {section} mid-animation strictly between"
+            );
+        }
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peers_tab_empty_store_shows_no_peer_rows() {
+        // Normal startup with no pairings: the Peers screen invents no
+        // rows — no dummy/demo entries from anywhere in the pipeline.
+        let _store_guard = crate::thunder::pairing::store_test_guard();
+        let dir = isolate_store("nopeers");
+        let mut app = App::new();
+        open_thunder(&mut app);
+        app.thunder_ui.set_tab(3);
+        let text = render_text(&mut app, 120, 40);
+        assert!(text.contains("Peers"), "peers section header");
+        assert_eq!(count_occurrences(&text, "[=]"), 0, "zero peer rows");
+        assert!(!text.contains("Alice"), "no dummy Alice peers");
+        unisolate(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peers_tab_repeated_trust_renders_single_row() {
+        // One peer re-registered repeatedly (reconnect / refresh / one
+        // peer with many models) still renders exactly ONE peer row:
+        // identity is peer_id, and rows come from the id-keyed store.
+        let _store_guard = crate::thunder::pairing::store_test_guard();
+        let dir = isolate_store("onerow");
+        for _ in 0..3 {
+            assert!(crate::thunder_ui::ThunderUiState::trust_peer(
+                "thunder-alice",
+                [5u8; 32],
+                "Alice",
+                true,
+                false,
+                true,
+            ));
+        }
+        let mut app = App::new();
+        open_thunder(&mut app);
+        app.thunder_ui.set_tab(3);
+        let text = render_text(&mut app, 120, 40);
+        assert_eq!(
+            count_occurrences(&text, "[=]"),
+            1,
+            "exactly one row for one peer id"
+        );
+        // The id additionally appears in that peer's own action rows
+        // (toggle inference/forwarding, remove trust) — same single peer.
+        assert!(text.contains("thunder-alice"));
+        assert!(crate::thunder_ui::ThunderUiState::untrust_peer(
+            "thunder-alice"
+        ));
+        unisolate(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_style_narrow_terminals() {
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        for style in crate::app_chrome::AppChromeStyle::all() {
+            for (w, h) in [(60u16, 16u16), (80, 24)] {
+                let mut app = App::new();
+                let text = chrome_text(&mut app, style, w, h);
+                assert!(!text.is_empty(), "{style:?} at {w}x{h} renders");
+            }
+        }
+        unisolate_chrome(_guard, real_home, tmp, saved);
     }
 }
