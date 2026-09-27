@@ -1,4 +1,4 @@
-<img src="logo.png" width="100%" alt="Hercules Agent — run LLM on your machine">
+<img src="banner.png" width="100%" alt="Hercules Agent — run LLM on your machine">
 
 Local coding agent with a terminal UI. It runs models on your machine,
 gives the model real tools (files, shell, web, sub-agents), and renders
