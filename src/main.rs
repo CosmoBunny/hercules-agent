@@ -180,6 +180,10 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
         app
     };
 
+    // Restore the persisted tool permission mode (Ask vs AlwaysAllow).
+    // Done once here — never inside App::new, which tests construct.
+    hercules_agent::agent::sync_permission_mode_from_settings();
+
     let res = run_app(&mut terminal, &mut app).await;
 
     if let Ok(mut g) = app.is_generating.lock() {
@@ -220,8 +224,12 @@ async fn run_app(
             std::thread::spawn(cleanup_engines);
             return Ok(());
         }
+        // Snapshot BEFORE the tick: handle_events advances animations,
+        // and a tick that *completes* one must still draw the settled
+        // rest state (see App::should_draw_frame).
+        let anim_was_in_progress = app.krama.is_any_animation_inprogress();
         let needs_redraw = app.handle_events().await?;
-        if needs_redraw || app.krama.is_any_animation_inprogress() {
+        if app.should_draw_frame(needs_redraw, anim_was_in_progress) {
             terminal.draw(|f| app.draw(f))?;
         }
         if app.should_quit {

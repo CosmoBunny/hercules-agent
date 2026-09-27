@@ -1,10 +1,9 @@
 # Hercules Agent
 
-Local coding agent with a terminal UI. Runs models on your machine via:
-
-- **llama.cpp** (`llama-server` HTTP) for practical GGUF inference
-- **llama.rs** pure-Rust GGUF path (no C/FFI; still maturing)
-- **Ollama** as an alternate backend
+Local coding agent with a terminal UI. It runs models on your machine,
+gives the model real tools (files, shell, web, sub-agents), and renders
+everything in a Ratatui TUI with tool chips, fly-out panels, and a code
+graph.
 
 Working name / crate: `hercules-agent`. Binary: `hercules`.
 
@@ -63,14 +62,69 @@ select the model you just downloaded.
   Default is DuckDuckGo.
 - **HF Token** — if Hugging Face searches return empty (rate limiting),
   create a Hugging Face token and paste it here to avoid the error.
+- **OCR Engine** — Auto / Tesseract / Native / pdftotext for reading
+  text out of attached images and PDFs.
+- **Code Graph / LSP Diagnostics** — F6 code-graph panel and which
+  language-server diagnostics to surface in it.
+- **App Style / Color Palette** — chrome style (Modern, BorderLine,
+  None) plus palettes (Rose Pine, Catppuccin, Tokyo Night, Gruvbox,
+  Custom, Simple).
+- **Auto Compact** — master switch plus CTX-meter threshold (75–95%,
+  default 80%) for automatic semantic context compaction.
 
-## Features (current)
+## Backends and model formats
 
-- Ratatui TUI chat with tool chips (`write`, `cmd`, `ls`, `read`, `memory`)
-- Runtime menu: context size, power mode, temperature, permissions
-- Context compact to durable memory (`/compact`)
-- Task manager for long-running shell commands
-- Optional warm `llama-server` process (load GGUF once)
+Implemented today:
+
+- **llama.cpp** (`llama-server` HTTP) — GGUF, incl. vision models with
+  `mmproj` weights, for practical local inference.
+- **Ollama** daemon (local HTTP) — whatever the daemon serves, incl.
+  vision models (`llava`, `qwen2-vl`, …).
+- **llama.rs** — pure-Rust GGUF path (no C/FFI; still maturing).
+
+On the roadmap as resolver capability entries (the model picker already
+explains compatibility precisely): **Transformers** (SafeTensors, HF
+layout), **MLX** (SafeTensors, MLX layout, Apple Silicon only),
+**OpenAI-compatible** endpoints (vLLM, LM Studio, …), and **Shared
+Thunder** (a paired peer's model over the encrypted Thunder protocol).
+
+The in-app Registry downloads **GGUF** weights. Repos that ship only
+SafeTensors/PyTorch weights are rejected with a message that says so —
+pick a GGUF quant from the same model family instead.
+
+## What the agent can do
+
+- **Tools**: `write` / `cmd` / `read` (incl. `line="45-55"` ranges) /
+  `ls` / `mcp` / `skill` / `websearch` / sub-`agent` / `memory`, parsed
+  from the model stream through a canonical parser with exactly-once
+  dispatch — a chip is display only, never authority.
+- **Permissions**: Ask mode (approve with Y / Enter / N, or A for the
+  session) vs Always Allow, plus Current-Dir vs All-Dirs scope (`/allow`).
+- **Sub-agent swarm** (`/swarm`) with bounded depth for parallel work.
+- **MCP tools** — configure command-based tools in settings.
+- **Web search** — DuckDuckGo, Google, Brave, Tavily, SearXNG, ArXiv.
+- **Vision**: paste/attach images, OCR them, and reason over them with a
+  vision model; optional image generation (SD WebUI, Ollama, diffusers)
+  and video generation (AnimateDiff, CogVideoX).
+- **Sessions**: `/save` / `/load`, resume, `/copy` chat export.
+- **Context management**: `/compact` (manual) plus auto-compact driven
+  by the CTX meter; stall watchdog and repeat-loop detector keep runs
+  from wedging.
+- **Background jobs**: task manager for long-running shell commands
+  (`/tasks`).
+- **Shared Thunder**: encrypted P2P inference sharing (identity →
+  pairing → ...) — inference only, never filesystem, shell, or tools.
+
+## TUI essentials
+
+- Tool chips with kind badges (`WROTE file +45 -3`, `READ file
+  [45,55]`, `RAN cmd 34s` / `RUN cmd 45s`) — click to expand inline or
+  open the fly-out panel.
+- Input completion: `/commands`, `@paths`, `$CURRENT`, model names.
+- F6 code graph with LSP diagnostics; F2 registry; F3 models.
+- Slash commands: `/help` `/allow` `/swarm` `/compact` (`/gc`,
+  `/compact!`) `/tasks` `/save` `/load` `/copy` `/theme`
+  `/download-status` and more.
 
 ## Build
 
@@ -110,8 +164,18 @@ src/
   main.rs          # binary entry
   app.rs           # TUI
   agent.rs         # tools + system prompt
-  backend.rs       # Ollama
+  backend.rs       # backends (llama.cpp, Ollama, …)
+  model/           # registry, resolver, formats, hardware caps
+  thunder/         # encrypted P2P inference sharing
   llama/           # llama.rs + llama-server client
+  compact.rs       # semantic context compaction
+  complete.rs      # input completion engine
+  code_graph.rs    # F6 code graph
+  lsp.rs           # language-server diagnostics
+  ocr.rs / media.rs / graphic.rs  # vision + attachments + image/video gen
+  mcp.rs           # command-based tools
+  smart_system.rs  # optimistic file consistency + revisions
+  agent_io.rs      # agent I/O scheduler + filesystem sandbox
   settings.rs      # runtime settings
   ...
 ```

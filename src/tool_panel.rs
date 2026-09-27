@@ -79,6 +79,11 @@ pub struct ToolChip {
     pub anchor_msg: Option<usize>,
     pub expanded: bool,
     pub anim_start: Option<Instant>,
+    /// Write diff stats once executed (`WROTE file +a -r`).
+    pub added: Option<usize>,
+    pub removed: Option<usize>,
+    /// Read `line="45-55"` scope (`READ file [45,55]`).
+    pub line_range: Option<String>,
 }
 
 /// Terminal rows reserved under an agent turn for one chip (bordered 3-row button).
@@ -89,65 +94,193 @@ impl ToolChip {
         self.label_text_with_duration(None)
     }
 
-    pub fn label_text_with_duration(&self, duration: Option<&str>) -> String {
-        let base = match self.kind {
+    /// Kind verb matching the label (`WRITE`/`WROTE`, `RUN`/`RAN`,
+    /// `READ`, …) — used by the label and the transcript badge alike so
+    /// the two can never disagree.
+    pub fn badge_verb(&self) -> &'static str {
+        match self.kind {
             ToolPanelKind::Write => {
-                let short = self.target.rsplit('/').next().unwrap_or(&self.target);
-                let lines = line_count(&self.body);
-                if self.pending {
-                    format!("WRITE {short} ({lines} lines, pending)")
-                } else if self.tag_closed {
-                    format!("WROTE {lines} lines to {short}")
+                if self.pending || !self.tag_closed {
+                    "WRITE"
                 } else {
-                    format!("WRITE {short} ({lines} lines…)")
+                    "WROTE"
                 }
             }
             ToolPanelKind::Cmd => {
-                let cmd = clean_cmd(&self.target);
-                let cmd = trunc(&cmd, 42);
                 if self.pending {
-                    format!("RUN `{cmd}` (pending)")
-                } else if !self.body.is_empty() {
-                    format!("RAN `{cmd}`")
+                    "RUN"
+                } else if self.tag_closed && !self.body.is_empty() {
+                    "RAN"
                 } else {
-                    format!("RUN `{cmd}`")
+                    "RUN"
+                }
+            }
+            ToolPanelKind::Read => "READ",
+            ToolPanelKind::Agent => "AGENT",
+            ToolPanelKind::WebSearch => "SEARCH",
+            ToolPanelKind::Skill => "SKILL",
+            ToolPanelKind::Mcp => "MCP",
+        }
+    }
+
+    /// Amber badge text above the chip: ` READ `, ` WROTE `,
+    /// ` RUN 45s ` — the kind, never the generic "Action".
+    pub fn badge_text(&self, dur_secs: Option<u64>) -> String {
+        match dur_secs {
+            Some(d) => format!(" {} {d}s ", self.badge_verb()),
+            None => format!(" {} ", self.badge_verb()),
+        }
+    }
+
+    /// Plain-text label (tooltips, headers, width). Single format
+    /// definition lives in [`Self::label_spans`]; this just concatenates.
+    pub fn label_text_with_duration(&self, duration: Option<&str>) -> String {
+        self.label_spans(Color::Rgb(0, 0, 0), duration)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    /// Compact kind-first label with per-part colors:
+    /// `WROTE file +45 -3` (+green/-red), `READ file [45,55]`,
+    /// `RAN cmd 34s` / `RUN cmd 45s`. `bg` is painted on every span so
+    /// callers can drop the result straight into any row.
+    pub fn label_spans(&self, bg: Color, duration: Option<&str>) -> Vec<Span<'static>> {
+        const GREEN: Color = Color::Rgb(120, 220, 140);
+        const RED: Color = Color::Rgb(255, 120, 120);
+        const DIM: Color = Color::Rgb(140, 150, 165);
+        let accent = self.kind.accent();
+        let verb = |t: String| {
+            Span::styled(
+                t,
+                Style::default()
+                    .fg(accent)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let plain = |t: String| Span::styled(t, Style::default().fg(Color::White).bg(bg));
+        let dim = |t: String| Span::styled(t, Style::default().fg(DIM).bg(bg));
+        let mut out: Vec<Span<'static>> = Vec::new();
+        let mut dur = |out: &mut Vec<Span<'static>>| {
+            if let Some(d) = duration {
+                out.push(dim(format!(" {d}")));
+            }
+        };
+        match self.kind {
+            ToolPanelKind::Write => {
+                let short = self
+                    .target
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&self.target)
+                    .to_string();
+                if self.pending {
+                    out.push(verb(format!("{} ", self.badge_verb())));
+                    out.push(plain(short));
+                    out.push(dim(" (pending)".into()));
+                } else if !self.tag_closed {
+                    out.push(verb(format!("{} ", self.badge_verb())));
+                    out.push(plain(short));
+                    out.push(dim("…".into()));
+                } else {
+                    out.push(verb(format!("{} ", self.badge_verb())));
+                    out.push(plain(short));
+                    match (self.added, self.removed) {
+                        (Some(a), Some(r)) if a + r > 0 => {
+                            out.push(Span::styled(
+                                format!(" +{a}"),
+                                Style::default()
+                                    .fg(GREEN)
+                                    .bg(bg)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                            out.push(Span::styled(
+                                format!(" -{r}"),
+                                Style::default().fg(RED).bg(bg).add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        (Some(_), Some(_)) => {
+                            out.push(dim(" (no changes)".into()));
+                        }
+                        _ => {
+                            let lines = line_count(&self.body);
+                            out.push(Span::styled(
+                                format!(" +{lines}"),
+                                Style::default()
+                                    .fg(GREEN)
+                                    .bg(bg)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                    }
+                }
+            }
+            ToolPanelKind::Cmd => {
+                let cmd = trunc(&clean_cmd(&self.target), 42);
+                let done = self.tag_closed && !self.body.is_empty();
+                if self.pending {
+                    out.push(verb(format!("{} ", self.badge_verb())));
+                    out.push(plain(cmd));
+                    out.push(dim(" (pending)".into()));
+                } else if done {
+                    out.push(verb(format!("{} ", self.badge_verb())));
+                    out.push(plain(cmd));
+                    dur(&mut out);
+                } else {
+                    out.push(verb(format!("{} ", self.badge_verb())));
+                    out.push(plain(cmd));
+                    if duration.is_some() {
+                        dur(&mut out);
+                    } else {
+                        out.push(dim("…".into()));
+                    }
                 }
             }
             ToolPanelKind::Read => {
-                let short = self.target.rsplit('/').next().unwrap_or(&self.target);
-                let short = trunc(short, 36);
-                let lines = line_count(&self.body);
-                if self.tag_closed && !self.body.is_empty() {
-                    format!("READ {short} ({lines} lines)")
-                } else if self.tag_closed {
-                    format!("READ {short}")
-                } else {
-                    format!("READ {short}…")
+                let short = trunc(self.target.rsplit('/').next().unwrap_or(&self.target), 36);
+                out.push(verb(format!("{} ", self.badge_verb())));
+                out.push(plain(short));
+                if let Some(ref r) = self.line_range {
+                    out.push(Span::styled(
+                        format!(" [{}]", fmt_line_range(r)),
+                        Style::default()
+                            .fg(accent)
+                            .bg(bg)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else if !self.tag_closed {
+                    out.push(dim("…".into()));
                 }
+                dur(&mut out);
             }
             ToolPanelKind::Agent => {
-                format!("AGENT {}", self.target)
+                out.push(verb(format!("{} ", self.badge_verb())));
+                out.push(plain(self.target.clone()));
+                dur(&mut out);
             }
             ToolPanelKind::WebSearch => {
                 let q = trunc(&self.target, 50);
-                if self.tag_closed {
-                    format!("SEARCH {q}")
-                } else {
-                    format!("SEARCH {q}…")
+                out.push(verb(format!("{} ", self.badge_verb())));
+                out.push(plain(q));
+                if !self.tag_closed {
+                    out.push(dim("…".into()));
                 }
+                dur(&mut out);
             }
             ToolPanelKind::Skill => {
-                format!("SKILL {}", self.target)
+                out.push(verb(format!("{} ", self.badge_verb())));
+                out.push(plain(self.target.clone()));
+                dur(&mut out);
             }
             ToolPanelKind::Mcp => {
-                format!("MCP {}", self.target)
+                out.push(verb(format!("{} ", self.badge_verb())));
+                out.push(plain(self.target.clone()));
+                dur(&mut out);
             }
-        };
-        if let Some(dur) = duration {
-            format!("{} [{dur}]", base)
-        } else {
-            base
         }
+        out
     }
 
     pub fn fit_width(&self) -> u16 {
@@ -176,14 +309,8 @@ impl ToolChip {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                self.label_text(),
-                Style::default()
-                    .fg(accent)
-                    .bg(bg_color)
-                    .add_modifier(Modifier::BOLD),
-            )))
-            .style(Style::default().bg(bg_color)),
+            Paragraph::new(Line::from(self.label_spans(bg_color, None)))
+                .style(Style::default().bg(bg_color)),
             inner,
         );
         self.rect = Some(area);
@@ -344,6 +471,17 @@ fn line_count(body: &str) -> usize {
     }
 }
 
+/// Display form of a `<read line="…">` scope: `45-55` → `45,55`,
+/// `55` → `55`.
+pub fn fmt_line_range(raw: &str) -> String {
+    let r = raw.trim();
+    if let Some((a, b)) = r.split_once('-') {
+        format!("{},{}", a.trim(), b.trim())
+    } else {
+        r.to_string()
+    }
+}
+
 fn clean_cmd(s: &str) -> String {
     s.trim()
         .trim_end_matches('<')
@@ -434,6 +572,8 @@ pub struct StreamToolView {
     pub target: String,
     pub body: String,
     pub tag_closed: bool,
+    /// Raw `<read line="…">` scope, if present.
+    pub line_range: Option<String>,
 }
 
 fn detect_mcp(text: &str) -> Vec<StreamToolView> {
@@ -452,6 +592,7 @@ fn detect_mcp(text: &str) -> Vec<StreamToolView> {
                 target: action,
                 body,
                 tag_closed: r.find("</mcp>").is_some(),
+                line_range: None,
             });
             rest = if r.find("</mcp>").is_some() {
                 &r[end + 6..]
@@ -481,6 +622,7 @@ fn detect_skill(text: &str) -> Vec<StreamToolView> {
                 target: action,
                 body,
                 tag_closed: r.find("</skill>").is_some(),
+                line_range: None,
             });
             rest = if r.find("</skill>").is_some() {
                 &r[end + 8..]
@@ -497,7 +639,7 @@ fn detect_skill(text: &str) -> Vec<StreamToolView> {
 fn detect_websearch(text: &str) -> Vec<StreamToolView> {
     let mut out = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find("<websearch") {
+    while let Some(start) = crate::agent::AgentEngine::find_tag_open(rest, "<websearch") {
         let r = &rest[start..];
         if let Some(close_bracket) = r.find('>') {
             let header = &r[..close_bracket + 1];
@@ -556,7 +698,8 @@ fn detect_websearch(text: &str) -> Vec<StreamToolView> {
                 kind: ToolPanelKind::WebSearch,
                 target: action,
                 body,
-                tag_closed: true, // Optional close: treat self-contained query as closed
+                tag_closed: true,
+                line_range: None, // Optional close: treat self-contained query as closed
             });
             rest = &after[advance.min(after.len())..];
         } else {
@@ -599,6 +742,7 @@ fn detect_agent(text: &str) -> Vec<StreamToolView> {
                 target: target_label,
                 body,
                 tag_closed: r.find("</agent>").is_some(),
+                line_range: None,
             });
             rest = if r.find("</agent>").is_some() {
                 &r[end + 8..]
@@ -654,7 +798,7 @@ fn detect_ls(text: &str) -> Vec<StreamToolView> {
     let outside = crate::agent::AgentEngine::strip_think_blocks(text);
     let mut out = Vec::new();
     let mut rest = outside.as_str();
-    while let Some(start) = rest.find("<ls") {
+    while let Some(start) = crate::agent::AgentEngine::find_tag_open(rest, "<ls") {
         let r = &rest[start..];
         let Some(gt) = r.find('>') else { break };
         let path = extract_attr(&r[..gt + 1], "path").unwrap_or_else(|| "$CURRENT".into());
@@ -663,6 +807,7 @@ fn detect_ls(text: &str) -> Vec<StreamToolView> {
             target: expand_path_display(&path),
             body: String::new(),
             tag_closed: true,
+            line_range: None,
         });
         rest = &r[gt + 1..];
     }
@@ -678,11 +823,13 @@ fn detect_reads(text: &str) -> Vec<StreamToolView> {
         let r = &rest[start..];
         let Some(gt) = r.find('>') else { break };
         let path = extract_attr(&r[..gt + 1], "src").unwrap_or_else(|| "unknown".into());
+        let line_range = extract_attr(&r[..gt + 1], "line");
         out.push(StreamToolView {
             kind: ToolPanelKind::Read,
             target: expand_path_display(&path),
             body: String::new(),
             tag_closed: true,
+            line_range,
         });
         rest = &r[gt + 1..];
     }
@@ -725,6 +872,7 @@ pub fn detect_all_writes(text: &str) -> Vec<StreamToolView> {
                 target: expand_path_display(&path),
                 body,
                 tag_closed: true,
+                line_range: None,
             });
             // Advance past this write
             if let Some(close_gt) = after[end..].find('>') {
@@ -747,6 +895,7 @@ pub fn detect_all_writes(text: &str) -> Vec<StreamToolView> {
                 target: expand_path_display(&path),
                 body,
                 tag_closed: false,
+                line_range: None,
             });
             break; // rest is incomplete tail of this write
         }
@@ -769,6 +918,7 @@ fn detect_cmd(text: &str) -> Option<StreamToolView> {
             target: cmd,
             body: String::new(),
             tag_closed: true,
+            line_range: None,
         })
     } else {
         let mut cmd = after.lines().next().unwrap_or("").to_string();
@@ -784,6 +934,7 @@ fn detect_cmd(text: &str) -> Option<StreamToolView> {
             target: cmd,
             body: String::new(),
             tag_closed: false,
+            line_range: None,
         })
     }
 }
@@ -807,32 +958,147 @@ fn extract_attr(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-pub fn redact_tools_for_chat(content: &str) -> String {
-    let mut s = content.to_string();
-    let tags = [
-        "<write",
-        "<cmd",
-        "<read",
-        "<ls",
-        "<mcp",
-        "<skill",
-        "<websearch",
-        "<agent",
-        "<memory",
+/// True when `c` can directly follow a tool-tag name (`<write␣`,
+/// `<cmd>`, `<ls/>`, `<read\n` …). Anything else (`<ready>`, `<lsp>`,
+/// `<writer>`) is ordinary prose, never a tool.
+fn is_tag_delimiter(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '>' | '/')
+}
+
+/// Byte length of the tool construct starting at `tag` (which must begin
+/// with `<`), or `None` when the text at this position is NOT a
+/// structurally valid tool construct. Only allow-listed constructs with
+/// well-formed headers — and, for block kinds, a matching closer — are
+/// recognized. Everything else (unknown tags, stray closers like
+/// `</anything>`, malformed headers, prose prefix-collisions like
+/// `<ready>` or `<lsp>`, unterminated trailing fragments) returns `None`
+/// and is preserved byte-for-byte by the caller.
+fn match_tool_construct_len(tag: &str) -> Option<usize> {
+    debug_assert!(tag.starts_with('<'));
+    // Stray closing tags are always ordinary text.
+    if tag.starts_with("</") {
+        return None;
+    }
+    // Exact single-token constructs.
+    if tag.starts_with("<cmd>") {
+        let after = &tag["<cmd>".len()..];
+        let end = after.find("</cmd>")?;
+        return Some("<cmd>".len() + end + "</cmd>".len());
+    }
+    // `<name` + delimiter openers.
+    const BLOCKS: &[(&str, &str)] = &[
+        ("<write", "</write"),
+        ("<mcp", "</mcp>"),
+        ("<skill", "</skill>"),
+        ("<websearch", "</websearch>"),
+        ("<agent", "</agent>"),
+        ("<memory", "</memory>"),
+        ("<read", ""),
+        ("<ls", ""),
     ];
-    for tag in tags {
-        let close_tag = format!("</{}>", tag.trim_start_matches('<'));
-        while let Some(start) = s.find(tag) {
-            if let Some(rel_end) = s[start..].find(&close_tag) {
-                s.replace_range(start..start + rel_end + close_tag.len(), "");
-            } else {
-                // Partial/streaming tool tag: strip from tag opening to end of string
-                s = s[..start].to_string();
+    for (open, close) in BLOCKS {
+        if !tag.starts_with(open) {
+            continue;
+        }
+        let after_open = &tag[open.len()..];
+        let mut chars = after_open.chars();
+        match chars.next() {
+            Some(c) if is_tag_delimiter(c) => {}
+            _ => continue, // `<ready>`, `<lsp>`, `<writer>` … prose, keep scanning
+        }
+        let hdr_end = tag.find('>')?;
+        let header = &tag[..hdr_end + 1];
+        if *open == "<read" && !header.contains("src=") {
+            continue; // bare `<read>` never executes — keep visible
+        }
+        if *open == "<write" && !header.contains("src=") {
+            continue; // malformed write (no target) never executes
+        }
+        if close.is_empty() {
+            return Some(hdr_end + 1); // self-contained `<read …>` / `<ls …>`
+        }
+        // Block kinds need their matching closer; `<memory>` bare tags
+        // (no push/replace) are valid singletons like the parser runs.
+        if *open == "<memory" && !header.contains("push") && !header.contains("replace=") {
+            return Some(hdr_end + 1);
+        }
+        let after = &tag[hdr_end + 1..];
+        let end = after.find(close)?;
+        let tail = &after[end + close.len()..];
+        // Closer must terminate (`>` or end); a longer name (`</writex>`)
+        // is not our closer.
+        match tail.chars().next() {
+            Some('>') => return Some(hdr_end + 1 + end + close.len() + 1),
+            None => return Some(tag.len()),
+            _ => continue,
+        }
+    }
+    None
+}
+
+pub fn redact_tools_for_chat(content: &str) -> String {
+    // Structural allow-list redaction for transcript DISPLAY (chips carry
+    // the executed tool bodies). Only spans that parse as complete, valid
+    // tool constructs are removed, plus a trailing UNCLOSED valid write /
+    // cmd whose body is already live in its chip (otherwise the partial
+    // tag duplicates the chip while streaming). Everything else — prose,
+    // unknown tags, stray closers, malformed headers, unterminated
+    // fragments of anything else — passes through untouched. In
+    // particular there is no strip-to-end fallback for unrecognized text.
+    let mut s = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(lt) = rest.find('<') {
+        s.push_str(&rest[..lt]);
+        let tag = &rest[lt..];
+        match match_tool_construct_len(tag) {
+            Some(len) => {
+                rest = &tag[len.min(tag.len())..];
+            }
+            None if trailing_live_construct(tag) => {
+                // In-progress write/cmd already shown in its chip.
                 break;
+            }
+            None => {
+                s.push('<');
+                rest = &tag[1..];
             }
         }
     }
+    if rest.find('<').is_none() {
+        s.push_str(rest);
+    }
     s.trim().to_string()
+}
+
+/// True when `tag` (starting at `<`) opens a VALID tool construct whose
+/// body is already live in a chip but whose closer hasn't arrived: a
+/// sourced `<write …>` header, or an exact `<cmd>`. Malformed headers
+/// (`<write>` without src) and every other kind stay visible.
+fn trailing_live_construct(tag: &str) -> bool {
+    if tag.starts_with("<cmd>") {
+        return tag["<cmd>".len()..].find("</cmd>").is_none();
+    }
+    const PREFIXES: &[&str] = &["<write"];
+    for open in PREFIXES {
+        if !tag.starts_with(open) {
+            continue;
+        }
+        let after_open = &tag[open.len()..];
+        match after_open.chars().next() {
+            Some(c) if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '>' || c == '/' => {}
+            _ => return false,
+        }
+        let Some(hdr_end) = tag.find('>') else {
+            return false;
+        };
+        if !tag[..hdr_end + 1].contains("src=") {
+            return false;
+        }
+        if tag[hdr_end + 1..].find("</write").is_none() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Classify tool activity in a model reply for UI labels / chips.
@@ -1232,6 +1498,11 @@ mod tests {
         // Natural-language intent is not an executed action: no chips.
         assert!(detect_all_stream_tools("I should search the web.").is_empty());
         assert!(detect_all_stream_tools("I will read foo.rs next.").is_empty());
+        // Bracketed prose lookalikes are not tools either.
+        assert!(detect_all_stream_tools("check <lsp> diagnostics").is_empty());
+        assert!(detect_all_stream_tools("be <ready> when done").is_empty());
+        assert!(detect_all_stream_tools("the <writer> writes").is_empty());
+        assert!(detect_all_stream_tools("hello </anything> world").is_empty());
     }
 
     #[test]
@@ -1260,5 +1531,246 @@ mod tests {
             detect_all_stream_tools("<think>hmm</think><websearch>rust borrow checker</websearch>");
         assert_eq!(chips.len(), 1);
         assert_eq!(chips[0].kind, ToolPanelKind::WebSearch);
+    }
+
+    /// Malformed-tag matrix: the transcript redactor is a structural
+    /// allow-list. Only complete, valid tool constructs are removed
+    /// (chips carry them); every other byte survives verbatim. In
+    /// particular there is no strip-to-end fallback and no
+    /// prefix-collision (`<ready>`, `<lsp>`, `<writer>` are prose).
+    #[test]
+    fn test_redact_preserves_stray_closing_tags() {
+        assert_eq!(
+            redact_tools_for_chat("hello </anything> world"),
+            "hello </anything> world"
+        );
+        assert_eq!(
+            redact_tools_for_chat("hello </write> world"),
+            "hello </write> world"
+        );
+        assert_eq!(
+            redact_tools_for_chat("hello </cmd> world"),
+            "hello </cmd> world"
+        );
+    }
+
+    #[test]
+    fn test_redact_preserves_unknown_tags() {
+        assert_eq!(
+            redact_tools_for_chat("hello <unknown> world"),
+            "hello <unknown> world"
+        );
+        assert_eq!(
+            redact_tools_for_chat("prose <unknown attr=\"x\"> more prose </unknown>"),
+            "prose <unknown attr=\"x\"> more prose </unknown>"
+        );
+    }
+
+    #[test]
+    fn test_redact_preserves_prose_prefix_collisions() {
+        assert_eq!(
+            redact_tools_for_chat("be <ready> when done"),
+            "be <ready> when done"
+        );
+        assert_eq!(
+            redact_tools_for_chat("check <lsp> diagnostics output"),
+            "check <lsp> diagnostics output"
+        );
+        assert_eq!(
+            redact_tools_for_chat("the <writer> writes prose"),
+            "the <writer> writes prose"
+        );
+        assert_eq!(
+            redact_tools_for_chat("<div><p>literal html</p></div>"),
+            "<div><p>literal html</p></div>"
+        );
+    }
+
+    #[test]
+    fn test_redact_preserves_malformed_and_partial_tools() {
+        // No src: never executes, stays visible.
+        assert_eq!(
+            redact_tools_for_chat("hello <write> world"),
+            "hello <write> world"
+        );
+        // Unterminated fragment: stays visible.
+        assert_eq!(redact_tools_for_chat("hello <wri"), "hello <wri");
+        // Trailing UNCLOSED valid write/cmd: hidden from the message
+        // because the body is already live in the tool chip (no
+        // duplication while streaming).
+        assert_eq!(
+            redact_tools_for_chat("prose <write src=\"a\"> body"),
+            "prose"
+        );
+        assert_eq!(redact_tools_for_chat("run <cmd>ls"), "run");
+    }
+
+    #[test]
+    fn test_redact_removes_only_valid_complete_tools() {
+        // Valid block removed, stray closer + prose preserved.
+        assert_eq!(
+            redact_tools_for_chat("hello </write> middle <write src=\"a\">x</write> end"),
+            "hello </write> middle  end"
+        );
+        assert_eq!(redact_tools_for_chat("run <cmd>ls</cmd> now"), "run  now");
+        assert_eq!(
+            redact_tools_for_chat("see <read src=\"f\"> and <ls> today"),
+            "see  and  today"
+        );
+    }
+
+    fn mk_chip() -> ToolChip {
+        ToolChip {
+            id: 1,
+            kind: ToolPanelKind::Write,
+            target: String::new(),
+            body: String::new(),
+            tag_closed: true,
+            pending: false,
+            spawned: false,
+            rect: None,
+            anchor_msg: None,
+            expanded: false,
+            anim_start: None,
+            added: None,
+            removed: None,
+            line_range: None,
+        }
+    }
+
+    #[test]
+    fn test_chip_label_wrote_diff_stats() {
+        // WROTE file +added -removed, plain-text form.
+        let mut c = mk_chip();
+        c.target = "/x/src/main.rs".into();
+        c.added = Some(45);
+        c.removed = Some(3);
+        assert_eq!(c.label_text(), "WROTE main.rs +45 -3");
+        // No-change write stays honest, never "+0 -0".
+        c.added = Some(0);
+        c.removed = Some(0);
+        assert_eq!(c.label_text(), "WROTE main.rs (no changes)");
+        // Stats unknown: fall back to body line count as +N.
+        c.added = None;
+        c.removed = None;
+        c.body = "a\nb\nc".into();
+        assert_eq!(c.label_text(), "WROTE main.rs +3");
+        // Pending/streaming keep present tense.
+        c.pending = true;
+        assert_eq!(c.label_text(), "WRITE main.rs (pending)");
+        c.pending = false;
+        c.tag_closed = false;
+        assert_eq!(c.label_text(), "WRITE main.rs…");
+    }
+
+    #[test]
+    fn test_chip_label_diff_spans_carry_colors() {
+        let mut c = mk_chip();
+        c.target = "main.rs".into();
+        c.added = Some(45);
+        c.removed = Some(3);
+        let spans = c.label_spans(Color::Rgb(0, 0, 0), None);
+        let plus = spans
+            .iter()
+            .find(|s| s.content == " +45")
+            .expect("+45 span");
+        assert_eq!(plus.style.fg, Some(Color::Rgb(120, 220, 140)));
+        let minus = spans.iter().find(|s| s.content == " -3").expect("-3 span");
+        assert_eq!(minus.style.fg, Some(Color::Rgb(255, 120, 120)));
+    }
+
+    #[test]
+    fn test_chip_label_read_ranges() {
+        // [45,55] line range, [55] single line.
+        let mut c = mk_chip();
+        c.kind = ToolPanelKind::Read;
+        c.target = "/x/src/lib.rs".into();
+        c.line_range = Some("45-55".into());
+        assert_eq!(c.label_text(), "READ lib.rs [45,55]");
+        c.line_range = Some("55".into());
+        assert_eq!(c.label_text(), "READ lib.rs [55]");
+        // Full-file read: no range, no line-count noise.
+        c.line_range = None;
+        c.body = "a\nb".into();
+        assert_eq!(c.label_text(), "READ lib.rs");
+        assert_eq!(fmt_line_range("45-55"), "45,55");
+        assert_eq!(fmt_line_range("55"), "55");
+    }
+
+    #[test]
+    fn test_chip_label_cmd_durations() {
+        // RAN 34s when done, RUN 45s while running, … with no clock.
+        let mut c = mk_chip();
+        c.kind = ToolPanelKind::Cmd;
+        c.target = "cargo check".into();
+        c.body = "ok".into();
+        assert_eq!(
+            c.label_text_with_duration(Some("34s")),
+            "RAN cargo check 34s"
+        );
+        c.tag_closed = false;
+        c.body.clear();
+        assert_eq!(
+            c.label_text_with_duration(Some("45s")),
+            "RUN cargo check 45s"
+        );
+        assert_eq!(c.label_text(), "RUN cargo check…");
+        c.pending = true;
+        assert_eq!(c.label_text(), "RUN cargo check (pending)");
+    }
+
+    #[test]
+    fn test_chip_badge_shows_kind_verb() {
+        // Transcript badge carries the kind, never generic "Action".
+        let mut c = mk_chip();
+        c.kind = ToolPanelKind::Read;
+        assert_eq!(c.badge_text(None), " READ ");
+        c.kind = ToolPanelKind::Write;
+        c.tag_closed = true;
+        assert_eq!(c.badge_text(None), " WROTE ");
+        c.tag_closed = false;
+        assert_eq!(c.badge_text(None), " WRITE ");
+        c.kind = ToolPanelKind::Cmd;
+        c.tag_closed = true;
+        c.body = "ok".into();
+        assert_eq!(c.badge_text(Some(34)), " RAN 34s ");
+        c.tag_closed = false;
+        c.body.clear();
+        assert_eq!(c.badge_text(Some(45)), " RUN 45s ");
+        // Label and badge share one verb definition.
+        assert!(c.label_text_with_duration(Some("45s")).starts_with("RUN "));
+        assert_eq!(c.badge_verb(), "RUN");
+    }
+
+    #[test]
+    fn test_detect_reads_captures_line_attr() {
+        let v = detect_all_stream_tools("<read src=\"a.rs\" line=\"45-55\">");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, ToolPanelKind::Read);
+        assert_eq!(v[0].line_range.as_deref(), Some("45-55"));
+        // No line attr: full-file read, no range.
+        let v = detect_all_stream_tools("<read src=\"b.rs\">");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].line_range, None);
+    }
+
+    fn test_transcript_scenario_stray_tag_between_writes() {
+        // Exact failure shape: prose + write + stray + prose + write.
+        // Final transcript keeps every prose line and the stray tag;
+        // executed writes are carried by chips (removed here).
+        let stream = "I will create the project.\n<write src=\"index.html\">H</write>\n</stray>\nNow I will create the next file.\n<write src=\"main.ts\">M</write>\nDone.";
+        let shown = redact_tools_for_chat(stream);
+        for prose in [
+            "I will create the project.",
+            "</stray>",
+            "Now I will create the next file.",
+            "Done.",
+        ] {
+            assert!(shown.contains(prose), "transcript must keep {prose:?}");
+        }
+        assert!(
+            !shown.contains("<write"),
+            "executed writes carried by chips"
+        );
     }
 }

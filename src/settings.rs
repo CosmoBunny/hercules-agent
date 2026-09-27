@@ -108,6 +108,9 @@ pub const DEFAULT_CONTEXT_TOKEN_LIMIT: usize = 256_000;
 pub const MAX_CONTEXT_TOKEN_LIMIT: usize = 1_048_576; // 1M
 /// When estimated context usage reaches this fraction, compact → memory.
 pub const CONTEXT_COMPACT_RATIO: f32 = 0.80;
+/// Adjustable auto-compact thresholds (fraction of the CTX meter).
+/// Default stays 0.80; the Auto Compact settings tab cycles these.
+pub const COMPACT_RATIO_PRESETS: [f32; 5] = [0.75, 0.80, 0.85, 0.90, 0.95];
 
 /// Default sampling temperature (low = more deterministic / better tool following).
 pub const DEFAULT_TEMPERATURE: f32 = 0.2;
@@ -253,9 +256,13 @@ pub struct RuntimeSettings {
     /// Max context tokens (prompt budget). Default 256K.
     #[serde(default = "context_limit_from_env")]
     pub context_token_limit: usize,
-    /// Fraction of limit that triggers auto-compact (default 0.80).
+    /// Fraction of the CTX meter that triggers auto-compact (default 0.80).
     #[serde(default = "default_compact_ratio")]
     pub compact_ratio: f32,
+    /// Master switch for automatic compaction (default on). Manual
+    /// `/compact` always works regardless of this flag.
+    #[serde(default = "default_true")]
+    pub auto_compact_enabled: bool,
     /// Sampling temperature for llama.cpp / HTTP / (hint for llama.rs).
     #[serde(default = "default_temperature")]
     pub temperature: f32,
@@ -342,6 +349,10 @@ pub struct RuntimeSettings {
     /// Application color palette (independent from the chrome style).
     #[serde(default = "default_color_palette")]
     pub color_palette: crate::app_palette::AppPaletteStyle,
+    /// Tool permission mode (Ask vs AlwaysAllow). The live session flag
+    /// stays memory-only; only the mode persists across restarts.
+    #[serde(default = "default_permission_mode")]
+    pub permission_mode: crate::agent::PermissionMode,
     /// User-edited colors used when `color_palette == Custom`.
     #[serde(default = "default_custom_palette")]
     pub custom_palette: crate::app_palette::AppPalette,
@@ -355,6 +366,9 @@ fn default_app_chrome_style() -> crate::app_chrome::AppChromeStyle {
 }
 fn default_color_palette() -> crate::app_palette::AppPaletteStyle {
     crate::app_palette::AppPaletteStyle::RosePine
+}
+fn default_permission_mode() -> crate::agent::PermissionMode {
+    crate::agent::PermissionMode::Ask
 }
 fn default_custom_palette() -> crate::app_palette::AppPalette {
     crate::app_palette::AppPalette::custom_default()
@@ -424,6 +438,7 @@ impl Default for RuntimeSettings {
             repeat_detect_thinking: true,
             context_token_limit: context_limit_from_env(),
             compact_ratio: CONTEXT_COMPACT_RATIO,
+            auto_compact_enabled: true,
             temperature: DEFAULT_TEMPERATURE,
             subagent_quick_response: true,
             ocr_model: "none".to_string(),
@@ -455,6 +470,7 @@ impl Default for RuntimeSettings {
             app_chrome_style: crate::app_chrome::AppChromeStyle::Modern,
             color_palette: crate::app_palette::AppPaletteStyle::RosePine,
             custom_palette: crate::app_palette::AppPalette::custom_default(),
+            permission_mode: crate::agent::PermissionMode::Ask,
         }
     }
 }
@@ -1204,6 +1220,60 @@ pub fn nudge_context_token_limit(dir: i32) -> usize {
     next
 }
 
+/// Auto-compact master switch.
+pub fn auto_compact_enabled() -> bool {
+    get_settings().auto_compact_enabled
+}
+
+pub fn set_auto_compact_enabled(on: bool) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        g.get_or_insert_with(RuntimeSettings::default)
+            .auto_compact_enabled = on;
+    }
+}
+
+pub fn toggle_auto_compact() -> bool {
+    let next = !auto_compact_enabled();
+    set_auto_compact_enabled(next);
+    next
+}
+
+/// Current auto-compact threshold as a fraction (clamped 0.50..=0.99).
+pub fn compact_ratio() -> f32 {
+    get_settings().compact_ratio.clamp(0.50, 0.99)
+}
+
+pub fn set_compact_ratio(r: f32) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        g.get_or_insert_with(RuntimeSettings::default).compact_ratio = r.clamp(0.50, 0.99);
+    }
+}
+
+/// Step the auto-compact threshold through 75 → 80 → 85 → 90 → 95%.
+/// `dir > 0` next higher, `dir < 0` next lower. Returns the new ratio.
+pub fn nudge_compact_ratio(dir: i32) -> f32 {
+    let cur = compact_ratio();
+    let mut idx = 0usize;
+    let mut best = f32::MAX;
+    for (i, &p) in COMPACT_RATIO_PRESETS.iter().enumerate() {
+        let d = (cur - p).abs();
+        if d < best {
+            best = d;
+            idx = i;
+        }
+    }
+    let next_idx = if dir > 0 {
+        (idx + 1).min(COMPACT_RATIO_PRESETS.len() - 1)
+    } else if dir < 0 {
+        idx.saturating_sub(1)
+    } else {
+        idx
+    };
+    let next = COMPACT_RATIO_PRESETS[next_idx];
+    set_compact_ratio(next);
+    next
+}
+
 /// Step repeat threshold by `delta` (clamped 2..=100).
 pub fn nudge_repeat_threshold(delta: i32) -> usize {
     let cur = get_settings().repeat_threshold as i32;
@@ -1601,6 +1671,20 @@ pub fn get_custom_palette() -> crate::app_palette::AppPalette {
     get_settings().custom_palette
 }
 
+/// Persisted tool permission mode (Ask vs AlwaysAllow). Read once at
+/// startup; the live session flag is never stored.
+pub fn get_persisted_permission_mode() -> crate::agent::PermissionMode {
+    get_settings().permission_mode
+}
+
+pub fn set_persisted_permission_mode(mode: crate::agent::PermissionMode) {
+    if let Ok(mut g) = SETTINGS.lock() {
+        let s = g.get_or_insert_with(RuntimeSettings::default);
+        s.permission_mode = mode;
+        save_settings_to_disk(s);
+    }
+}
+
 pub fn set_custom_palette(p: crate::app_palette::AppPalette) {
     if let Ok(mut g) = SETTINGS.lock() {
         let s = g.get_or_insert_with(RuntimeSettings::default);
@@ -1746,9 +1830,11 @@ mod tests {
         assert_eq!(crate::app::SETTINGS_LSP_DIAGNOSTICS, 12);
         assert_eq!(crate::app::SETTINGS_APP_STYLE, 13);
         assert_eq!(crate::app::SETTINGS_COLOR_PALETTE, 14);
-        assert_eq!(crate::app::SETTINGS_TAB_NAMES.len(), 15);
+        assert_eq!(crate::app::SETTINGS_AUTO_COMPACT, 15);
+        assert_eq!(crate::app::SETTINGS_TAB_NAMES.len(), 16);
         assert_eq!(crate::app::SETTINGS_TAB_NAMES[13], "App Style");
         assert_eq!(crate::app::SETTINGS_TAB_NAMES[14], "Color Palette");
+        assert_eq!(crate::app::SETTINGS_TAB_NAMES[15], "Auto Compact");
     }
 
     #[test]
@@ -1829,6 +1915,35 @@ mod tests {
             back.app_chrome_style,
             crate::app_chrome::AppChromeStyle::Modern
         );
+    }
+
+    #[test]
+    fn compact_ratio_presets_cycle_and_clamp() {
+        let _guard = app_style_test_guard();
+        let saved_settings = SETTINGS.lock().unwrap().take();
+
+        // Default stays 80%.
+        set_compact_ratio(CONTEXT_COMPACT_RATIO);
+        assert!((compact_ratio() - 0.80).abs() < f32::EPSILON);
+        // Step through 75 → 80 → 85 → 90 → 95.
+        assert!((nudge_compact_ratio(-1) - 0.75).abs() < f32::EPSILON);
+        assert!((nudge_compact_ratio(1) - 0.80).abs() < f32::EPSILON);
+        assert!((nudge_compact_ratio(1) - 0.85).abs() < f32::EPSILON);
+        assert!((nudge_compact_ratio(1) - 0.90).abs() < f32::EPSILON);
+        assert!((nudge_compact_ratio(1) - 0.95).abs() < f32::EPSILON);
+        // Clamped at the top; stepping down works.
+        assert!((nudge_compact_ratio(1) - 0.95).abs() < f32::EPSILON);
+        assert!((nudge_compact_ratio(-1) - 0.90).abs() < f32::EPSILON);
+        // Out-of-range sets clamp into 0.50..=0.99.
+        set_compact_ratio(5.0);
+        assert!((compact_ratio() - 0.99).abs() < f32::EPSILON);
+        // Master switch toggles and restores.
+        set_auto_compact_enabled(true);
+        assert!(auto_compact_enabled());
+        assert!(!toggle_auto_compact());
+        assert!(toggle_auto_compact());
+
+        *SETTINGS.lock().unwrap() = saved_settings;
     }
 
     #[test]

@@ -15,7 +15,7 @@ fn trunc_err(s: &str, max: usize) -> String {
 }
 
 /// Whether tool writes/commands need confirmation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PermissionMode {
     /// Block write/cmd until session `/allow` or user sets AlwaysAllow.
     Ask,
@@ -94,6 +94,8 @@ pub fn set_permission_mode(mode: PermissionMode) {
             p.session_allow = true;
         }
     }
+    // Persist the MODE so it survives restarts.
+    crate::settings::set_persisted_permission_mode(mode);
 }
 
 pub fn set_folder_scope(scope: FolderScope) {
@@ -106,6 +108,15 @@ pub fn allow_session_tools() {
     if let Ok(mut p) = TOOL_PERMS.lock() {
         p.session_allow = true;
     }
+}
+
+/// Apply the persisted permission mode at startup. Called once from
+/// main — never from `App::new`, which tests also construct (and which
+/// must not re-read the user's real settings file mid-suite).
+/// `session_allow` itself stays explicitly session-scoped and is only
+/// ever flipped live (plus as a side effect of choosing AlwaysAllow).
+pub fn sync_permission_mode_from_settings() {
+    set_permission_mode(crate::settings::get_persisted_permission_mode());
 }
 
 fn tools_allowed_for_write_cmd() -> Result<(), String> {
@@ -503,6 +514,14 @@ impl StreamingParser {
         ("<skill", "</skill>"),
         ("<websearch", "</websearch>"),
     ];
+
+    /// Byte offset of a valid write closer (`</write>` exactly — not a
+    /// longer name like `</writes>`) within `s`, or `None` when the write
+    /// is still open. The ONLY authoritative completion condition for a
+    /// streamed write; never timing, length, or heuristics.
+    fn find_write_close(s: &str) -> Option<usize> {
+        s.find("</write>")
+    }
 
     /// Byte index of the first tool opener with no matching closer
     /// after it, if any. Closed pairs are skipped left to right, so a
@@ -1928,7 +1947,7 @@ Common Tasks:
         let scrubbed = Self::blank_closed_write_blocks(text);
         let mut out = Vec::new();
         let mut rest: &str = &scrubbed;
-        while let Some(start_tag) = rest.find("<mcp") {
+        while let Some(start_tag) = Self::find_tag_open(rest, "<mcp") {
             let r = &rest[start_tag..];
             if let Some(close_bracket) = r.find('>') {
                 let header = &r[..close_bracket + 1];
@@ -1981,7 +2000,7 @@ Common Tasks:
             break;
         }
         rest = &scrubbed;
-        while let Some(start_tag) = rest.find("<websearch") {
+        while let Some(start_tag) = Self::find_tag_open(rest, "<websearch") {
             let r = &rest[start_tag..];
             if let Some(close_bracket) = r.find('>') {
                 let header = &r[..close_bracket + 1];
@@ -2105,7 +2124,7 @@ Common Tasks:
             }
         }
         rest = &scrubbed;
-        while let Some(start_tag) = rest.find("<ls") {
+        while let Some(start_tag) = Self::find_tag_open(rest, "<ls") {
             let r = &rest[start_tag..];
             if let Some(close_bracket) = r.find('>') {
                 let tag_header = &r[..close_bracket + 1];
@@ -2129,43 +2148,41 @@ Common Tasks:
     fn parse_write_cmd_actions(text: &str, source: ToolCallSource) -> Vec<ProposedAction> {
         let mut out = Vec::new();
         let mut rest = text;
-        while let Some(start_tag) = rest.find("<write") {
+        while let Some(start_tag) = Self::find_tag_open(rest, "<write") {
             let r = &rest[start_tag..];
-            if let Some(close_bracket) = r.find('>') {
-                let tag_header = &r[..close_bracket + 1];
-                let path_attr = Self::extract_attribute(tag_header, "src");
-                let line_attr = Self::extract_attribute(tag_header, "line");
-                let content_after_header = &r[close_bracket + 1..];
+            let Some(close_bracket) = r.find('>') else {
+                break; // partial header — wait for more text
+            };
+            let tag_header = &r[..close_bracket + 1];
+            let path_attr = Self::extract_attribute(tag_header, "src");
+            let line_attr = Self::extract_attribute(tag_header, "line");
+            let content_after_header = &r[close_bracket + 1..];
 
-                let (body, next) = if let Some(end_tag) = content_after_header.find("</write") {
-                    let body = &content_after_header[..end_tag];
-                    let after = if let Some(ec) = content_after_header[end_tag..].find('>') {
-                        &content_after_header[end_tag + ec + 1..]
-                    } else {
-                        ""
-                    };
-                    (body.to_string(), after)
-                } else {
-                    (content_after_header.to_string(), "")
-                };
-                if let Some(path_str) = path_attr {
-                    let body = body.trim_matches(|c| c == '\n' || c == '\r').to_string();
-                    let target = Self::normalize_write_path(&path_str, &body);
-                    out.push(ProposedAction::new(
-                        ProposedKind::Write,
-                        target,
-                        body,
-                        line_attr,
-                        source,
-                    ));
-                }
-                if next.is_empty() {
-                    break;
-                }
-                rest = next;
-            } else {
-                break;
+            // Authoritative completion condition: a valid `</write>`
+            // closer. Anything else (no closer yet, or a longer name like
+            // `</writes>`) is INCOMPLETE — never an executable action, in
+            // ANY source. Incomplete detection/recovery/retention stay
+            // string-level (has_incomplete_tool_tag, StreamingParser
+            // retention); when the closer arrives the tag parses as the
+            // single executable action. An explicitly closed EMPTY body
+            // (`<write src="a"></write>`) is complete and executable.
+            let Some(end_tag) = Self::find_write_close(content_after_header) else {
+                break; // unclosed: wait for more text (or recovery)
+            };
+            let body = &content_after_header[..end_tag];
+            let after = &content_after_header[end_tag + "</write>".len()..];
+            if let Some(path_str) = path_attr {
+                let body = body.trim_matches(|c| c == '\n' || c == '\r').to_string();
+                let target = Self::normalize_write_path(&path_str, &body);
+                out.push(ProposedAction::new(
+                    ProposedKind::Write,
+                    target,
+                    body,
+                    line_attr,
+                    source,
+                ));
             }
+            rest = after;
         }
         // cmd parsing follows — <cmd> tags quoted inside a <write> file
         // body are example text, never commands. Merge writes at the end.
@@ -2336,12 +2353,54 @@ Common Tasks:
 
     /// Validates syntax of tool tags in the response and returns System error messages if malformed.
     pub fn validate_tool_tags(response: &str) -> Vec<String> {
+        Self::validate_tool_tags_inner(response)
+    }
+
+    /// True when `c` can directly follow a tool-tag name (`<write␣`,
+    /// `<ls/>`, `<read\n` …). Anything else (`<ready>`, `<lsp>`,
+    /// `<writer>`) is ordinary prose, never a tool. Shared by every
+    /// sub-parser and the transcript redactor so prose can never
+    /// execute, validate-error, or be consumed as markup.
+    pub(crate) fn is_tag_delimiter(c: char) -> bool {
+        matches!(c, ' ' | '\t' | '\n' | '\r' | '>' | '/')
+    }
+
+    /// Like `str::find` for a tool opener, but only matches when the
+    /// opener is followed by a tag delimiter. Returns the absolute byte
+    /// index, or `None` when only prose lookalikes occur. NOTE: only for
+    /// `<name`-style prefixes; exact tokens like `<cmd>` keep raw find.
+    pub(crate) fn find_tag_open(haystack: &str, open: &str) -> Option<usize> {
+        let mut from = 0;
+        while let Some(rel) = haystack[from..].find(open) {
+            let idx = from + rel;
+            let ok = haystack[idx + open.len()..]
+                .chars()
+                .next()
+                .map(Self::is_tag_delimiter)
+                .unwrap_or(true);
+            if ok {
+                return Some(idx);
+            }
+            from = idx + 1;
+        }
+        None
+    }
+
+    /// Byte offset of a valid write closer (`</write>` exactly — not a
+    /// longer name like `</writes>`) within `s`, or `None` when the write
+    /// is still open. The ONLY authoritative completion condition for a
+    /// streamed write; never timing, length, or heuristics.
+    fn find_write_close(s: &str) -> Option<usize> {
+        s.find("</write>")
+    }
+
+    fn validate_tool_tags_inner(response: &str) -> Vec<String> {
         let outside = Self::strip_think_blocks(response);
         let mut errors = Vec::new();
 
         // Check <write> tags
         let mut text = outside.as_str();
-        while let Some(start) = text.find("<write") {
+        while let Some(start) = Self::find_tag_open(text, "<write") {
             let rest = &text[start..];
             if let Some(close_bracket) = rest.find('>') {
                 let header = &rest[..close_bracket + 1];
@@ -2372,7 +2431,7 @@ Common Tasks:
 
         // Check <read> tags
         text = outside.as_str();
-        while let Some(start) = text.find("<read") {
+        while let Some(start) = Self::find_tag_open(text, "<read") {
             let rest = &text[start..];
             if let Some(close_bracket) = rest.find('>') {
                 let header = &rest[..close_bracket + 1];
@@ -2447,7 +2506,7 @@ Common Tasks:
         // 3. Memory — OUTSIDE <think> and <write> bodies only
         let scan_text = Self::blank_closed_write_blocks(&cleaned_outside_think);
         let mut text = scan_text.as_str();
-        while let Some(start_tag) = text.find("<memory") {
+        while let Some(start_tag) = Self::find_tag_open(text, "<memory") {
             let rest = &text[start_tag..];
             if let Some(close_bracket) = rest.find('>') {
                 let tag_header = &rest[..close_bracket + 1];
@@ -2486,22 +2545,20 @@ Common Tasks:
     fn blank_closed_write_blocks(text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
-        while let Some(start) = rest.find("<write") {
+        while let Some(start) = Self::find_tag_open(rest, "<write") {
             let r = &rest[start..];
             let Some(hdr_end) = r.find('>') else {
                 break; // partial header — keep remainder as-is
             };
             let after_hdr = &r[hdr_end + 1..];
-            let Some(close_start) = after_hdr.find("</write") else {
+            // Exact `</write>` closer, matching the execution parser:
+            // a longer name is not a closer, and an unclosed trailing
+            // write keeps current semantics (streaming live-detect
+            // relies on it).
+            let Some(close_start) = after_hdr.find("</write>") else {
                 break; // unclosed trailing write — keep remainder as-is
             };
-            let close_abs = hdr_end + 1 + close_start;
-            let tail = &after_hdr[close_start..];
-            let cut = if let Some(gt) = tail.find('>') {
-                close_abs + gt + 1
-            } else {
-                r.len()
-            };
+            let cut = hdr_end + 1 + close_start + "</write>".len();
             out.push_str(&rest[..start]);
             rest = &r[cut.min(r.len())..];
         }
@@ -3168,6 +3225,380 @@ mod tests {
         let inside = "<think>need docs <help></think> ok";
         let res = AgentEngine::process_response(inside).unwrap();
         assert!(res.contains("Hercules Agent Tool Documentation"));
+    }
+
+    /// Malformed-tag execution matrix: prose lookalikes, stray closers,
+    /// and malformed headers must never become executable actions.
+    /// Mirrors the transcript-preservation matrix in tool_panel tests.
+    fn writes_in(actions: &[ProposedAction]) -> Vec<String> {
+        actions
+            .iter()
+            .filter(|a| a.kind == ProposedKind::Write)
+            .map(|a| a.target.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_stray_closers_execute_nothing() {
+        for sample in [
+            "hello </anything> world",
+            "hello </write> world",
+            "hello </cmd> world",
+            "hello </read> world",
+        ] {
+            assert!(
+                AgentEngine::extract_proposed_actions(sample).is_empty(),
+                "stray closer must not execute: {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_tags_execute_nothing() {
+        for sample in [
+            "hello <unknown> world",
+            "prose <unknown attr=\"x\"> more prose </unknown>",
+            "be <ready> when done",
+            "check <lsp> diagnostics output",
+            "the <writer> writes prose",
+            "<div><p>literal html</p></div>",
+        ] {
+            assert!(
+                AgentEngine::extract_proposed_actions(sample).is_empty(),
+                "prose must not execute: {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_malformed_writes_execute_nothing() {
+        // No src: the parser drops it (no target), so nothing executes.
+        // (Unclosed-but-sourced writes still parse — streaming live-detect
+        // needs them; at finalize the incomplete-tool path takes over and
+        // process_response never runs them twice.)
+        assert!(
+            AgentEngine::extract_proposed_actions("hello <write> world").is_empty(),
+            "src-less write must not execute"
+        );
+    }
+
+    #[test]
+    fn test_stray_closer_beside_valid_write_executes_once() {
+        let sample = "hello </write> middle <write src=\"a.txt\">x</write> end";
+        let actions = AgentEngine::extract_proposed_actions(sample);
+        assert_eq!(writes_in(&actions), vec!["a.txt".to_string()]);
+    }
+
+    #[test]
+    fn test_multi_write_stream_parses_each_exactly_once() {
+        // a/b/c multi-file turn: three writes, in order, no duplicates.
+        let sample = "Creating files...\n<write src=\"a.txt\">\nA\n</write>\nCreating second file...\n<write src=\"b.txt\">\nB\n</write>\nCreating third file...\n<write src=\"c.txt\">\nC\n</write>\nDone.";
+        let actions = AgentEngine::extract_proposed_actions(sample);
+        assert_eq!(
+            writes_in(&actions),
+            vec![
+                "a.txt".to_string(),
+                "b.txt".to_string(),
+                "c.txt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_skip_write_targets_prevents_double_execution() {
+        // Streamed writes must not run again at completion: every target
+        // in the skip list is excluded even though the tags are valid.
+        // (All targets skipped → no results → None. This performs no FS
+        // writes by construction.)
+        let sample = "<write src=\"a.txt\">A</write><write src=\"b.txt\">B</write>";
+        let skip = vec!["a.txt".to_string(), "b.txt".to_string()];
+        assert!(AgentEngine::process_response_with(sample, &skip).is_none());
+    }
+
+    /// Faithful harness for the streaming lifecycle under test: each poll
+    /// feeds one chunk through a stateful `StreamingParser` (ModelStream),
+    /// claims every parsed write through the canonical
+    /// `ToolDispatchRegistry`, and records execution into an in-memory
+    /// filesystem. Mirrors the App streaming loop (parse → claim →
+    /// execute) with no real FS side effects.
+    struct StreamHarness {
+        parser: StreamingParser,
+        registry: ToolDispatchRegistry,
+        files: std::collections::HashMap<String, String>,
+        counts: std::collections::HashMap<String, usize>,
+    }
+
+    impl StreamHarness {
+        fn new() -> Self {
+            Self {
+                parser: StreamingParser::with_source(ToolCallSource::ModelStream),
+                registry: ToolDispatchRegistry::new(),
+                files: std::collections::HashMap::new(),
+                counts: std::collections::HashMap::new(),
+            }
+        }
+
+        /// Feed one chunk; returns executions this poll.
+        fn poll(&mut self, chunk: &str) -> usize {
+            let mut n = 0;
+            for a in self.parser.feed(chunk) {
+                if a.kind != ProposedKind::Write {
+                    continue;
+                }
+                if !self.registry.try_claim(&a) {
+                    continue;
+                }
+                *self.counts.entry(a.target.clone()).or_insert(0) += 1;
+                self.files.insert(a.target.clone(), a.body.clone());
+                n += 1;
+            }
+            n
+        }
+
+        fn flush(&mut self) -> usize {
+            let mut n = 0;
+            for a in self.parser.flush() {
+                if a.kind != ProposedKind::Write {
+                    continue;
+                }
+                if !self.registry.try_claim(&a) {
+                    continue;
+                }
+                *self.counts.entry(a.target.clone()).or_insert(0) += 1;
+                self.files.insert(a.target.clone(), a.body.clone());
+                n += 1;
+            }
+            n
+        }
+
+        /// One-shot completion re-parse against the SAME registry (what
+        /// finalize does): returns additional executions (must be 0 for
+        /// already-executed calls).
+        fn reparse_completion(&mut self, full: &str) -> usize {
+            let mut n = 0;
+            for a in AgentEngine::parse_tool_calls(full, ToolCallSource::ModelCompletion) {
+                if a.kind != ProposedKind::Write {
+                    continue;
+                }
+                if !self.registry.try_claim(&a) {
+                    continue;
+                }
+                *self.counts.entry(a.target.clone()).or_insert(0) += 1;
+                self.files.insert(a.target.clone(), a.body.clone());
+                n += 1;
+            }
+            n
+        }
+
+        fn count(&self, target: &str) -> usize {
+            self.counts.get(target).copied().unwrap_or(0)
+        }
+    }
+
+    #[test]
+    fn complete_write_is_executable() {
+        let actions = AgentEngine::parse_tool_calls(
+            "<write src=\"a.txt\">hello</write>",
+            ToolCallSource::ModelStream,
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].target, "a.txt");
+        assert_eq!(actions[0].body, "hello");
+        // Explicitly closed EMPTY body is complete and executable.
+        let actions = AgentEngine::parse_tool_calls(
+            "<write src=\"a.txt\"></write>",
+            ToolCallSource::ModelStream,
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].body, "");
+    }
+
+    #[test]
+    fn incomplete_write_is_not_executable() {
+        // Unclosed writes produce NO executable action in ANY source.
+        // Incomplete detection stays string-level (retention/recovery).
+        for source in [ToolCallSource::ModelStream, ToolCallSource::ModelCompletion] {
+            assert!(
+                AgentEngine::parse_tool_calls("<write src=\"a.txt\">partial", source).is_empty(),
+                "unclosed write must not execute: {source:?}"
+            );
+            assert!(
+                AgentEngine::parse_tool_calls("<write src=\"a.txt\">", source).is_empty(),
+                "bare opener must not execute: {source:?}"
+            );
+            // A longer name is not the closer.
+            assert!(
+                AgentEngine::parse_tool_calls("<write src=\"a.txt\">X</writes>", source).is_empty(),
+                "</writes> is not a closer: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_open_write_does_not_execute() {
+        let mut h = StreamHarness::new();
+        assert_eq!(h.poll("<write src=\"test.txt\">"), 0);
+        assert!(!h.files.contains_key("test.txt"));
+    }
+
+    #[test]
+    fn streaming_partial_write_does_not_execute() {
+        let mut h = StreamHarness::new();
+        assert_eq!(h.poll("<write src=\"test.txt\">"), 0);
+        assert_eq!(h.poll("\nline 1"), 0);
+        assert_eq!(h.poll("\nline 2"), 0);
+        assert!(!h.files.contains_key("test.txt"));
+    }
+
+    #[test]
+    fn streaming_close_write_executes_once() {
+        let mut h = StreamHarness::new();
+        assert_eq!(
+            h.poll("<write src=\"test.txt\">\nline 1\nline 2\n</write>"),
+            1
+        );
+        assert_eq!(
+            h.files.get("test.txt").map(String::as_str),
+            Some("line 1\nline 2")
+        );
+        assert_eq!(h.count("test.txt"), 1);
+    }
+
+    #[test]
+    fn repeated_stream_poll_does_not_duplicate() {
+        // T1 open → nothing; T2 partial → nothing; T3 closer → execute
+        // once; T4 same stream again → zero additional executions.
+        let mut h = StreamHarness::new();
+        assert_eq!(h.poll("<write src=\"a.txt\">"), 0);
+        assert_eq!(h.poll("\nAAA"), 0);
+        assert_eq!(h.poll("\nBBB\n</write>"), 1);
+        assert_eq!(h.files.get("a.txt").map(String::as_str), Some("AAA\nBBB"));
+        assert_eq!(h.poll(""), 0);
+        assert_eq!(h.poll(""), 0);
+        assert_eq!(h.count("a.txt"), 1);
+    }
+
+    #[test]
+    fn multiple_streamed_writes_preserve_bodies() {
+        let mut h = StreamHarness::new();
+        for (target, body) in [
+            ("a.txt", "A"),
+            ("b.txt", "B"),
+            ("c.txt", "C"),
+            ("d.txt", "D"),
+        ] {
+            assert_eq!(h.poll(&format!("<write src=\"{target}\">")), 0);
+            assert!(!h.files.contains_key(target));
+            assert_eq!(h.poll(body), 0);
+            assert!(!h.files.contains_key(target));
+            assert_eq!(h.poll("</write>"), 1);
+            assert_eq!(h.files.get(target).map(String::as_str), Some(body));
+        }
+        for t in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            assert_eq!(h.count(t), 1, "{t} executed exactly once");
+        }
+    }
+
+    #[test]
+    fn rapid_multiple_writes_preserve_bodies() {
+        // Several complete writes in ONE poll (timing must not matter).
+        let mut h = StreamHarness::new();
+        assert_eq!(
+            h.poll("<write src=\"a.txt\">AAAA</write><write src=\"b.txt\">BBBB</write><write src=\"c.txt\">CCCC</write>"),
+            3
+        );
+        assert_eq!(h.files.get("a.txt").map(String::as_str), Some("AAAA"));
+        assert_eq!(h.files.get("b.txt").map(String::as_str), Some("BBBB"));
+        assert_eq!(h.files.get("c.txt").map(String::as_str), Some("CCCC"));
+        // Same-target second version is a different call: executes, wins.
+        assert_eq!(h.poll("<write src=\"a.txt\">A2</write>"), 1);
+        assert_eq!(h.files.get("a.txt").map(String::as_str), Some("A2"));
+        assert_eq!(h.count("a.txt"), 2);
+    }
+
+    #[test]
+    fn completion_reparse_does_not_execute_again() {
+        let full = "x<write src=\"a.txt\">A</write>y<write src=\"b.txt\">B</write>z";
+        let mut h = StreamHarness::new();
+        assert_eq!(h.poll(full), 2);
+        // Finalize re-parses the same full response: claims already held,
+        // so zero additional executions.
+        assert_eq!(h.reparse_completion(full), 0);
+        assert_eq!(h.count("a.txt"), 1);
+        assert_eq!(h.count("b.txt"), 1);
+        assert_eq!(h.files.get("a.txt").map(String::as_str), Some("A"));
+    }
+
+    #[test]
+    fn incomplete_write_recovery_does_not_write_partial_body() {
+        // Model stops mid-write: flush yields nothing executable, the
+        // partial body is never recorded, recovery stays string-level.
+        let mut h = StreamHarness::new();
+        assert_eq!(h.poll("<write src=\"a.txt\">\npartial content..."), 0);
+        assert_eq!(h.flush(), 0);
+        assert!(!h.files.contains_key("a.txt"));
+        assert_eq!(h.count("a.txt"), 0);
+    }
+
+    #[test]
+    fn byte_by_byte_stream_regression() {
+        // Mandatory: exact chunk sequence; zero executions until the
+        // closer, exactly one after, with the complete body.
+        let mut h = StreamHarness::new();
+        assert_eq!(h.poll("<write src="), 0);
+        assert!(!h.files.contains_key("test.txt"));
+        assert_eq!(h.poll("\"test.txt\">"), 0);
+        assert!(!h.files.contains_key("test.txt"));
+        assert_eq!(h.poll("\nline 1"), 0);
+        assert!(!h.files.contains_key("test.txt"));
+        assert_eq!(h.poll("\nline 2"), 0);
+        assert!(!h.files.contains_key("test.txt"));
+        assert_eq!(h.poll("\nline 3"), 0);
+        assert!(!h.files.contains_key("test.txt"));
+        assert_eq!(h.poll("\n</write>"), 1);
+        assert_eq!(
+            h.files.get("test.txt").map(String::as_str),
+            Some("line 1\nline 2\nline 3")
+        );
+        assert_eq!(h.count("test.txt"), 1);
+    }
+
+    #[test]
+    fn multi_file_stream_regression() {
+        // Svelte+Deno shape: each file absent until its closer, complete
+        // after, executed exactly once.
+        let files: &[(&str, &str)] = &[
+            (
+                "package.json",
+                "{\n  \"name\": \"flowchart-app\",\n  \"version\": \"1.0.0\"\n}",
+            ),
+            (
+                "deno.json",
+                "{\n  \"tasks\": {\n    \"dev\": \"deno run ...\"\n  }\n}",
+            ),
+            ("vite.config.js", "export default ..."),
+            ("src/App.svelte", "<script>\n  ...\n</script>\n..."),
+        ];
+        let mut h = StreamHarness::new();
+        for (target, body) in files {
+            assert_eq!(h.poll(&format!("<write src=\"{target}\">")), 0);
+            assert!(
+                !h.files.contains_key(*target),
+                "{target} must not exist yet"
+            );
+            // Body arrives in two chunks; still nothing executable.
+            let mid = body.len() / 2;
+            assert_eq!(h.poll(&body[..mid]), 0);
+            assert!(
+                !h.files.contains_key(*target),
+                "{target} must not exist yet"
+            );
+            assert_eq!(h.poll(&format!("{}</write>", &body[mid..])), 1);
+            assert_eq!(h.files.get(*target).map(String::as_str), Some(*body));
+        }
+        for (target, _) in files {
+            assert_eq!(h.count(*target), 1, "{target} executed exactly once");
+        }
     }
 
     #[test]

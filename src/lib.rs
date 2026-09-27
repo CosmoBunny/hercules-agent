@@ -17,6 +17,8 @@ pub mod ask_mode;
 pub mod backend;
 pub mod clipboard;
 pub mod code_graph;
+pub mod compact;
+pub mod complete;
 pub mod diagram;
 pub mod graphic;
 pub mod llama;

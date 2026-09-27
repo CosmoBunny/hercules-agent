@@ -279,6 +279,7 @@ pub const SETTINGS_TAB_NAMES: &[&str] = &[
     "LSP Diagnostics",
     "App Style",
     "Color Palette",
+    "Auto Compact",
 ];
 
 pub const SETTINGS_POWER_MODE: usize = 0;
@@ -296,6 +297,55 @@ pub const SETTINGS_CODE_GRAPH: usize = 11;
 pub const SETTINGS_LSP_DIAGNOSTICS: usize = 12;
 pub const SETTINGS_APP_STYLE: usize = 13;
 pub const SETTINGS_COLOR_PALETTE: usize = 14;
+pub const SETTINGS_AUTO_COMPACT: usize = 15;
+
+/// Explicit generation lifecycle. A turn is complete only when the model
+/// says it is complete AND no pending tool calls or continuations remain —
+/// `ExecutingTool` never transitions straight to `Completed` merely
+/// because one tool finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GenerationPhase {
+    /// Quiescent: no generation running or expected.
+    #[default]
+    Idle,
+    /// Model tokens streaming (or freshly triggered).
+    Generating,
+    /// A completed tool tag is being claimed + executed.
+    ExecutingTool,
+    /// Tool results appended; resuming the same run for more tokens.
+    ResumingAfterTool,
+    /// Turn fully complete, run closed.
+    Completed,
+    /// User-cancelled; no automatic resume may start.
+    Cancelled,
+    /// Unrecoverable generation/backend failure.
+    Failed,
+}
+
+/// Pure continuation decision shared by finalize paths (and unit-tested):
+/// resume only when this turn produced tool results, the completion still
+/// owns a live uncancelled run, nothing deliberately stopped the loop,
+/// and no generation is already running. Exactly-once execution is
+/// unaffected — this only decides whether the SAME run continues.
+pub fn should_resume_after_tools(
+    produced_results: bool,
+    stop_deliberate: bool,
+    incomplete: bool,
+    owns_run: bool,
+    cancelled: bool,
+    ask_parked: bool,
+    auto_turns: usize,
+    already_generating: bool,
+) -> bool {
+    produced_results
+        && !stop_deliberate
+        && !incomplete
+        && owns_run
+        && !cancelled
+        && !ask_parked
+        && auto_turns < 20
+        && !already_generating
+}
 
 /// Code Graph pane selection (three-pane layout)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,6 +454,12 @@ pub struct App {
     /// Estimated context tokens used / limit (for status)
     pub context_tokens_est: usize,
     pub context_compact_count: u32,
+    /// Installed AI-written compact context (None until first compaction).
+    /// Injected into every model request; the retired transcript is gone.
+    pub compact_context: Option<String>,
+    /// Auto-compaction tripped in sync context and waits for the next
+    /// async submit to run the shared pipeline.
+    pub compact_pending_auto: bool,
     /// Actual model context limit (from n_ctx_train / n_ctx)
     pub model_context_limit: Option<usize>,
 
@@ -433,9 +489,12 @@ pub struct App {
     // Multimodal attachments & Path Autocomplete
     pub attachments: Vec<crate::media::MediaAttachment>,
     pub next_attachment_id: usize,
-    pub path_suggestions: Vec<String>,
+    pub path_suggestions: Vec<crate::complete::CompletionCandidate>,
     pub path_suggestion_index: usize,
     pub path_suggestion_active: bool,
+    /// First visible popup row (windowed scroll over suggestions).
+    /// Brief directory-listing cache for completion (single-level only).
+    pub completion_cache: crate::complete::DirCache,
 
     // Live Activity Logs (Split Pane Console)
     pub activity_logs: Arc<Mutex<Vec<String>>>,
@@ -462,6 +521,8 @@ pub struct App {
     // Streaming response state
     pub streaming_response: Arc<Mutex<String>>,
     pub is_generating: Arc<Mutex<bool>>,
+    /// Explicit lifecycle phase (see [`GenerationPhase`]).
+    pub gen_phase: GenerationPhase,
     pub was_generating: bool,
     pub generation_error: Arc<Mutex<Option<String>>>,
 
@@ -677,6 +738,8 @@ impl App {
             section_label_hits: Vec::new(),
             context_tokens_est: 0,
             context_compact_count: 0,
+            compact_context: None,
+            compact_pending_auto: false,
             hf_models: Vec::new(),
             registry_search_query: String::new(),
             search_results: Arc::new(Mutex::new(None)),
@@ -686,6 +749,7 @@ impl App {
             path_suggestions: Vec::new(),
             path_suggestion_index: 0,
             path_suggestion_active: false,
+            completion_cache: crate::complete::DirCache::new(),
             activity_logs: Arc::new(Mutex::new(vec![
                 "[SYSTEM] Hercules Engine initialized.".to_string(),
                 "[HARDWARE] Vulkan/WGPU GPU acceleration active.".to_string(),
@@ -745,6 +809,7 @@ impl App {
             download_error: Arc::new(Mutex::new(None)),
             streaming_response: Arc::new(Mutex::new(String::new())),
             is_generating: Arc::new(Mutex::new(false)),
+            gen_phase: GenerationPhase::Idle,
             was_generating: false,
             generation_error: Arc::new(Mutex::new(None)),
             initialized: true,
@@ -903,6 +968,9 @@ impl App {
                             anchor_msg: Some(idx),
                             expanded: false,
                             anim_start: None,
+                            added: None,
+                            removed: None,
+                            line_range: view.line_range,
                         });
                     }
                 }
@@ -1067,6 +1135,9 @@ impl App {
             if let Some(chip) = self.tool_chips.iter_mut().find(|c| c.id == chip_id) {
                 chip.pending = false;
                 chip.tag_closed = true;
+                // Diff stats feed the `WROTE file +a -r` chip label.
+                chip.added = Some(added);
+                chip.removed = Some(removed);
             }
 
             self.force_open_panel_from_chip(chip_id);
@@ -1197,14 +1268,38 @@ impl App {
         }
     }
 
+    /// True when one target path refines the other (`site` →
+    /// `site/index.html`): the shorter must be a `/`-boundary prefix of
+    /// the longer. Unrelated names (`vite.config.js` vs `index.html`)
+    /// never refine, so concurrent open writes can never steal each
+    /// other's chips while streaming.
+    fn path_refines(a: &str, b: &str) -> bool {
+        let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        if short.is_empty() || short == long {
+            return false;
+        }
+        long.starts_with(short)
+            && long
+                .as_bytes()
+                .get(short.len())
+                .map(|c| *c == b'/')
+                .unwrap_or(false)
+    }
+
     fn sync_tool_chips(&mut self, stream: &str) {
         let mut auto_open: Option<u64> = None;
         let anchor = self.latest_agent_msg_idx();
         for view in tool_panel::detect_all_stream_tools(stream) {
             let target = tool_panel::normalize_target(view.kind, &view.target);
             // Only upsert within the *current* agent turn — never steal older chips.
-            // For WRITE: also coalesce path renames on the same turn (one streaming write
-            // must not become file.txt + index.html + title_slug.html chips).
+            // Target and body are an inseparable pair: a view matches a
+            // chip ONLY on identical normalized targets, except for an
+            // open write whose path is still refining (extensionless
+            // "site" → "site/index.html"), matched by strict path-prefix.
+            // Matching across unrelated targets (e.g. a closed
+            // vite.config.js view stealing an open index.html chip and
+            // overwriting its target AND body) is what corrupted
+            // target/body pairing in multi-file streams.
             let existing_idx = self
                 .tool_chips
                 .iter()
@@ -1217,8 +1312,12 @@ impl App {
                     if tool_panel::same_tool_target(view.kind, &c.target, &target) {
                         return true;
                     }
-                    // Same open write stream, path still settling
-                    view.kind == ToolPanelKind::Write && (!c.tag_closed || !view.tag_closed)
+                    // Same open write stream, path still settling: the
+                    // shorter target must be a path prefix of the longer
+                    // (refinement), never an unrelated name.
+                    view.kind == ToolPanelKind::Write
+                        && (!c.tag_closed || !view.tag_closed)
+                        && Self::path_refines(&c.target, &target)
                 })
                 .map(|(i, _)| i);
 
@@ -1236,6 +1335,10 @@ impl App {
                     chip.body = view.body;
                 }
                 chip.tag_closed = view.tag_closed;
+                // Read scope refines with the stream; never clear a known range.
+                if view.line_range.is_some() {
+                    chip.line_range = view.line_range.clone();
+                }
                 if was_open
                     || matches!(view.kind, ToolPanelKind::Write | ToolPanelKind::Read)
                     || view.tag_closed
@@ -1257,6 +1360,9 @@ impl App {
                     anchor_msg: anchor,
                     expanded: false,
                     anim_start: None,
+                    added: None,
+                    removed: None,
+                    line_range: view.line_range.clone(),
                 });
                 auto_open = Some(id);
             }
@@ -1293,6 +1399,17 @@ impl App {
                 existing.tag_closed = existing.tag_closed || chip.tag_closed;
                 existing.pending = existing.pending || chip.pending;
                 existing.target = tool_panel::normalize_target(chip.kind, &chip.target);
+                // Diff stats / read scope survive the merge; never
+                // downgrade known values back to None.
+                if chip.added.is_some() {
+                    existing.added = chip.added;
+                }
+                if chip.removed.is_some() {
+                    existing.removed = chip.removed;
+                }
+                if chip.line_range.is_some() {
+                    existing.line_range = chip.line_range;
+                }
             } else {
                 kept.push(chip);
             }
@@ -1682,6 +1799,10 @@ impl App {
                 chip.body = a.body.clone();
                 chip.tag_closed = true;
                 chip.pending = true;
+                // Keep the read range on the chip (`READ file [45,55]`).
+                if kind == ToolPanelKind::Read && a.line_attr.is_some() {
+                    chip.line_range = a.line_attr.clone();
+                }
 
                 let chip_id = chip.id;
 
@@ -1706,6 +1827,9 @@ impl App {
                     anchor_msg: anchor,
                     expanded: false,
                     anim_start: None,
+                    added: None,
+                    removed: None,
+                    line_range: a.line_attr.clone(),
                 });
 
                 a.chip_id = Some(id);
@@ -2059,6 +2183,15 @@ impl App {
                         chip.pending = false;
                         chip.tag_closed = true;
                         chip.body = result.clone();
+                        // Scheduler-served reads carry the range on the
+                        // action (`READ file [45,55]`).
+                        if matches!(
+                            a.kind,
+                            crate::agent::ProposedKind::Read | crate::agent::ProposedKind::Ls
+                        ) && a.line_attr.is_some()
+                        {
+                            chip.line_range = a.line_attr.clone();
+                        }
                     }
                     self.force_open_panel_from_chip(chip_id);
                 }
@@ -2175,6 +2308,7 @@ impl App {
     /// Terminal idle state: Ready + close the current agent run.
     fn mark_ready(&mut self) {
         self.status_message = "Ready.".to_string();
+        self.gen_phase = GenerationPhase::Completed;
         self.finish_current_run(crate::run_timeline::AgentRunState::Completed);
     }
 
@@ -2243,6 +2377,7 @@ impl App {
             tok.cancel();
         }
         *self.is_generating.lock().unwrap() = false;
+        self.gen_phase = GenerationPhase::Cancelled;
         if let Ok(mut l) = self.activity_logs.lock() {
             l.push(format!("[CANCEL-GEN] {reason}"));
         }
@@ -2269,6 +2404,7 @@ impl App {
         self.user_cancelled_gen = true;
         self.auto_tool_turns = 0;
         *self.is_generating.lock().unwrap() = false;
+        self.gen_phase = GenerationPhase::Cancelled;
         if kill_tasks {
             let n = self.task_manager.running_count();
             if n > 0 {
@@ -2332,6 +2468,9 @@ impl App {
                     anchor_msg: self.latest_agent_msg_idx(),
                     expanded: false,
                     anim_start: None,
+                    added: None,
+                    removed: None,
+                    line_range: None,
                 });
             }
             self.messages.push(format!(
@@ -2466,6 +2605,7 @@ impl App {
                         );
                     }
                     self.trigger_generation_from_context();
+                    self.gen_phase = GenerationPhase::ResumingAfterTool;
                 }
                 self.status_message = format!("Task #{id} parked (long-running)");
                 if let Ok(mut l) = self.activity_logs.lock() {
@@ -2531,6 +2671,7 @@ impl App {
                         );
                     }
                     self.trigger_generation_from_context();
+                    self.gen_phase = GenerationPhase::ResumingAfterTool;
                 }
             }
         }
@@ -2879,6 +3020,13 @@ impl App {
             }
         }
 
+        // Installed compact context: the retired transcript is GONE from
+        // `messages` (only the recent tail remains there), so this block
+        // is the model's sole source of older conversation state.
+        if let Some(ref compact) = self.compact_context {
+            parts.push(crate::compact::compact_block(compact));
+        }
+
         let chat: Vec<String> = self
             .messages
             .iter()
@@ -3055,6 +3203,9 @@ impl App {
             }
             n = n.saturating_add(estimate_tokens(m));
         }
+        if let Some(ref compact) = self.compact_context {
+            n = n.saturating_add(estimate_tokens(compact));
+        }
         for r in self.tool_result_context.iter() {
             n = n.saturating_add(estimate_tokens(r));
         }
@@ -3065,13 +3216,39 @@ impl App {
         n
     }
 
-    /// Auto-compact when full session ≥ 80% of context limit.
+    /// Single source of truth for CTX usage: the exact numbers the
+    /// top-bar CTX meter displays (used tokens, effective limit, percent).
+    /// Auto-compact triggers off this so the meter and the trigger can
+    /// never disagree. Effective limit is the model-reported cap clamped
+    /// to the configured window, exactly like the meter.
+    fn ctx_usage(&self) -> (usize, usize, f64) {
+        let requested = crate::settings::context_token_limit().max(1);
+        let limit = self
+            .model_context_limit
+            .unwrap_or(requested)
+            .min(requested)
+            .max(1);
+        let used = self.estimate_full_session_tokens();
+        let pct = (used as f64 / limit as f64) * 100.0;
+        (used, limit, pct)
+    }
+
+    /// Auto-compact when the CTX meter reaches the configured threshold
+    /// (Auto Compact settings tab, default 80%). Sync context (called
+    /// from trigger) cannot await the model, so this only arms
+    /// `compact_pending_auto`: the next async submit runs the shared
+    /// [`Self::compact_context`] pipeline before sending anything.
     fn maybe_compact_context(&mut self) {
+        if self.compact_pending_auto {
+            return;
+        }
         let settings = crate::settings::get_settings();
-        let limit = settings.context_token_limit.max(2048);
-        let est = self.estimate_full_session_tokens();
+        if !settings.auto_compact_enabled {
+            return;
+        }
+        let (est, limit, _pct) = self.ctx_usage();
         self.context_tokens_est = est;
-        let threshold = ((limit as f32) * settings.compact_ratio) as usize;
+        let threshold = ((limit as f32) * crate::settings::compact_ratio()) as usize;
         // Also compact if message count is huge (hallucination / loop risk)
         let msg_pressure = self.messages.len() >= 40
             || self
@@ -3083,16 +3260,20 @@ impl App {
         if est < threshold && !msg_pressure {
             return;
         }
-        self.compact_context_to_memory(false);
+        self.compact_pending_auto = true;
+        self.status_message =
+            "Context over budget — semantic compaction runs before the next send.".to_string();
+        if let Ok(mut l) = self.activity_logs.lock() {
+            l.push(format!(
+                "[CONTEXT] auto-compact armed at ~{} tokens (limit {})",
+                est, limit
+            ));
+        }
     }
 
-    /// Compress chat → memory and forget prior turns.
-    /// `manual` = user typed `/compact` (more aggressive keep-tail).
-    fn compact_context_to_memory(&mut self, manual: bool) {
-        let before = self.estimate_full_session_tokens();
-        self.context_tokens_est = before;
-
-        // Gather material to compress — skip UI settings so they never enter memory/AI
+    /// Collect the retireable conversation (everything the model currently
+    /// sees, minus UI-only lines) for the summarizer.
+    fn collect_compact_archive(&self) -> String {
         let mut archive = String::new();
         for m in &self.messages {
             if Self::is_ui_only_message(m) {
@@ -3114,50 +3295,96 @@ impl App {
             archive.push_str(r);
             archive.push('\n');
         }
+        archive
+    }
 
-        if archive.trim().is_empty() && !manual {
+    /// Unified semantic compaction pipeline (manual + automatic share all
+    /// of it — only the trigger and the recent-tail size differ).
+    /// Order is failure-safe: snapshot → generate → validate → install →
+    /// only then discard. On model failure an honestly-labeled
+    /// deterministic fallback is installed; the original conversation is
+    /// never discarded without install-ready content.
+    async fn compact_context(&mut self, reason: crate::compact::CompactReason) {
+        use crate::compact::CompactReason;
+        let before = self.estimate_full_session_tokens();
+        self.context_tokens_est = before;
+        let archive = self.collect_compact_archive();
+        if archive.trim().len() < 200 {
+            // Pure no-op: nothing pushed, nothing discarded.
+            self.status_message =
+                "Nothing worth compacting yet — conversation too short.".to_string();
+            return;
+        }
+        // Snapshot first: install only ever replaces from these clones.
+        let snapshot_messages = self.messages.clone();
+        let _snapshot_tools = self.tool_result_context.clone();
+
+        self.status_message = "Reading conversation…".to_string();
+        let budget = crate::compact::MAX_COMPACT_TOKENS;
+        let backend = self.backend.clone();
+        self.status_message = "Building compact context…".to_string();
+        let prompt = crate::compact::build_summarize_prompt(&archive, budget);
+        let generated = backend.generate(&prompt).await;
+        let mut summary = match generated {
+            Ok(text) => text,
+            Err(e) => {
+                if let Ok(mut l) = self.activity_logs.lock() {
+                    l.push(format!(
+                        "[CONTEXT] AI summary failed ({e}); deterministic fallback"
+                    ));
+                }
+                String::new()
+            }
+        };
+        // Validate; one concise retry when oversize/invalid for size.
+        let mut used_fallback = false;
+        if crate::compact::validate(&summary, budget).is_err() {
+            if !summary.trim().is_empty() {
+                let retry = crate::compact::build_retry_prompt(summary.trim(), budget / 2);
+                match backend.generate(&retry).await {
+                    Ok(text) => summary = text,
+                    Err(e) => {
+                        if let Ok(mut l) = self.activity_logs.lock() {
+                            l.push(format!("[CONTEXT] retry failed ({e}); fallback"));
+                        }
+                        summary.clear();
+                    }
+                }
+            }
+            if crate::compact::validate(&summary, budget).is_err() {
+                summary = crate::compact::fallback_compact(&compress_transcript(&archive));
+                used_fallback = true;
+            }
+        }
+        // Defensive: never install anything that fails validation now.
+        if crate::compact::validate(&summary, budget).is_err() {
+            self.messages.push(format!(
+                "System: Compaction failed — original conversation kept intact.                  ({})",
+                reason.label()
+            ));
             return;
         }
 
-        // Deterministic compress — never ask the model to summarize (hallucinates)
-        let summary = compress_transcript(&archive);
-        let note = format!(
-            "[compact #{} | {}] {}",
-            self.context_compact_count + 1,
-            if manual { "manual /compact" } else { "auto" },
-            summary
-        );
-        let _ = crate::agent::AgentEngine::memory_push(&note);
-
-        // Manual: keep only last user+agent pair; auto: last 4 turns
-        let keep_n = if manual { 2usize } else { 4usize };
-        let recent: Vec<String> = self
-            .messages
-            .iter()
-            .rev()
-            .filter(|m| m.starts_with("You: ") || m.starts_with("Agent: "))
-            .take(keep_n)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-
+        // Install: compact block + banner + recent tail replace history.
+        let keep_n = reason.keep_tail_messages();
+        let recent = crate::compact::select_recent_tail(&snapshot_messages, keep_n);
+        self.compact_context = Some(summary.clone());
         self.messages.clear();
         self.messages.push(format!(
-            "System: [Context compacted — {}] was ~{} tokens (limit {} · {}% auto). \
-             Prior chat FORGOTTEN. Facts live in memory (compact #{}). \
-             Do NOT invent old conversation details; use [Memory] only. \
-             Prefer tools over guessing.",
-            if manual { "manual /compact" } else { "auto" },
+            "System: [Compact context active — {}] was ~{} tokens. Prior transcript retired;              semantic state lives in the compact block below, NOT in memory.              Do NOT invent old conversation details.",
+            reason.label(),
             before,
-            crate::settings::context_token_limit(),
-            (crate::settings::get_settings().compact_ratio * 100.0) as u32,
-            self.context_compact_count + 1
         ));
+        // Recent tail *before* the banner? No — banner first (UI order),
+        // tail after, matching prior layout.
         self.messages.extend(recent);
-        // Drop tool chips tied to forgotten turns (reduce UI noise / stale anchors)
-        if manual {
+        self.tool_result_context.clear();
+        self.auto_tool_turns = 0;
+        self.recent_tool_calls.clear();
+        self.repeat_count = 0;
+        self.context_compact_count += 1;
+        // Chips anchor to message indices that no longer exist.
+        if reason == CompactReason::Manual {
             self.tool_chips.clear();
             self.tool_panel = None;
             self.tool_panel_rect = None;
@@ -3174,25 +3401,44 @@ impl App {
                 chip.anchor_msg = agent_idxs.last().copied();
             }
         }
-        self.tool_result_context.clear();
-        self.auto_tool_turns = 0;
-        self.recent_tool_calls.clear();
-        self.repeat_count = 0;
-        self.context_compact_count += 1;
-        self.context_tokens_est = self.estimate_full_session_tokens();
+        self.compact_pending_auto = false;
+        let after = self.estimate_full_session_tokens();
+        self.context_tokens_est = after;
         self.status_message = format!(
-            "{} compact #{} · ~{} → ~{} tokens (memory updated)",
-            if manual { "Manual" } else { "Auto" },
+            "{} compact #{} · ~{} → ~{} tokens{}",
+            if reason == CompactReason::Manual {
+                "Manual"
+            } else {
+                "Auto"
+            },
             self.context_compact_count,
             before,
-            self.context_tokens_est
+            after,
+            if used_fallback {
+                " (deterministic fallback — AI summary unavailable)"
+            } else {
+                ""
+            },
         );
+        self.messages.push(format!(
+            "System: [OK] Compact complete: ~{} → ~{} tokens{}. {}",
+            before,
+            after,
+            if used_fallback {
+                " (deterministic fallback — AI summary was unavailable)"
+            } else {
+                ""
+            },
+            "Continue from the compact context + recent tail."
+        ));
         if let Ok(mut l) = self.activity_logs.lock() {
             l.push(format!(
-                "[CONTEXT] {} compact #{} — ~{} tok → memory, history cleared",
-                if manual { "Manual" } else { "Auto" },
+                "[CONTEXT] {} compact #{} — ~{} tok → ~{} tok{}",
+                reason.label(),
                 self.context_compact_count,
-                before
+                before,
+                after,
+                if used_fallback { " (fallback)" } else { "" },
             ));
         }
     }
@@ -3273,6 +3519,9 @@ impl App {
                 anchor_msg: anchor,
                 expanded: false,
                 anim_start: None,
+                added: None,
+                removed: None,
+                line_range: None,
             });
         }
 
@@ -3361,6 +3610,7 @@ impl App {
 
     pub fn trigger_generation_from_context(&mut self) {
         // Each model generation is a real timeline step, not just a separate timer.
+        self.gen_phase = GenerationPhase::Generating;
         self.start_run_step(
             crate::run_timeline::StepKind::Generate,
             "Generate response".to_string(),
@@ -3382,7 +3632,8 @@ impl App {
         if let Some(old) = self.gen_cancel_token.replace(child_token.clone()) {
             old.cancel();
         }
-        // 80% of context budget → compress to memory, forget old turns
+        // CTX meter hit the auto-compact threshold → arm semantic
+        // compaction (runs before the next send).
         self.maybe_compact_context();
         let context_prompt = self.build_context_prompt();
         // Status shows full-session estimate (auto-compact uses this, not trimmed prompt)
@@ -3402,16 +3653,14 @@ impl App {
 
         self.messages.push("Agent: ".to_string());
         self.typewriter_len = 0;
+        // Same CTX-meter numbers as the top bar and the auto-compact trigger.
+        let (ctx_used_now, _, ctx_pct_now) = self.ctx_usage();
         let limit = crate::settings::context_token_limit();
-        let pct = if limit > 0 {
-            (self.context_tokens_est * 100 / limit).min(100)
-        } else {
-            0
-        };
+        let pct = ctx_pct_now.min(100.0) as usize;
         self.status_message = format!(
             "Generating via {}… ctx ~{}tok ({}% of {})",
             self.backend.name(),
-            self.context_tokens_est,
+            ctx_used_now,
             pct,
             limit
         );
@@ -3870,6 +4119,19 @@ impl App {
                 let next = crate::settings::cycle_color_palette(if dir != 0 { dir } else { 1 });
                 self.status_message = format!("Color Palette: {}", next.label());
             }
+            15 => {
+                // Auto Compact — Enter toggles the master switch,
+                // Left/Right steps the CTX threshold 75 → 95%.
+                if dir == 0 {
+                    let on = crate::settings::toggle_auto_compact();
+                    self.status_message =
+                        format!("Auto Compact: {}", if on { "ON" } else { "OFF" });
+                } else {
+                    let r = crate::settings::nudge_compact_ratio(dir);
+                    self.status_message =
+                        format!("Auto Compact threshold: {:.0}% of CTX", r * 100.0);
+                }
+            }
             _ => {}
         }
     }
@@ -4099,88 +4361,32 @@ impl App {
         (lines, cursor_col, cursor_row)
     }
 
-    /// Check if the text before the cursor matches a path prefix (`$CURRENT/`, `~/`, `/`, `./`)
+    /// Check if the text before the cursor wants host-side completion
+    /// (`/`, `@`, `$CURRENT`, `~`, absolute/relative paths). Single source
+    /// of truth: the [`crate::complete`] engine triages the token around
+    /// the cursor, lists one directory level, and records the exact
+    /// `[start..end)` range acceptance replaces.
     pub fn update_path_autocomplete(&mut self) {
-        let prefix_before_cursor: String = self
-            .input
-            .chars()
-            .take(self.input_cursor_position)
-            .collect();
-        let last_word = prefix_before_cursor.split_whitespace().last().unwrap_or("");
-
-        if last_word.starts_with("$CURRENT")
-            || last_word.starts_with('~')
-            || last_word.starts_with('/')
-            || last_word.starts_with("./")
-            || last_word.starts_with("../")
-        {
-            let resolved_prefix = if last_word.starts_with("$CURRENT") {
-                let rest = last_word
-                    .trim_start_matches("$CURRENT")
-                    .trim_start_matches('/');
-                std::env::current_dir()
-                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                    .join(rest)
-            } else if last_word.starts_with('~') {
-                let rest = last_word.trim_start_matches('~').trim_start_matches('/');
-                dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/"))
-                    .join(rest)
-            } else {
-                std::path::PathBuf::from(last_word)
-            };
-
-            let search_dir = if resolved_prefix.is_dir() {
-                resolved_prefix.clone()
-            } else {
-                resolved_prefix
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-            };
-
-            let filter_name = if resolved_prefix.is_dir() {
-                String::new()
-            } else {
-                resolved_prefix
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_lowercase()
-            };
-
-            let mut suggestions = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&search_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with('.') && !filter_name.starts_with('.') {
-                        continue;
-                    }
-                    if filter_name.is_empty() || name.to_lowercase().contains(&filter_name) {
-                        let path = entry.path();
-                        let is_dir = path.is_dir();
-                        let display_name = if is_dir { format!("{name}/") } else { name };
-                        suggestions.push(display_name);
-                        if suggestions.len() >= 15 {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if !suggestions.is_empty() {
-                self.path_suggestions = suggestions;
-                self.path_suggestion_index = self
-                    .path_suggestion_index
-                    .min(self.path_suggestions.len().saturating_sub(1));
-                self.path_suggestion_active = true;
-                return;
-            }
-        }
-
         self.path_suggestions.clear();
         self.path_suggestion_active = false;
         self.path_suggestion_index = 0;
+        let Ok(cwd) = std::env::current_dir() else {
+            return;
+        };
+        // Borrow-split: immutable input for triage, mutable cache for
+        // single-level directory reads.
+        let cursor = self.input_cursor_position;
+        let cache = &mut self.completion_cache;
+        let ctx = crate::complete::context_for_with(&cwd, &self.input, cursor, &mut |dir| {
+            cache.entries(dir)
+        });
+        let Some(ctx) = ctx else { return };
+        if ctx.candidates.is_empty() {
+            return;
+        }
+        self.path_suggestions = ctx.candidates;
+        self.path_suggestion_index = 0;
+        self.path_suggestion_active = true;
     }
 
     pub fn accept_path_suggestion(&mut self) -> bool {
@@ -4188,37 +4394,41 @@ impl App {
             return false;
         }
 
-        let selected = self.path_suggestions[self.path_suggestion_index].clone();
-        let prefix_before_cursor: String = self
-            .input
-            .chars()
-            .take(self.input_cursor_position)
-            .collect();
-        let last_word = prefix_before_cursor
-            .split_whitespace()
-            .last()
-            .unwrap_or("")
-            .to_string();
-
-        let replacement = if last_word.ends_with('/') {
-            format!("{last_word}{selected}")
-        } else if let Some(idx) = last_word.rfind('/') {
-            format!("{}{selected}", &last_word[..=idx])
-        } else {
-            selected.clone()
-        };
-
-        // Replace last word in input
-        let start_pos = self
-            .input_cursor_position
-            .saturating_sub(last_word.chars().count());
-        let mut chars: Vec<char> = self.input.chars().collect();
-        chars.splice(start_pos..self.input_cursor_position, replacement.chars());
-        self.input = chars.into_iter().collect();
-        self.input_cursor_position = start_pos + replacement.chars().count();
+        // Range splice over the token under the cursor. The engine insert
+        // already carries sigils and typed prefixes (`@src/main.rs`,
+        // `/compact`, `$CURRENT/src/`).
+        let selected = self.path_suggestions[self.path_suggestion_index]
+            .insert_text
+            .clone();
+        let chars: Vec<char> = self.input.chars().collect();
+        let cursor = self.input_cursor_position.min(chars.len());
+        let mut start = cursor;
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let mut end = cursor;
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+        // Mid-token cursor with a directory insert: keep the already-typed
+        // tail (`@sr|c/main.rs` + `@src/` keeps `/main.rs`), collapsing a
+        // doubled slash at the junction. Otherwise the insert already
+        // covers the whole token.
+        let mut insert = selected.clone();
+        if cursor < end && insert.ends_with('/') {
+            let tail: String = chars[cursor..end].iter().collect();
+            insert.push_str(tail.trim_start_matches('/'));
+        }
+        let mut next: Vec<char> = Vec::with_capacity(chars.len());
+        next.extend_from_slice(&chars[..start]);
+        next.extend(insert.chars());
+        next.extend_from_slice(&chars[end..]);
+        self.input = next.into_iter().collect();
+        self.input_cursor_position = start + insert.chars().count();
 
         // If file is an image, video, or pdf, also automatically attach it
-        let clean_path_str = replacement
+        let clean_path_str = insert
+            .trim_start_matches('@')
             .trim_start_matches("$CURRENT/")
             .trim_start_matches("$CURRENT");
         let path = std::path::Path::new(clean_path_str);
@@ -4363,6 +4573,16 @@ impl App {
         } else {
             self.menu_anim_progress = 0.0;
         }
+    }
+
+    /// Frame-draw decision for the main loop. The animation flag must
+    /// be snapshotted BEFORE the event tick: the tick can *complete* an
+    /// animation, and checking only the post-tick state skips the final
+    /// redraw — freezing the last animating frame on screen forever
+    /// (e.g. a chip collapse stuck as badge + label with zero body
+    /// lines instead of settling into the collapsed badge row).
+    pub fn should_draw_frame(&self, needs_redraw: bool, anim_was_in_progress: bool) -> bool {
+        needs_redraw || anim_was_in_progress || self.krama.is_any_animation_inprogress()
     }
 
     pub fn tick_animations(&mut self) {
@@ -4609,7 +4829,9 @@ impl App {
                         if !self.claim_tool_call(&action) {
                             continue;
                         }
+                        self.gen_phase = GenerationPhase::ExecutingTool;
                         let write_result = crate::agent::AgentEngine::execute_proposed(&action);
+                        self.gen_phase = GenerationPhase::Generating;
                         self.streamed_writes_done.push(action.target.clone());
 
                         // Record +/- stats into context so AI knows what changed next turn
@@ -4666,6 +4888,8 @@ impl App {
                         }) {
                             chip.pending = false;
                             chip.tag_closed = true;
+                            chip.added = Some(added);
+                            chip.removed = Some(removed);
                             // Keep actual write file contents in chip.body so panel & line counts display properly
                             if chip.body.is_empty() && !action.body.is_empty() {
                                 chip.body = action.body.clone();
@@ -4708,6 +4932,9 @@ impl App {
                     }
                 }
                 if let Some(err) = err_opt {
+                    // Fresh-write signal for the resume check below: the
+                    // clear wipes per-turn state, so capture first.
+                    let had_streamed = !self.streamed_writes_done.is_empty();
                     self.streamed_writes_done.clear();
                     if run_live_at_finish {
                         self.finish_open_run_step(
@@ -4716,6 +4943,7 @@ impl App {
                             Some(err.chars().take(80).collect()),
                         );
                         self.finish_current_run(crate::run_timeline::AgentRunState::Failed);
+                        self.gen_phase = GenerationPhase::Failed;
                     } else if let Ok(mut l) = self.activity_logs.lock() {
                         l.push("[STALE] superseded generation error discarded".into());
                     }
@@ -4731,6 +4959,37 @@ impl App {
                             if last.starts_with("Agent: ") {
                                 *last = format!("Error: {}", err);
                             }
+                        }
+                        // Stall/timeout cancel with writes already executed
+                        // this turn: resume the SAME run once so the model
+                        // receives its tool results instead of stalling
+                        // silently. Real user cancellation, AskMode parks,
+                        // genuine backend errors, and the turn cap never
+                        // resume here. Results already sit in
+                        // tool_result_context (canonical context feed).
+                        let stall_cancelled =
+                            err == "[Generation Cancelled by User]" && !self.user_cancelled_gen;
+                        let run_live = self
+                            .run_cancel_token
+                            .as_ref()
+                            .map(|t| !t.is_cancelled())
+                            .unwrap_or(true);
+                        if had_streamed
+                            && stall_cancelled
+                            && run_live
+                            && self.ask_mode_state.is_none()
+                            && self.auto_tool_turns < 20
+                            && !*self.is_generating.lock().unwrap()
+                        {
+                            self.auto_tool_turns += 1;
+                            if let Ok(mut l) = self.activity_logs.lock() {
+                                l.push(
+                                    "[RESUME] stall-cancel with pending writes, resuming run"
+                                        .into(),
+                                );
+                            }
+                            self.trigger_generation_from_context();
+                            self.gen_phase = GenerationPhase::ResumingAfterTool;
                         }
                     }
                 } else if !current_stream.is_empty() && !current_stream.starts_with("__HERCULES") {
@@ -4836,6 +5095,13 @@ impl App {
                                 tool_output_opt = Some(recent_writes.join("\n\n"));
                             }
                         }
+
+                        // Continuation bookkeeping for the safety net below:
+                        // did THIS turn produce tool results, and did any
+                        // branch deliberately stop the loop (repeat guard,
+                        // denied permission, tagless output)?
+                        let produced_results = tool_output_opt.is_some() || had_streamed_writes;
+                        let mut stop_deliberate = false;
 
                         // Recover tools only on the *first* attempt. After we already have
                         // tool results, recovery re-fires the same <read> and wipes the answer.
@@ -5037,6 +5303,7 @@ impl App {
                             );
 
                             if only_repeated_tool || ls_spam_on_create {
+                                stop_deliberate = true;
                                 self.messages.push(
                                 "System: [Host] Finished inspecting files. Ready for next prompt."
                                     .to_string(),
@@ -5051,6 +5318,7 @@ impl App {
                                     );
                                 }
                             } else if let Some(reason) = loop_hit {
+                                stop_deliberate = true;
                                 self.repeat_count = settings.repeat_threshold;
                                 self.messages.push(format!(
                             "System: Repeat detector (threshold {}): {}. \
@@ -5066,114 +5334,47 @@ impl App {
                                 self.repeat_count = 0;
                             } else if need_accept {
                                 // "Ask" permission mode WITHOUT session allow:
-                                // writes must go through the canonical
-                                // executor (`execute_proposed` →
-                                // `execute_write`), which enforces BOTH the
-                                // Ask-mode permission gate
-                                // (`tools_allowed_for_write_cmd`) AND the
-                                // filesystem sandbox (`path_allowed`).
-                                // Raw `fs::write` here would bypass both.
-                                // Without `/allow` this records a permission
-                                // denial (nothing is written); with freshly
-                                // granted allow the next turn proceeds.
-                                // Reuse the result already computed above; re-running
-                                // process_response here would execute every tool twice.
+                                // proposed writes must NOT execute here — the
+                                // canonical executor would only deny them
+                                // instantly (timeline ✗, silent run end, and
+                                // a "WROTE" chip over a file that was never
+                                // written). Route them to the existing
+                                // Y/Enter/N/A approval flow instead; the run
+                                // stays OPEN and the accept path executes +
+                                // resumes afterwards. Non-write outputs
+                                // already computed (reads etc.) are recorded
+                                // so they wait in context for the
+                                // post-accept continuation — but nothing
+                                // triggers yet.
                                 let tool_out = tool_output_opt.clone().or_else(|| {
                                     crate::agent::AgentEngine::process_response_with(
                                         &effective_stream,
                                         &self.streamed_writes_done,
                                     )
                                 });
-                                for a in &proposed {
-                                    if a.kind == crate::agent::ProposedKind::Write {
-                                        if !self.claim_tool_call(a) {
-                                            continue;
-                                        }
-                                        let write_result =
-                                            crate::agent::AgentEngine::execute_proposed(a);
-                                        let ok = !write_result.trim_start().starts_with("Error:");
-                                        if !ok {
-                                            // Failed executions hold no claim:
-                                            // nothing ran, so an explicit
-                                            // later acceptance (`/allow`, Y)
-                                            // can still claim + execute it.
-                                            // Releasing only on failure keeps
-                                            // exactly-once for successes.
-                                            self.dispatch_registry.release(a);
-                                        }
-                                        self.finish_run_call(
-                                            a.call_id,
-                                            if ok {
-                                                crate::run_timeline::StepStatus::Succeeded
-                                            } else {
-                                                crate::run_timeline::StepStatus::Failed
-                                            },
-                                            Some(if ok {
-                                                format!(
-                                                    "wrote {} lines (ask-mode auto-execute)",
-                                                    a.body.lines().count()
-                                                )
-                                            } else {
-                                                write_result
-                                                    .lines()
-                                                    .next()
-                                                    .unwrap_or("write blocked")
-                                                    .to_string()
-                                            }),
-                                        );
-                                        let anchor = self.latest_agent_msg_idx();
-                                        let kind = tool_panel::ToolPanelKind::Write;
-                                        let path =
-                                            crate::agent::AgentEngine::expand_path(&a.target);
-                                        let target_str = tool_panel::normalize_target(
-                                            kind,
-                                            &path.display().to_string(),
-                                        );
-                                        let chip_exists = self.tool_chips.iter().any(|c| {
-                                            c.kind == kind
-                                                && tool_panel::same_tool_target(
-                                                    c.kind,
-                                                    &c.target,
-                                                    &target_str,
-                                                )
-                                        });
-                                        if !chip_exists {
-                                            let id = self.next_chip_id;
-                                            self.next_chip_id += 1;
-                                            self.tool_chips.push(tool_panel::ToolChip {
-                                                id,
-                                                kind,
-                                                target: target_str,
-                                                body: a.body.clone(),
-                                                tag_closed: true,
-                                                pending: false,
-                                                spawned: false,
-                                                rect: None,
-                                                anchor_msg: anchor,
-                                                expanded: false,
-                                                anim_start: None,
-                                            });
-                                        }
-                                    }
-                                }
                                 if let Some(out) = tool_out {
                                     self.record_tool_result_ui("tool", &out);
-                                    self.auto_tool_turns += 1;
-                                    if self.auto_tool_turns == 20 {
-                                        self.messages.push(
-                                    "System: [Agent has taken 20 tool turns — press Ctrl+C to stop]"
-                                        .to_string(),
-                                );
-                                    }
-                                    self.trigger_generation_from_context();
-                                } else {
+                                }
+                                let writes: Vec<_> = proposed
+                                    .iter()
+                                    .filter(|a| a.kind == crate::agent::ProposedKind::Write)
+                                    .cloned()
+                                    .collect();
+                                if writes.is_empty() {
+                                    stop_deliberate = true;
                                     self.auto_tool_turns = 0;
                                     self.mark_ready();
+                                } else {
+                                    // Deliberately paused for approval: the
+                                    // safety net must not resume either.
+                                    stop_deliberate = true;
+                                    self.propose_actions(writes);
                                 }
                             } else if let Some(tool_output) = tool_output_opt {
                                 if !crate::agent::AgentEngine::response_has_tool_tags(
                                     &effective_stream,
                                 ) {
+                                    stop_deliberate = true;
                                     self.auto_tool_turns = 0;
                                     self.mark_ready();
                                 } else {
@@ -5203,10 +5404,67 @@ impl App {
                                 );
                                     }
                                     self.trigger_generation_from_context();
+                                    self.gen_phase = GenerationPhase::ResumingAfterTool;
                                 }
                             } else {
                                 self.auto_tool_turns = 0;
                                 self.mark_ready();
+                            }
+                            // Canonical continuation safety net: if this turn
+                            // produced tool results but no branch above
+                            // scheduled a continuation (and none is already
+                            // running), resume the SAME run once through the
+                            // canonical trigger. Results already sit in
+                            // tool_result_context, so the model receives an
+                            // actual tool result — never a synthetic user
+                            // "continue". Deliberate stops (repeat guard,
+                            // denied permission, tagless output), incomplete
+                            // tools, AskMode parks, and cancellations never
+                            // reach this trigger.
+                            {
+                                let cancelled = self.user_cancelled_gen
+                                    || self
+                                        .run_cancel_token
+                                        .as_ref()
+                                        .map(|t| t.is_cancelled())
+                                        .unwrap_or(false);
+                                let generating_now = *self.is_generating.lock().unwrap();
+                                if crate::app::should_resume_after_tools(
+                                    produced_results,
+                                    stop_deliberate,
+                                    incomplete,
+                                    run_live_at_finish,
+                                    cancelled,
+                                    self.ask_mode_state.is_some(),
+                                    self.auto_tool_turns,
+                                    generating_now,
+                                ) {
+                                    self.auto_tool_turns += 1;
+                                    if let Ok(mut l) = self.activity_logs.lock() {
+                                        l.push(
+                                            "[RESUME] safety net: tool results pending, resuming run"
+                                                .into(),
+                                        );
+                                    }
+                                    self.trigger_generation_from_context();
+                                    self.gen_phase = GenerationPhase::ResumingAfterTool;
+                                } else if produced_results && !generating_now {
+                                    // Results exist but no continuation: log
+                                    // the exact veto so a stall names its
+                                    // cause instead of dying silently.
+                                    if let Ok(mut l) = self.activity_logs.lock() {
+                                        l.push(format!(
+                                            "[NO-RESUME] produced={} deliberate_stop={} incomplete={} owns_run={} cancelled={} ask_parked={} turns={}",
+                                            produced_results,
+                                            stop_deliberate,
+                                            incomplete,
+                                            run_live_at_finish,
+                                            cancelled,
+                                            self.ask_mode_state.is_some(),
+                                            self.auto_tool_turns,
+                                        ));
+                                    }
+                                }
                             }
                             self.streamed_writes_done.clear();
 
@@ -6134,12 +6392,12 @@ impl App {
         let top_area = chunks[0];
         let full_top_w = top_area.width as usize;
 
-        let requested_ctx = crate::settings::context_token_limit().max(1);
-        let actual_ctx = self.model_context_limit.unwrap_or(requested_ctx);
-        let ctx_limit = actual_ctx.min(requested_ctx);
-        let ctx_used = self.estimate_full_session_tokens();
+        // CTX meter: single source of truth shared with the
+        // auto-compact trigger (`ctx_usage`), so the displayed percent
+        // is exactly what compaction fires on.
+        let (ctx_used, ctx_limit, ctx_pct_raw) = self.ctx_usage();
         self.context_tokens_est = ctx_used;
-        let ctx_pct = ((ctx_used as f64 / ctx_limit as f64) * 100.0).min(999.0);
+        let ctx_pct = ctx_pct_raw.min(999.0);
         let _ctx_color = if ctx_pct >= 80.0 {
             Color::Rgb(255, 130, 140)
         } else if ctx_pct >= 50.0 {
@@ -6177,6 +6435,7 @@ impl App {
         } else {
             let ctx_label = crate::settings::format_context_tokens(ctx_limit);
             let ctx_str = format!("CTX {:.0}% {}", ctx_pct, ctx_label);
+            let requested_ctx = crate::settings::context_token_limit().max(1);
             if self.model_context_limit.is_some()
                 && self.model_context_limit.unwrap() != requested_ctx
             {
@@ -7228,11 +7487,10 @@ impl App {
                         .get(&chip.id)
                         .map(|s| s.elapsed().as_secs().max(1));
                     let chip_dur = self.action_durations.get(&chip.id).copied().or(live_dur);
-                    let action_tag = if let Some(dur) = chip_dur {
-                        format!(" Action {}s ", dur)
-                    } else {
-                        " Action ".to_string()
-                    };
+                    // Badge shows the kind verb (` READ `, ` WROTE `,
+                    // ` RUN 45s `), never the generic "Action".
+                    let action_tag = chip.badge_text(chip_dur);
+                    let badge_w = action_tag.chars().count();
                     let is_open = chip.expanded || !chip.tag_closed;
                     let action_duration = chip_dur.map(|d| format!("{}s", d));
                     let anim_id = (chip.id as u32) | 0x8000_0000;
@@ -7259,11 +7517,12 @@ impl App {
                         // Fully collapsed: buffer for horizontal row line up
                         collapsed_row_buf.push((
                             badge_span,
-                            8,
+                            badge_w,
                             SectionKind::Action(chip.id),
                             action_bg,
                             format!(
-                                "Action: {}",
+                                "{}: {}",
+                                chip.badge_verb(),
                                 chip.label_text_with_duration(action_duration.as_deref())
                             ),
                         ));
@@ -7283,7 +7542,8 @@ impl App {
                         section_headers.push((
                             chip_start,
                             format!(
-                                "Action: {}",
+                                "{}: {}",
+                                chip.badge_verb(),
                                 chip.label_text_with_duration(action_duration.as_deref())
                             ),
                             action_bg,
@@ -7291,31 +7551,30 @@ impl App {
                         all_section_hits_unmapped.push((
                             chip_start,
                             0,
-                            8,
+                            badge_w.min(u16::MAX as usize) as u16,
                             SectionKind::Action(chip.id),
                         ));
                         push_full_shaded!(
                             &mut chat_lines,
                             vec![badge_span],
-                            8,
+                            badge_w,
                             available_width,
                             action_row_bg
                         );
 
-                        let chip_summary =
-                            chip.label_text_with_duration(action_duration.as_deref());
-                        let cur_spans = vec![
+                        let mut cur_spans = vec![
                             Span::styled("▎", Style::default().fg(action_bg).bg(action_row_bg)),
                             Span::styled(" ", Style::default().bg(action_row_bg)),
-                            Span::styled(
-                                chip_summary.clone(),
-                                Style::default()
-                                    .fg(chip.kind.accent())
-                                    .bg(action_row_bg)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
                         ];
-                        let cur_w = 2 + chip_summary.chars().count();
+                        // Kind-first label with per-part colors
+                        // (`WROTE file +45 -3`, `READ file [45,55]`, …).
+                        let chip_spans =
+                            chip.label_spans(action_row_bg, action_duration.as_deref());
+                        let cur_w = 2 + chip_spans
+                            .iter()
+                            .map(|s| s.content.chars().count())
+                            .sum::<usize>();
+                        cur_spans.extend(chip_spans);
                         push_full_shaded!(
                             &mut chat_lines,
                             cur_spans,
@@ -7572,7 +7831,18 @@ impl App {
         if !unanchored_chips.is_empty() {
             let action_bg = Color::Rgb(235, 203, 139);
             for chip in unanchored_chips {
-                let action_tag = " Action ";
+                // Kind badge with elapsed time, like the anchored path.
+                let unanchored_secs = self
+                    .action_start_times
+                    .get(&chip.id)
+                    .map(|s| s.elapsed().as_secs().max(1));
+                let unanchored_dur = self
+                    .action_durations
+                    .get(&chip.id)
+                    .copied()
+                    .or(unanchored_secs);
+                let action_tag = chip.badge_text(unanchored_dur);
+                let badge_w = action_tag.chars().count();
                 let is_open = chip.expanded || !chip.tag_closed;
                 let anim_id = (chip.id as u32) | 0x8000_0000;
                 let is_anim = self.krama.is_animating("collapse", anim_id);
@@ -7607,11 +7877,12 @@ impl App {
                 if (!is_open && !is_anim) || (!is_open && anim_progress2 == 0.0) {
                     collapsed_row_buf.push((
                         badge_span,
-                        8,
+                        badge_w,
                         SectionKind::Action(chip.id),
                         action_bg,
                         format!(
-                            "Action: {}",
+                            "{}: {}",
+                            chip.badge_verb(),
                             chip.label_text_with_duration(action_duration.as_deref())
                         ),
                     ));
@@ -7631,7 +7902,8 @@ impl App {
                     section_headers.push((
                         chip_start,
                         format!(
-                            "Action: {}",
+                            "{}: {}",
+                            chip.badge_verb(),
                             chip.label_text_with_duration(action_duration.as_deref())
                         ),
                         action_bg,
@@ -7639,30 +7911,27 @@ impl App {
                     all_section_hits_unmapped.push((
                         chip_start,
                         0,
-                        8,
+                        badge_w.min(u16::MAX as usize) as u16,
                         SectionKind::Action(chip.id),
                     ));
                     push_full_shaded!(
                         &mut chat_lines,
                         vec![badge_span],
-                        8,
+                        badge_w,
                         available_width,
                         action_row_bg
                     );
 
-                    let chip_summary = chip.label_text_with_duration(action_duration.as_deref());
-                    let cur_spans = vec![
+                    let mut cur_spans = vec![
                         Span::styled("▎", Style::default().fg(action_bg).bg(action_row_bg)),
                         Span::styled(" ", Style::default().bg(action_row_bg)),
-                        Span::styled(
-                            chip_summary.clone(),
-                            Style::default()
-                                .fg(chip.kind.accent())
-                                .bg(action_row_bg)
-                                .add_modifier(Modifier::BOLD),
-                        ),
                     ];
-                    let cur_w = 2 + chip_summary.chars().count();
+                    let chip_spans = chip.label_spans(action_row_bg, action_duration.as_deref());
+                    let cur_w = 2 + chip_spans
+                        .iter()
+                        .map(|s| s.content.chars().count())
+                        .sum::<usize>();
+                    cur_spans.extend(chip_spans);
                     push_full_shaded!(
                         &mut chat_lines,
                         cur_spans,
@@ -8322,12 +8591,62 @@ impl App {
         let input_box = Paragraph::new(input_ui_lines).style(Style::default().bg(pal_bg()));
         frame.render_widget(input_box, input_area);
 
-        // Path Autocomplete Popup floating above input
+        // Completion popup floating above input: windowed scroll over
+        // candidates, palette chrome, kind tags + descriptions.
         if !self.show_menu && self.path_suggestion_active && !self.path_suggestions.is_empty() {
-            let num_items = self.path_suggestions.len().min(8);
-            let pop_h = (num_items as u16) + 2;
+            use crate::complete::CandidateKind;
+            let total = self.path_suggestions.len();
+            // Keep the selected row inside the visible window.
+            let visible: usize = 8;
+            let scroll = if self.path_suggestion_index >= visible {
+                self.path_suggestion_index + 1 - visible
+            } else {
+                0
+            };
+            let shown: Vec<(usize, &crate::complete::CompletionCandidate)> = self
+                .path_suggestions
+                .iter()
+                .enumerate()
+                .skip(scroll)
+                .take(visible)
+                .collect();
+            let pop_w = 56.min(area.width.saturating_sub(4));
+            let pal = crate::app_palette::current_palette();
+            let mut list_items = Vec::new();
+            for (idx, sug) in shown {
+                let is_sel = idx == self.path_suggestion_index;
+                let style = if is_sel {
+                    Style::default()
+                        .fg(crate::app_palette::contrasting_text_on(pal.accent, &pal))
+                        .bg(pal.accent_c())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(pal.foreground_c()).bg(pal.menu_bg_c())
+                };
+                let tag = match sug.kind {
+                    CandidateKind::Command => "[CMD] ",
+                    CandidateKind::Dir => "[DIR] ",
+                    CandidateKind::File => "[FILE] ",
+                };
+                let mut label = format!(" {tag}{} ", sug.display_text);
+                if let Some(desc) = sug.description.as_ref() {
+                    let room = pop_w as usize;
+                    let suffix = format!("\u{2014} {desc}");
+                    if label.chars().count() + suffix.chars().count() + 1 <= room {
+                        label.push_str(&suffix);
+                    }
+                }
+                list_items.push(ListItem::new(Span::styled(label, style)));
+            }
+            if total > visible {
+                list_items.push(ListItem::new(Span::styled(
+                    format!(" \u{2026} {} more (Up/Down) ", total - visible.min(total)),
+                    Style::default().fg(pal.muted_c()).bg(pal.menu_bg_c()),
+                )));
+            }
+
+            let pop_h = (list_items.len() as u16) + 2;
             let pop_y = input_area.y.saturating_sub(pop_h);
-            let pop_w = 40.min(area.width.saturating_sub(4));
             let pop_area = Rect {
                 x: input_area.x.saturating_add(2),
                 y: pop_y,
@@ -8335,36 +8654,14 @@ impl App {
                 height: pop_h,
             };
 
-            frame.render_widget(Clear, pop_area);
-            let mut list_items = Vec::new();
-            for (idx, sug) in self.path_suggestions.iter().take(num_items).enumerate() {
-                let is_sel = idx == self.path_suggestion_index;
-                let style = if is_sel {
-                    Style::default()
-                        .fg(crate::app_palette::contrasting_text_on(
-                            crate::app_palette::current_palette().accent,
-                            &crate::app_palette::current_palette(),
-                        ))
-                        .bg(crate::app_palette::current_palette().accent_c())
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White).bg(Color::Rgb(46, 52, 64))
-                };
-                let tag = if sug.ends_with('/') {
-                    "[DIR] "
-                } else {
-                    "[FILE] "
-                };
-                list_items.push(ListItem::new(Span::styled(format!(" {tag}{sug} "), style)));
-            }
-
             let block = Block::default()
                 .borders(Borders::ALL)
                 .title(" Suggestions (Tab/Enter: select) ")
-                .border_style(Style::default().fg(Color::Rgb(143, 218, 255)))
-                .style(Style::default().bg(Color::Rgb(46, 52, 64)));
+                .border_style(Style::default().fg(pal.separator_c()))
+                .style(Style::default().bg(pal.menu_bg_c()));
             let block = crate::app_chrome::frame_container(block);
             let list_widget = List::new(list_items).block(block);
+            frame.render_widget(Clear, pop_area);
             frame.render_widget(list_widget, pop_area);
         }
 
@@ -8423,9 +8720,21 @@ impl App {
                     _ => " Session Info ",
                 };
 
-                // Color transition with opacity fade
-                let border_alpha = (255.0_f32 * anim_p).round() as u8;
-                let border_color = Color::Rgb(border_alpha, border_alpha, border_alpha);
+                // Color transition with opacity fade: the frame fades
+                // from dark into the palette ACCENT as the menu opens,
+                // so the menu border lands on the theme color instead of
+                // hard-coded white. Same animation curve as before.
+                let fpal = crate::app_palette::current_palette();
+                let acc = fpal.accent;
+                let bc = [
+                    (acc[0] as f32 * anim_p).round() as u8,
+                    (acc[1] as f32 * anim_p).round() as u8,
+                    (acc[2] as f32 * anim_p).round() as u8,
+                ];
+                let border_color = Color::Rgb(bc[0], bc[1], bc[2]);
+                // Badge text contrasts against the CURRENT (possibly still
+                // fading) frame color so it stays legible mid-animation.
+                let border_fg = crate::app_palette::contrasting_text_on(bc, &fpal);
                 let close_btn_str = " x ";
                 let close_btn_len = close_btn_str.chars().count() as u16;
 
@@ -8480,11 +8789,12 @@ impl App {
                     chrome.modal_tr_mid,
                     Style::default().fg(border_color).bg(modal_bg()),
                 ));
-                // " x " close button
+                // " x " close button (accent badge, same language as the
+                // title badge).
                 row0_spans.push(Span::styled(
                     close_btn_str,
                     Style::default()
-                        .fg(NORDIC_BG)
+                        .fg(border_fg)
                         .bg(border_color)
                         .add_modifier(Modifier::BOLD),
                 ));
@@ -10955,6 +11265,90 @@ impl App {
                                     val_scroll =
                                         (opt_lines[opt] + 1).saturating_sub(h.max(1)) as u16;
                                 }
+                            }
+                            15 => {
+                                // Auto Compact — master switch + CTX threshold.
+                                let on = s.auto_compact_enabled;
+                                val_lines.push(Line::from(vec![
+                                    Span::styled(
+                                        "Auto Compact: ",
+                                        Style::default()
+                                            .fg(Color::White)
+                                            .bg(modal_bg())
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
+                                    Span::styled(
+                                        if on { "ENABLED" } else { "DISABLED" },
+                                        Style::default()
+                                            .fg(if on {
+                                                Color::Rgb(163, 190, 140)
+                                            } else {
+                                                Color::Rgb(255, 120, 120)
+                                            })
+                                            .bg(modal_bg())
+                                            .add_modifier(Modifier::BOLD),
+                                    ),
+                                ]));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Compact threshold (% of CTX meter):",
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(modal_bg())
+                                        .add_modifier(Modifier::BOLD),
+                                )));
+                                for preset in crate::settings::COMPACT_RATIO_PRESETS {
+                                    let active = (s.compact_ratio - preset).abs() < f32::EPSILON;
+                                    let sym = if active { "● " } else { "○ " };
+                                    let color = if active {
+                                        Color::Rgb(163, 190, 140)
+                                    } else {
+                                        Color::Rgb(160, 175, 195)
+                                    };
+                                    val_lines.push(Line::from(vec![
+                                        Span::styled(
+                                            sym,
+                                            Style::default()
+                                                .fg(color)
+                                                .bg(modal_bg())
+                                                .add_modifier(Modifier::BOLD),
+                                        ),
+                                        Span::styled(
+                                            format!(
+                                                "{:.0}% {}",
+                                                preset * 100.0,
+                                                if (preset - 0.80).abs() < f32::EPSILON {
+                                                    "(default)"
+                                                } else {
+                                                    ""
+                                                }
+                                            ),
+                                            Style::default()
+                                                .fg(if active { Color::White } else { color })
+                                                .bg(modal_bg())
+                                                .add_modifier(if active {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ),
+                                    ]));
+                                }
+                                let (_, _, live_pct) = self.ctx_usage();
+                                val_lines.push(Line::from(Span::styled(
+                                    format!(
+                                        "CTX now: {:.0}% — compaction arms when it reaches the threshold, then runs before the next send. Manual /compact always works.",
+                                        live_pct.max(0.0)
+                                    ),
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
+                                )));
+                                val_lines.push(Line::from(Span::styled(
+                                    "Enter toggles on/off · ←/→ steps the threshold.",
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
+                                )));
                             }
                             _ => {}
                         }
@@ -14322,6 +14716,12 @@ impl App {
                     } else if self.header_dropdown_open {
                         self.header_dropdown_open = false;
                         self.esc_hold_start = None;
+                    } else if !self.show_menu && self.path_suggestion_active {
+                        // Dismiss the completion popup, keep the input.
+                        self.path_suggestions.clear();
+                        self.path_suggestion_active = false;
+                        self.path_suggestion_index = 0;
+                        self.esc_hold_start = None;
                     } else {
                         // Start / continue hold-to-exit (1s)
                         if self.esc_hold_start.is_none() {
@@ -14762,6 +15162,9 @@ impl App {
                             self.input_cursor_position =
                                 self.input_cursor_position.saturating_sub(1);
                         }
+                        if !self.show_menu {
+                            self.update_path_autocomplete();
+                        }
                     } else {
                         self.table_scroll_x = self.table_scroll_x.saturating_sub(4);
                     }
@@ -14773,6 +15176,9 @@ impl App {
                         } else {
                             self.input_cursor_position =
                                 (self.input_cursor_position + 1).min(self.input.chars().count());
+                        }
+                        if !self.show_menu {
+                            self.update_path_autocomplete();
                         }
                     } else {
                         self.table_scroll_x = self.table_scroll_x.saturating_add(4);
@@ -15921,6 +16327,12 @@ impl App {
                                 } else {
                                     self.settings_col = 1;
                                 }
+                            } else if self.settings_tab == SETTINGS_AUTO_COMPACT {
+                                if self.settings_col == 1 {
+                                    self.adjust_setting_value(0); // toggle master switch
+                                } else {
+                                    self.settings_col = 1;
+                                }
                             } else if self.settings_col == 0 {
                                 self.settings_col = 1; // shift focus to Column 2
                             } else {
@@ -15997,6 +16409,10 @@ impl App {
                         self.recent_tool_calls.clear();
                         self.tool_result_context.clear();
                         self.dispatch_registry.reset_turn();
+                        // `@path` is UI sugar for cwd-relative paths: rewrite
+                        // to the `$CURRENT/` form the model protocol already
+                        // understands (host expands it for tools).
+                        let prompt = crate::complete::resolve_at_paths(&prompt);
                         // A new user prompt opens a new first-class agent run.
                         // Any live previous run is cancelled + archived first.
                         self.start_new_run(prompt.clone());
@@ -16009,6 +16425,15 @@ impl App {
                             ));
                         }
 
+                        // Deferred automatic compaction runs here (same
+                        // pipeline as manual /compact) before anything is
+                        // sent, so the new turn never carries the retired
+                        // transcript.
+                        if self.compact_pending_auto && !*self.is_generating.lock().unwrap() {
+                            self.compact_context(crate::compact::CompactReason::Automatic)
+                                .await;
+                        }
+
                         if prompt.starts_with('/') {
                             self.messages.push(format!("You: {}", prompt));
                             let parts: Vec<&str> = prompt.split_whitespace().collect();
@@ -16018,7 +16443,7 @@ impl App {
                                         "System: Press F1 for shortcut overlay.\n\
 /allow   — grant write/cmd for this session (Ask mode)\n\
 /swarm   — initialize swarm orchestrator mode and spawn sub-agents\n\
-/compact — compress chat → memory, forget old turns\n\
+/compact — compress chat → compact context, forget old turns\n\
 /cancel-download — clear stuck HF download lock so you can install another model\n\
 /download-status — show active download lock\n\
 /copy /theme /save /load — utilities"
@@ -16072,16 +16497,15 @@ impl App {
                                     self.trigger_generation_from_context();
                                 }
                                 "/compact" | "/compact!" | "/gc" => {
-                                    let before = self.estimate_full_session_tokens();
-                                    let msgs = self.messages.len();
-                                    self.compact_context_to_memory(true);
-                                    self.messages.push(format!(
-                                        "System: [OK] /compact done — was ~{} tokens / {} messages → \
-                                         ~{} tokens now. Summary in memory. Type a new question.",
-                                        before,
-                                        msgs,
-                                        self.context_tokens_est
-                                    ));
+                                    if *self.is_generating.lock().unwrap() {
+                                        self.messages.push(
+                                            "System: Cannot compact while generating — interrupt first."
+                                                .to_string(),
+                                        );
+                                    } else {
+                                        self.compact_context(crate::compact::CompactReason::Manual)
+                                            .await;
+                                    }
                                 }
                                 "/tasks" => {
                                     let list = self.task_manager.list();
@@ -16257,7 +16681,7 @@ pub fn calculate_app_menu_layout(area: ratatui::layout::Rect, anim_p: f32) -> Ap
 }
 
 /// Deterministic transcript compress for context budget (small models can't self-summarize reliably).
-fn compress_transcript(archive: &str) -> String {
+pub(crate) fn compress_transcript(archive: &str) -> String {
     let mut user_bits = Vec::new();
     let mut agent_bits = Vec::new();
     let mut tool_bits = Vec::new();
@@ -16460,6 +16884,46 @@ mod tests {
             "Animation must complete"
         );
         assert!(frames >= 1, "Should have run at least one frame");
+    }
+
+    #[tokio::test]
+    async fn test_completed_animation_still_draws_final_frame() {
+        // Frozen-chip regression: a chip collapse whose completion lands
+        // on an otherwise-idle tick must still draw the settled rest
+        // state. The old loop condition (`needs_redraw || post-tick
+        // animating`) skipped that tick, freezing the last transient
+        // frame (badge + label, zero body lines) on screen forever.
+        let mut app = App::new();
+        let anim_id = 7u32;
+        app.krama
+            .insert_new_id("collapse", anim_id, TRES16Bits::from_millis(250));
+        app.krama.restart_progress("collapse", anim_id);
+
+        // Tick 1 (mid-flight): animating before and after → draw.
+        let was = app.krama.is_any_animation_inprogress();
+        assert!(was);
+        app.krama.update_progress(TRES16Bits::from_millis(100));
+        assert!(app.krama.is_any_animation_inprogress());
+        assert!(app.should_draw_frame(false, was));
+
+        // Tick 2 (completion): animating before, settled after → the
+        // final rest state must STILL draw.
+        let was = app.krama.is_any_animation_inprogress();
+        assert!(was);
+        app.krama.update_progress(TRES16Bits::from_millis(200));
+        let still = app.krama.is_any_animation_inprogress();
+        assert!(!still, "250ms animation completes on this tick");
+        assert!(
+            !(false || still),
+            "old condition skips the completion tick — the bug"
+        );
+        assert!(
+            app.should_draw_frame(false, was),
+            "settled rest state must draw after the completing tick"
+        );
+
+        // Idle afterwards: nothing before, nothing after → no draw.
+        assert!(!app.should_draw_frame(false, false));
     }
 
     #[tokio::test]
@@ -17897,6 +18361,60 @@ mod thunder_tests {
         unisolate_chrome(_guard, real_home, tmp, saved);
     }
 
+    #[test]
+    fn resume_decision_matrix_after_completed_tools() {
+        // The canonical continuation decision: resume the SAME run iff
+        // this turn produced tool results, the completion still owns a
+        // live uncancelled run, nothing deliberately stopped the loop,
+        // and no generation is already running.
+        use crate::app::should_resume_after_tools;
+        // Happy path: completed write, live run → resume.
+        assert!(should_resume_after_tools(
+            true, false, false, true, false, false, 1, false
+        ));
+        // Every veto independently blocks the resume.
+        assert!(!should_resume_after_tools(
+            false, false, false, true, false, false, 1, false
+        )); // nothing produced
+        assert!(!should_resume_after_tools(
+            true, true, false, true, false, false, 1, false
+        )); // deliberate stop
+        assert!(!should_resume_after_tools(
+            true, false, true, true, false, false, 1, false
+        )); // incomplete tool
+        assert!(!should_resume_after_tools(
+            true, false, false, false, false, false, 1, false
+        )); // stale run
+        assert!(!should_resume_after_tools(
+            true, false, false, true, true, false, 1, false
+        )); // cancelled
+        assert!(!should_resume_after_tools(
+            true, false, false, true, false, true, 1, false
+        )); // ask parked
+        assert!(!should_resume_after_tools(
+            true, false, false, true, false, false, 20, false
+        )); // turn cap
+        assert!(!should_resume_after_tools(
+            true, false, false, true, false, false, 999, false
+        )); // repeat block
+        assert!(!should_resume_after_tools(
+            true, false, false, true, false, false, 1, true
+        )); // already running
+    }
+
+    #[test]
+    fn incomplete_tool_path_preserved() {
+        // Genuinely incomplete tags still route to the recovery path —
+        // the resume decision never fires for them.
+        assert!(App::has_incomplete_tool_tag("prose <write src=\"a\">..."));
+        assert!(!App::has_incomplete_tool_tag(
+            "prose <write src=\"a\">x</write> done"
+        ));
+        assert!(!crate::app::should_resume_after_tools(
+            true, false, true, true, false, false, 0, false
+        ));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn menu_keyboard_nav_intact() {
         // Keyboard navigation unaffected by the geometry work: Right in
@@ -17913,6 +18431,321 @@ mod thunder_tests {
         app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
             .await;
         assert_eq!(app.settings_tab, 3, "left returns to previous tab");
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    /// App with a failing backend (no daemon): drives the labeled
+    /// deterministic-fallback branch hermetically — no network, no model.
+    /// Caller must hold `isolate_chrome()` across the whole test.
+    fn compact_test_app() -> App {
+        let mut app = App::new();
+        app.backend = crate::backend::AgentBackend::Ollama(crate::backend::OllamaBackend::new(
+            "test-none".into(),
+        ));
+        app
+    }
+
+    fn compact_long_history() -> (Vec<String>, Vec<String>) {
+        // A long conversation with decisions, changed requirements, a
+        // fixed bug, tool use, and one UNRESOLVED bug — plus unique
+        // markers that must vanish from the next request.
+        let mut messages = vec!["System: Welcome to Hercules".to_string()];
+        for i in 0..30 {
+            messages.push(format!("You: filler question {i} ANCIENT-MARKER-{i}"));
+            messages.push(format!("Agent: filler answer {i} with some prose"));
+        }
+        messages.push("You: use deno backend DEN-O-REQUIREMENT".to_string());
+        messages.push("Agent: switched runtime to deno DENO-STATE".to_string());
+        messages.push("You: add magnetic snapping".to_string());
+        messages.push("Agent: snapping unfinished SNAPPING-OPEN-BUG".to_string());
+        let tools = vec![
+            "[write: a.txt] Wrote 5 lines.".to_string(),
+            "System: [Task #1 DONE] `cargo test` (3 lines) — result delivered to agent".to_string(),
+        ];
+        (messages, tools)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compact_pipeline_fallback_installs_and_replaces() {
+        // Full pipeline with an unavailable model: labeled deterministic
+        // fallback installs, old transcript leaves, tail stays.
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mem_before = crate::agent::AgentEngine::memory_read_all();
+        let mut app = compact_test_app();
+        let (messages, tools) = compact_long_history();
+        app.messages = messages;
+        app.tool_result_context = tools;
+        let before = app.estimate_full_session_tokens();
+        let count_before = app.context_compact_count;
+
+        app.compact_context(crate::compact::CompactReason::Manual)
+            .await;
+
+        let compact = app.compact_context.clone().expect("compact installed");
+        assert!(
+            compact.contains("deterministic fallback"),
+            "fallback labeled honestly"
+        );
+        // Old markers gone from stored messages…
+        assert!(!app.messages.iter().any(|m| m.contains("ANCIENT-MARKER-7")));
+        assert!(!app.messages.iter().any(|m| m.contains("DEN-O-REQUIREMENT")));
+        // …tail kept (manual = last pair)…
+        assert!(app.messages.iter().any(|m| m.contains("SNAPPING-OPEN-BUG")));
+        // …tools cleared, count bumped, estimate shrank.
+        assert!(app.tool_result_context.is_empty());
+        assert_eq!(app.context_compact_count, count_before + 1);
+        let after = app.estimate_full_session_tokens();
+        assert!(
+            after < before,
+            "compaction must shrink context ({after} < {before})"
+        );
+        // Memory untouched: compact context is NOT permanent memory.
+        assert_eq!(crate::agent::AgentEngine::memory_read_all(), mem_before);
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compact_next_request_excludes_retired_transcript() {
+        // The acceptance payload with a SEMANTIC compact installed (what
+        // the model path produces): system + compact + tail, never the
+        // retired transcript — and smaller than the original.
+        // (The deterministic fallback path is covered by the pipeline
+        // test above; fallback quotes are approximate by labeled design.)
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mut app = compact_test_app();
+        let (messages, _tools) = compact_long_history();
+        let before = {
+            app.messages = messages.clone();
+            app.estimate_full_session_tokens()
+        };
+        app.messages = vec![
+            "You: add magnetic snapping".to_string(),
+            "Agent: snapping unfinished SNAPPING-OPEN-BUG".to_string(),
+        ];
+        app.compact_context = Some(
+            "# COMPACT CONTEXT\n\n## Current Goal\nBuild it.\n\n## User Requirements\n\
+             - Deno backend DENO-STATE.\n\n## Implemented\n- a.txt created.\n\n\
+             ## Known Bugs / Unresolved\n- Magnetic snapping unfinished SNAPPING-OPEN-BUG.\n\n\
+             ## Files / Components\n- a.txt.\n\n## Tests / Verification\n- cargo test passes.\n\n\
+             ## Constraints\n- None.\n\n## Next Required Work\n- Finish snapping.\n"
+                .to_string(),
+        );
+        let prompt = app.build_context_prompt();
+        // Compact present with the state that matters…
+        assert!(prompt.contains("# COMPACT CONTEXT"));
+        assert!(
+            prompt.contains("SNAPPING-OPEN-BUG"),
+            "unresolved bug survives"
+        );
+        assert!(prompt.contains("DENO-STATE"), "requirements/state survive");
+        // …retired markers absent…
+        assert!(
+            !prompt.contains("ANCIENT-MARKER-12"),
+            "old messages excluded"
+        );
+        assert!(!prompt.contains("ANCIENT-MARKER-0"));
+        assert!(!prompt.contains("filler answer 5"));
+        // …and the whole request is smaller.
+        assert!(
+            crate::settings::estimate_tokens(&prompt) < before,
+            "request must shrink after compaction"
+        );
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compact_auto_trigger_respects_switch_and_threshold() {
+        // The CTX-meter trigger: switch OFF never arms (even over
+        // budget), the threshold arms only past its own percent, and a
+        // roomy window stays quiet. No backend calls: arming only.
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let saved_on = crate::settings::auto_compact_enabled();
+        let saved_ratio = crate::settings::compact_ratio();
+        let saved_limit = crate::settings::context_token_limit();
+        let (messages, tools) = compact_long_history();
+        let mk_app = || {
+            let mut app = compact_test_app();
+            app.messages = messages.clone();
+            app.tool_result_context = tools.clone();
+            app
+        };
+
+        // Over budget (4K window) but switched OFF → silent.
+        crate::settings::set_auto_compact_enabled(false);
+        crate::settings::set_context_token_limit(4_096);
+        crate::settings::set_compact_ratio(0.75);
+        let mut app = mk_app();
+        app.maybe_compact_context();
+        assert!(!app.compact_pending_auto, "disabled switch must not arm");
+
+        // Same pressure, switched ON → arms before the next send.
+        crate::settings::set_auto_compact_enabled(true);
+        let mut app = mk_app();
+        app.maybe_compact_context();
+        assert!(app.compact_pending_auto, "over-threshold CTX must arm");
+
+        // Same history, roomy window at 95% → stays quiet. Short
+        // history here so the 40-message safety valve stays out of it:
+        // this case isolates the token threshold alone.
+        crate::settings::set_context_token_limit(262_144);
+        crate::settings::set_compact_ratio(0.95);
+        let mut app = compact_test_app();
+        app.messages = vec!["System: Welcome to Hercules".to_string()];
+        for i in 0..10 {
+            app.messages.push(format!("You: filler question {i}"));
+            app.messages.push(format!("Agent: filler answer {i}"));
+        }
+        app.maybe_compact_context();
+        assert!(
+            !app.compact_pending_auto,
+            "below-threshold CTX must not arm"
+        );
+
+        crate::settings::set_auto_compact_enabled(saved_on);
+        crate::settings::set_compact_ratio(saved_ratio);
+        crate::settings::set_context_token_limit(saved_limit);
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compact_short_history_keeps_original_intact() {
+        // Nothing worth compacting: no backend call effect, messages and
+        // count untouched — no destructive partial compaction.
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mut app = compact_test_app();
+        app.messages = vec![
+            "System: Welcome to Hercules".to_string(),
+            "You: hi".to_string(),
+            "Agent: hello".to_string(),
+        ];
+        let before_msgs = app.messages.clone();
+        let before_count = app.context_compact_count;
+        app.compact_context(crate::compact::CompactReason::Manual)
+            .await;
+        assert_eq!(app.messages, before_msgs, "original kept intact");
+        assert!(app.compact_context.is_none());
+        assert_eq!(app.context_compact_count, before_count);
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn input_completion_commands_and_at_paths() {
+        // Host-side completion wiring: `/` lists commands, Tab accepts;
+        // `@` lists the workspace and keeps its sigil on accept.
+        fn inserts(app: &App) -> Vec<String> {
+            app.path_suggestions
+                .iter()
+                .map(|c| c.insert_text.clone())
+                .collect()
+        }
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mut app = App::new();
+        app.input = "/".to_string();
+        app.input_cursor_position = 1;
+        app.update_path_autocomplete();
+        assert!(app.path_suggestion_active, "bare slash lists commands");
+        assert!(inserts(&app).contains(&"/help".to_string()));
+        assert!(inserts(&app).contains(&"/compact".to_string()));
+
+        app.input = "/co".to_string();
+        app.input_cursor_position = 3;
+        app.update_path_autocomplete();
+        assert!(inserts(&app).contains(&"/compact".to_string()));
+        assert!(!inserts(&app).contains(&"/help".to_string()));
+        app.path_suggestion_index = app
+            .path_suggestions
+            .iter()
+            .position(|s| s.insert_text == "/compact")
+            .unwrap();
+        assert!(app.accept_path_suggestion());
+        assert_eq!(app.input, "/compact", "Tab completes the command");
+
+        // `@` completes against the real workspace (repo cwd is never
+        // empty) and preserves the sigil.
+        app.input = "@sr".to_string();
+        app.input_cursor_position = 3;
+        app.update_path_autocomplete();
+        assert!(app.path_suggestion_active, "@ lists workspace entries");
+        let idx = app
+            .path_suggestions
+            .iter()
+            .position(|s| s.insert_text == "@src/")
+            .expect("repo has src/");
+        app.path_suggestion_index = idx;
+        assert!(app.accept_path_suggestion());
+        assert_eq!(app.input, "@src/", "sigil preserved, dir open for more");
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completion_integration_at_flow_and_submit() {
+        // Integration shape from the spec: type `@` (candidates appear),
+        // `src/` (update), `ma` (`main.rs` appears), Tab (input becomes
+        // `@src/main.rs`); then `read @` + select + submit path contains
+        // exactly the selected path. Uses the repo workspace as cwd.
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mut app = App::new();
+        let mut type_text = |app: &mut App, chunk: &str| {
+            for c in chunk.chars() {
+                app.input.insert(app.input_cursor_position, c);
+                app.input_cursor_position += 1;
+            }
+            app.update_path_autocomplete();
+        };
+        type_text(&mut app, "@");
+        assert!(app.path_suggestion_active, "candidates appear");
+        type_text(&mut app, "src/");
+        assert!(app.path_suggestion_active, "candidates update");
+        type_text(&mut app, "ma");
+        assert!(
+            app.path_suggestions
+                .iter()
+                .any(|s| s.insert_text == "@src/main.rs"),
+            "main.rs appears"
+        );
+        app.path_suggestion_index = app
+            .path_suggestions
+            .iter()
+            .position(|s| s.insert_text == "@src/main.rs")
+            .unwrap();
+        assert!(app.accept_path_suggestion());
+        assert_eq!(app.input, "@src/main.rs");
+
+        // Second flow: `read @` then pick the first candidate via Tab.
+        app.input.clear();
+        app.input_cursor_position = 0;
+        app.update_path_autocomplete();
+        type_text(&mut app, "read @");
+        assert!(app.path_suggestion_active);
+        app.path_suggestion_index = app
+            .path_suggestions
+            .iter()
+            .position(|s| s.insert_text == "@src/")
+            .expect("workspace lists src/");
+        assert!(app.accept_path_suggestion());
+        assert_eq!(app.input, "read @src/");
+        let submitted = crate::complete::resolve_at_paths(&app.input);
+        assert_eq!(submitted, "read $CURRENT/src/");
+        assert!(!submitted.contains('@'), "no raw sigil reaches the model");
+
+        // `$CURRENT/…` and `@…` resolve to the same canonical file.
+        let via_current = crate::agent::AgentEngine::expand_path("$CURRENT/src/main.rs");
+        let via_at = crate::agent::AgentEngine::expand_path(&crate::complete::resolve_at_paths(
+            "@src/main.rs",
+        ));
+        assert_eq!(via_current, via_at);
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(via_current, cwd.join("src/main.rs"));
+
+        // Esc dismisses the popup without touching the input.
+        app.input = "@sr".to_string();
+        app.input_cursor_position = 3;
+        app.update_path_autocomplete();
+        assert!(app.path_suggestion_active);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .await;
+        assert!(!app.path_suggestion_active, "Esc closes completion");
+        assert_eq!(app.input, "@sr", "input untouched by Esc");
         unisolate_chrome(_guard, real_home, tmp, saved);
     }
 
@@ -18038,6 +18871,100 @@ mod thunder_tests {
 
     fn count_occurrences(haystack: &str, needle: &str) -> usize {
         haystack.matches(needle).count()
+    }
+
+    /// (target, body) of the write chip whose target ends with `suffix`.
+    fn write_chip_pair(app: &App, suffix: &str) -> (String, String) {
+        let c = app
+            .tool_chips
+            .iter()
+            .find(|c| {
+                c.kind == crate::tool_panel::ToolPanelKind::Write && c.target.ends_with(suffix)
+            })
+            .unwrap_or_else(|| panic!("write chip for {suffix} must exist"));
+        (c.target.clone(), c.body.clone())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_chips_keep_target_body_pairs_across_polls() {
+        // Exact reported regression: staggered multi-file stream where an
+        // HTML body once showed up under vite.config.js. Target and body
+        // must stay an inseparable pair on every chip, on every poll,
+        // through completion — and the Action panel must render the body
+        // stored in THAT action, never a neighbor's.
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mut app = App::new();
+        let mut stream = String::new();
+        // package.json → JSON, svelte.config.js → config,
+        // vite.config.js → config, index.html → HTML.
+        let pkg = "{\n  \"name\": \"flowchart-app\"\n}";
+        let svelte = "const config = svelte();";
+        let vite = "export default { plugins: [] };";
+        // Poll 1-2: package.json opens, streams, closes.
+        stream.push_str("<write src=\"package.json\">");
+        app.sync_tool_chips(&stream);
+        stream.push_str(pkg);
+        app.sync_tool_chips(&stream);
+        stream.push_str("</write>");
+        app.sync_tool_chips(&stream);
+        // Poll 3-4: svelte.config.js opens, closes.
+        stream.push_str("<write src=\"svelte.config.js\">");
+        app.sync_tool_chips(&stream);
+        stream.push_str(svelte);
+        app.sync_tool_chips(&stream);
+        stream.push_str("</write>");
+        app.sync_tool_chips(&stream);
+        // Poll 5-6: vite.config.js opens, closes.
+        stream.push_str("<write src=\"vite.config.js\">");
+        app.sync_tool_chips(&stream);
+        stream.push_str(vite);
+        app.sync_tool_chips(&stream);
+        stream.push_str("</write>");
+        app.sync_tool_chips(&stream);
+        // Poll 7-9: index.html streams its HTML body in chunks while all
+        // previous chips are closed — the crossing moment.
+        stream.push_str("<write src=\"index.html\">");
+        app.sync_tool_chips(&stream);
+        stream.push_str("<!DOCTYPE html>\n<html>");
+        app.sync_tool_chips(&stream);
+        // The reported mismatch, asserted on EVERY poll from here on:
+        // vite keeps its config body, index keeps the HTML.
+        for chunk in ["\n</html>", "</write>"] {
+            stream.push_str(chunk);
+            app.sync_tool_chips(&stream);
+            let (vt, vb) = write_chip_pair(&app, "vite.config.js");
+            assert!(
+                !vb.trim_start().starts_with("<!DOCTYPE html>"),
+                "vite body crossed: {vt}"
+            );
+            assert!(vb.contains("export default"), "vite keeps its body");
+            let (it, ib) = write_chip_pair(&app, "index.html");
+            assert!(ib.contains("<!DOCTYPE html>"), "index keeps its HTML: {it}");
+            let (pt, pb) = write_chip_pair(&app, "package.json");
+            assert!(pb.contains("flowchart-app"), "package keeps JSON: {pt}");
+            let (st, sb) = write_chip_pair(&app, "svelte.config.js");
+            assert!(sb.contains("svelte()"), "svelte keeps config: {st}");
+        }
+        // Exactly one chip per file, all closed.
+        let writes: Vec<_> = app
+            .tool_chips
+            .iter()
+            .filter(|c| c.kind == crate::tool_panel::ToolPanelKind::Write)
+            .collect();
+        assert_eq!(writes.len(), 4, "one chip per file, no duplicates");
+        assert!(writes.iter().all(|c| c.tag_closed));
+        // The Action panel renders the stored body of THAT chip.
+        let vite_id = app
+            .tool_chips
+            .iter()
+            .find(|c| c.target.ends_with("vite.config.js"))
+            .expect("vite chip")
+            .id;
+        app.force_open_panel_from_chip(vite_id);
+        let panel = app.tool_panel.as_ref().expect("panel open");
+        assert!(!panel.body.trim_start().starts_with("<!DOCTYPE html>"));
+        assert!(panel.body.contains("export default"));
+        unisolate_chrome(_guard, real_home, tmp, saved);
     }
 
     #[tokio::test(flavor = "current_thread")]
