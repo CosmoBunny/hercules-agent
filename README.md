@@ -8,6 +8,62 @@ Local coding agent with a terminal UI. Runs models on your machine via:
 
 Working name / crate: `hercules-agent`. Binary: `hercules`.
 
+## Getting started (Beta 3)
+
+Download the latest release here:
+[CosmoBunny/hercules-agent — Releases](https://github.com/CosmoBunny/hercules-agent/releases/tag/v0.0.3b)
+
+### 1. Pick the binary for your machine
+
+| OS      | Integrated graphics | NVIDIA GPU | AMD Radeon GPU | ARM (aarch64) |
+| ------- | ------------------- | ---------- | -------------- | ------------- |
+| Linux   | `hercules-normal-linux-x86_64.zip` | `hercules-nvidia-linux-x86_64.zip` | `hercules-amd-linux-x86_64.zip` | `hercules-normal-linux-aarch64.zip` |
+| Windows | `hercules-normal-windows-x86_64.zip` | `hercules-nvidia-windows-x86_64.zip` | `hercules-amd-windows-x86_64.zip` | — |
+| macOS   | `hercules-normal-macos-aarch64.zip` (Metal GPU acceleration) | — | — | ✅ (same file) |
+
+Unzip and run the `hercules` binary.
+
+### 2. Download an LLM model
+
+Press **F2** to open the Registry menu, type a model name to search,
+navigate with the **↑/↓** arrow keys, and press **Enter** to download.
+
+> ⚠️ Caution: Instruct models may ignore the system tool instructions —
+> prefer a tool-capable chat model.
+
+![Registry menu: search and download a model (F2)](https://github.com/user-attachments/assets/ac1925d1-13d6-4b16-9749-906a3967a842)
+
+### 3. Select the model
+
+After the download finishes, press **F3** to open the Model menu and
+select the model you just downloaded.
+
+![Model menu: select the downloaded model (F3)](https://github.com/user-attachments/assets/4312585c-28e0-4185-b008-21fdceabf367)
+
+### 4. Configuration (optional)
+
+![Settings: runtime configuration](https://github.com/user-attachments/assets/9af8f4fb-9365-42c5-8f12-4d37e07f61d5)
+
+- **Power Mode** — how much power to spend on this AI model.
+- **MTP** — multi-token prediction: extra prediction of the next tokens
+  at the cost of RAM usage and precision.
+- **Auto Collapse** — when enabled, every Agent response collapses the
+  previous label.
+- **Target FPS** — increase for smoother-feeling animation.
+- **Stall Time** — watchdog against worst cases like the AI getting stuck
+  on prefill.
+- **Repeat Detector** — detects consecutive repeated text when the AI
+  hallucinates/loops, and notifies the AI about the repetition.
+- **Context Window** — lowers KV-cache demand. In the worst case the OS
+  may kill the process for system safety, so decreasing this can prevent
+  crashes.
+- **Permission** — allow the AI to act and control directory access.
+  Default is always allow.
+- **Web Search** — which web provider the AI may use for online search.
+  Default is DuckDuckGo.
+- **HF Token** — if Hugging Face searches return empty (rate limiting),
+  create a Hugging Face token and paste it here to avoid the error.
+
 ## Features (current)
 
 - Ratatui TUI chat with tool chips (`write`, `cmd`, `ls`, `read`, `memory`)
