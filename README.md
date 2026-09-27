@@ -2,7 +2,7 @@
   <img src="logo.png" width="160" alt="Hercules Agent logo">
 </p>
 
-# Hercules Agent
+# ℍ𝕖𝕣𝕔𝕦𝕝𝕖𝕤 𝔸𝕘𝕖𝕟𝕥
 
 Local coding agent with a terminal UI. It runs models on your machine,
 gives the model real tools (files, shell, web, sub-agents), and renders
