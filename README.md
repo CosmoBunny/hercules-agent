@@ -8,10 +8,10 @@ Local coding agent with a terminal UI. Runs models on your machine via:
 
 Working name / crate: `hercules-agent`. Binary: `hercules`.
 
-## Getting started (Beta 3)
+## Getting started
 
 Download the latest release here:
-[CosmoBunny/hercules-agent — Releases](https://github.com/CosmoBunny/hercules-agent/releases/tag/v0.0.3b)
+[CosmoBunny/hercules-agent — Releases](https://github.com/CosmoBunny/hercules-agent/releases/latest)
 
 ### 1. Pick the binary for your machine
 
@@ -28,7 +28,7 @@ Unzip and run the `hercules` binary.
 Press **F2** to open the Registry menu, type a model name to search,
 navigate with the **↑/↓** arrow keys, and press **Enter** to download.
 
-> ⚠️ Caution: Instruct models may ignore the system tool instructions —
+> **Caution:** Instruct models may ignore the system tool instructions —
 > prefer a tool-capable chat model.
 
 ![Registry menu: search and download a model (F2)](https://github.com/user-attachments/assets/ac1925d1-13d6-4b16-9749-906a3967a842)
