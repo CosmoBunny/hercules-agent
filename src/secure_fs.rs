@@ -568,7 +568,10 @@ fn secure_open_write_anchored(
                 .unwrap_or(libc::AT_FDCWD),
             name_c.as_ptr(),
             flags,
-            0o666 as libc::mode_t,
+            // mode_t is u16 on macOS: passing it straight to the
+            // variadic openat is E0617 there. c_uint (u32 everywhere)
+            // is what the compiler expects for variadic args.
+            0o666 as libc::c_uint,
         )
     };
     if fd < 0 {
@@ -705,10 +708,12 @@ fn open_write_handle(path: &Path, mode: WriteOpenMode) -> Result<File, SecureOpe
     {
         use std::os::windows::ffi::OsStrExt;
         use std::os::windows::io::{FromRawHandle, OwnedHandle};
-        use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Foundation::{
+            GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        };
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
+            FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING,
         };
         const ERROR_FILE_NOT_FOUND: u32 = 2;
         const ERROR_PATH_NOT_FOUND: u32 = 3;
