@@ -9,7 +9,7 @@ Working name / crate: `hercules-agent`. Binary: `hercules`.
 
 ## Demo
 
-![Hercules Agent demo](demo.gif)
+<img src="demo.gif" width="100%" alt="Hercules Agent demo">
 
 ## Getting started
 
