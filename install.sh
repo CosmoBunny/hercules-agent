@@ -64,7 +64,7 @@ if [[ "$FLAVOR" == "auto" ]]; then
     FLAVOR="normal" # Metal acceleration is in the standard macOS build
   elif command -v nvidia-smi >/dev/null 2>&1; then
     FLAVOR="nvidia"
-  elif command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qiE 'vga|3d|display.*amd|radeon'; then
+  elif command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qiE 'amd|radeon'; then
     FLAVOR="amd"
   else
     FLAVOR="normal"
