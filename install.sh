@@ -99,16 +99,19 @@ pretty_os() { case "$1" in
 esac; }
 
 # --- 3. Banner ------------------------------------------------------------
-SPLASH="$(curl -fsSL --max-time 15 "https://raw.githubusercontent.com/$REPO/main/splash.txt" 2>/dev/null || true)"
+# Plain box-drawing only: the splash.txt sextants turn to tofu on many
+# fonts, so the installer uses its own portable mark.
 LINE="-------------------------------------------------------------------------"
 echo "$LINE"
-if [[ -n "$SPLASH" ]]; then
-  # Tabs expand at width 4 — same as the in-app splash renderer
-  # (src/splash.rs); raw terminals use 8 and break the artwork.
-  printf '%s\n' "$SPLASH" | expand -t 4
-else
-  echo "HERCULES AGENT"
-fi
+cat <<'BANNER'
+  ██╗  ██╗
+  ██║  ██║
+  ███████║
+  ██╔══██║
+  ██║  ██║
+  ╚═╝  ╚═╝
+  HERCULES AGENT
+BANNER
 echo "$LINE"
 echo "  CPU : $CPU"
 echo "  GPU : $GPU"
@@ -151,7 +154,9 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cd "$TMP"
 BASE_URL="https://github.com/$REPO/releases/download/$TAG"
-curl -fL --progress-bar -o "$ASSET" "$BASE_URL/$ASSET"
+echo "  Downloading (this can take a minute on slow connections)..."
+curl -fsSL -o "$ASSET" "$BASE_URL/$ASSET"
+echo "  Downloaded $ASSET ($(du -h "$ASSET" | cut -f1))"
 if printf '%s\n' "$ASSETS" | grep -qxF "$ASSET.sha256"; then
   curl -fsSL -o "$ASSET.sha256" "$BASE_URL/$ASSET.sha256"
   if command -v sha256sum >/dev/null 2>&1; then

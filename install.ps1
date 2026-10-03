@@ -24,6 +24,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Clean, fast downloads: the default progress bar is slow and garbles.
+$ProgressPreference = 'SilentlyContinue'
 $Repo = 'CosmoBunny/hercules-agent'
 $Line = '-------------------------------------------------------------------------'
 
@@ -64,13 +66,16 @@ if ($Flavor -eq 'auto') {
 $PrettyFlavor = @{ normal = 'Normal'; nvidia = 'Nvidia'; amd = 'Amd' }[$Flavor]
 
 # --- 3. Banner ---------------------------------------------------------------
+# Plain box-drawing only (same portable mark as install.sh): the
+# splash.txt sextants turn to tofu on many fonts.
 Write-Host $Line
-try {
-  $Splash = Invoke-RestMethod "https://raw.githubusercontent.com/$Repo/main/splash.txt" -TimeoutSec 15
-  Write-Host $Splash
-} catch {
-  Write-Host 'HERCULES AGENT'
-}
+Write-Host '  ██╗  ██╗'
+Write-Host '  ██║  ██║'
+Write-Host '  ███████║'
+Write-Host '  ██╔══██║'
+Write-Host '  ██║  ██║'
+Write-Host '  ╚═╝  ╚═╝'
+Write-Host '  HERCULES AGENT'
 Write-Host $Line
 Write-Host "  CPU : $Cpu"
 Write-Host "  GPU : $Gpu"
@@ -110,7 +115,10 @@ New-Item -ItemType Directory -Path $Temp | Out-Null
 try {
   $BaseUrl = "https://github.com/$Repo/releases/download/$Tag"
   $Archive = Join-Path $Temp $Asset
+  Write-Host '  Downloading (this can take a minute on slow connections)...'
   Invoke-WebRequest "$BaseUrl/$Asset" -OutFile $Archive
+  $SizeMB = [math]::Round((Get-Item $Archive).Length / 1MB, 1)
+  Write-Host "  Downloaded $Asset (${SizeMB} MB)"
   $ChecksumName = "$Asset.sha256"
   if ($Names -contains $ChecksumName) {
     $ChecksumFile = Join-Path $Temp $ChecksumName
