@@ -66,20 +66,25 @@ if ($Flavor -eq 'auto') {
 $PrettyFlavor = @{ normal = 'Normal'; nvidia = 'Nvidia'; amd = 'Amd' }[$Flavor]
 
 # --- 3. Banner ---------------------------------------------------------------
-# Plain box-drawing only (same portable mark as install.sh): the
-# splash.txt sextants turn to tofu on many fonts.
-Write-Host $Line
-Write-Host '  ██╗  ██╗'
-Write-Host '  ██║  ██║'
-Write-Host '  ███████║'
-Write-Host '  ██╔══██║'
-Write-Host '  ██║  ██║'
-Write-Host '  ╚═╝  ╚═╝'
-Write-Host '  HERCULES AGENT'
-Write-Host $Line
-Write-Host "  CPU : $Cpu"
-Write-Host "  GPU : $Gpu"
-Write-Host "  RAM : $Ram"
+# Actual splash.txt, printed raw. A splash.txt next to the script wins
+# (repo checkout); otherwise fetch from GitHub.
+$Splash = $null
+$LocalSplash = Join-Path $PSScriptRoot 'splash.txt'
+if ($LocalSplash -and (Test-Path $LocalSplash)) {
+  $Splash = Get-Content -Raw $LocalSplash
+} else {
+  try {
+    $Splash = Invoke-RestMethod "https://raw.githubusercontent.com/$Repo/main/splash.txt" -TimeoutSec 15
+  } catch {
+    $Splash = 'HERCULES AGENT'
+  }
+}
+$SplashLines = ($Splash -split "`n")
+$Hw = @("CPU : $Cpu", "GPU : $Gpu", "RAM : $Ram")
+for ($i = 0; $i -lt $SplashLines.Count; $i++) {
+  if ($i -lt $Hw.Count) { Write-Host ($SplashLines[$i] + '  ' + $Hw[$i]) }
+  else { Write-Host $SplashLines[$i] }
+}
 Write-Host $Line
 Write-Host "> Downloading Hercules | $PrettyFlavor | Windows ($Arch)"
 
@@ -116,9 +121,53 @@ try {
   $BaseUrl = "https://github.com/$Repo/releases/download/$Tag"
   $Archive = Join-Path $Temp $Asset
   Write-Host '  Downloading (this can take a minute on slow connections)...'
+  $DlStart = Get-Date
   Invoke-WebRequest "$BaseUrl/$Asset" -OutFile $Archive
+  $Secs = ((Get-Date) - $DlStart).TotalSeconds
+  if ($Secs -le 0) { $Secs = 1 }
   $SizeMB = [math]::Round((Get-Item $Archive).Length / 1MB, 1)
   Write-Host "  Downloaded $Asset (${SizeMB} MB)"
+  $Mbps = [math]::Round(($SizeMB / $Secs), 1)
+  $Slow = @(
+    'Library WiFi and your network - no difference at all.',
+    'Feeling bad for your ISP. They can''t provide that much speed.',
+    'My ice cream is melting. Please go fast.',
+    'Downloading at this speed? The model will finish training first.',
+    'Are you downloading via carrier pigeon?',
+    'Dial-up called. It wants its speed back.',
+    'Is your internet powered by a hamster on a wheel?',
+    'This speed makes dial-up look ambitious.',
+    'I''ve seen glacial ice melt faster than this download.',
+    'Your packets appear to be traveling by surface mail.',
+    'Even a carrier pigeon would request hazard pay for this route.',
+    'At this rate the file will arrive sometime next fiscal year.'
+  )
+  $Mid = @(
+    'Respectable. Like instant noodles - gets the job done.',
+    'Not bad. Your ISP showed up to work today.',
+    'Steady. No awards, no complaints.',
+    'Mid speed, mid day, still downloading. It is what it is.',
+    'Solid performance. Neither spectacular nor disappointing.',
+    'Your ISP is meeting the contractual minimum today.',
+    'Consistent throughput. Reliable, if unremarkable.',
+    'Average velocity for an average afternoon.',
+    'Functional and serviceable. No further comment required.'
+  )
+  $Fast = @(
+    'Certified fiber enjoyer. Blink and you''ll miss it.',
+    'Your ISP deserves a raise.',
+    'Ludicrous speed. Go plaid.',
+    'That download was faster than my last relationship.',
+    'Blazing throughput. Your neighbors are almost certainly jealous.',
+    'Fiber optic excellence operating at full capacity.',
+    'This connection could download the internet itself.',
+    'Your download just established a new personal best.',
+    'Speed that borders on the unreasonable. Impressive.'
+  )
+  if ($Mbps -lt 1) { $Pick = $Slow | Get-Random }
+  elseif ($Mbps -gt 25) { $Pick = $Fast | Get-Random }
+  else { $Pick = $Mid | Get-Random }
+  Write-Host "  Speed: $Mbps MB/s - $Pick"
   $ChecksumName = "$Asset.sha256"
   if ($Names -contains $ChecksumName) {
     $ChecksumFile = Join-Path $Temp $ChecksumName
