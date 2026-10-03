@@ -151,6 +151,20 @@ jobs:
           pattern: hercules-*
           merge-multiple: true
           
+      - name: Clear stale release assets
+        # The same tag can be re-pushed across version bumps; the attach
+        # step below only appends, so without this old-version archives
+        # pile up next to the new ones on every re-run.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            for a in $(gh release view "$TAG" --json assets --jq -r '.assets[].name'); do
+              gh release delete-asset "$TAG" "$a" -y
+            done
+          fi
+
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
