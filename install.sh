@@ -58,25 +58,32 @@ case "$ARCH" in
   *) echo "Unsupported CPU architecture: $ARCH" >&2; exit 1 ;;
 esac
 
-# --- 2. Pick the GPU flavor ----------------------------------------------
+# --- 2. Hardware info (also drives flavor auto-detect) --------------------
+if [[ "$PLATFORM" == "macos" ]]; then
+  CPU="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "$ARCH")"
+  GPU="Apple Silicon (Metal)"
+  RAM="$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0fG", $1/1024/1024/1024}')"
+else
+  CPU="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs || echo "$ARCH")"
+  CPU="$CPU ($(nproc 2>/dev/null || echo ?) cores)"
+  GPU_LINES="$(lspci 2>/dev/null | grep -iE 'vga|3d controller|display controller' || true)"
+  GPU="$(printf '%s' "$GPU_LINES" | head -1 | sed 's/^.*VGA compatible controller: //;s/^.*3D controller: //;s/^.*Display controller: //;s/ (rev.*//' | xargs || true)"
+  [[ -n "$GPU" ]] || GPU="unknown"
+  RAM="$(free -h 2>/dev/null | awk '/^Mem:/{print $2}')"
+  RAM="${RAM%i}"
+  [[ -n "$RAM" ]] || RAM="unknown"
+fi
+
 if [[ "$FLAVOR" == "auto" ]]; then
   if [[ "$PLATFORM" == "macos" ]]; then
     FLAVOR="normal" # Metal acceleration is in the standard macOS build
   elif command -v nvidia-smi >/dev/null 2>&1; then
     FLAVOR="nvidia"
-    echo "Reason: nvidia-smi is present"
+  elif printf '%s' "$GPU_LINES" | grep -qiE 'amd|radeon'; then
+    FLAVOR="amd"
   else
-    AMD_LINE="$(lspci 2>/dev/null | grep -iE 'vga|3d controller|display controller' | grep -iE 'amd|radeon' | head -1 || true)"
-    if [[ -n "$AMD_LINE" ]]; then
-      FLAVOR="amd"
-      echo "Reason: lspci reports AMD graphics: $AMD_LINE"
-    else
-      FLAVOR="normal"
-      echo "Reason: no NVIDIA (no nvidia-smi) and no AMD display device in lspci"
-    fi
+    FLAVOR="normal"
   fi
-elif [[ -n "${HERCULES_FLAVOR:-}" ]]; then
-  echo "Reason: flavor forced by HERCULES_FLAVOR=$HERCULES_FLAVOR"
 fi
 case "$FLAVOR" in
   normal|cpu) FLAVOR="normal" ;;
@@ -84,9 +91,32 @@ case "$FLAVOR" in
   *) echo "Unknown flavor: $FLAVOR (want: normal, nvidia, amd)" >&2; exit 1 ;;
 esac
 
-echo "Detected: $PLATFORM / $ARCH, flavor: $FLAVOR"
+pretty_flavor() { case "$1" in
+  normal) echo "Normal" ;; nvidia) echo "Nvidia" ;; amd) echo "Amd" ;;
+esac; }
+pretty_os() { case "$1" in
+  linux) echo "Linux" ;; macos) echo "Mac" ;;
+esac; }
 
-# --- 3. Resolve the release and find our asset ----------------------------
+# --- 3. Banner ------------------------------------------------------------
+SPLASH="$(curl -fsSL --max-time 15 "https://raw.githubusercontent.com/$REPO/main/splash.txt" 2>/dev/null || true)"
+LINE="-------------------------------------------------------------------------"
+echo "$LINE"
+if [[ -n "$SPLASH" ]]; then
+  # Tabs expand at width 4 — same as the in-app splash renderer
+  # (src/splash.rs); raw terminals use 8 and break the artwork.
+  printf '%s\n' "$SPLASH" | expand -t 4
+else
+  echo "HERCULES AGENT"
+fi
+echo "$LINE"
+echo "  CPU : $CPU"
+echo "  GPU : $GPU"
+echo "  RAM : $RAM"
+echo "$LINE"
+echo "> Downloading Hercules | $(pretty_flavor "$FLAVOR") | $(pretty_os "$PLATFORM") ($ARCH)"
+
+# --- 4. Resolve the release and find our asset ----------------------------
 API="https://api.github.com/repos/$REPO/releases"
 if [[ "$TAG" == "latest" ]]; then
   RELEASE_JSON="$(curl -fsSL "$API/latest")"
@@ -97,15 +127,11 @@ TAG="$(printf '%s' "$RELEASE_JSON" | grep -o '"tag_name": *"[^"]*"' | head -1 | 
 ASSETS="$(printf '%s' "$RELEASE_JSON" | grep -o '"name": *"[^"]*"' | sed 's/.*": *"//;s/"//')"
 [[ -n "$TAG" ]] || { echo "Could not resolve a release from GitHub API" >&2; exit 1; }
 
-pick_asset() { # $1 = flavor infix ("" for normal, "-nvidia" etc.)
-  printf '%s\n' "$ASSETS" | grep -E "^hercules-agent$1-[0-9][^-]*-${PLATFORM}-${ARCH}\\.tar\\.gz$" | head -1 || true
-}
-
 if [[ "$FLAVOR" == "normal" ]]; then
   # Plain build has no flavor infix; exclude the GPU ones explicitly.
   ASSET="$(printf '%s\n' "$ASSETS" | grep -E "^hercules-agent-[0-9][^-]*-${PLATFORM}-${ARCH}\\.tar\\.gz$" | grep -vE -- '-amd-|-nvidia-' | head -1 || true)"
 else
-  ASSET="$(pick_asset "-$FLAVOR")"
+  ASSET="$(printf '%s\n' "$ASSETS" | grep -E "^hercules-agent-${FLAVOR}-[0-9][^-]*-${PLATFORM}-${ARCH}\\.tar\\.gz$" | head -1 || true)"
   if [[ -z "$ASSET" ]]; then
     echo "No $FLAVOR build for $PLATFORM/$ARCH in $TAG, falling back to the standard build." >&2
     ASSET="$(printf '%s\n' "$ASSETS" | grep -E "^hercules-agent-[0-9][^-]*-${PLATFORM}-${ARCH}\\.tar\\.gz$" | grep -vE -- '-amd-|-nvidia-' | head -1 || true)"
@@ -118,14 +144,14 @@ fi
   exit 1
 }
 
-echo "Installing $ASSET ($TAG)"
+echo "  Package: $ASSET ($TAG)"
 
-# --- 4. Download + verify --------------------------------------------------
+# --- 5. Download + verify --------------------------------------------------
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cd "$TMP"
 BASE_URL="https://github.com/$REPO/releases/download/$TAG"
-curl -fsSL -o "$ASSET" "$BASE_URL/$ASSET"
+curl -fL --progress-bar -o "$ASSET" "$BASE_URL/$ASSET"
 if printf '%s\n' "$ASSETS" | grep -qxF "$ASSET.sha256"; then
   curl -fsSL -o "$ASSET.sha256" "$BASE_URL/$ASSET.sha256"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -138,7 +164,7 @@ else
   echo "Warning: no .sha256 published for $ASSET, skipping verification." >&2
 fi
 
-# --- 5. Install user-local -------------------------------------------------
+# --- 6. Install user-local -------------------------------------------------
 SHARE="$PREFIX/share/hercules-agent"
 BIN_DIR="$PREFIX/bin"
 rm -rf "$SHARE"
@@ -150,17 +176,16 @@ EXE="$BUNDLE_TOP/bin/hercules"
 [[ -x "$EXE" ]] || { echo "Archive layout unexpected: no bin/hercules under $BUNDLE_TOP" >&2; exit 1; }
 ln -sf "$EXE" "$BIN_DIR/hercules"
 
-echo
-echo "Installed to $EXE"
-echo "Symlinked  $BIN_DIR/hercules"
+echo "$LINE"
+echo "  Installed : $EXE"
+echo "  Symlinked : $BIN_DIR/hercules"
 "$BIN_DIR/hercules" --version || true
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *)
-    echo
-    echo "$BIN_DIR is not on your PATH. Add it with:"
-    echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+    echo "  NOTE: $BIN_DIR is not on your PATH. Add it with:"
+    echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
     ;;
 esac
-echo
+echo "$LINE"
 echo "Run it with: hercules"

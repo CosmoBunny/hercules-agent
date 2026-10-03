@@ -25,6 +25,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Repo = 'CosmoBunny/hercules-agent'
+$Line = '-------------------------------------------------------------------------'
 
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
   $InstallDir = Join-Path $env:LOCALAPPDATA 'hercules-agent'
@@ -43,19 +44,41 @@ if ($ArchName -ne 'AMD64') {
 }
 $Platform = 'windows'; $Arch = 'x86_64'
 
-# --- 2. Pick the GPU flavor ------------------------------------------------
+# --- 2. Hardware info (also drives flavor auto-detect) ---------------------
+$Cpu = ((Get-CimInstance Win32_Processor | Select-Object -First 1).Name).Trim()
+$Controllers = Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name.Trim() }
+$Gpu = ($Controllers | Select-Object -First 1)
+$RamGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+$Ram = "${RamGB}G"
+
 if ($Flavor -eq 'auto') {
   if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
     $Flavor = 'nvidia'
+  } elseif ($Controllers -match 'AMD|Radeon') {
+    $Flavor = 'amd'
   } else {
-    $amd = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
-      Where-Object { $_.Name -match 'AMD|Radeon' }
-    $Flavor = if ($amd) { 'amd' } else { 'normal' }
+    $Flavor = 'normal'
   }
 }
-Write-Host "Detected: $Platform / $Arch, flavor: $Flavor"
 
-# --- 3. Resolve the release and find our asset -----------------------------
+$PrettyFlavor = @{ normal = 'Normal'; nvidia = 'Nvidia'; amd = 'Amd' }[$Flavor]
+
+# --- 3. Banner ---------------------------------------------------------------
+Write-Host $Line
+try {
+  $Splash = Invoke-RestMethod "https://raw.githubusercontent.com/$Repo/main/splash.txt" -TimeoutSec 15
+  Write-Host $Splash
+} catch {
+  Write-Host 'HERCULES AGENT'
+}
+Write-Host $Line
+Write-Host "  CPU : $Cpu"
+Write-Host "  GPU : $Gpu"
+Write-Host "  RAM : $Ram"
+Write-Host $Line
+Write-Host "> Downloading Hercules | $PrettyFlavor | Windows ($Arch)"
+
+# --- 4. Resolve the release and find our asset -----------------------------
 if ([string]::IsNullOrWhiteSpace($Version)) {
   $Release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
 } else {
@@ -79,9 +102,9 @@ if (-not $matchFlavor) {
   }
 }
 $Asset = @($matchFlavor)[0]
-Write-Host "Installing $Asset ($Tag)"
+Write-Host "  Package: $Asset ($Tag)"
 
-# --- 4. Download + verify --------------------------------------------------
+# --- 5. Download + verify --------------------------------------------------
 $Temp = Join-Path $env:TEMP ("hercules-install-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $Temp | Out-Null
 try {
@@ -100,7 +123,7 @@ try {
     Write-Warning "No .sha256 published for $Asset, skipping verification."
   }
 
-  # --- 5. Install user-local -------------------------------------------------
+  # --- 6. Install user-local -------------------------------------------------
   if (Test-Path $InstallDir) { Remove-Item $InstallDir -Recurse -Force }
   New-Item -ItemType Directory -Path $InstallDir | Out-Null
   tar.exe -xzf $Archive -C $InstallDir
@@ -116,10 +139,10 @@ try {
   }
   if (($env:Path -split ';') -notcontains $BinDir) { $env:Path += ";$BinDir" }
 
-  Write-Host ''
-  Write-Host "Installed to $Exe"
+  Write-Host $Line
+  Write-Host "  Installed : $Exe"
   & $Exe --version
-  Write-Host ''
+  Write-Host $Line
   Write-Host 'Run it with: hercules.exe (restart your terminal first if PATH was just updated)'
 } finally {
   Remove-Item $Temp -Recurse -Force -ErrorAction SilentlyContinue
