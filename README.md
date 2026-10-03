@@ -7,6 +7,10 @@ graph.
 
 Working name / crate: `hercules-agent`. Binary: `hercules`.
 
+## Demo
+
+![Hercules Agent demo](demo.gif)
+
 ## Getting started
 
 ### 1. Install with one line
