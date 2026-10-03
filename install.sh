@@ -64,11 +64,19 @@ if [[ "$FLAVOR" == "auto" ]]; then
     FLAVOR="normal" # Metal acceleration is in the standard macOS build
   elif command -v nvidia-smi >/dev/null 2>&1; then
     FLAVOR="nvidia"
-  elif command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -iE 'vga|3d controller|display controller' | grep -qiE 'amd|radeon'; then
-    FLAVOR="amd"
+    echo "Reason: nvidia-smi is present"
   else
-    FLAVOR="normal"
+    AMD_LINE="$(lspci 2>/dev/null | grep -iE 'vga|3d controller|display controller' | grep -iE 'amd|radeon' | head -1 || true)"
+    if [[ -n "$AMD_LINE" ]]; then
+      FLAVOR="amd"
+      echo "Reason: lspci reports AMD graphics: $AMD_LINE"
+    else
+      FLAVOR="normal"
+      echo "Reason: no NVIDIA (no nvidia-smi) and no AMD display device in lspci"
+    fi
   fi
+elif [[ -n "${HERCULES_FLAVOR:-}" ]]; then
+  echo "Reason: flavor forced by HERCULES_FLAVOR=$HERCULES_FLAVOR"
 fi
 case "$FLAVOR" in
   normal|cpu) FLAVOR="normal" ;;
