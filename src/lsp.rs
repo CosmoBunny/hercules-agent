@@ -302,6 +302,17 @@ impl LspClient {
 
     /// Start the configured LSP server and initialize the LSP connection
     pub async fn start(&mut self) -> Result<()> {
+        // HARD GATE at the spawn site: no caller — present or future,
+        // F6, settings, bounce, anything — can start a language server
+        // while the user turned diagnostics off. Call-site checks are
+        // not trusted alone.
+        if !crate::settings::get_lsp_diagnostics_enabled() {
+            warn!(
+                "LSP spawn refused for workspace {:?}: diagnostics switch is off",
+                self.workspace_root
+            );
+            anyhow::bail!("refused: LSP diagnostics switch is off");
+        }
         info!(
             "Starting LSP server '{}' for workspace: {:?}",
             self.server_config.name, self.workspace_root
@@ -768,6 +779,14 @@ impl LspClient {
         }
         Ok(())
     }
+
+    /// PID of the spawned server process, if still tracked.
+    pub fn process_id(&self) -> Option<u32> {
+        self.process
+            .try_lock()
+            .ok()
+            .and_then(|p| p.as_ref().and_then(|c| c.id()))
+    }
 }
 
 impl Drop for LspClient {
@@ -846,6 +865,12 @@ impl LspManager {
 
     /// Start the LSP client using discovered configuration
     pub async fn start(&mut self) -> Result<()> {
+        // Never stack servers: a previous client (e.g. from an earlier
+        // build) is stopped first. Otherwise every rebuild leaks a
+        // cold-indexing rust-analyzer and small machines hang.
+        if self.client.is_some() {
+            let _ = self.shutdown().await;
+        }
         // Discover LSP configurations if not already done
         if self.discovered_config.is_none() {
             let configs = discover_lsp_configs(&self.workspace_root).await;
@@ -891,6 +916,11 @@ impl LspManager {
     /// Get mutable LSP client
     pub fn client_mut(&mut self) -> Option<&mut LspClient> {
         self.client.as_mut()
+    }
+
+    /// PID of the running language server, if any (for logging).
+    pub fn server_pid(&self) -> Option<u32> {
+        self.client.as_ref().and_then(|c| c.process_id())
     }
 
     /// Check if LSP is available and initialized

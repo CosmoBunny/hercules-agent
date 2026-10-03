@@ -244,14 +244,32 @@ fn is_multipart_gguf(name: &str) -> bool {
 }
 
 /// Rank GGUF filenames: prefer **single-file** mid-size quants (never multi-part if avoidable).
-fn pick_best_gguf(files: &[String]) -> String {
-    // Prefer single-file only when any exist
-    let singles: Vec<&String> = files.iter().filter(|f| !is_multipart_gguf(f)).collect();
-    let pool: Vec<&String> = if singles.is_empty() {
-        files.iter().collect()
-    } else {
-        singles
+pub(crate) fn pick_best_gguf(files: &[String]) -> String {
+    // Vision projectors are companions, never the main weights: exclude
+    // them from the pick unless the repo holds nothing else. (A repo
+    // like prism-ml/Ternary-Bonsai-2-27B-gguf ships
+    // `...-mmproj-Q8_0.gguf` next to ternary `...-TQ1_0.gguf` weights;
+    // without this the projector outscores the real model and the user
+    // "downloads the model" but gets mmproj.) Companions are fetched
+    // separately by the VL flow after the main weights land.
+    let pool0: Vec<&String> = {
+        let non_mmproj: Vec<&String> = files
+            .iter()
+            .filter(|f| !f.to_lowercase().contains("mmproj"))
+            .collect();
+        if non_mmproj.is_empty() {
+            files.iter().collect()
+        } else {
+            non_mmproj
+        }
     };
+    // Prefer single-file only when any exist
+    let singles: Vec<&String> = pool0
+        .iter()
+        .filter(|f| !is_multipart_gguf(f))
+        .copied()
+        .collect();
+    let pool: Vec<&String> = if singles.is_empty() { pool0 } else { singles };
 
     let mut ranked: Vec<(i32, &String)> = pool
         .into_iter()
@@ -269,6 +287,18 @@ fn pick_best_gguf(files: &[String]) -> String {
                 score += 3;
             } else if lower.contains("q3_k") {
                 score += 4;
+            } else if lower.contains("q2_0") || lower.contains("q2_k") || lower.contains("iq2") {
+                // 2-bit class (covers ternary TQ2_0, which contains
+                // "q2_0"): the headline quant on ternary/2-bit repos.
+                // Ranks above 1-bit (TQ1_0/IQ1 fall in the default
+                // bucket below), beside Q6/Q8.
+                score += 5;
+            } else if lower.contains("tq1_0") || lower.contains("iq1") {
+                // 1-bit class (ternary TQ1_0, IQ1_S/M): extreme quant,
+                // ranked below the 2-bit headline but above full
+                // precision. Explicit so it never silently shifts when
+                // the default bucket changes.
+                score += 6;
             } else if lower.contains("q6_k") || lower.contains("q8_0") {
                 score += 5;
             } else if lower.contains("f16") || lower.contains("fp16") {
@@ -307,10 +337,39 @@ fn pick_best_gguf(files: &[String]) -> String {
         .unwrap_or_else(|| files[0].clone())
 }
 
+/// Candidate repo ids for a GGUF download: the id itself plus common
+/// community naming patterns. Shared by resolve + file-listing so both
+/// agree on which repo wins.
+fn gguf_repo_candidates(clean_repo: &str) -> Vec<String> {
+    let mut candidates: Vec<String> = vec![clean_repo.to_string()];
+    // Common community GGUF naming patterns
+    if !clean_repo.to_lowercase().contains("gguf") {
+        candidates.push(format!("{}-GGUF", clean_repo));
+        candidates.push(format!("{}-gguf", clean_repo));
+        if !clean_repo.contains("Instruct") {
+            candidates.push(format!("{}-Instruct-GGUF", clean_repo));
+            candidates.push(format!("{}-Instruct-gguf", clean_repo));
+        }
+        // Popular quant hosts (bartowski, unsloth, lmstudio-community, …)
+        let short = clean_repo.rsplit('/').next().unwrap_or(clean_repo);
+        for org in [
+            "bartowski",
+            "unsloth",
+            "lmstudio-community",
+            "QuantFactory",
+            "TheBloke",
+        ] {
+            candidates.push(format!("{org}/{short}-GGUF"));
+            candidates.push(format!("{org}/{short}-gguf"));
+            candidates.push(format!("{org}/{short}"));
+        }
+    }
+    candidates
+}
 /// Given a multi-part GGUF shard name (e.g. `Foo-Q4_K_M-00001-of-00013.gguf`)
 /// and the full file listing, return all sibling parts in order.
 /// For single-file GGUFs, returns `vec![name.to_string()]`.
-fn find_multipart_siblings(name: &str, all_files: &[String]) -> Vec<String> {
+pub(crate) fn find_multipart_siblings(name: &str, all_files: &[String]) -> Vec<String> {
     if !is_multipart_gguf(name) {
         return vec![name.to_string()];
     }
@@ -955,6 +1014,74 @@ impl ModelManager {
     /// 4. Prefer Q4_K_M / Q4_0 single-file quantizations
     ///
     /// Returns `(download_repo_id, filename)`. Never returns safetensors.
+    /// List a repo's GGUF weight files with byte sizes (one blobs call).
+    /// Used by the registry file picker so users can SEE every variant
+    /// (1-bit, 2-bit, …) instead of only getting the auto-pick.
+    /// Returns `(resolved_repo, [(filename, bytes)])`. Sizes may be 0
+    /// when only the tree fallback answered.
+    pub async fn list_repo_weight_files(
+        &self,
+        repo_id: &str,
+    ) -> Result<(String, Vec<(String, u64)>), String> {
+        let clean_repo = repo_id
+            .split('[')
+            .next()
+            .unwrap_or(repo_id)
+            .trim()
+            .trim_start_matches("HuggingFace: ")
+            .trim()
+            .to_string();
+        let client = reqwest::Client::builder()
+            .user_agent("Hercules-CLI/1.0")
+            .build()
+            .map_err(|e| e.to_string())?;
+        for repo in gguf_repo_candidates(&clean_repo) {
+            // Sized listing first: siblings carry size/lfs.size.
+            let url = format!("https://huggingface.co/api/models/{}?blobs=true", repo);
+            if let Ok(res) = client.get(&url).send().await {
+                if res.status().is_success() {
+                    if let Ok(text) = res.text().await {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                            let mut out = Vec::new();
+                            if let Some(siblings) = json.get("siblings").and_then(|s| s.as_array())
+                            {
+                                for f in siblings {
+                                    let name =
+                                        f.get("rfilename").and_then(|v| v.as_str()).unwrap_or("");
+                                    if !name.to_lowercase().ends_with(".gguf") {
+                                        continue;
+                                    }
+                                    let sz = f
+                                        .get("size")
+                                        .and_then(|s| s.as_u64())
+                                        .or_else(|| {
+                                            f.get("lfs")
+                                                .and_then(|l| l.get("size"))
+                                                .and_then(|s| s.as_u64())
+                                        })
+                                        .unwrap_or(0);
+                                    out.push((name.to_string(), sz));
+                                }
+                            }
+                            if !out.is_empty() {
+                                return Ok((repo, out));
+                            }
+                        }
+                    }
+                }
+            }
+            // Tree fallback: names only.
+            let names = self
+                .list_gguf_files(&client, &repo)
+                .await
+                .unwrap_or_default();
+            if !names.is_empty() {
+                return Ok((repo, names.into_iter().map(|n| (n, 0)).collect()));
+            }
+        }
+        Err(format!("No GGUF weights found for '{}'.", clean_repo))
+    }
+
     pub async fn resolve_gguf_file(
         &self,
         repo_id: &str,
@@ -983,28 +1110,7 @@ impl ModelManager {
             .next()
             .unwrap_or(&clean_repo)
             .to_string();
-        let mut candidates: Vec<String> = vec![clean_repo.clone()];
-        // Common community GGUF naming patterns
-        if !clean_repo.to_lowercase().contains("gguf") {
-            candidates.push(format!("{}-GGUF", clean_repo));
-            candidates.push(format!("{}-gguf", clean_repo));
-            if !clean_repo.contains("Instruct") {
-                candidates.push(format!("{}-Instruct-GGUF", clean_repo));
-                candidates.push(format!("{}-Instruct-gguf", clean_repo));
-            }
-            // Popular quant hosts (bartowski, unsloth, lmstudio-community, …)
-            for org in [
-                "bartowski",
-                "unsloth",
-                "lmstudio-community",
-                "QuantFactory",
-                "TheBloke",
-            ] {
-                candidates.push(format!("{org}/{short}-GGUF"));
-                candidates.push(format!("{org}/{short}-gguf"));
-                candidates.push(format!("{org}/{short}"));
-            }
-        }
+        let candidates = gguf_repo_candidates(&clean_repo);
 
         let mut tried = Vec::new();
         for repo in &candidates {

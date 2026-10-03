@@ -1037,6 +1037,17 @@ impl CodeGraphBuilder {
         self.lsp_manager = Some(lsp_manager);
     }
 
+    /// Stop the language server after the build. Enrichment is a
+    /// build-time snapshot — nothing re-queries the server afterwards,
+    /// so keeping it alive only burns CPU/RAM (cold-indexing a big
+    /// workspace can hang a small machine). Awaited shutdown, not
+    /// best-effort Drop: the process must actually die.
+    pub async fn shutdown_lsp(&mut self) {
+        if let Some(mut manager) = self.lsp_manager.take() {
+            let _ = manager.shutdown().await;
+        }
+    }
+
     /// Extract a file's Tree-sitter graph, dispatching on the file extension:
     /// .rs uses the Rust extractor, other supported languages use their
     /// generic extractor (created lazily on first use).

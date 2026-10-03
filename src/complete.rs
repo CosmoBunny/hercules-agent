@@ -32,7 +32,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/cdl", "Cancel active model download (alias)"),
     ("/download-status", "Show download progress"),
     ("/dlstatus", "Show download progress (alias)"),
-    ("/copy", "Export chat to file"),
+    ("/copy", "Copy conversation/chip to clipboard"),
     ("/theme", "Set theme color"),
     ("/save", "Save session"),
     ("/load", "Load session"),

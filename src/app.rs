@@ -355,6 +355,19 @@ pub enum CodeGraphPane {
     Details, // Right pane - node metadata
 }
 
+/// Registry weight-file picker: one repo's .gguf variants with sizes,
+/// best auto-pick first. Opened by Enter on a multi-file repo so the
+/// user sees every quant (1-bit, 2-bit, …) instead of getting one
+/// silently. Enter downloads the highlighted file, Esc goes back.
+#[derive(Debug, Clone)]
+pub struct RepoFilePick {
+    pub repo: String,
+    pub resolved: String,
+    pub files: Vec<(String, u64)>,
+    pub best: String,
+    pub state: ratatui::widgets::ListState,
+}
+
 pub struct App {
     pub should_quit: bool,
     pub status_message: String,
@@ -431,12 +444,31 @@ pub struct App {
     /// Click-down while selection active → cancel only if released without drag.
     pub selection_pending_cancel: bool,
     pub selected_text_buffer: String,
+    /// Logical copy anchor/focus (render-map indices + char cols).
+    /// Source of truth for clipboard content; screen coords only drive
+    /// the highlight. Stable across scroll/resize/stream-append;
+    /// cleared on compact/load/clear (indices die with the transcript).
+    pub sel_anchor: Option<crate::copy::SelPoint>,
+    pub sel_focus: Option<crate::copy::SelPoint>,
+    /// Per-frame logical render map, parallel to the drawn chat lines:
+    /// every visible row knows its owner (message / chip / chrome).
+    /// Rebuilt every render, same frame as the terminal shows.
+    pub chat_render_map: Vec<crate::copy::RenderRow>,
+    /// Conversation archive (UI history): retired messages verbatim +
+    /// retired chips (stable ids) + compact summaries. Append-only,
+    /// survives compaction; feeds /copy, never the model.
+    pub conversation_archive: Vec<crate::copy::ArchiveEntry>,
+    /// Chip ids already archived (auto-compact keeps chips live across
+    /// compactions — never archive one twice).
+    pub archived_chip_ids: std::collections::HashSet<u64>,
     /// Last chat area for selection ↔ screen mapping
     pub last_chat_area: Option<ratatui::layout::Rect>,
     /// Plain text of each logical chat line (same index as draw lines) for copy.
     pub last_chat_plain_lines: Vec<String>,
     /// Visual start offset of each logical line (for accurate mouse selection mapping)
     pub last_chat_visual_at: Vec<u16>,
+    /// Content width the current render map was wrapped at (for slice math).
+    pub last_chat_width: usize,
     /// Active preview mode toggles per code block index
     pub code_block_previews: std::collections::HashSet<usize>,
     /// Interactive Normal/Preview toggle hit zones
@@ -485,6 +517,19 @@ pub struct App {
     /// only the latest query's fetch may publish (stale "deep" results
     /// can never overwrite fresh "deepseek" ones).
     pub registry_search_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// True while a registry search is outstanding (set on fire, cleared
+    /// when its results land). Drives the "Finding models…" empty state
+    /// so the list never claims "no models" mid-flight. UI thread only.
+    pub registry_searching: bool,
+    /// Registry weight-file picker: when a repo holds several .gguf
+    /// variants (1-bit, 2-bit, …), Enter opens this instead of silently
+    /// auto-downloading one. `None` = repo list mode.
+    pub repo_file_pick: Option<RepoFilePick>,
+    /// Handoff slot for the async file-listing task (gen-guarded like
+    /// registry search). Drained in `handle_events`, never rendered from.
+    pub repo_file_pick_result: Arc<Mutex<Option<(u64, String, String, Vec<(String, u64)>)>>>,
+    /// Generation counter for picker listings (UI thread only).
+    pub repo_file_pick_gen: u64,
 
     // Multimodal attachments & Path Autocomplete
     pub attachments: Vec<crate::media::MediaAttachment>,
@@ -726,9 +771,15 @@ impl App {
             selection_dragged: false,
             selection_pending_cancel: false,
             selected_text_buffer: String::new(),
+            sel_anchor: None,
+            sel_focus: None,
+            chat_render_map: Vec::new(),
+            conversation_archive: Vec::new(),
+            archived_chip_ids: std::collections::HashSet::new(),
             last_chat_area: None,
             last_chat_plain_lines: Vec::new(),
             last_chat_visual_at: Vec::new(),
+            last_chat_width: 80,
             code_block_previews: std::collections::HashSet::new(),
             code_block_hits: Vec::new(),
             code_block_copy_hits: Vec::new(),
@@ -744,6 +795,10 @@ impl App {
             registry_search_query: String::new(),
             search_results: Arc::new(Mutex::new(None)),
             registry_search_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            registry_searching: false,
+            repo_file_pick: None,
+            repo_file_pick_result: Arc::new(Mutex::new(None)),
+            repo_file_pick_gen: 0,
             attachments: Vec::new(),
             next_attachment_id: 1,
             path_suggestions: Vec::new(),
@@ -1568,6 +1623,8 @@ impl App {
         self.selection_dragged = false;
         self.selection_pending_cancel = false;
         self.selected_text_buffer.clear();
+        self.sel_anchor = None;
+        self.sel_focus = None;
     }
 
     fn copy_selection_to_clipboard(&mut self) -> bool {
@@ -1582,10 +1639,7 @@ impl App {
         let ok = crate::clipboard::copy_text_silent(&text);
         let n = text.chars().count();
         self.status_message = if ok {
-            format!(
-                "Copied {n} chars → clipboard + {}",
-                crate::clipboard::clipboard_file_path()
-            )
+            "Copied selection → clipboard".to_string()
         } else {
             format!(
                 "Saved {n} chars to {} (no system clipboard tool)",
@@ -1593,49 +1647,153 @@ impl App {
             )
         };
         if let Ok(mut l) = self.activity_logs.lock() {
-            l.push(format!("[CLIPBOARD] {n} chars (silent)"));
+            l.push(format!("[CLIPBOARD] selection ({n} chars, silent)"));
         }
         self.clear_selection();
         true
     }
 
-    fn rebuild_selected_text(&mut self) {
-        let (Some(start), Some(end)) = (self.selection_start, self.selection_end) else {
-            self.selected_text_buffer.clear();
-            return;
-        };
-        let min_y = start.1.min(end.1) as i32;
-        let max_y = start.1.max(end.1) as i32;
-        let chat_y = self
-            .last_chat_area
-            .map(|a| a.y.saturating_add(1) as i32)
-            .unwrap_or(1);
-        // Prefer plain lines from last draw (matches shaded rows accurately with wrapping)
-        let mut extracted: Vec<String> = Vec::new();
-        if !self.last_chat_plain_lines.is_empty() {
-            for (i, line) in self.last_chat_plain_lines.iter().enumerate() {
-                let vis_start = self.last_chat_visual_at.get(i).copied().unwrap_or(i as u16) as i32;
-                let vis_count = if i + 1 < self.last_chat_visual_at.len() {
-                    (self.last_chat_visual_at[i + 1] - self.last_chat_visual_at[i]) as i32
-                } else {
-                    1
-                };
-                let screen_y_start = chat_y + vis_start - self.scroll_offset as i32;
-                let screen_y_end = screen_y_start + vis_count - 1;
-                if max_y >= screen_y_start && min_y <= screen_y_end {
-                    extracted.push(line.clone());
-                }
+    /// Execute a parsed `/copy` request against live chips, the
+    /// conversation archive (survives compaction) and live messages.
+    fn exec_copy_request(&mut self, req: crate::copy::CopyRequest) {
+        use crate::copy::CopyRequest;
+        match req {
+            CopyRequest::All => {
+                let live: Vec<String> = self
+                    .messages
+                    .iter()
+                    .filter(|m| !Self::is_ui_only_message(m))
+                    .cloned()
+                    .collect();
+                let text = crate::copy::conversation_copy_text(
+                    &self.conversation_archive,
+                    self.compact_context.as_deref(),
+                    &live,
+                );
+                self.clipboard_report(text, "Copied conversation → clipboard");
             }
-        } else {
-            let full = self.messages.join("\n");
-            for (l_idx, line) in full.lines().enumerate() {
-                let screen_y = chat_y + l_idx as i32 - self.scroll_offset as i32;
-                if screen_y >= min_y && screen_y <= max_y {
-                    extracted.push(line.to_string());
+            CopyRequest::Chip(id) => match self.chip_copy_text_by_id(id) {
+                Some(text) => {
+                    self.clipboard_report(text, &format!("Copied chip #{id} → clipboard"))
+                }
+                None => {
+                    self.status_message = format!("Copy failed: no chip #{id}");
+                }
+            },
+            CopyRequest::Range { start, end } => {
+                let mut parts_out = Vec::new();
+                let mut missing = None;
+                for id in start..=end {
+                    match self.chip_copy_text_by_id(id) {
+                        Some(t) => parts_out.push(t),
+                        None => {
+                            missing = Some(id);
+                            break;
+                        }
+                    }
+                }
+                if let Some(id) = missing {
+                    self.status_message = format!("Copy failed: no chip #{id} — nothing copied");
+                } else {
+                    self.clipboard_report(
+                        parts_out.join("\n"),
+                        &format!("Copied chips #{start}–#{end} → clipboard"),
+                    );
                 }
             }
         }
-        self.selected_text_buffer = extracted.join("\n");
+    }
+
+    /// Canonical copy text for one logical chip: live chips first, then
+    /// archived (post-compaction) ones. Never a terminal row.
+    fn chip_copy_text_by_id(&self, id: u64) -> Option<String> {
+        if let Some(chip) = self.tool_chips.iter().find(|c| c.id == id) {
+            return Some(crate::copy::chip_copy_text(&chip.label_text(), &chip.body));
+        }
+        self.conversation_archive
+            .iter()
+            .find(|e| e.kind == crate::copy::ArchiveKind::Chip && e.id == id)
+            .map(|e| e.text.clone())
+    }
+
+    /// Clipboard handoff with spec status strings; file fallback keeps
+    /// the backend's existing behavior.
+    fn clipboard_report(&mut self, text: String, ok_msg: &str) {
+        if text.trim().is_empty() {
+            self.status_message = "Nothing to copy".to_string();
+            return;
+        }
+        let n = text.chars().count();
+        let ok = crate::clipboard::copy_text_silent(&text);
+        self.status_message = if ok {
+            ok_msg.to_string()
+        } else {
+            format!(
+                "Saved {n} chars to {} (no system clipboard tool)",
+                crate::clipboard::clipboard_file_path()
+            )
+        };
+        if let Ok(mut l) = self.activity_logs.lock() {
+            l.push(format!("[CLIPBOARD] {ok_msg} ({n} chars)"));
+        }
+    }
+
+    fn rebuild_selected_text(&mut self) {
+        // Logical path: anchor/focus are render-map indices, so scroll,
+        // resize and streaming appends can't misroute the copy. Screen
+        // coordinates only ever drive the highlight.
+        let (Some(a), Some(f)) = (self.sel_anchor, self.sel_focus) else {
+            self.selected_text_buffer.clear();
+            return;
+        };
+        let width = self.last_chat_width;
+        self.selected_text_buffer =
+            crate::copy::resolve_mouse_selection(&self.chat_render_map, a, f, width);
+    }
+
+    /// Map a screen point to a logical selection point (map index + char
+    /// offset). Frame-exact: this frame's own area, scroll offset and
+    /// visual map — no scroll arithmetic on content, so scrolling and
+    /// resize can never select the wrong message.
+    fn screen_to_sel_point(&self, col: u16, row: u16) -> Option<crate::copy::SelPoint> {
+        let area = self.last_chat_area?;
+        if self.chat_render_map.is_empty() {
+            return None;
+        }
+        let chat_y = area.y.saturating_add(1) as i32;
+        let chat_left = area.x as i32;
+        let vis = row as i32 - chat_y + self.scroll_offset as i32;
+        if vis < 0 {
+            return None;
+        }
+        // Inverse visual map: largest logical index starting at/before vis.
+        let va = &self.last_chat_visual_at;
+        if va.len() != self.chat_render_map.len() {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = va.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if (va[mid] as i32) <= vis {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return None;
+        }
+        let idx = lo - 1;
+        let entry = &self.chat_render_map[idx];
+        let sub = (vis - va[idx] as i32).max(0) as usize;
+        let (s, e) = crate::copy::visual_slice_range(&entry.text, sub, self.last_chat_width);
+        let col_off = (col as i32 - chat_left).max(0) as usize;
+        let slice_len = e.saturating_sub(s);
+        Some(crate::copy::SelPoint {
+            row: idx,
+            col: s + col_off.min(slice_len),
+        })
     }
 
     fn selection_active(&self) -> bool {
@@ -3369,6 +3527,30 @@ impl App {
         let keep_n = reason.keep_tail_messages();
         let recent = crate::compact::select_recent_tail(&snapshot_messages, keep_n);
         self.compact_context = Some(summary.clone());
+        // Archive the retired transcript BEFORE discarding: everything
+        // except the kept tail (which stays live — archiving it too would
+        // duplicate it at the next compact). UI-only lines never enter
+        // the archive. Retired chips serialize with stable ids, deduped
+        // across compactions since auto-compact keeps chips live.
+        {
+            let retired = snapshot_messages.len().saturating_sub(recent.len());
+            for m in snapshot_messages.iter().take(retired) {
+                if Self::is_ui_only_message(m) {
+                    continue;
+                }
+                self.conversation_archive
+                    .push(crate::copy::ArchiveEntry::msg(m.clone()));
+            }
+            for chip in &self.tool_chips {
+                if self.archived_chip_ids.insert(chip.id) {
+                    let text = crate::copy::chip_copy_text(&chip.label_text(), &chip.body);
+                    self.conversation_archive
+                        .push(crate::copy::ArchiveEntry::chip(chip.id, text));
+                }
+            }
+        }
+        // A selection points at retired indices — drop it with the transcript.
+        self.clear_selection();
         self.messages.clear();
         self.messages.push(format!(
             "System: [Compact context active — {}] was ~{} tokens. Prior transcript retired;              semantic state lives in the compact block below, NOT in memory.              Do NOT invent old conversation details.",
@@ -4250,6 +4432,8 @@ impl App {
         } else {
             self.registry_search_query.clone()
         };
+        // A fetch is now outstanding (covers the debounce wait too).
+        self.registry_searching = true;
         let manager = self.manager.clone();
         let results = self.search_results.clone();
         let gen_shared = self.registry_search_gen.clone();
@@ -4263,6 +4447,79 @@ impl App {
             let matches = manager.search_all_models(&query).await;
             if gen_shared.load(Ordering::SeqCst) == tag {
                 *results.lock().unwrap() = Some(matches);
+            }
+        });
+    }
+
+    /// Download the file highlighted in the registry weight-file picker
+    /// (explicit user choice — no auto-pick). Multipart siblings of the
+    /// chosen file travel with it.
+    fn download_picked_repo_file(&mut self) {
+        let Some(pick) = self.repo_file_pick.take() else {
+            return;
+        };
+        let idx = pick.state.selected().unwrap_or(0);
+        if idx >= pick.files.len() {
+            return;
+        }
+        let (file, _size) = pick.files[idx].clone();
+        let all_names: Vec<String> = pick.files.iter().map(|(n, _)| n.clone()).collect();
+        self.download_repo_file(pick.repo, pick.resolved, file, all_names);
+        self.menu_closing = true;
+    }
+
+    /// Download one explicit repo file (picker choice or single-file
+    /// fast path). Same completion reporting as the legacy flow.
+    fn download_repo_file(
+        &mut self,
+        repo: String,
+        resolved: String,
+        file: String,
+        all_names: Vec<String>,
+    ) {
+        let shards = crate::manager::find_multipart_siblings(&file, &all_names);
+        self.status_message = format!("Downloading {} …", file);
+        self.messages.push(format!(
+            "System: Downloading weight file: {} from {} (failures report here).",
+            file, repo
+        ));
+        if let Ok(mut l) = self.activity_logs.lock() {
+            l.push(format!(
+                "[USER] Downloading weight file {} from {}",
+                file, repo
+            ));
+        }
+        *self.download_progress.lock().unwrap() = Some(0.0);
+        let progress_clone = self.download_progress.clone();
+        let complete_clone = self.download_complete.clone();
+        let error_clone = self.download_error.clone();
+        let logs_clone = self.activity_logs.clone();
+        let manager_clone = self.manager.clone();
+        tokio::spawn(async move {
+            let res = manager_clone
+                .download_hf_model(
+                    &resolved,
+                    &file,
+                    &shards,
+                    progress_clone,
+                    logs_clone.clone(),
+                )
+                .await;
+            match res {
+                Ok(path) => {
+                    if let Ok(mut l) = logs_clone.lock() {
+                        l.push(format!("[SUCCESS] Installed GGUF at {}", path.display()));
+                    }
+                    *complete_clone.lock().unwrap() = true;
+                }
+                Err(e) => {
+                    if let Ok(mut l) = logs_clone.lock() {
+                        l.push(format!("[ERROR] {}", e));
+                    }
+                    *complete_clone.lock().unwrap() = false;
+                    *error_clone.lock().unwrap() =
+                        Some(format!("Download failed for '{}': {}", file, e));
+                }
             }
         });
     }
@@ -4622,6 +4879,9 @@ impl App {
     pub async fn handle_events(&mut self) -> Result<bool, std::io::Error> {
         // Install completed background code-graph builds without blocking the loop
         self.poll_code_graph_job();
+        // Install a finished registry file-listing: open the weight-file
+        // picker (stale generations are dropped).
+        self.poll_repo_file_pick();
         let now = std::time::Instant::now();
         let elapsed_secs = now.duration_since(self.last_metrics_time).as_secs_f64();
         self.last_metrics_time = now;
@@ -5518,6 +5778,8 @@ impl App {
         {
             let mut res = self.search_results.lock().unwrap();
             if let Some(models) = res.take() {
+                // Results landed: no longer "finding".
+                self.registry_searching = false;
                 let mut installed = self.manager.list_installed_local();
                 let mut hf_items = Vec::new();
                 let mut ollama_items = Vec::new();
@@ -6188,6 +6450,20 @@ impl App {
                                         self.selection_start = Some((mouse.column, mouse.row));
                                         self.selection_end = Some((mouse.column, mouse.row));
                                         self.is_selecting = true;
+                                        // Freeze auto-scroll for the gesture
+                                        // (streaming must not move content
+                                        // under the pointer) and anchor the
+                                        // logical selection.
+                                        self.auto_scroll_enabled = false;
+                                        if let Some(pt) =
+                                            self.screen_to_sel_point(mouse.column, mouse.row)
+                                        {
+                                            self.sel_anchor = Some(pt);
+                                            self.sel_focus = Some(pt);
+                                        } else {
+                                            self.sel_anchor = None;
+                                            self.sel_focus = None;
+                                        }
                                         self.selection_dragged = false;
                                         if !self.has_selection {
                                             self.selected_text_buffer.clear();
@@ -6207,6 +6483,18 @@ impl App {
                             self.selection_start = Some((mouse.column, mouse.row));
                             self.selection_end = Some((mouse.column, mouse.row));
                             self.is_selecting = true;
+                            // Freeze auto-scroll for the gesture
+                            // (streaming must not move content
+                            // under the pointer) and anchor the
+                            // logical selection.
+                            self.auto_scroll_enabled = false;
+                            if let Some(pt) = self.screen_to_sel_point(mouse.column, mouse.row) {
+                                self.sel_anchor = Some(pt);
+                                self.sel_focus = Some(pt);
+                            } else {
+                                self.sel_anchor = None;
+                                self.sel_focus = None;
+                            }
                             self.selection_dragged = false;
                             if !self.has_selection {
                                 self.selected_text_buffer.clear();
@@ -6223,6 +6511,11 @@ impl App {
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if self.is_selecting {
                             self.selection_end = Some((mouse.column, mouse.row));
+                            // Logical focus tracks the drag; highlight keeps
+                            // using screen coords.
+                            if let Some(pt) = self.screen_to_sel_point(mouse.column, mouse.row) {
+                                self.sel_focus = Some(pt);
+                            }
                             if let (Some(s), Some(e)) = (self.selection_start, self.selection_end) {
                                 if s != e {
                                     self.selection_dragged = true;
@@ -6245,6 +6538,9 @@ impl App {
                     MouseEventKind::Up(MouseButton::Left) => {
                         if self.is_selecting {
                             self.selection_end = Some((mouse.column, mouse.row));
+                            if let Some(pt) = self.screen_to_sel_point(mouse.column, mouse.row) {
+                                self.sel_focus = Some(pt);
+                            }
                             self.finalize_selection();
                         }
                     }
@@ -6727,6 +7023,9 @@ impl App {
         let mut chat_lines: Vec<Line> = Vec::new();
         // (chip_id, logical chat_lines index where chip spacer starts)
         let mut chip_line_starts: Vec<(u64, usize)> = Vec::new();
+        // Logical copy owners: (chat_lines index, owner). Rows inherit the
+        // last mark at or before them; built into chat_render_map below.
+        let mut owner_marks: Vec<(usize, crate::copy::RowOwner)> = Vec::new();
         let mut section_headers: Vec<(usize, String, Color)> = Vec::new();
         let mut all_toggle_buttons: Vec<(usize, usize, u16, u16, u16, u16)> = Vec::new();
         let mut all_copy_buttons: Vec<(usize, usize, u16, u16, String)> = Vec::new();
@@ -6758,10 +7057,12 @@ impl App {
              btn_list: &mut Vec<(usize, u16, u16, SectionKind)>,
              headers: &mut Vec<(usize, String, Color)>,
              buf: &mut Vec<(Span<'static>, usize, SectionKind, Color, String)>,
-             max_w: usize| {
+             max_w: usize,
+             marks: &mut Vec<(usize, crate::copy::RowOwner)>| {
                 if buf.is_empty() {
                     return;
                 }
+                marks.push((lines.len(), crate::copy::RowOwner::Ui));
                 let mut cur_line_spans: Vec<Span<'static>> = Vec::new();
                 let mut cur_line_w: usize = 0;
                 let mut cur_line_idx = lines.len();
@@ -6851,11 +7152,13 @@ impl App {
                         &mut section_headers,
                         &mut collapsed_row_buf,
                         available_width,
+                        &mut owner_marks,
                     );
 
                     let title_line_idx = chat_lines.len();
                     all_section_hits_unmapped.push((title_line_idx, 0, 5, SectionKind::You(m_idx)));
                     section_headers.push((title_line_idx, "You".to_string(), user_bg));
+                    owner_marks.push((title_line_idx, crate::copy::RowOwner::Msg(m_idx)));
                     let row_bg = if is_collapsed { pal_bg() } else { content_bg };
                     push_full_shaded!(
                         &mut chat_lines,
@@ -7051,6 +7354,7 @@ impl App {
                                 &mut section_headers,
                                 &mut collapsed_row_buf,
                                 available_width,
+                                &mut owner_marks,
                             );
 
                             let title_line_idx = chat_lines.len();
@@ -7065,6 +7369,7 @@ impl App {
                                 think_tag.trim().to_string(),
                                 think_bg,
                             ));
+                            owner_marks.push((title_line_idx, crate::copy::RowOwner::Msg(m_idx)));
                             let header_row_bg = if is_collapsed { pal_bg() } else { content_bg };
                             push_full_shaded!(
                                 &mut chat_lines,
@@ -7280,6 +7585,7 @@ impl App {
                                 &mut section_headers,
                                 &mut collapsed_row_buf,
                                 available_width,
+                                &mut owner_marks,
                             );
                             let title_line_idx = chat_lines.len();
                             all_section_hits_unmapped.push((
@@ -7293,6 +7599,7 @@ impl App {
                                 agent_label.trim().to_string(),
                                 agent_bg,
                             ));
+                            owner_marks.push((title_line_idx, crate::copy::RowOwner::Msg(m_idx)));
                             let row_bg = if is_collapsed { pal_bg() } else { content_bg };
                             push_full_shaded!(
                                 &mut chat_lines,
@@ -7533,10 +7840,12 @@ impl App {
                             &mut section_headers,
                             &mut collapsed_row_buf,
                             available_width,
+                            &mut owner_marks,
                         );
 
                         let chip_start = chat_lines.len();
                         chip_line_starts.push((chip.id, chip_start));
+                        owner_marks.push((chip_start, crate::copy::RowOwner::Ui));
 
                         let action_row_bg = if is_open { content_bg } else { pal_bg() };
                         section_headers.push((
@@ -7561,6 +7870,7 @@ impl App {
                             available_width,
                             action_row_bg
                         );
+                        owner_marks.push((chat_lines.len(), crate::copy::RowOwner::Chip(chip.id)));
 
                         let mut cur_spans = vec![
                             Span::styled("▎", Style::default().fg(action_bg).bg(action_row_bg)),
@@ -7610,6 +7920,7 @@ impl App {
                                 ),
                             ];
                             let cur_w = 2 + rule_w;
+                            owner_marks.push((chat_lines.len(), crate::copy::RowOwner::Ui));
                             push_full_shaded!(
                                 &mut chat_lines,
                                 rule_spans,
@@ -7733,6 +8044,7 @@ impl App {
                         &mut section_headers,
                         &mut collapsed_row_buf,
                         available_width,
+                        &mut owner_marks,
                     );
 
                     let title_line_idx = chat_lines.len();
@@ -7743,6 +8055,7 @@ impl App {
                         SectionKind::System(m_idx),
                     ));
                     section_headers.push((title_line_idx, "System".to_string(), sys_bg));
+                    owner_marks.push((title_line_idx, crate::copy::RowOwner::Msg(m_idx)));
                     let row_bg = if is_collapsed { pal_bg() } else { content_bg };
                     push_full_shaded!(
                         &mut chat_lines,
@@ -7809,6 +8122,7 @@ impl App {
                     &mut section_headers,
                     &mut collapsed_row_buf,
                     available_width,
+                    &mut owner_marks,
                 );
                 chat_lines.push(Line::from(Span::styled(
                     m.clone(),
@@ -7893,10 +8207,12 @@ impl App {
                         &mut section_headers,
                         &mut collapsed_row_buf,
                         available_width,
+                        &mut owner_marks,
                     );
 
                     let chip_start = chat_lines.len();
                     chip_line_starts.push((chip.id, chip_start));
+                    owner_marks.push((chip_start, crate::copy::RowOwner::Ui));
 
                     let action_row_bg = if is_open { content_bg } else { pal_bg() };
                     section_headers.push((
@@ -7921,6 +8237,7 @@ impl App {
                         available_width,
                         action_row_bg
                     );
+                    owner_marks.push((chat_lines.len(), crate::copy::RowOwner::Chip(chip.id)));
 
                     let mut cur_spans = vec![
                         Span::styled("▎", Style::default().fg(action_bg).bg(action_row_bg)),
@@ -7966,6 +8283,7 @@ impl App {
                             ),
                         ];
                         let cur_w = 2 + rule_w;
+                        owner_marks.push((chat_lines.len(), crate::copy::RowOwner::Ui));
                         push_full_shaded!(
                             &mut chat_lines,
                             rule_spans,
@@ -8053,19 +8371,25 @@ impl App {
             &mut section_headers,
             &mut collapsed_row_buf,
             available_width,
+            &mut owner_marks,
         );
 
         let mut total_visual_lines: u16 = 0;
         let mut visual_at: Vec<u16> = Vec::with_capacity(chat_lines.len() + 1);
         for line in &chat_lines {
             visual_at.push(total_visual_lines);
-            let w = line.width();
-            if w == 0 {
-                total_visual_lines += 1;
+            // True word-wrap row count, exactly as the Paragraph renders
+            // it. Naive ceil-division undercounts when words break early
+            // ("aa bb cc" at width 4 is 3 rows, not 2), which desyncs
+            // hit-testing, scroll limits and mouse mapping from the
+            // displayed frame. Single-row fast path when it fits.
+            let rows = if line.width() <= available_width {
+                1u16
             } else {
-                let lines = (w + available_width - 1) / available_width;
-                total_visual_lines += lines as u16;
-            }
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                crate::copy::wrap_line_rows(&text, available_width).len() as u16
+            };
+            total_visual_lines += rows.max(1);
         }
         self.last_chat_visual_at = visual_at.clone();
 
@@ -8143,6 +8467,35 @@ impl App {
                     .collect::<String>()
             })
             .collect();
+
+        // Logical render map for copy: same frame, same order. Every row
+        // inherits the last owner mark at or before it, so scrolling,
+        // resize and streaming never change what a row means — only
+        // compaction/load/clear invalidate indices (selection is cleared
+        // there).
+        {
+            let mut marks = std::mem::take(&mut owner_marks);
+            marks.sort_by_key(|(idx, _)| *idx);
+            let mut cur = crate::copy::RowOwner::Ui;
+            let mut mi = 0usize;
+            let mut map = Vec::with_capacity(chat_lines.len());
+            for (idx, line) in chat_lines.iter().enumerate() {
+                while mi < marks.len() && marks[mi].0 <= idx {
+                    cur = marks[mi].1;
+                    mi += 1;
+                }
+                map.push(crate::copy::RenderRow {
+                    text: line
+                        .spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>(),
+                    owner: cur,
+                });
+            }
+            self.chat_render_map = map;
+            self.last_chat_width = available_width;
+        }
 
         // Shade selected rows while dragging OR after release (has_selection) using visual row alignment
         if self.selection_active() {
@@ -9149,420 +9502,439 @@ impl App {
                     }
                     1 => {
                         // === Registry Section (Tab Bar + Search Bar + Filtered Model List) ===
-                        let chunks = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints(
-                                [
-                                    Constraint::Length(2),
-                                    Constraint::Length(2),
-                                    Constraint::Min(1),
-                                ]
-                                .as_ref(),
-                            )
-                            .split(content_inner);
-
-                        let hf_style = if self.registry_tab == 0 {
-                            Style::default()
-                                .fg(NORDIC_BG)
-                                .bg(Color::White)
-                                .add_modifier(Modifier::BOLD)
+                        // Weight-file picker replaces the repo list while open.
+                        if self.repo_file_pick.is_some() {
+                            self.render_repo_file_pick(frame, content_inner);
                         } else {
-                            Style::default()
-                                .fg(Color::Rgb(160, 180, 200))
-                                .bg(modal_bg())
-                        };
-                        let ol_style = if self.registry_tab == 1 {
-                            Style::default()
-                                .fg(NORDIC_BG)
-                                .bg(Color::White)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default()
-                                .fg(Color::Rgb(160, 180, 200))
-                                .bg(modal_bg())
-                        };
+                            let chunks = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints(
+                                    [
+                                        Constraint::Length(2),
+                                        Constraint::Length(2),
+                                        Constraint::Min(1),
+                                    ]
+                                    .as_ref(),
+                                )
+                                .split(content_inner);
 
-                        let tab_bar = Paragraph::new(Line::from(vec![
-                            Span::styled(" [ HuggingFace Models ] ", hf_style),
-                            Span::styled("  ", Style::default().bg(modal_bg())),
-                            Span::styled(" [ Ollama Models ] ", ol_style),
-                            Span::styled(
-                                "   (Left/Right to switch tab | Enter to download)",
+                            let hf_style = if self.registry_tab == 0 {
                                 Style::default()
-                                    .fg(Color::Rgb(120, 140, 160))
-                                    .bg(modal_bg()),
-                            ),
-                        ]))
-                        .style(Style::default().bg(modal_bg()));
-                        frame.render_widget(tab_bar, chunks[0]);
-
-                        // Search Bar
-                        let search_text = if self.registry_search_query.is_empty() {
-                            Span::styled(
-                                " Search models (type to filter query)...",
+                                    .fg(NORDIC_BG)
+                                    .bg(Color::White)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
                                 Style::default()
-                                    .fg(Color::Rgb(100, 120, 140))
-                                    .bg(modal_bg()),
-                            )
-                        } else {
-                            Span::styled(
-                                format!(" Search: {}", self.registry_search_query),
-                                Style::default()
-                                    .fg(Color::White)
+                                    .fg(Color::Rgb(160, 180, 200))
                                     .bg(modal_bg())
-                                    .add_modifier(Modifier::BOLD),
-                            )
-                        };
-                        frame.render_widget(
-                            Paragraph::new(Line::from(vec![search_text]))
-                                .style(Style::default().bg(modal_bg())),
-                            chunks[1],
-                        );
-
-                        let q_raw = self.registry_search_query.trim();
-                        let total_w = chunks[2].width as usize;
-
-                        // Helper closure to build highlighted spans with bold matching chars
-                        let build_highlighted_spans = |text: &str,
-                                                       query: &str,
-                                                       base_style: Style,
-                                                       match_style: Style|
-                         -> Vec<Span> {
-                            if query.is_empty() {
-                                return vec![Span::styled(text.to_string(), base_style)];
-                            }
-                            let text_lower = text.to_lowercase();
-                            let mut spans = Vec::new();
-                            let mut last_idx = 0;
-
-                            // Check if query is in text as substring or match sub-tokens
-                            let search_term = if let Some(slash_idx) = query.rfind('/') {
-                                &query[slash_idx + 1..]
-                            } else {
-                                query
                             };
-                            let needle = search_term.to_lowercase();
-
-                            if !needle.is_empty() && text_lower.contains(&needle) {
-                                for (match_start, _) in text_lower.match_indices(&needle) {
-                                    if match_start > last_idx {
-                                        spans.push(Span::styled(
-                                            text[last_idx..match_start].to_string(),
-                                            base_style,
-                                        ));
-                                    }
-                                    let match_end = match_start + needle.len();
-                                    spans.push(Span::styled(
-                                        text[match_start..match_end].to_string(),
-                                        match_style,
-                                    ));
-                                    last_idx = match_end;
-                                }
-                                if last_idx < text.len() {
-                                    spans.push(Span::styled(
-                                        text[last_idx..].to_string(),
-                                        base_style,
-                                    ));
-                                }
+                            let ol_style = if self.registry_tab == 1 {
+                                Style::default()
+                                    .fg(NORDIC_BG)
+                                    .bg(Color::White)
+                                    .add_modifier(Modifier::BOLD)
                             } else {
-                                spans.push(Span::styled(text.to_string(), base_style));
-                            }
-                            spans
-                        };
+                                Style::default()
+                                    .fg(Color::Rgb(160, 180, 200))
+                                    .bg(modal_bg())
+                            };
 
-                        let filtered_models = self.filtered_registry_models();
+                            let tab_bar = Paragraph::new(Line::from(vec![
+                                Span::styled(" [ HuggingFace Models ] ", hf_style),
+                                Span::styled("  ", Style::default().bg(modal_bg())),
+                                Span::styled(" [ Ollama Models ] ", ol_style),
+                                Span::styled(
+                                    "   (Left/Right to switch tab | Enter to download)",
+                                    Style::default()
+                                        .fg(Color::Rgb(120, 140, 160))
+                                        .bg(modal_bg()),
+                                ),
+                            ]))
+                            .style(Style::default().bg(modal_bg()));
+                            frame.render_widget(tab_bar, chunks[0]);
 
-                        // Lively adjust selection cap to match filtered items length
-                        if filtered_models.is_empty() {
-                            self.registry_state.select(None);
-                        } else {
-                            let cur_sel = self.registry_state.selected().unwrap_or(0);
-                            if cur_sel >= filtered_models.len() {
-                                self.registry_state.select(Some(filtered_models.len() - 1));
-                            } else if self.registry_state.selected().is_none() {
-                                self.registry_state.select(Some(0));
-                            }
-                        }
+                            // Search Bar
+                            let search_text = if self.registry_search_query.is_empty() {
+                                Span::styled(
+                                    " Search models (type to filter query)...",
+                                    Style::default()
+                                        .fg(Color::Rgb(100, 120, 140))
+                                        .bg(modal_bg()),
+                                )
+                            } else {
+                                Span::styled(
+                                    format!(" Search: {}", self.registry_search_query),
+                                    Style::default()
+                                        .fg(Color::White)
+                                        .bg(modal_bg())
+                                        .add_modifier(Modifier::BOLD),
+                                )
+                            };
+                            frame.render_widget(
+                                Paragraph::new(Line::from(vec![search_text]))
+                                    .style(Style::default().bg(modal_bg())),
+                                chunks[1],
+                            );
 
-                        let selected_idx = self.registry_state.selected();
+                            let q_raw = self.registry_search_query.trim();
+                            let total_w = chunks[2].width as usize;
 
-                        let items: Vec<ListItem> = if self.registry_tab == 0 {
-                            filtered_models
-                                .iter()
-                                .enumerate()
-                                .map(|(row_idx, m)| {
-                                    let is_selected = selected_idx == Some(row_idx);
-                                    let row_bg = if is_selected {
-                                        crate::app_palette::current_palette().selection_bg_c()
+                            // Helper closure to build highlighted spans with bold matching chars
+                            let build_highlighted_spans =
+                                |text: &str,
+                                 query: &str,
+                                 base_style: Style,
+                                 match_style: Style|
+                                 -> Vec<Span> {
+                                    if query.is_empty() {
+                                        return vec![Span::styled(text.to_string(), base_style)];
+                                    }
+                                    let text_lower = text.to_lowercase();
+                                    let mut spans = Vec::new();
+                                    let mut last_idx = 0;
+
+                                    // Check if query is in text as substring or match sub-tokens
+                                    let search_term = if let Some(slash_idx) = query.rfind('/') {
+                                        &query[slash_idx + 1..]
                                     } else {
-                                        modal_bg()
+                                        query
                                     };
+                                    let needle = search_term.to_lowercase();
 
-                                    // Split org/repo [size] into columns: Org │ Model │ Size
-                                    let (repo_part, size_part) =
-                                        if let Some(bracket_idx) = m.find('[') {
-                                            (m[..bracket_idx].trim(), m[bracket_idx..].trim())
+                                    if !needle.is_empty() && text_lower.contains(&needle) {
+                                        for (match_start, _) in text_lower.match_indices(&needle) {
+                                            if match_start > last_idx {
+                                                spans.push(Span::styled(
+                                                    text[last_idx..match_start].to_string(),
+                                                    base_style,
+                                                ));
+                                            }
+                                            let match_end = match_start + needle.len();
+                                            spans.push(Span::styled(
+                                                text[match_start..match_end].to_string(),
+                                                match_style,
+                                            ));
+                                            last_idx = match_end;
+                                        }
+                                        if last_idx < text.len() {
+                                            spans.push(Span::styled(
+                                                text[last_idx..].to_string(),
+                                                base_style,
+                                            ));
+                                        }
+                                    } else {
+                                        spans.push(Span::styled(text.to_string(), base_style));
+                                    }
+                                    spans
+                                };
+
+                            let filtered_models = self.filtered_registry_models();
+
+                            // Lively adjust selection cap to match filtered items length
+                            if filtered_models.is_empty() {
+                                self.registry_state.select(None);
+                            } else {
+                                let cur_sel = self.registry_state.selected().unwrap_or(0);
+                                if cur_sel >= filtered_models.len() {
+                                    self.registry_state.select(Some(filtered_models.len() - 1));
+                                } else if self.registry_state.selected().is_none() {
+                                    self.registry_state.select(Some(0));
+                                }
+                            }
+
+                            let selected_idx = self.registry_state.selected();
+
+                            let items: Vec<ListItem> = if self.registry_tab == 0 {
+                                filtered_models
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(row_idx, m)| {
+                                        let is_selected = selected_idx == Some(row_idx);
+                                        let row_bg = if is_selected {
+                                            crate::app_palette::current_palette().selection_bg_c()
                                         } else {
-                                            (m.trim(), "")
+                                            modal_bg()
                                         };
-                                    let (org, model_name) =
-                                        if let Some(slash_idx) = repo_part.find('/') {
+
+                                        // Split org/repo [size] into columns: Org │ Model │ Size
+                                        let (repo_part, size_part) =
+                                            if let Some(bracket_idx) = m.find('[') {
+                                                (m[..bracket_idx].trim(), m[bracket_idx..].trim())
+                                            } else {
+                                                (m.trim(), "")
+                                            };
+                                        let (org, model_name) = if let Some(slash_idx) =
+                                            repo_part.find('/')
+                                        {
                                             (&repo_part[..slash_idx], &repo_part[slash_idx + 1..])
                                         } else {
                                             ("-", repo_part)
                                         };
 
-                                    let org_col = format!(
-                                        "{:<14}",
-                                        if org.len() > 14 { &org[..14] } else { org }
-                                    );
-                                    let size_clean = size_part
-                                        .trim_matches(|c| c == '[' || c == ']')
-                                        .replace("Q4 est.", "est")
-                                        .replace("GGUF", "")
-                                        .trim()
-                                        .to_string();
-                                    let size_col = format!(
-                                        "{:>12}",
-                                        if size_clean.len() > 12 {
-                                            &size_clean[..12]
-                                        } else {
-                                            &size_clean
-                                        }
-                                    );
-
-                                    let used_w = 14 + 3 + 12 + 3; // org + " │ " + size + " │ "
-                                    let model_max_w = total_w.saturating_sub(used_w).max(10);
-                                    let model_col = format!(
-                                        "{:<width$}",
-                                        if model_name.len() > model_max_w {
-                                            &model_name[..model_max_w]
-                                        } else {
-                                            model_name
-                                        },
-                                        width = model_max_w
-                                    );
-
-                                    let org_base_style = Style::default()
-                                        .fg(if is_selected {
-                                            Color::Rgb(143, 218, 255)
-                                        } else {
-                                            Color::Rgb(136, 192, 208)
-                                        })
-                                        .bg(row_bg);
-                                    let org_match_style = Style::default()
-                                        .fg(Color::White)
-                                        .bg(Color::Rgb(94, 129, 172))
-                                        .add_modifier(Modifier::BOLD);
-                                    let org_spans = build_highlighted_spans(
-                                        &org_col,
-                                        q_raw,
-                                        org_base_style,
-                                        org_match_style,
-                                    );
-
-                                    let model_base_style = Style::default()
-                                        .fg(if is_selected {
-                                            Color::White
-                                        } else {
-                                            Color::Rgb(220, 230, 242)
-                                        })
-                                        .bg(row_bg)
-                                        .add_modifier(if is_selected {
-                                            Modifier::BOLD
-                                        } else {
-                                            Modifier::empty()
-                                        });
-                                    let model_match_style = Style::default()
-                                        .fg(Color::Rgb(235, 203, 139))
-                                        .bg(Color::Rgb(67, 76, 94))
-                                        .add_modifier(Modifier::BOLD);
-                                    let model_spans = build_highlighted_spans(
-                                        &model_col,
-                                        q_raw,
-                                        model_base_style,
-                                        model_match_style,
-                                    );
-
-                                    let mut line_spans = Vec::new();
-                                    line_spans.extend(org_spans);
-                                    line_spans.push(Span::styled(
-                                        " │ ",
-                                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
-                                    ));
-                                    line_spans.extend(model_spans);
-                                    line_spans.push(Span::styled(
-                                        " │ ",
-                                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
-                                    ));
-                                    line_spans.push(Span::styled(
-                                        size_col,
-                                        Style::default()
-                                            .fg(if is_selected {
-                                                Color::Rgb(180, 240, 160)
+                                        let org_col = format!(
+                                            "{:<14}",
+                                            if org.len() > 14 { &org[..14] } else { org }
+                                        );
+                                        let size_clean = size_part
+                                            .trim_matches(|c| c == '[' || c == ']')
+                                            .replace("Q4 est.", "est")
+                                            .replace("GGUF", "")
+                                            .trim()
+                                            .to_string();
+                                        let size_col = format!(
+                                            "{:>12}",
+                                            if size_clean.len() > 12 {
+                                                &size_clean[..12]
                                             } else {
-                                                Color::Rgb(163, 190, 140)
+                                                &size_clean
+                                            }
+                                        );
+
+                                        let used_w = 14 + 3 + 12 + 3; // org + " │ " + size + " │ "
+                                        let model_max_w = total_w.saturating_sub(used_w).max(10);
+                                        let model_col = format!(
+                                            "{:<width$}",
+                                            if model_name.len() > model_max_w {
+                                                &model_name[..model_max_w]
+                                            } else {
+                                                model_name
+                                            },
+                                            width = model_max_w
+                                        );
+
+                                        let org_base_style = Style::default()
+                                            .fg(if is_selected {
+                                                Color::Rgb(143, 218, 255)
+                                            } else {
+                                                Color::Rgb(136, 192, 208)
+                                            })
+                                            .bg(row_bg);
+                                        let org_match_style = Style::default()
+                                            .fg(Color::White)
+                                            .bg(Color::Rgb(94, 129, 172))
+                                            .add_modifier(Modifier::BOLD);
+                                        let org_spans = build_highlighted_spans(
+                                            &org_col,
+                                            q_raw,
+                                            org_base_style,
+                                            org_match_style,
+                                        );
+
+                                        let model_base_style = Style::default()
+                                            .fg(if is_selected {
+                                                Color::White
+                                            } else {
+                                                Color::Rgb(220, 230, 242)
                                             })
                                             .bg(row_bg)
                                             .add_modifier(if is_selected {
                                                 Modifier::BOLD
                                             } else {
                                                 Modifier::empty()
-                                            }),
-                                    ));
+                                            });
+                                        let model_match_style = Style::default()
+                                            .fg(Color::Rgb(235, 203, 139))
+                                            .bg(Color::Rgb(67, 76, 94))
+                                            .add_modifier(Modifier::BOLD);
+                                        let model_spans = build_highlighted_spans(
+                                            &model_col,
+                                            q_raw,
+                                            model_base_style,
+                                            model_match_style,
+                                        );
 
-                                    ListItem::new(Line::from(line_spans))
-                                        .style(Style::default().bg(row_bg))
-                                })
-                                .collect()
-                        } else {
-                            filtered_models
-                                .iter()
-                                .enumerate()
-                                .map(|(row_idx, m)| {
-                                    let is_selected = selected_idx == Some(row_idx);
-                                    let row_bg = if is_selected {
-                                        crate::app_palette::current_palette().selection_bg_c()
-                                    } else {
-                                        modal_bg()
-                                    };
+                                        let mut line_spans = Vec::new();
+                                        line_spans.extend(org_spans);
+                                        line_spans.push(Span::styled(
+                                            " │ ",
+                                            Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
+                                        ));
+                                        line_spans.extend(model_spans);
+                                        line_spans.push(Span::styled(
+                                            " │ ",
+                                            Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
+                                        ));
+                                        line_spans.push(Span::styled(
+                                            size_col,
+                                            Style::default()
+                                                .fg(if is_selected {
+                                                    Color::Rgb(180, 240, 160)
+                                                } else {
+                                                    Color::Rgb(163, 190, 140)
+                                                })
+                                                .bg(row_bg)
+                                                .add_modifier(if is_selected {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ));
 
-                                    let (name_part, size_part) = if let Some(idx) = m.find('(') {
-                                        (
-                                            m[..idx].trim(),
-                                            m[idx..].trim_matches(|c| c == '(' || c == ')').trim(),
-                                        )
-                                    } else if let Some(idx) = m.find('[') {
-                                        (
-                                            m[..idx].trim(),
-                                            m[idx..].trim_matches(|c| c == '[' || c == ']').trim(),
-                                        )
-                                    } else {
-                                        (m.trim(), "")
-                                    };
+                                        ListItem::new(Line::from(line_spans))
+                                            .style(Style::default().bg(row_bg))
+                                    })
+                                    .collect()
+                            } else {
+                                filtered_models
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(row_idx, m)| {
+                                        let is_selected = selected_idx == Some(row_idx);
+                                        let row_bg = if is_selected {
+                                            crate::app_palette::current_palette().selection_bg_c()
+                                        } else {
+                                            modal_bg()
+                                        };
 
-                                    let (org, model_name) =
-                                        if let Some(slash_idx) = name_part.find('/') {
+                                        let (name_part, size_part) = if let Some(idx) = m.find('(')
+                                        {
+                                            (
+                                                m[..idx].trim(),
+                                                m[idx..]
+                                                    .trim_matches(|c| c == '(' || c == ')')
+                                                    .trim(),
+                                            )
+                                        } else if let Some(idx) = m.find('[') {
+                                            (
+                                                m[..idx].trim(),
+                                                m[idx..]
+                                                    .trim_matches(|c| c == '[' || c == ']')
+                                                    .trim(),
+                                            )
+                                        } else {
+                                            (m.trim(), "")
+                                        };
+
+                                        let (org, model_name) = if let Some(slash_idx) =
+                                            name_part.find('/')
+                                        {
                                             (&name_part[..slash_idx], &name_part[slash_idx + 1..])
                                         } else {
                                             ("ollama", name_part)
                                         };
 
-                                    let org_col = format!(
-                                        "{:<14}",
-                                        if org.len() > 14 { &org[..14] } else { org }
-                                    );
-                                    let size_col = format!(
-                                        "{:>12}",
-                                        if size_part.len() > 12 {
-                                            &size_part[..12]
-                                        } else {
-                                            size_part
-                                        }
-                                    );
-                                    let used_w = 14 + 3 + 12 + 3;
-                                    let model_max_w = total_w.saturating_sub(used_w).max(10);
-                                    let model_col = format!(
-                                        "{:<width$}",
-                                        if model_name.len() > model_max_w {
-                                            &model_name[..model_max_w]
-                                        } else {
-                                            model_name
-                                        },
-                                        width = model_max_w
-                                    );
-
-                                    let org_base_style = Style::default()
-                                        .fg(if is_selected {
-                                            Color::Rgb(143, 218, 255)
-                                        } else {
-                                            Color::Rgb(136, 192, 208)
-                                        })
-                                        .bg(row_bg);
-                                    let org_match_style = Style::default()
-                                        .fg(Color::White)
-                                        .bg(Color::Rgb(94, 129, 172))
-                                        .add_modifier(Modifier::BOLD);
-                                    let org_spans = build_highlighted_spans(
-                                        &org_col,
-                                        q_raw,
-                                        org_base_style,
-                                        org_match_style,
-                                    );
-
-                                    let model_base_style = Style::default()
-                                        .fg(if is_selected {
-                                            Color::White
-                                        } else {
-                                            Color::Rgb(220, 230, 242)
-                                        })
-                                        .bg(row_bg)
-                                        .add_modifier(if is_selected {
-                                            Modifier::BOLD
-                                        } else {
-                                            Modifier::empty()
-                                        });
-                                    let model_match_style = Style::default()
-                                        .fg(Color::Rgb(235, 203, 139))
-                                        .bg(Color::Rgb(67, 76, 94))
-                                        .add_modifier(Modifier::BOLD);
-                                    let model_spans = build_highlighted_spans(
-                                        &model_col,
-                                        q_raw,
-                                        model_base_style,
-                                        model_match_style,
-                                    );
-
-                                    let mut line_spans = Vec::new();
-                                    line_spans.extend(org_spans);
-                                    line_spans.push(Span::styled(
-                                        " │ ",
-                                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
-                                    ));
-                                    line_spans.extend(model_spans);
-                                    line_spans.push(Span::styled(
-                                        " │ ",
-                                        Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
-                                    ));
-                                    line_spans.push(Span::styled(
-                                        size_col,
-                                        Style::default()
-                                            .fg(if is_selected {
-                                                Color::Rgb(180, 240, 160)
+                                        let org_col = format!(
+                                            "{:<14}",
+                                            if org.len() > 14 { &org[..14] } else { org }
+                                        );
+                                        let size_col = format!(
+                                            "{:>12}",
+                                            if size_part.len() > 12 {
+                                                &size_part[..12]
                                             } else {
-                                                Color::Rgb(163, 190, 140)
+                                                size_part
+                                            }
+                                        );
+                                        let used_w = 14 + 3 + 12 + 3;
+                                        let model_max_w = total_w.saturating_sub(used_w).max(10);
+                                        let model_col = format!(
+                                            "{:<width$}",
+                                            if model_name.len() > model_max_w {
+                                                &model_name[..model_max_w]
+                                            } else {
+                                                model_name
+                                            },
+                                            width = model_max_w
+                                        );
+
+                                        let org_base_style = Style::default()
+                                            .fg(if is_selected {
+                                                Color::Rgb(143, 218, 255)
+                                            } else {
+                                                Color::Rgb(136, 192, 208)
+                                            })
+                                            .bg(row_bg);
+                                        let org_match_style = Style::default()
+                                            .fg(Color::White)
+                                            .bg(Color::Rgb(94, 129, 172))
+                                            .add_modifier(Modifier::BOLD);
+                                        let org_spans = build_highlighted_spans(
+                                            &org_col,
+                                            q_raw,
+                                            org_base_style,
+                                            org_match_style,
+                                        );
+
+                                        let model_base_style = Style::default()
+                                            .fg(if is_selected {
+                                                Color::White
+                                            } else {
+                                                Color::Rgb(220, 230, 242)
                                             })
                                             .bg(row_bg)
                                             .add_modifier(if is_selected {
                                                 Modifier::BOLD
                                             } else {
                                                 Modifier::empty()
-                                            }),
-                                    ));
+                                            });
+                                        let model_match_style = Style::default()
+                                            .fg(Color::Rgb(235, 203, 139))
+                                            .bg(Color::Rgb(67, 76, 94))
+                                            .add_modifier(Modifier::BOLD);
+                                        let model_spans = build_highlighted_spans(
+                                            &model_col,
+                                            q_raw,
+                                            model_base_style,
+                                            model_match_style,
+                                        );
 
-                                    ListItem::new(Line::from(line_spans))
-                                        .style(Style::default().bg(row_bg))
-                                })
-                                .collect()
-                        };
+                                        let mut line_spans = Vec::new();
+                                        line_spans.extend(org_spans);
+                                        line_spans.push(Span::styled(
+                                            " │ ",
+                                            Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
+                                        ));
+                                        line_spans.extend(model_spans);
+                                        line_spans.push(Span::styled(
+                                            " │ ",
+                                            Style::default().fg(Color::Rgb(76, 86, 106)).bg(row_bg),
+                                        ));
+                                        line_spans.push(Span::styled(
+                                            size_col,
+                                            Style::default()
+                                                .fg(if is_selected {
+                                                    Color::Rgb(180, 240, 160)
+                                                } else {
+                                                    Color::Rgb(163, 190, 140)
+                                                })
+                                                .bg(row_bg)
+                                                .add_modifier(if is_selected {
+                                                    Modifier::BOLD
+                                                } else {
+                                                    Modifier::empty()
+                                                }),
+                                        ));
 
-                        if items.is_empty() {
-                            let empty_msg = if q_raw.is_empty() {
-                                "Loading model catalog from Hugging Face & Ollama..."
-                            } else {
-                                "No models found matching query. Press Backspace or search another author/model."
+                                        ListItem::new(Line::from(line_spans))
+                                            .style(Style::default().bg(row_bg))
+                                    })
+                                    .collect()
                             };
-                            let p = Paragraph::new(Line::from(vec![Span::styled(
-                                format!("  {}", empty_msg),
-                                Style::default()
-                                    .fg(Color::Rgb(160, 180, 200))
-                                    .bg(modal_bg()),
-                            )]))
-                            .style(Style::default().bg(modal_bg()));
-                            frame.render_widget(p, chunks[2]);
-                        } else {
-                            let list = List::new(items).style(Style::default().bg(modal_bg()));
-                            frame.render_stateful_widget(list, chunks[2], &mut self.registry_state);
+
+                            if items.is_empty() {
+                                let empty_msg = if self.registry_searching {
+                                    "Finding models…"
+                                } else if q_raw.is_empty() {
+                                    "Loading model catalog from Hugging Face & Ollama..."
+                                } else {
+                                    "No models found matching query. Press Backspace or search another author/model."
+                                };
+                                let p = Paragraph::new(Line::from(vec![Span::styled(
+                                    format!("  {}", empty_msg),
+                                    Style::default()
+                                        .fg(Color::Rgb(160, 180, 200))
+                                        .bg(modal_bg()),
+                                )]))
+                                .style(Style::default().bg(modal_bg()));
+                                frame.render_widget(p, chunks[2]);
+                            } else {
+                                let list = List::new(items).style(Style::default().bg(modal_bg()));
+                                frame.render_stateful_widget(
+                                    list,
+                                    chunks[2],
+                                    &mut self.registry_state,
+                                );
+                            }
                         }
                     }
                     2 => {
@@ -11816,13 +12188,14 @@ impl App {
         self.code_graph_error = None;
 
         let job_slot = self.code_graph_job.clone();
+        let logs = self.activity_logs.clone();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build();
             let result = match rt {
-                Ok(rt) => rt.block_on(Self::build_code_graph_task()),
+                Ok(rt) => rt.block_on(Self::build_code_graph_task(logs)),
                 Err(e) => Err(format!("Failed to create runtime: {}", e)),
             };
             if let Ok(mut slot) = job_slot.lock() {
@@ -11831,16 +12204,37 @@ impl App {
         });
     }
 
-    async fn build_code_graph_task() -> Result<(crate::code_graph::CodeGraph, usize, usize), String>
-    {
-        let mut lsp_manager = crate::lsp::LspManager::new(
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        );
+    async fn build_code_graph_task(
+        logs: Arc<Mutex<Vec<String>>>,
+    ) -> Result<(crate::code_graph::CodeGraph, usize, usize), String> {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let mut lsp_manager = crate::lsp::LspManager::new(workspace.clone());
         // Honor the LSP switch: when the user turned LSP diagnostics off,
         // do not spawn language servers at all — Tree-sitter alone builds
-        // the graph (same fallback as a failed start).
-        if crate::settings::get_lsp_diagnostics_enabled() && lsp_manager.start().await.is_err() {
-            // LSP failed, but we can still use Tree-sitter
+        // the graph (same fallback as a failed start). The spawn site
+        // itself (LspClient::start) enforces this too, so no caller can
+        // ever start a server behind the switch's back.
+        match lsp_manager.start().await {
+            Ok(()) => {}
+            Err(e) => {
+                // LSP refused/failed, but we can still use Tree-sitter.
+                if let Ok(mut l) = logs.lock() {
+                    l.push(format!(
+                        "[LSP] no language server ({e}) — Tree-sitter only."
+                    ));
+                }
+            }
+        }
+        // Visible spawn record: a language server indexing a big workspace
+        // can hang a small machine, and the user must see who started it.
+        if let Some(pid) = lsp_manager.server_pid() {
+            if let Ok(mut l) = logs.lock() {
+                l.push(format!(
+                    "[LSP] rust-analyzer spawned (pid {}) for {} — stopped automatically when the graph build finishes.",
+                    pid,
+                    workspace.display()
+                ));
+            }
         }
 
         let config = crate::code_graph::config_from_settings();
@@ -11870,10 +12264,159 @@ impl App {
             }
         }
 
+        // The server's job is done: stop it now (awaited) instead of
+        // leaving a cold-indexing rust-analyzer on the machine. The panel
+        // shows a snapshot — reopening reuses the cached graph, `r`
+        // rebuilds explicitly with a fresh server.
+        builder.shutdown_lsp().await;
+        if let Ok(mut l) = logs.lock() {
+            l.push("[LSP] language server stopped after graph build.".to_string());
+        }
         Ok((merged_graph, total_files, failed_files))
     }
 
     /// Install a finished background code-graph build, if one completed.
+    /// Drain a finished registry file-listing into the weight-file
+    /// picker. Stale generations and closed menus drop the payload.
+    fn poll_repo_file_pick(&mut self) {
+        let payload = self
+            .repo_file_pick_result
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        let Some((tag, repo, resolved, files)) = payload else {
+            return;
+        };
+        if tag != self.repo_file_pick_gen || !self.show_menu || self.menu_section != 1 {
+            return;
+        }
+        // Single file: download it straight away and close the menu
+        // (same as the old auto behavior, minus the guesswork).
+        if files.len() == 1 {
+            let (file, _size) = files[0].clone();
+            let all_names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+            self.download_repo_file(repo, resolved, file, all_names);
+            self.menu_closing = true;
+            return;
+        }
+        // Best auto-pick first, rest alphabetical — every variant
+        // visible (1-bit, 2-bit, …, projector labeled in the rows).
+        let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+        let best = crate::manager::pick_best_gguf(&names);
+        let mut files = files;
+        files.sort_by(|a, b| {
+            let a_best = a.0 == best;
+            let b_best = b.0 == best;
+            b_best.cmp(&a_best).then_with(|| a.0.cmp(&b.0))
+        });
+        let mut state = ratatui::widgets::ListState::default();
+        state.select(Some(0));
+        self.repo_file_pick = Some(RepoFilePick {
+            repo: repo.clone(),
+            resolved,
+            files,
+            best,
+            state,
+        });
+        // Listing is not downloading: drop the 0% indicator.
+        *self.download_progress.lock().unwrap() = None;
+        self.status_message = format!(
+            "Pick a weight file for {} — Enter downloads, Esc goes back.",
+            repo
+        );
+    }
+
+    /// Render the registry weight-file picker: one repo's .gguf variants
+    /// with sizes, best auto-pick starred first. Replaces the repo list
+    /// while open.
+    fn render_repo_file_pick(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(pick) = self.repo_file_pick.clone() else {
+            return;
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(1)].as_ref())
+            .split(area);
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" Files in {} ", pick.repo),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(modal_bg())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " (Enter downloads file | Esc back to repos)",
+                Style::default()
+                    .fg(Color::Rgb(120, 140, 160))
+                    .bg(modal_bg()),
+            ),
+        ]))
+        .style(Style::default().bg(modal_bg()));
+        frame.render_widget(header, chunks[0]);
+
+        let total_w = chunks[1].width as usize;
+        let name_w = total_w.saturating_sub(16).max(10);
+        let items: Vec<ListItem> = pick
+            .files
+            .iter()
+            .enumerate()
+            .map(|(idx, (name, bytes))| {
+                let is_selected = pick.state.selected() == Some(idx);
+                let is_best = *name == pick.best;
+                let row_bg = if is_selected {
+                    crate::app_palette::current_palette().selection_bg_c()
+                } else {
+                    modal_bg()
+                };
+                let mut label: String = name.chars().take(name_w).collect();
+                if name.to_lowercase().contains("mmproj") {
+                    label.push_str("  (vision projector)");
+                }
+                if is_best {
+                    label = format!("★ {}", label);
+                }
+                let size_col = if *bytes > 0 {
+                    crate::manager::format_byte_size(*bytes)
+                } else {
+                    "-".to_string()
+                };
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("{:<width$} ", label, width = name_w.min(total_w)),
+                        Style::default()
+                            .fg(if is_selected {
+                                Color::White
+                            } else {
+                                Color::Rgb(220, 230, 242)
+                            })
+                            .bg(row_bg)
+                            .add_modifier(if is_selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(
+                        format!("{:>12}", size_col),
+                        Style::default()
+                            .fg(if is_selected {
+                                Color::Rgb(180, 240, 160)
+                            } else {
+                                Color::Rgb(163, 190, 140)
+                            })
+                            .bg(row_bg),
+                    ),
+                ]);
+                ListItem::new(line).style(Style::default().bg(row_bg))
+            })
+            .collect();
+        let list = List::new(items).style(Style::default().bg(modal_bg()));
+        if let Some(ref mut live) = self.repo_file_pick {
+            frame.render_stateful_widget(list, chunks[1], &mut live.state);
+        }
+    }
+
     fn poll_code_graph_job(&mut self) {
         let finished = self
             .code_graph_job
@@ -12023,6 +12566,7 @@ impl App {
             2 => &[
                 ("↑↓", " Navigate "),
                 ("Enter", " Select "),
+                ("Del", " Delete "),
                 ("Esc", " Close "),
             ],
             3 => &[
@@ -14706,6 +15250,10 @@ impl App {
                             self.status_message = "Token editing cancelled.".to_string();
                         } else if self.custom_color_editing {
                             self.custom_cancel_editing();
+                        } else if self.repo_file_pick.is_some() {
+                            // Back out of the weight-file picker to the repo list.
+                            self.repo_file_pick = None;
+                            self.status_message = "Back to repository list.".to_string();
                         } else if self.settings_col == 1 {
                             // Exit second column back to tab column
                             self.settings_col = 0;
@@ -14854,7 +15402,11 @@ impl App {
                 }
                 KeyCode::Left if self.show_menu => {
                     if self.menu_section == 1 {
-                        // Registry tab: toggle HF / Ollama
+                        // Registry tab: toggle HF / Ollama (not while
+                        // the weight-file picker owns the list)
+                        if self.repo_file_pick.is_some() {
+                            return None;
+                        }
                         self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
                         self.registry_state.select(Some(0));
                     } else if self.menu_section == 3 {
@@ -14976,7 +15528,11 @@ impl App {
                 }
                 KeyCode::Right if self.show_menu => {
                     if self.menu_section == 1 {
-                        // Registry tab: toggle HF / Ollama
+                        // Registry tab: toggle HF / Ollama (not while
+                        // the weight-file picker owns the list)
+                        if self.repo_file_pick.is_some() {
+                            return None;
+                        }
                         self.registry_tab = if self.registry_tab == 0 { 1 } else { 0 };
                         self.registry_state.select(Some(0));
                     } else if self.menu_section == 3 {
@@ -15207,21 +15763,39 @@ impl App {
                 }
                 KeyCode::Up if self.show_menu => {
                     if self.menu_section == 1 {
-                        let total = self.filtered_registry_models().len();
-                        let i = match self.registry_state.selected() {
-                            Some(i) => {
-                                if total == 0 {
-                                    0
-                                } else if i == 0 {
-                                    total.saturating_sub(1)
-                                } else {
-                                    i - 1
+                        // File picker open: move inside the file list.
+                        if let Some(ref mut pick) = self.repo_file_pick {
+                            let total = pick.files.len();
+                            let i = match pick.state.selected() {
+                                Some(i) => {
+                                    if total == 0 {
+                                        0
+                                    } else if i == 0 {
+                                        total.saturating_sub(1)
+                                    } else {
+                                        i - 1
+                                    }
                                 }
-                            }
-                            None => 0,
-                        };
-                        self.registry_state
-                            .select(if total == 0 { None } else { Some(i) });
+                                None => 0,
+                            };
+                            pick.state.select(if total == 0 { None } else { Some(i) });
+                        } else {
+                            let total = self.filtered_registry_models().len();
+                            let i = match self.registry_state.selected() {
+                                Some(i) => {
+                                    if total == 0 {
+                                        0
+                                    } else if i == 0 {
+                                        total.saturating_sub(1)
+                                    } else {
+                                        i - 1
+                                    }
+                                }
+                                None => 0,
+                            };
+                            self.registry_state
+                                .select(if total == 0 { None } else { Some(i) });
+                        }
                     } else if self.menu_section == 2 {
                         let total = self.modal_list_len();
                         let i = match self.installed_state.selected() {
@@ -15365,21 +15939,39 @@ impl App {
                 }
                 KeyCode::Down if self.show_menu => {
                     if self.menu_section == 1 {
-                        let total = self.filtered_registry_models().len();
-                        let i = match self.registry_state.selected() {
-                            Some(i) => {
-                                if total == 0 {
-                                    0
-                                } else if i >= total.saturating_sub(1) {
-                                    0
-                                } else {
-                                    i + 1
+                        // File picker open: move inside the file list.
+                        if let Some(ref mut pick) = self.repo_file_pick {
+                            let total = pick.files.len();
+                            let i = match pick.state.selected() {
+                                Some(i) => {
+                                    if total == 0 {
+                                        0
+                                    } else if i >= total.saturating_sub(1) {
+                                        0
+                                    } else {
+                                        i + 1
+                                    }
                                 }
-                            }
-                            None => 0,
-                        };
-                        self.registry_state
-                            .select(if total == 0 { None } else { Some(i) });
+                                None => 0,
+                            };
+                            pick.state.select(if total == 0 { None } else { Some(i) });
+                        } else {
+                            let total = self.filtered_registry_models().len();
+                            let i = match self.registry_state.selected() {
+                                Some(i) => {
+                                    if total == 0 {
+                                        0
+                                    } else if i >= total.saturating_sub(1) {
+                                        0
+                                    } else {
+                                        i + 1
+                                    }
+                                }
+                                None => 0,
+                            };
+                            self.registry_state
+                                .select(if total == 0 { None } else { Some(i) });
+                        }
                     } else if self.menu_section == 2 {
                         let total = self.modal_list_len();
                         let i = match self.installed_state.selected() {
@@ -15790,7 +16382,15 @@ impl App {
                 }
                 KeyCode::Char('y') | KeyCode::Char('Y') if self.delete_confirm_model.is_some() => {
                     if let Some(target) = self.delete_confirm_model.take() {
-                        if target.contains("Local GGUF:") || target.contains(".gguf") {
+                        // Never delete the model the backend is running.
+                        let is_active = self.backend.name().contains(&target)
+                            || target.contains(&self.backend.name());
+                        if is_active {
+                            self.status_message = format!(
+                                "Cannot delete '{}': it is the active model — switch to another model first.",
+                                target
+                            );
+                        } else if target.contains("Local GGUF:") || target.contains(".gguf") {
                             if let Err(e) = self.manager.delete_local_model(&target) {
                                 if let Ok(mut l) = self.activity_logs.lock() {
                                     l.push(format!("[DELETE ERROR] {}", e));
@@ -15801,14 +16401,15 @@ impl App {
                                     target
                                 ));
                             }
-                        }
-                        self.installed_models.retain(|m| m != &target);
-                        self.status_message = format!("Model '{}' deleted successfully.", target);
-                        if let Ok(mut l) = self.activity_logs.lock() {
-                            l.push(format!(
-                                "[DELETE] User confirmed deletion of model '{}'",
-                                target
-                            ));
+                            self.installed_models.retain(|m| m != &target);
+                            self.status_message =
+                                format!("Model '{}' deleted successfully.", target);
+                            if let Ok(mut l) = self.activity_logs.lock() {
+                                l.push(format!(
+                                    "[DELETE] User confirmed deletion of model '{}'",
+                                    target
+                                ));
+                            }
                         }
                     }
                 }
@@ -15932,7 +16533,10 @@ impl App {
                     }
                 }
                 KeyCode::Delete => {
-                    if self.show_menu && self.menu_section == 1 {
+                    // Registry (1) and Installed Models (2) share the
+                    // installed list + selection: Del arms the Y/N
+                    // delete confirm, highlighted red in the row.
+                    if self.show_menu && (self.menu_section == 1 || self.menu_section == 2) {
                         if let Some(idx) = self.installed_state.selected() {
                             if idx < self.installed_models.len() {
                                 self.delete_confirm_model =
@@ -15988,140 +16592,188 @@ impl App {
                             // Shared Thunder: activate selected action
                             self.thunder_activate().await;
                         } else if self.menu_section == 1 {
-                            // Registry tab: download selected model
-                            let filtered_models = self.filtered_registry_models();
-                            if let Some(i) = self.registry_state.selected() {
-                                if i < filtered_models.len() {
-                                    let item_str = filtered_models[i].clone();
-                                    if item_str.starts_with("Ollama:")
-                                        || item_str.starts_with("Ollama Local:")
-                                    {
-                                        let ollama_name = item_str
-                                            .replace("Ollama:", "")
-                                            .replace("Ollama Local:", "")
-                                            .split('(')
-                                            .next()
-                                            .unwrap_or(&item_str)
-                                            .split('[')
-                                            .next()
-                                            .unwrap_or(&item_str)
-                                            .trim()
-                                            .to_string();
-
-                                        self.status_message =
-                                            format!("Pulling Ollama Model {}", ollama_name);
-                                        self.messages.push(format!(
-                                            "System: Pulling Ollama Model: {}",
-                                            ollama_name
-                                        ));
-                                        if let Ok(mut l) = self.activity_logs.lock() {
-                                            l.push(format!(
-                                                "[OLLAMA] Initiated pull stream for model: {}",
-                                                ollama_name
-                                            ));
-                                        }
-
-                                        *self.download_progress.lock().unwrap() = Some(0.0);
-                                        let progress_clone = self.download_progress.clone();
-                                        let complete_clone = self.download_complete.clone();
-                                        let error_clone = self.download_error.clone();
-                                        let logs_clone = self.activity_logs.clone();
-                                        let manager_clone = self.manager.clone();
-
-                                        tokio::spawn(async move {
-                                            let res = manager_clone
-                                                .download_ollama_model(
-                                                    &ollama_name,
-                                                    progress_clone,
-                                                    logs_clone,
-                                                )
-                                                .await;
-                                            if res.is_ok() {
-                                                *complete_clone.lock().unwrap() = true;
-                                            } else {
-                                                *complete_clone.lock().unwrap() = false;
-                                                *error_clone.lock().unwrap() = Some(format!(
-                                                    "Ollama pull failed for '{}': {}",
-                                                    ollama_name,
-                                                    res.err().unwrap_or_default()
-                                                ));
-                                            }
-                                        });
-                                    } else {
-                                        let repo_id = {
-                                            let s = item_str
-                                                .replace("HuggingFace:", "")
+                            // Weight-file picker open: Enter downloads the
+                            // highlighted file, not the auto-pick.
+                            if self.repo_file_pick.is_some() {
+                                self.download_picked_repo_file();
+                            } else {
+                                // Registry tab: download selected model
+                                let filtered_models = self.filtered_registry_models();
+                                if let Some(i) = self.registry_state.selected() {
+                                    if i < filtered_models.len() {
+                                        let item_str = filtered_models[i].clone();
+                                        if item_str.starts_with("Ollama:")
+                                            || item_str.starts_with("Ollama Local:")
+                                        {
+                                            let ollama_name = item_str
+                                                .replace("Ollama:", "")
+                                                .replace("Ollama Local:", "")
+                                                .split('(')
+                                                .next()
+                                                .unwrap_or(&item_str)
+                                                .split('[')
+                                                .next()
+                                                .unwrap_or(&item_str)
                                                 .trim()
                                                 .to_string();
-                                            let s = s.split('[').next().unwrap_or(&s).trim();
-                                            s.split_whitespace().next().unwrap_or(s).to_string()
-                                        };
 
-                                        self.status_message =
-                                            format!("Resolving weights for {}", repo_id);
-                                        self.messages.push(format!("System: Resolving GGUF weights for: {} (download starts once weights are found; failures report here).", repo_id));
-                                        if let Ok(mut l) = self.activity_logs.lock() {
-                                            l.push(format!("[USER] Initiated download for HuggingFace model: {}", repo_id));
-                                        }
+                                            self.status_message =
+                                                format!("Pulling Ollama Model {}", ollama_name);
+                                            self.messages.push(format!(
+                                                "System: Pulling Ollama Model: {}",
+                                                ollama_name
+                                            ));
+                                            if let Ok(mut l) = self.activity_logs.lock() {
+                                                l.push(format!(
+                                                    "[OLLAMA] Initiated pull stream for model: {}",
+                                                    ollama_name
+                                                ));
+                                            }
 
-                                        *self.download_progress.lock().unwrap() = Some(0.0);
-                                        let progress_clone = self.download_progress.clone();
-                                        let complete_clone = self.download_complete.clone();
-                                        let error_clone = self.download_error.clone();
-                                        let logs_clone = self.activity_logs.clone();
-                                        let manager_clone = self.manager.clone();
+                                            *self.download_progress.lock().unwrap() = Some(0.0);
+                                            let progress_clone = self.download_progress.clone();
+                                            let complete_clone = self.download_complete.clone();
+                                            let error_clone = self.download_error.clone();
+                                            let logs_clone = self.activity_logs.clone();
+                                            let manager_clone = self.manager.clone();
 
-                                        tokio::spawn(async move {
-                                            let resolved =
-                                                manager_clone.resolve_gguf_file(&repo_id).await;
-                                            match resolved {
-                                                Ok((dl_repo, weight_filename, shard_files)) => {
-                                                    let progress_for_dl = progress_clone.clone();
-                                                    let res = manager_clone
-                                                        .download_hf_model(
-                                                            &dl_repo,
-                                                            &weight_filename,
-                                                            &shard_files,
-                                                            progress_for_dl,
-                                                            logs_clone.clone(),
-                                                        )
-                                                        .await;
-                                                    match res {
-                                                        Ok(path) => {
-                                                            if let Ok(mut l) = logs_clone.lock() {
-                                                                l.push(format!(
+                                            tokio::spawn(async move {
+                                                let res = manager_clone
+                                                    .download_ollama_model(
+                                                        &ollama_name,
+                                                        progress_clone,
+                                                        logs_clone,
+                                                    )
+                                                    .await;
+                                                if res.is_ok() {
+                                                    *complete_clone.lock().unwrap() = true;
+                                                } else {
+                                                    *complete_clone.lock().unwrap() = false;
+                                                    *error_clone.lock().unwrap() = Some(format!(
+                                                        "Ollama pull failed for '{}': {}",
+                                                        ollama_name,
+                                                        res.err().unwrap_or_default()
+                                                    ));
+                                                }
+                                            });
+                                            // Ollama pulls close the menu at
+                                            // once; HF stays open until the
+                                            // file listing resolves (picker
+                                            // or single-file download).
+                                            self.menu_closing = true;
+                                        } else {
+                                            let repo_id = {
+                                                let s = item_str
+                                                    .replace("HuggingFace:", "")
+                                                    .trim()
+                                                    .to_string();
+                                                let s = s.split('[').next().unwrap_or(&s).trim();
+                                                s.split_whitespace().next().unwrap_or(s).to_string()
+                                            };
+
+                                            self.status_message =
+                                                format!("Resolving weights for {}", repo_id);
+                                            self.messages.push(format!("System: Resolving GGUF weights for: {} (download starts once weights are found; failures report here).", repo_id));
+                                            if let Ok(mut l) = self.activity_logs.lock() {
+                                                l.push(format!("[USER] Initiated download for HuggingFace model: {}", repo_id));
+                                            }
+
+                                            *self.download_progress.lock().unwrap() = Some(0.0);
+                                            let progress_clone = self.download_progress.clone();
+                                            let complete_clone = self.download_complete.clone();
+                                            let error_clone = self.download_error.clone();
+                                            let logs_clone = self.activity_logs.clone();
+                                            let manager_clone = self.manager.clone();
+                                            // File-picker generation: a newer Enter
+                                            // supersedes an older listing.
+                                            self.repo_file_pick_gen =
+                                                self.repo_file_pick_gen.wrapping_add(1);
+                                            let pick_gen = self.repo_file_pick_gen;
+                                            let pick_slot = self.repo_file_pick_result.clone();
+
+                                            tokio::spawn(async move {
+                                                // List first: multi-file repos
+                                                // open the weight-file picker;
+                                                // single-file proceeds below.
+                                                // Anything else falls through to
+                                                // the legacy resolve flow.
+                                                let listed = match manager_clone
+                                                    .list_repo_weight_files(&repo_id)
+                                                    .await
+                                                {
+                                                    Ok((resolved, files)) => {
+                                                        Some((resolved, files))
+                                                    }
+                                                    _ => None,
+                                                };
+                                                if let Some((resolved, files)) = listed {
+                                                    *pick_slot.lock().unwrap() =
+                                                        Some((pick_gen, repo_id, resolved, files));
+                                                    return;
+                                                }
+                                                let resolved =
+                                                    manager_clone.resolve_gguf_file(&repo_id).await;
+                                                match resolved {
+                                                    Ok((dl_repo, weight_filename, shard_files)) => {
+                                                        let progress_for_dl =
+                                                            progress_clone.clone();
+                                                        let res = manager_clone
+                                                            .download_hf_model(
+                                                                &dl_repo,
+                                                                &weight_filename,
+                                                                &shard_files,
+                                                                progress_for_dl,
+                                                                logs_clone.clone(),
+                                                            )
+                                                            .await;
+                                                        match res {
+                                                            Ok(path) => {
+                                                                if let Ok(mut l) = logs_clone.lock()
+                                                                {
+                                                                    l.push(format!(
                                                                     "[SUCCESS] Installed GGUF at {}",
                                                                     path.display()
                                                                 ));
+                                                                }
+                                                                *complete_clone.lock().unwrap() =
+                                                                    true;
                                                             }
-                                                            *complete_clone.lock().unwrap() = true;
-                                                        }
-                                                        Err(e) => {
-                                                            if let Ok(mut l) = logs_clone.lock() {
-                                                                l.push(format!("[ERROR] {}", e));
+                                                            Err(e) => {
+                                                                if let Ok(mut l) = logs_clone.lock()
+                                                                {
+                                                                    l.push(format!(
+                                                                        "[ERROR] {}",
+                                                                        e
+                                                                    ));
+                                                                }
+                                                                *complete_clone.lock().unwrap() =
+                                                                    false;
+                                                                *progress_clone.lock().unwrap() =
+                                                                    None;
+                                                                *error_clone.lock().unwrap() = Some(
+                                                                    format!(
+                                                                        "Download failed for '{}': {}",
+                                                                        repo_id, e
+                                                                    ),
+                                                                );
                                                             }
-                                                            *complete_clone.lock().unwrap() = false;
-                                                            *progress_clone.lock().unwrap() = None;
-                                                            *error_clone.lock().unwrap() =
-                                                                Some(format!(
-                                                                    "Download failed for '{}': {}",
-                                                                    repo_id, e
-                                                                ));
                                                         }
                                                     }
-                                                }
-                                                Err(e) => {
-                                                    if let Ok(mut l) = logs_clone.lock() {
-                                                        l.push(format!("[RESOLVE ERROR] {}", e));
+                                                    Err(e) => {
+                                                        if let Ok(mut l) = logs_clone.lock() {
+                                                            l.push(format!(
+                                                                "[RESOLVE ERROR] {}",
+                                                                e
+                                                            ));
+                                                        }
+                                                        *complete_clone.lock().unwrap() = false;
+                                                        *progress_clone.lock().unwrap() = None;
+                                                        *error_clone.lock().unwrap() = Some(e);
                                                     }
-                                                    *complete_clone.lock().unwrap() = false;
-                                                    *progress_clone.lock().unwrap() = None;
-                                                    *error_clone.lock().unwrap() = Some(e);
                                                 }
-                                            }
-                                        });
+                                            });
+                                        }
                                     }
-                                    self.menu_closing = true;
                                 }
                             }
                         } else if self.menu_section == 2 {
@@ -16543,16 +17195,15 @@ impl App {
                                     self.messages.push(format!("System: {s}"));
                                     self.status_message = s;
                                 }
-                                "/copy" => {
-                                    let full_chat = self.messages.join("\n\n");
-                                    let ok = crate::clipboard::copy_text_silent(&full_chat);
-                                    let _ =
-                                        std::fs::write("/tmp/hercules_chat_export.txt", &full_chat);
-                                    self.messages.push(format!(
-                                        "System: Chat exported to /tmp/hercules_chat_export.txt{}",
-                                        if ok { " (+ clipboard)" } else { "" }
-                                    ));
-                                }
+                                "/copy" => match crate::copy::parse_copy_command(&prompt) {
+                                    Some(Ok(req)) => self.exec_copy_request(req),
+                                    Some(Err(e)) => {
+                                        self.status_message = format!("Copy failed: {e}");
+                                    }
+                                    None => self
+                                        .messages
+                                        .push(format!("System: Unknown command '{}'", parts[0])),
+                                },
                                 "/theme" => {
                                     if parts.len() > 1 {
                                         match parts[1] {
@@ -16578,6 +17229,12 @@ impl App {
                                         if let Ok(data) = std::fs::read_to_string(parts[1]) {
                                             self.messages =
                                                 data.split('\n').map(|s| s.to_string()).collect();
+                                            // A loaded transcript replaces the
+                                            // conversation: archive, chip
+                                            // record and selection die with it.
+                                            self.conversation_archive.clear();
+                                            self.archived_chip_ids.clear();
+                                            self.clear_selection();
                                             self.messages.push(format!(
                                                 "System: Session loaded from {}",
                                                 parts[1]
@@ -17020,6 +17677,31 @@ mod tests {
             "cancel must not resume generation"
         );
         assert_eq!(app.status_message, "Ask Mode: cancelled");
+    }
+
+    #[tokio::test]
+    async fn test_delete_arms_confirm_in_models_modal() {
+        // F3 Installed Models modal (menu_section 2): Del must arm the
+        // Y/N delete confirm exactly like the Registry tab (section 1).
+        // Regression: Del was scoped to section 1 only, so it silently
+        // did nothing in the modal.
+        let mut app = App::new();
+        app.show_menu = true;
+        app.menu_section = 2;
+        app.installed_models = vec!["Local GGUF: qwen3-4b".to_string()];
+        app.installed_state.select(Some(0));
+        app.handle_key(ask_test_key(crossterm::event::KeyCode::Delete))
+            .await;
+        assert_eq!(
+            app.delete_confirm_model.as_deref(),
+            Some("Local GGUF: qwen3-4b"),
+            "Del in the Models modal must arm delete confirm"
+        );
+        // N cancels without touching the list.
+        app.handle_key(ask_test_key(crossterm::event::KeyCode::Char('n')))
+            .await;
+        assert!(app.delete_confirm_model.is_none());
+        assert_eq!(app.installed_models.len(), 1);
     }
 
     #[tokio::test]
@@ -18608,6 +19290,79 @@ mod thunder_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compact_archives_retired_transcript_and_chips_for_copy() {
+        // Spec §14/§20: compaction retires the transcript from the model
+        // context but must not destroy /copy. Retired messages + chips
+        // land in the archive (kept tail excluded — no duplication), and
+        // /copy (All) still contains chips 1..N after compact.
+        let (_guard, real_home, tmp, saved) = isolate_chrome();
+        let mut app = compact_test_app();
+        let (messages, tools) = compact_long_history();
+        app.messages = messages;
+        app.tool_result_context = tools;
+        app.tool_chips.push(ToolChip {
+            id: 7,
+            kind: tool_panel::ToolPanelKind::Read,
+            target: "a.rs".to_string(),
+            body: "fn a() {}".to_string(),
+            tag_closed: true,
+            pending: false,
+            spawned: false,
+            rect: None,
+            anchor_msg: Some(1),
+            expanded: false,
+            anim_start: None,
+            added: None,
+            removed: None,
+            line_range: None,
+        });
+        app.compact_context(crate::compact::CompactReason::Manual)
+            .await;
+        // Retired transcript archived (ancient markers survive)...
+        assert!(
+            app.conversation_archive
+                .iter()
+                .any(|e| e.text.contains("ANCIENT-MARKER-0")),
+            "retired transcript must be archived"
+        );
+        // ...kept tail NOT duplicated into the archive...
+        assert!(
+            !app.conversation_archive
+                .iter()
+                .any(|e| e.text.contains("SNAPPING-OPEN-BUG")),
+            "kept tail must not duplicate into the archive"
+        );
+        assert!(
+            app.messages.iter().any(|m| m.contains("SNAPPING-OPEN-BUG")),
+            "kept tail stays live"
+        );
+        // ...chips archived under stable ids with bodies...
+        assert!(app.archived_chip_ids.contains(&7));
+        let chip_text = app
+            .conversation_archive
+            .iter()
+            .find(|e| e.kind == crate::copy::ArchiveKind::Chip && e.id == 7)
+            .map(|e| e.text.clone())
+            .unwrap_or_default();
+        assert!(
+            chip_text.contains("fn a() {}"),
+            "archived chip keeps its body"
+        );
+        // ...and /copy (All) assembles archive + summary + tail.
+        let out = crate::copy::conversation_copy_text(
+            &app.conversation_archive,
+            app.compact_context.as_deref(),
+            &app.messages,
+        );
+        assert!(out.contains("ANCIENT-MARKER-0"));
+        assert!(out.contains("# COMPACT CONTEXT"));
+        assert!(out.contains("SNAPPING-OPEN-BUG"));
+        // /copy <id> resolves the archived chip post-compact.
+        assert_eq!(app.chip_copy_text_by_id(7).unwrap_or_default(), chip_text);
+        unisolate_chrome(_guard, real_home, tmp, saved);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn compact_short_history_keeps_original_intact() {
         // Nothing worth compacting: no backend call effect, messages and
         // count untouched — no destructive partial compaction.
@@ -18712,10 +19467,15 @@ mod thunder_tests {
         assert_eq!(app.input, "@src/main.rs");
 
         // Second flow: `read @` then pick the first candidate via Tab.
+        // NOTE: filtered `@s` on purpose — the unfiltered root listing is
+        // capped at 15 entries, so asserting `@src/` there depends on stray
+        // repo-root files (a dropped screenshot once pushed src/ past the
+        // cap and flaked this test). The trigger/accept/resolve path under
+        // test is identical either way.
         app.input.clear();
         app.input_cursor_position = 0;
         app.update_path_autocomplete();
-        type_text(&mut app, "read @");
+        type_text(&mut app, "read @s");
         assert!(app.path_suggestion_active);
         app.path_suggestion_index = app
             .path_suggestions
