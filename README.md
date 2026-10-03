@@ -9,18 +9,32 @@ Working name / crate: `hercules-agent`. Binary: `hercules`.
 
 ## Getting started
 
-Download the latest release here:
+### 1. Install with one line
+
+Linux / macOS (installs user-local under `~/.local`, no sudo):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/CosmoBunny/hercules-agent/main/install.sh | bash
+```
+
+Windows PowerShell (installs under `%LOCALAPPDATA%\hercules-agent`, no admin):
+
+```powershell
+irm https://raw.githubusercontent.com/CosmoBunny/hercules-agent/main/install.ps1 | iex
+```
+
+The script detects your OS, CPU and GPU and picks the right package
+(`normal`, `nvidia` or `amd` build). Override with `--nvidia` / `--amd` /
+`--cpu` on Linux/macOS, or `-Flavor nvidia|amd|normal` on Windows.
+
+Prefer to do it by hand? Download the latest release here:
 [CosmoBunny/hercules-agent — Releases](https://github.com/CosmoBunny/hercules-agent/releases/latest)
 
-### 1. Pick the binary for your machine
-
-| OS      | Integrated graphics | NVIDIA GPU | AMD Radeon GPU | ARM (aarch64) |
-| ------- | ------------------- | ---------- | -------------- | ------------- |
-| Linux   | `hercules-normal-linux-x86_64.zip` | `hercules-nvidia-linux-x86_64.zip` | `hercules-amd-linux-x86_64.zip` | `hercules-normal-linux-aarch64.zip` |
-| Windows | `hercules-normal-windows-x86_64.zip` | `hercules-nvidia-windows-x86_64.zip` | `hercules-amd-windows-x86_64.zip` | — |
-| macOS   | `hercules-normal-macos-aarch64.zip` (Metal GPU acceleration) | — | — | ✅ (same file) |
-
-Unzip and run the `hercules` binary.
+Pick the `hercules-agent-<version>-<os>-<arch>.tar.gz` file for your
+machine (`nvidia` / `amd` in the name means a GPU build, e.g.
+`hercules-agent-nvidia-<version>-linux-x86_64.tar.gz`). macOS ships one
+build (`macos-aarch64`, Metal acceleration included). Extract it and run
+the `hercules` binary inside `bin/`.
 
 ### 2. Download an LLM model
 
@@ -183,7 +197,3 @@ src/
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-## Roadmap
-
-See [TODO.md](TODO.md).
